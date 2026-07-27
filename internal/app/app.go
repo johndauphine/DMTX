@@ -55,6 +55,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return showState(args[1:], stdout, true)
 	case "history":
 		return showState(args[1:], stdout, false)
+	case "validate":
+		return validate(args[1:], stdout, stderr)
 	case "preflight", "health-check":
 		return preflight(args[1:], stdout, stderr)
 	default:
