@@ -38,3 +38,13 @@ func TestValidateMigrationAcceptsImplementedPairs(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateMigrationRejectsSameEndpoint(t *testing.T) {
+	err := ValidateMigration(config.Config{
+		Source: config.Endpoint{Type: "postgres", Host: "db.example.test", Database: "dmtx"},
+		Target: config.Endpoint{Type: "postgres", Host: "DB.EXAMPLE.TEST", Port: 5432, Database: "dmtx"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "same endpoint") {
+		t.Fatalf("error = %v", err)
+	}
+}

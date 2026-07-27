@@ -36,7 +36,8 @@ func preflight(args []string, stdout, stderr io.Writer) int {
 		return ConfigurationError
 	}
 	findings := []preflightFinding{}
-	if err := engine.ValidateMigration(cfg); err != nil {
+	sameSQLiteDatabase := cfg.Source.Type == "sqlite" && cfg.Target.Type == "sqlite" && cfg.Source.Database != "" && cfg.Source.Database == cfg.Target.Database
+	if err := engine.ValidateMigration(cfg); err != nil && !sameSQLiteDatabase {
 		findings = append(findings, preflightFinding{"unsupported_capability", "error", err.Error()})
 	}
 	if cfg.Source.Database == "" || cfg.Target.Database == "" {

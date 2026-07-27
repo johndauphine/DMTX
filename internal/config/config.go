@@ -32,6 +32,36 @@ type Config struct {
 	Migration Migration `yaml:"migration"`
 }
 
+// SameEndpoint reports whether source and target resolve to the same physical
+// database identity after engine aliases have been canonicalized.
+func SameEndpoint(source, target Endpoint) bool {
+	if source.Type != target.Type || source.Database == "" || source.Database != target.Database {
+		return false
+	}
+	if source.Type == "sqlite" {
+		return true
+	}
+	return strings.EqualFold(source.Host, target.Host) && effectivePort(source) == effectivePort(target)
+}
+
+func effectivePort(endpoint Endpoint) int {
+	if endpoint.Port != 0 {
+		return endpoint.Port
+	}
+	switch endpoint.Type {
+	case "postgres":
+		return 5432
+	case "mssql":
+		return 1433
+	case "mysql":
+		return 3306
+	case "clickhouse":
+		return 9440
+	default:
+		return 0
+	}
+}
+
 func Parse(data []byte) (Config, error) {
 	var value Config
 	if err := yaml.Unmarshal(data, &value); err != nil {

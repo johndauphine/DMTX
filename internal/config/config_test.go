@@ -34,3 +34,12 @@ func TestParseRejectsUnknownEngine(t *testing.T) {
 		t.Fatal("expected unsupported engine error")
 	}
 }
+
+func TestSameEndpointNormalizesDefaultNetworkPorts(t *testing.T) {
+	if !SameEndpoint(Endpoint{Type: "postgres", Host: "DB.EXAMPLE.TEST", Database: "dmtx"}, Endpoint{Type: "postgres", Host: "db.example.test", Port: 5432, Database: "dmtx"}) {
+		t.Fatal("expected equivalent PostgreSQL endpoints")
+	}
+	if SameEndpoint(Endpoint{Type: "postgres", Host: "db.example.test", Database: "dmtx"}, Endpoint{Type: "postgres", Host: "db.example.test", Database: "other"}) {
+		t.Fatal("different databases must not compare equal")
+	}
+}

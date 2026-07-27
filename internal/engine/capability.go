@@ -41,6 +41,9 @@ func ValidateMigration(cfg config.Config) error {
 	if _, ok := TargetCapability(cfg.Source.Type); !ok {
 		return fmt.Errorf("source engine %q is not registered", cfg.Source.Type)
 	}
+	if config.SameEndpoint(cfg.Source, cfg.Target) {
+		return fmt.Errorf("source and target resolve to the same endpoint")
+	}
 	if cfg.Migration.TargetMode == "upsert" && !target.Upsert {
 		return fmt.Errorf("target engine %s does not support upsert mode", cfg.Target.Type)
 	}
