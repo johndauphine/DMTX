@@ -67,11 +67,12 @@ func Run(args []string, stdout, stderr io.Writer) int {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
-	if len(args) != 2 || args[0] != "--config" {
-		fmt.Fprintln(stderr, "usage: dmt run --config migration.yaml")
+	configPath, dryRun, ok := runArguments(args)
+	if !ok {
+		fmt.Fprintln(stderr, "usage: dmt run --config migration.yaml [--dry-run]")
 		return ConfigurationError
 	}
-	data, err := os.ReadFile(args[1])
+	data, err := os.ReadFile(configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "read configuration: %v\n", err)
 		return FileError
@@ -81,13 +82,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}
+	if dryRun {
+		plan, err := migrate.DryRun(context.Background(), cfg)
+		if err != nil {
+			fmt.Fprintf(stderr, "dry run: %v\n", err)
+			return ConfigurationError
+		}
+		if err := json.NewEncoder(stdout).Encode(plan); err != nil {
+			fmt.Fprintf(stderr, "write dry run: %v\n", err)
+			return FileError
+		}
+		return Success
+	}
 	configHash, err := config.Hash(cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "configuration hash: %v\n", err)
 		return StateError
 	}
 
-	store := state.SQLiteStore{Path: args[1] + ".state.db"}
+	store := state.SQLiteStore{Path: configPath + ".state.db"}
 	started := time.Now().UTC()
 	runID := started.Format("20060102T150405.000000000Z")
 	leaseStore, lease, err := acquireSQLiteTargetLease(cfg.Target.Database, runID)
@@ -109,7 +122,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "record configuration hash: %v\n", err)
 		return StateError
 	}
-	if err := appendAudit(args[1], runID, "run_started"); err != nil {
+	if err := appendAudit(configPath, runID, "run_started"); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
@@ -125,7 +138,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "record failed migration state: %v\n", stateErr)
 			return StateError
 		}
-		if auditErr := appendAudit(args[1], runID, "run_failed"); auditErr != nil {
+		if auditErr := appendAudit(configPath, runID, "run_failed"); auditErr != nil {
 			fmt.Fprintf(stderr, "%v\n", auditErr)
 			return StateError
 		}
@@ -136,7 +149,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "record completed migration state: %v\n", err)
 		return StateError
 	}
-	if err := appendAudit(args[1], runID, "run_succeeded"); err != nil {
+	if err := appendAudit(configPath, runID, "run_succeeded"); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
@@ -150,6 +163,30 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return FileError
 	}
 	return Success
+}
+
+func runArguments(args []string) (configPath string, dryRun, ok bool) {
+	if len(args) < 2 || len(args) > 3 {
+		return "", false, false
+	}
+	for index := 0; index < len(args); index++ {
+		switch args[index] {
+		case "--config":
+			if index+1 >= len(args) || configPath != "" {
+				return "", false, false
+			}
+			configPath = args[index+1]
+			index++
+		case "--dry-run":
+			if dryRun {
+				return "", false, false
+			}
+			dryRun = true
+		default:
+			return "", false, false
+		}
+	}
+	return configPath, dryRun, configPath != ""
 }
 
 func showState(args []string, stdout io.Writer, latest bool) int {
