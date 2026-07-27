@@ -28,6 +28,10 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}
+	if cfg.Source.Type != "sqlite" || cfg.Target.Type != "sqlite" {
+		fmt.Fprintln(stderr, "resume is currently supported only for SQLite-to-SQLite migrations")
+		return ConfigurationError
+	}
 	configHash, err := config.Hash(cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "configuration hash: %v\n", err)
