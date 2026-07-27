@@ -108,7 +108,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	store := state.SQLiteStore{Path: configPath + ".state.db"}
 	started := time.Now().UTC()
 	runID := started.Format("20060102T150405.000000000Z")
-	leaseStore, lease, err := acquireSQLiteTargetLease(cfg.Target.Database, runID)
+	leaseStore, lease, err := acquireTargetLease(cfg.Target, runID)
 	if err != nil {
 		fmt.Fprintf(stderr, "acquire target lease: %v\n", err)
 		return StateError

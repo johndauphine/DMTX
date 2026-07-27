@@ -1,22 +1,74 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/johndauphine/DMTX/internal/config"
 	"github.com/johndauphine/DMTX/internal/state"
 )
 
-func acquireSQLiteTargetLease(target, runID string) (state.SQLiteStore, state.Lease, error) {
-	canonicalTarget, err := filepath.Abs(target)
+// acquireTargetLease uses the actual endpoint identity. SQLite keeps its
+// adjacent lease database; network targets share a stable cache location so
+// separate config files still contend for the same physical endpoint.
+func acquireTargetLease(target config.Endpoint, runID string) (state.SQLiteStore, state.Lease, error) {
+	identity, storePath, err := targetLeaseLocation(target)
 	if err != nil {
-		return state.SQLiteStore{}, state.Lease{}, fmt.Errorf("canonicalize SQLite target: %w", err)
+		return state.SQLiteStore{}, state.Lease{}, err
 	}
-	store := state.SQLiteStore{Path: canonicalTarget + ".dmtx-lease.db"}
-	lease, err := store.AcquireLease("sqlite:"+canonicalTarget, runID, 30*time.Second)
+	store := state.SQLiteStore{Path: storePath}
+	lease, err := store.AcquireLease(identity, runID, 30*time.Second)
 	if err != nil {
 		return state.SQLiteStore{}, state.Lease{}, err
 	}
 	return store, lease, nil
+}
+
+func targetLeaseLocation(target config.Endpoint) (identity, storePath string, err error) {
+	if target.Type == "sqlite" {
+		canonicalTarget, err := filepath.Abs(target.Database)
+		if err != nil {
+			return "", "", fmt.Errorf("canonicalize SQLite target: %w", err)
+		}
+		return "sqlite:" + canonicalTarget, canonicalTarget + ".dmtx-lease.db", nil
+	}
+	if target.Host == "" || target.Database == "" {
+		return "", "", fmt.Errorf("network target host and database are required for lease")
+	}
+	port := target.Port
+	if port == 0 {
+		port = defaultLeasePort(target.Type)
+	}
+	identity = strings.Join([]string{target.Type, strings.ToLower(target.Host), strconv.Itoa(port), target.Database, target.Schema}, ":")
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return "", "", fmt.Errorf("locate DMTX lease cache: %w", err)
+	}
+	directory := filepath.Join(cache, "dmtx", "leases")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return "", "", fmt.Errorf("create DMTX lease cache: %w", err)
+	}
+	digest := sha256.Sum256([]byte(identity))
+	return identity, filepath.Join(directory, hex.EncodeToString(digest[:])+".db"), nil
+}
+
+func defaultLeasePort(engine string) int {
+	switch engine {
+	case "postgres":
+		return 5432
+	case "mysql":
+		return 3306
+	case "mssql":
+		return 1433
+	case "clickhouse":
+		return 9440
+	default:
+		return 0
+	}
 }

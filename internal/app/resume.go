@@ -56,7 +56,7 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "resumable run configuration does not match the supplied data-plane settings")
 		return ConfigurationError
 	}
-	leaseStore, lease, err := acquireSQLiteTargetLease(cfg.Target.Database, run.ID)
+	leaseStore, lease, err := acquireTargetLease(cfg.Target, run.ID)
 	if err != nil {
 		fmt.Fprintf(stderr, "acquire target lease: %v\n", err)
 		return StateError
