@@ -26,16 +26,18 @@ type TableObserver interface {
 	AfterTable(context.Context, string, int) error
 }
 
-// PageObserver records only a target-acknowledged integer-keyset frontier.
-// It is optional so table-level observers remain compatible.
+// PageObserver records target-acknowledged page frontiers. It is optional so
+// table-level observers remain compatible.
 type PageObserver interface {
 	AfterIntegerKeysetPage(context.Context, string, int, int64) error
+	AfterRowNumberPage(context.Context, string, int, int64) error
 }
 
 // TableProgress is the durable, reusable portion of an incomplete table.
 type TableProgress struct {
-	RowsDone         int
-	IntegerWatermark *int64
+	RowsDone           int
+	IntegerWatermark   *int64
+	RowNumberWatermark *int64
 }
 
 func SQLiteToSQLite(ctx context.Context, cfg config.Config) (Result, error) {
@@ -140,7 +142,7 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, mode string, o
 	if key, ok := integerPrimaryKey(table); ok {
 		return copyIntegerKeyset(ctx, source, target, table, columns, key, mode, observer, progress)
 	}
-	return copyOrderedRows(ctx, source, target, table, columns, mode)
+	return copyOrderedRows(ctx, source, target, table, columns, mode, observer, progress)
 }
 
 func copyIntegerKeyset(ctx context.Context, source, target *sql.DB, table schema.Table, columns []string, key string, mode string, observer TableObserver, progress TableProgress) (int, error) {
@@ -191,9 +193,13 @@ func copyIntegerKeyset(ctx context.Context, source, target *sql.DB, table schema
 	}
 }
 
-func copyOrderedRows(ctx context.Context, source, target *sql.DB, table schema.Table, columns []string, mode string) (int, error) {
+func copyOrderedRows(ctx context.Context, source, target *sql.DB, table schema.Table, columns []string, mode string, observer TableObserver, progress TableProgress) (int, error) {
 	count := 0
-	for lowerRow := 0; ; lowerRow += sqliteWriteBatchSize {
+	lowerRow := int64(0)
+	if progress.RowNumberWatermark != nil {
+		lowerRow = *progress.RowNumberWatermark
+	}
+	for {
 		batch, err := readRowNumberPage(ctx, source, table, columns, lowerRow)
 		if err != nil {
 			return 0, err
@@ -205,10 +211,16 @@ func copyOrderedRows(ctx context.Context, source, target *sql.DB, table schema.T
 			return 0, err
 		}
 		count += len(batch)
+		lowerRow += int64(len(batch))
+		if pageObserver, ok := observer.(PageObserver); ok {
+			if err := pageObserver.AfterRowNumberPage(ctx, table.Name, progress.RowsDone+count, lowerRow); err != nil {
+				return 0, fmt.Errorf("checkpoint page for %s: %w", table.Name, err)
+			}
+		}
 	}
 }
 
-func readRowNumberPage(ctx context.Context, source *sql.DB, table schema.Table, columns []string, lowerRow int) ([][]any, error) {
+func readRowNumberPage(ctx context.Context, source *sql.DB, table schema.Table, columns []string, lowerRow int64) ([][]any, error) {
 	order := quotedColumns(primaryKeyColumns(table))
 	query := "SELECT " + quotedColumns(columns) + " FROM (SELECT " + quotedColumns(columns) + ", ROW_NUMBER() OVER (ORDER BY " + order + ") AS dmtx_row_number FROM " + quote(table.Name) + ") WHERE dmtx_row_number > ? AND dmtx_row_number <= ? ORDER BY dmtx_row_number"
 	rows, err := source.QueryContext(ctx, query, lowerRow, lowerRow+sqliteWriteBatchSize)

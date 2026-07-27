@@ -14,8 +14,8 @@ func SQLiteToSQLiteResume(ctx context.Context, cfg config.Config, completed map[
 	return SQLiteToSQLiteResumeWithProgress(ctx, cfg, completed, nil, observer)
 }
 
-// SQLiteToSQLiteResumeWithProgress resumes integer-keyset pages only in
-// upsert mode. Rebuild mode restarts incomplete tables intentionally.
+// SQLiteToSQLiteResumeWithProgress resumes target-acknowledged pages in upsert
+// mode. Rebuild mode restarts incomplete tables intentionally.
 func SQLiteToSQLiteResumeWithProgress(ctx context.Context, cfg config.Config, completed map[string]bool, progress map[string]TableProgress, observer TableObserver) (Result, error) {
 	if cfg.Source.Type != "sqlite" || cfg.Target.Type != "sqlite" {
 		return Result{}, fmt.Errorf("SQLite first pass requires source.type and target.type to be sqlite")

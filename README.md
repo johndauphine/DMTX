@@ -57,11 +57,12 @@ source tables fails before target mutation.
 - Single-integer primary keys transfer through bounded, ascending keyset pages.
   A target-acknowledged page records its signed integer frontier locally.
 - Text and composite primary keys use deterministic `ROW_NUMBER()` pages in
-  primary-key order rather than an unbounded source read.
+  primary-key order rather than an unbounded source read. A
+  target-acknowledged page records its row-number frontier locally.
 - `dmt resume --config migration.yaml` reuses the interrupted run, verifies a
   completed table before skipping it, and rejects changed data-plane settings.
-  In upsert mode, an interrupted integer-key table resumes after its last
-  acknowledged keyset page; drop-recreate restarts an incomplete table safely.
+  In upsert mode, an interrupted table resumes after its last acknowledged
+  keyset or row-number page; drop-recreate restarts an incomplete table safely.
 
 Inspect state with:
 
@@ -73,9 +74,9 @@ Inspect state with:
 ## Scope and roadmap
 
 This is not yet the full DMT compatibility target. Network engines, richer
-schema evolution, row-number resume frontiers, deep validation, WebUI/TUI, and
-release hardening remain staged work. The complete specification and staged
-acceptance requirements are in [docs/RECREATE_DMT.md](docs/RECREATE_DMT.md).
+schema evolution, deep validation, WebUI/TUI, and release hardening remain
+staged work. The complete specification and staged acceptance requirements are
+in [docs/RECREATE_DMT.md](docs/RECREATE_DMT.md).
 
 ## Development
 

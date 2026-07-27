@@ -75,7 +75,11 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		if task.Status == "completed" {
 			completed[task.Table] = true
 		} else {
-			progress[task.Table] = migrate.TableProgress{RowsDone: task.RowsDone, IntegerWatermark: task.IntegerWatermark}
+			progress[task.Table] = migrate.TableProgress{
+				RowsDone:           task.RowsDone,
+				IntegerWatermark:   task.IntegerWatermark,
+				RowNumberWatermark: task.RowNumberWatermark,
+			}
 		}
 	}
 	observer := resumeCheckpointObserver{tableCheckpointObserver: tableCheckpointObserver{store: store, runID: run.ID}, existing: existing}
