@@ -20,6 +20,9 @@ func Execute(ctx context.Context, cfg config.Config, observer TableObserver) (Re
 	if cfg.Source.Type == "sqlite" && cfg.Target.Type == "postgres" {
 		return SQLiteToPostgresWithObserver(ctx, cfg, observer)
 	}
+	if cfg.Source.Type == "sqlite" && cfg.Target.Type == "mysql" {
+		return SQLiteToMySQLWithObserver(ctx, cfg, observer)
+	}
 	if cfg.Source.Type == "postgres" && cfg.Target.Type == "sqlite" {
 		return PostgresToSQLiteWithObserver(ctx, cfg, observer)
 	}

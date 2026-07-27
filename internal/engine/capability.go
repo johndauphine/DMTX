@@ -56,6 +56,7 @@ func ValidateMigration(cfg config.Config) error {
 func implementedPair(source, target string) bool {
 	return (source == "sqlite" && target == "sqlite") ||
 		(source == "sqlite" && target == "postgres") ||
+		(source == "sqlite" && target == "mysql") ||
 		(source == "postgres" && target == "sqlite") ||
 		(source == "mysql" && target == "sqlite") ||
 		(source == "mssql" && target == "sqlite")
