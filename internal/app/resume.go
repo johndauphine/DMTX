@@ -28,6 +28,11 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}
+	configHash, err := config.Hash(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "configuration hash: %v\n", err)
+		return StateError
+	}
 	store := state.SQLiteStore{Path: args[1] + ".state.db"}
 	run, found, err := store.LatestResumableForTarget(cfg.Target.Database)
 	if err != nil {
@@ -40,6 +45,15 @@ func resume(args []string, stdout, stderr io.Writer) int {
 	}
 	if run.Source != cfg.Source.Database {
 		fmt.Fprintln(stderr, "resumable run source does not match the supplied configuration")
+		return ConfigurationError
+	}
+	storedHash, found, err := store.ConfigHash(run.ID)
+	if err != nil {
+		fmt.Fprintf(stderr, "read configuration hash: %v\n", err)
+		return StateError
+	}
+	if !found || storedHash != configHash {
+		fmt.Fprintln(stderr, "resumable run configuration does not match the supplied data-plane settings")
 		return ConfigurationError
 	}
 	leaseStore, lease, err := acquireSQLiteTargetLease(cfg.Target.Database, run.ID)

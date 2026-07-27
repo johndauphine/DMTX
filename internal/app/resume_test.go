@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/johndauphine/DMTX/internal/config"
 	"github.com/johndauphine/DMTX/internal/state"
 	_ "modernc.org/sqlite"
 )
@@ -30,6 +31,13 @@ func TestResumeReusesValidatedCompletedTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.Append(state.Run{ID: "run-1", Source: sourcePath, Target: targetPath, Outcome: state.Failed, Resumable: true, Reason: "interrupted", StartedAt: started, EndedAt: started.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := config.Hash(config.Config{Source: config.Endpoint{Type: "sqlite", Database: sourcePath}, Target: config.Endpoint{Type: "sqlite", Database: targetPath}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveConfigHash("run-1", hash); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateTask(state.Task{RunID: "run-1", Table: "users", StartedAt: started}); err != nil {

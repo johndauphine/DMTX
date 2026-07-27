@@ -82,6 +82,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}
+	configHash, err := config.Hash(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "configuration hash: %v\n", err)
+		return StateError
+	}
 
 	store := state.SQLiteStore{Path: args[1] + ".state.db"}
 	started := time.Now().UTC()
@@ -94,6 +99,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	defer leaseStore.ReleaseLease(lease)
 	if err := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Running, Resumable: true, Reason: "migration in progress", StartedAt: started}); err != nil {
 		fmt.Fprintf(stderr, "record migration state: %v\n", err)
+		return StateError
+	}
+	if err := store.SaveConfigHash(runID, configHash); err != nil {
+		fmt.Fprintf(stderr, "record configuration hash: %v\n", err)
 		return StateError
 	}
 	observer := tableCheckpointObserver{store: store, runID: runID}
