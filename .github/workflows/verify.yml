@@ -23,5 +23,11 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      - name: Run static analysis
+        run: go vet ./...
+
+      - name: Detect data races
+        run: go test -race ./...
+
       - name: Build command
         run: go build ./cmd/dmt
