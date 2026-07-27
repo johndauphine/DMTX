@@ -192,40 +192,35 @@ func copyIntegerKeyset(ctx context.Context, source, target *sql.DB, table schema
 }
 
 func copyOrderedRows(ctx context.Context, source, target *sql.DB, table schema.Table, columns []string, mode string) (int, error) {
-	rows, err := source.QueryContext(ctx, "SELECT "+quotedColumns(columns)+" FROM "+quote(table.Name)+" ORDER BY "+quotedColumns(primaryKeyColumns(table)))
-	if err != nil {
-		return 0, fmt.Errorf("read %s: %w", table.Name, err)
-	}
-	defer rows.Close()
-	values, pointers := make([]any, len(columns)), make([]any, len(columns))
-	for i := range values {
-		pointers[i] = &values[i]
-	}
 	count := 0
-	batch := make([][]any, 0, sqliteWriteBatchSize)
-	for rows.Next() {
-		if err := rows.Scan(pointers...); err != nil {
-			return 0, fmt.Errorf("scan %s: %w", table.Name, err)
+	for lowerRow := 0; ; lowerRow += sqliteWriteBatchSize {
+		batch, err := readRowNumberPage(ctx, source, table, columns, lowerRow)
+		if err != nil {
+			return 0, err
 		}
-		batch = append(batch, append([]any(nil), values...))
-		if len(batch) == sqliteWriteBatchSize {
-			if err := writeBatch(ctx, target, table, columns, mode, batch); err != nil {
-				return 0, err
-			}
-			count += len(batch)
-			batch = batch[:0]
+		if len(batch) == 0 {
+			return count, nil
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("read %s: %w", table.Name, err)
-	}
-	if len(batch) > 0 {
 		if err := writeBatch(ctx, target, table, columns, mode, batch); err != nil {
 			return 0, err
 		}
 		count += len(batch)
 	}
-	return count, nil
+}
+
+func readRowNumberPage(ctx context.Context, source *sql.DB, table schema.Table, columns []string, lowerRow int) ([][]any, error) {
+	order := quotedColumns(primaryKeyColumns(table))
+	query := "SELECT " + quotedColumns(columns) + " FROM (SELECT " + quotedColumns(columns) + ", ROW_NUMBER() OVER (ORDER BY " + order + ") AS dmtx_row_number FROM " + quote(table.Name) + ") WHERE dmtx_row_number > ? AND dmtx_row_number <= ? ORDER BY dmtx_row_number"
+	rows, err := source.QueryContext(ctx, query, lowerRow, lowerRow+sqliteWriteBatchSize)
+	if err != nil {
+		return nil, fmt.Errorf("read %s row-number page: %w", table.Name, err)
+	}
+	defer rows.Close()
+	batch, _, err := scanPage(rows, len(columns), -1)
+	if err != nil {
+		return nil, fmt.Errorf("read %s row-number page: %w", table.Name, err)
+	}
+	return batch, nil
 }
 
 func scanPage(rows *sql.Rows, columnCount, keyIndex int) ([][]any, int64, error) {
@@ -239,9 +234,13 @@ func scanPage(rows *sql.Rows, columnCount, keyIndex int) ([][]any, int64, error)
 		if err := rows.Scan(pointers...); err != nil {
 			return nil, 0, err
 		}
-		key, err := sqliteIntegerValue(values[keyIndex])
-		if err != nil {
-			return nil, 0, err
+		var key int64
+		if keyIndex >= 0 {
+			var conversionErr error
+			key, conversionErr = sqliteIntegerValue(values[keyIndex])
+			if conversionErr != nil {
+				return nil, 0, conversionErr
+			}
 		}
 		batch = append(batch, append([]any(nil), values...))
 		lastKey = key

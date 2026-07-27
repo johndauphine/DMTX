@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"math"
 	"path/filepath"
 	"testing"
@@ -72,5 +73,33 @@ func TestSQLiteKeysetHandlesSignedIntegerExtremes(t *testing.T) {
 	}
 	if result.Rows != 4 {
 		t.Fatalf("rows = %d, want 4", result.Rows)
+	}
+}
+
+func TestSQLiteRowNumberFallbackPagesTextPrimaryKeys(t *testing.T) {
+	directory := t.TempDir()
+	sourcePath := filepath.Join(directory, "source.db")
+	targetPath := filepath.Join(directory, "target.db")
+	source, err := sql.Open("sqlite", sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Exec(`CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	for id := 0; id <= sqliteWriteBatchSize; id++ {
+		if _, err := source.Exec(`INSERT INTO items VALUES (?, ?)`, fmt.Sprintf("key-%04d", id), "item"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := SQLiteToSQLite(context.Background(), config.Config{Source: config.Endpoint{Type: "sqlite", Database: sourcePath}, Target: config.Endpoint{Type: "sqlite", Database: targetPath}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rows != sqliteWriteBatchSize+1 {
+		t.Fatalf("rows = %d", result.Rows)
 	}
 }
