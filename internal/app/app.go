@@ -4,9 +4,12 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/johndauphine/DMTX/internal/config"
@@ -99,6 +102,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration hash: %v\n", err)
 		return StateError
 	}
+	migrationContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 
 	store := state.SQLiteStore{Path: configPath + ".state.db"}
 	started := time.Now().UTC()
@@ -126,7 +131,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
-	migrationContext, heartbeat := startLeaseHeartbeat(context.Background(), leaseStore, lease, 30*time.Second)
+	migrationContext, heartbeat := startLeaseHeartbeat(migrationContext, leaseStore, lease, 30*time.Second)
 	observer := tableCheckpointObserver{store: store, runID: runID}
 	result, err := migrate.Execute(migrationContext, cfg, observer)
 	if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
@@ -143,7 +148,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return StateError
 		}
 		fmt.Fprintf(stderr, "migration: %v\n", err)
-		return TransferError
+		return migrationExitCode(err)
 	}
 	if err := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Success, Resumable: false, Reason: "migration completed", StartedAt: started, EndedAt: time.Now().UTC()}); err != nil {
 		fmt.Fprintf(stderr, "record completed migration state: %v\n", err)
@@ -163,6 +168,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return FileError
 	}
 	return Success
+}
+
+func migrationExitCode(err error) int {
+	if errors.Is(err, context.Canceled) {
+		return Cancelled
+	}
+	return TransferError
 }
 
 func runArguments(args []string) (configPath string, dryRun, ok bool) {
