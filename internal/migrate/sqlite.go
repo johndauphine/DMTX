@@ -18,6 +18,8 @@ type Result struct {
 	Validated bool `json:"validated"`
 }
 
+const sqliteWriteBatchSize = 500
+
 type TableObserver interface {
 	BeforeTable(context.Context, string) error
 	AfterTable(context.Context, string, int) error
@@ -112,37 +114,57 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, mode string) (
 		return 0, fmt.Errorf("read %s: %w", name, err)
 	}
 	defer rows.Close()
-	tx, err := target.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("begin write for %s: %w", name, err)
-	}
-	defer tx.Rollback()
-	statement, err := tx.PrepareContext(ctx, writeStatement(table, columns, mode))
-	if err != nil {
-		return 0, fmt.Errorf("prepare write for %s: %w", name, err)
-	}
-	defer statement.Close()
 	values, pointers := make([]any, len(columns)), make([]any, len(columns))
 	for i := range values {
 		pointers[i] = &values[i]
 	}
 	count := 0
+	batch := make([][]any, 0, sqliteWriteBatchSize)
 	for rows.Next() {
 		if err := rows.Scan(pointers...); err != nil {
 			return 0, fmt.Errorf("scan %s: %w", name, err)
 		}
-		if _, err := statement.ExecContext(ctx, values...); err != nil {
-			return 0, fmt.Errorf("write %s: %w", name, err)
+		batch = append(batch, append([]any(nil), values...))
+		if len(batch) == sqliteWriteBatchSize {
+			if err := writeBatch(ctx, target, table, columns, mode, batch); err != nil {
+				return 0, err
+			}
+			count += len(batch)
+			batch = batch[:0]
 		}
-		count++
 	}
 	if err := rows.Err(); err != nil {
 		return 0, fmt.Errorf("read %s: %w", name, err)
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit %s: %w", name, err)
+	if len(batch) > 0 {
+		if err := writeBatch(ctx, target, table, columns, mode, batch); err != nil {
+			return 0, err
+		}
+		count += len(batch)
 	}
 	return count, nil
+}
+
+func writeBatch(ctx context.Context, target *sql.DB, table schema.Table, columns []string, mode string, rows [][]any) error {
+	tx, err := target.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin write for %s: %w", table.Name, err)
+	}
+	defer tx.Rollback()
+	statement, err := tx.PrepareContext(ctx, writeStatement(table, columns, mode))
+	if err != nil {
+		return fmt.Errorf("prepare write for %s: %w", table.Name, err)
+	}
+	defer statement.Close()
+	for _, values := range rows {
+		if _, err := statement.ExecContext(ctx, values...); err != nil {
+			return fmt.Errorf("write %s: %w", table.Name, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit %s: %w", table.Name, err)
+	}
+	return nil
 }
 
 func writeStatement(table schema.Table, columns []string, mode string) string {
