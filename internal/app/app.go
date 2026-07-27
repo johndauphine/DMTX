@@ -89,7 +89,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return StateError
 	}
 
-	result, err := migrate.SQLiteToSQLite(context.Background(), cfg)
+	observer := tableCheckpointObserver{store: store, runID: runID}
+	result, err := migrate.SQLiteToSQLiteWithObserver(context.Background(), cfg, observer)
 	if err != nil {
 		if stateErr := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Failed, Resumable: true, Reason: err.Error(), StartedAt: started, EndedAt: time.Now().UTC()}); stateErr != nil {
 			fmt.Fprintf(stderr, "record failed migration state: %v\n", stateErr)

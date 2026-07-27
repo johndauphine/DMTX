@@ -18,8 +18,19 @@ type Result struct {
 	Validated bool `json:"validated"`
 }
 
+// TableObserver receives durable-checkpoint boundaries around table mutation.
+type TableObserver interface {
+	BeforeTable(context.Context, string) error
+	AfterTable(context.Context, string, int) error
+}
+
 // SQLiteToSQLite migrates user tables and verifies each target row count.
 func SQLiteToSQLite(ctx context.Context, cfg config.Config) (Result, error) {
+	return SQLiteToSQLiteWithObserver(ctx, cfg, nil)
+}
+
+// SQLiteToSQLiteWithObserver migrates with a checkpoint callback at each table boundary.
+func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer TableObserver) (Result, error) {
 	if cfg.Source.Type != "sqlite" || cfg.Target.Type != "sqlite" {
 		return Result{}, fmt.Errorf("SQLite first pass requires source.type and target.type to be sqlite")
 	}
@@ -47,12 +58,22 @@ func SQLiteToSQLite(ctx context.Context, cfg config.Config) (Result, error) {
 	}
 	result := Result{Validated: true}
 	for _, name := range names {
+		if observer != nil {
+			if err := observer.BeforeTable(ctx, name); err != nil {
+				return Result{}, fmt.Errorf("checkpoint before %s: %w", name, err)
+			}
+		}
 		copied, err := copyTable(ctx, source, target, name, cfg.Migration.TargetMode)
 		if err != nil {
 			return Result{}, err
 		}
 		if err := validateCount(ctx, source, target, name); err != nil {
 			return Result{}, err
+		}
+		if observer != nil {
+			if err := observer.AfterTable(ctx, name, copied); err != nil {
+				return Result{}, fmt.Errorf("checkpoint after %s: %w", name, err)
+			}
 		}
 		result.Tables++
 		result.Rows += copied
@@ -88,7 +109,6 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, targetMode str
 	if err := prepareTarget(ctx, target, table, targetMode); err != nil {
 		return 0, err
 	}
-
 	rows, err := source.QueryContext(ctx, "SELECT "+quotedColumns(names)+" FROM "+quote(name))
 	if err != nil {
 		return 0, fmt.Errorf("read %s: %w", name, err)
@@ -179,6 +199,7 @@ func validateCount(ctx context.Context, source, target *sql.DB, name string) err
 	}
 	return nil
 }
+
 func countRows(ctx context.Context, database *sql.DB, name string) (int, error) {
 	var count int
 	err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+quote(name)).Scan(&count)
@@ -210,6 +231,7 @@ func inspectTable(ctx context.Context, database *sql.DB, name string) (schema.Ta
 }
 
 func quote(name string) string { return `"` + strings.ReplaceAll(name, `"`, `""`) + `"` }
+
 func quotedColumns(columns []string) string {
 	quoted := make([]string, len(columns))
 	for index, column := range columns {
@@ -217,6 +239,7 @@ func quotedColumns(columns []string) string {
 	}
 	return strings.Join(quoted, ", ")
 }
+
 func placeholders(count int) string {
 	values := make([]string, count)
 	for index := range values {
