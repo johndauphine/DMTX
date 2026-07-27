@@ -26,6 +26,8 @@ target:
   database: /absolute/path/target.db
 migration:
   target_mode: drop_recreate
+  include_tables: ["*"]
+  exclude_tables: ["temp_*"]
 ```
 
 Run the migration:
@@ -38,6 +40,11 @@ The command emits a JSON result containing table and row totals. `drop_recreate`
 recreates each migrated table. `upsert` retains an existing compatible target
 table and applies SQLite upsert-mode writes.
 
+`include_tables` and `exclude_tables` use Go path-style glob matching. Source
+tables are considered in deterministic name order; an empty include list means
+all tables, and an exclude pattern always wins. A configuration that selects no
+source tables fails before target mutation.
+
 ## Safety behavior implemented today
 
 - Source and target SQLite files must differ.
@@ -47,8 +54,14 @@ table and applies SQLite upsert-mode writes.
   after row-count validation succeeds.
 - Run history and checkpoints are stored in a local SQLite state database next
   to the configuration file.
+- Single-integer primary keys transfer through bounded, ascending keyset pages.
+  A target-acknowledged page records its signed integer frontier locally.
+- Text and composite primary keys use deterministic `ROW_NUMBER()` pages in
+  primary-key order rather than an unbounded source read.
 - `dmt resume --config migration.yaml` reuses the interrupted run, verifies a
   completed table before skipping it, and rejects changed data-plane settings.
+  In upsert mode, an interrupted integer-key table resumes after its last
+  acknowledged keyset page; drop-recreate restarts an incomplete table safely.
 
 Inspect state with:
 
@@ -60,7 +73,7 @@ Inspect state with:
 ## Scope and roadmap
 
 This is not yet the full DMT compatibility target. Network engines, richer
-schema evolution, partition-level recovery, deep validation, WebUI/TUI, and
+schema evolution, row-number resume frontiers, deep validation, WebUI/TUI, and
 release hardening remain staged work. The complete specification and staged
 acceptance requirements are in [docs/RECREATE_DMT.md](docs/RECREATE_DMT.md).
 
