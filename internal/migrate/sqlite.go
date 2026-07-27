@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/johndauphine/DMTX/internal/config"
@@ -124,9 +125,56 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, mode string) (
 	if err := prepareTarget(ctx, target, table, mode); err != nil {
 		return 0, err
 	}
-	rows, err := source.QueryContext(ctx, "SELECT "+quotedColumns(columns)+" FROM "+quote(name))
+	if key, ok := integerPrimaryKey(table); ok {
+		return copyIntegerKeyset(ctx, source, target, table, columns, key, mode)
+	}
+	return copyOrderedRows(ctx, source, target, table, columns, mode)
+}
+
+func copyIntegerKeyset(ctx context.Context, source, target *sql.DB, table schema.Table, columns []string, key string, mode string) (int, error) {
+	keyIndex := columnIndex(columns, key)
+	if keyIndex == -1 {
+		return 0, fmt.Errorf("integer primary key %s is not a selected column", key)
+	}
+
+	var lowerBound int64
+	hasLowerBound := false
+	count := 0
+	for {
+		query := "SELECT " + quotedColumns(columns) + " FROM " + quote(table.Name)
+		arguments := make([]any, 0, 2)
+		if hasLowerBound {
+			query += " WHERE " + quote(key) + " > ?"
+			arguments = append(arguments, lowerBound)
+		}
+		query += " ORDER BY " + quote(key) + " LIMIT ?"
+		arguments = append(arguments, sqliteWriteBatchSize)
+
+		rows, err := source.QueryContext(ctx, query, arguments...)
+		if err != nil {
+			return 0, fmt.Errorf("read %s keyset page: %w", table.Name, err)
+		}
+		batch, lastKey, err := scanPage(rows, len(columns), keyIndex)
+		rows.Close()
+		if err != nil {
+			return 0, fmt.Errorf("read %s keyset page: %w", table.Name, err)
+		}
+		if len(batch) == 0 {
+			return count, nil
+		}
+		if err := writeBatch(ctx, target, table, columns, mode, batch); err != nil {
+			return 0, err
+		}
+		count += len(batch)
+		lowerBound = lastKey
+		hasLowerBound = true
+	}
+}
+
+func copyOrderedRows(ctx context.Context, source, target *sql.DB, table schema.Table, columns []string, mode string) (int, error) {
+	rows, err := source.QueryContext(ctx, "SELECT "+quotedColumns(columns)+" FROM "+quote(table.Name)+" ORDER BY "+quotedColumns(primaryKeyColumns(table)))
 	if err != nil {
-		return 0, fmt.Errorf("read %s: %w", name, err)
+		return 0, fmt.Errorf("read %s: %w", table.Name, err)
 	}
 	defer rows.Close()
 	values, pointers := make([]any, len(columns)), make([]any, len(columns))
@@ -137,7 +185,7 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, mode string) (
 	batch := make([][]any, 0, sqliteWriteBatchSize)
 	for rows.Next() {
 		if err := rows.Scan(pointers...); err != nil {
-			return 0, fmt.Errorf("scan %s: %w", name, err)
+			return 0, fmt.Errorf("scan %s: %w", table.Name, err)
 		}
 		batch = append(batch, append([]any(nil), values...))
 		if len(batch) == sqliteWriteBatchSize {
@@ -149,7 +197,7 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, mode string) (
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("read %s: %w", name, err)
+		return 0, fmt.Errorf("read %s: %w", table.Name, err)
 	}
 	if len(batch) > 0 {
 		if err := writeBatch(ctx, target, table, columns, mode, batch); err != nil {
@@ -158,6 +206,70 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, mode string) (
 		count += len(batch)
 	}
 	return count, nil
+}
+
+func scanPage(rows *sql.Rows, columnCount, keyIndex int) ([][]any, int64, error) {
+	values, pointers := make([]any, columnCount), make([]any, columnCount)
+	for index := range values {
+		pointers[index] = &values[index]
+	}
+	batch := make([][]any, 0, sqliteWriteBatchSize)
+	var lastKey int64
+	for rows.Next() {
+		if err := rows.Scan(pointers...); err != nil {
+			return nil, 0, err
+		}
+		key, err := sqliteIntegerValue(values[keyIndex])
+		if err != nil {
+			return nil, 0, err
+		}
+		batch = append(batch, append([]any(nil), values...))
+		lastKey = key
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return batch, lastKey, nil
+}
+
+func integerPrimaryKey(table schema.Table) (string, bool) {
+	keys := primaryKeyColumns(table)
+	if len(keys) != 1 {
+		return "", false
+	}
+	for _, column := range table.Columns {
+		if column.Name == keys[0] && strings.Contains(strings.ToUpper(column.Type), "INT") {
+			return column.Name, true
+		}
+	}
+	return "", false
+}
+
+func columnIndex(columns []string, name string) int {
+	for index, column := range columns {
+		if column == name {
+			return index
+		}
+	}
+	return -1
+}
+
+func sqliteIntegerValue(value any) (int64, error) {
+	switch number := value.(type) {
+	case int64:
+		return number, nil
+	case int:
+		return int64(number), nil
+	case int32:
+		return int64(number), nil
+	case uint64:
+		if number > math.MaxInt64 {
+			return 0, fmt.Errorf("integer primary key exceeds signed 64-bit range")
+		}
+		return int64(number), nil
+	default:
+		return 0, fmt.Errorf("integer primary key has unexpected value type %T", value)
+	}
 }
 
 func writeBatch(ctx context.Context, target *sql.DB, table schema.Table, columns []string, mode string, rows [][]any) error {
