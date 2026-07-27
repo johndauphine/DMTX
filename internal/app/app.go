@@ -104,6 +104,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "record configuration hash: %v\n", err)
 		return StateError
 	}
+	if err := appendAudit(args[1], runID, "run_started"); err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return StateError
+	}
 	observer := tableCheckpointObserver{store: store, runID: runID}
 	result, err := migrate.SQLiteToSQLiteWithObserver(context.Background(), cfg, observer)
 	if err != nil {
@@ -111,11 +115,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "record failed migration state: %v\n", stateErr)
 			return StateError
 		}
+		if auditErr := appendAudit(args[1], runID, "run_failed"); auditErr != nil {
+			fmt.Fprintf(stderr, "%v\n", auditErr)
+			return StateError
+		}
 		fmt.Fprintf(stderr, "migration: %v\n", err)
 		return TransferError
 	}
 	if err := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Success, Resumable: false, Reason: "migration completed", StartedAt: started, EndedAt: time.Now().UTC()}); err != nil {
 		fmt.Fprintf(stderr, "record completed migration state: %v\n", err)
+		return StateError
+	}
+	if err := appendAudit(args[1], runID, "run_succeeded"); err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
 	if err := json.NewEncoder(stdout).Encode(result); err != nil {

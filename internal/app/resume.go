@@ -62,6 +62,10 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		return StateError
 	}
 	defer leaseStore.ReleaseLease(lease)
+	if err := appendAudit(args[1], run.ID, "resume_started"); err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return StateError
+	}
 
 	tasks, err := store.ListTasks(run.ID)
 	if err != nil {
@@ -89,11 +93,19 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "record failed resume state: %v\n", stateErr)
 			return StateError
 		}
+		if auditErr := appendAudit(args[1], run.ID, "resume_failed"); auditErr != nil {
+			fmt.Fprintf(stderr, "%v\n", auditErr)
+			return StateError
+		}
 		fmt.Fprintf(stderr, "resume: %v\n", err)
 		return TransferError
 	}
 	if err := store.Append(state.Run{ID: run.ID, Source: run.Source, Target: run.Target, Outcome: state.Success, Resumable: false, Reason: "migration resumed and completed", StartedAt: run.StartedAt, EndedAt: time.Now().UTC()}); err != nil {
 		fmt.Fprintf(stderr, "record resumed migration state: %v\n", err)
+		return StateError
+	}
+	if err := appendAudit(args[1], run.ID, "resume_succeeded"); err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
 	if err := json.NewEncoder(stdout).Encode(result); err != nil {

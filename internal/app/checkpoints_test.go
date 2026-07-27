@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/johndauphine/DMTX/internal/state"
@@ -45,5 +46,12 @@ func TestRunStoresCompletedTableCheckpoint(t *testing.T) {
 	}
 	if len(tasks) != 1 || tasks[0].Table != "users" || tasks[0].Status != "completed" {
 		t.Fatalf("tasks = %#v", tasks)
+	}
+	auditStream, err := os.ReadFile(configPath + ".audit.ndjson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(auditStream), `"type":"run_started"`) || !strings.Contains(string(auditStream), `"type":"run_succeeded"`) {
+		t.Fatalf("audit stream = %q", auditStream)
 	}
 }
