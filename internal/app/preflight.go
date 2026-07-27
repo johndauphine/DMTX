@@ -66,8 +66,13 @@ func preflight(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if cfg.Source.Type != "sqlite" {
-		if err := preflightNetworkSource(cfg.Source); err != nil {
+		if err := preflightNetworkEndpoint(cfg.Source); err != nil {
 			findings = append(findings, preflightFinding{"source_connect", "error", "source database cannot be reached: " + err.Error()})
+		}
+	}
+	if cfg.Target.Type != "sqlite" {
+		if err := preflightNetworkEndpoint(cfg.Target); err != nil {
+			findings = append(findings, preflightFinding{"target_connect", "error", "target database cannot be reached: " + err.Error()})
 		}
 	}
 	if err := json.NewEncoder(stdout).Encode(findings); err != nil {
@@ -82,7 +87,7 @@ func preflight(args []string, stdout, stderr io.Writer) int {
 	return Success
 }
 
-func preflightNetworkSource(endpoint config.Endpoint) error {
+func preflightNetworkEndpoint(endpoint config.Endpoint) error {
 	password, err := config.ExpandSecret(endpoint.Password)
 	if err != nil {
 		return fmt.Errorf("resolve source password: %w", err)

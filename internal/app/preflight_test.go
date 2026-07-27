@@ -89,3 +89,19 @@ func TestPreflightRejectsIncompleteNetworkSource(t *testing.T) {
 		t.Fatalf("output = %q", output.String())
 	}
 }
+
+func TestPreflightRejectsIncompleteNetworkTarget(t *testing.T) {
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "migration.yaml")
+	contents := "source:\n  type: sqlite\n  database: " + filepath.Join(directory, "source.db") + "\ntarget:\n  type: postgres\n  database: target\n  user: dmtx\n"
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var output, errors bytes.Buffer
+	if code := Run([]string{"preflight", "--config", configPath}, &output, &errors); code != ConfigurationError {
+		t.Fatalf("code = %d, stderr = %s", code, errors.String())
+	}
+	if !bytes.Contains(output.Bytes(), []byte(`"class":"target_connect"`)) || !bytes.Contains(output.Bytes(), []byte("PostgreSQL host")) {
+		t.Fatalf("output = %q", output.String())
+	}
+}
