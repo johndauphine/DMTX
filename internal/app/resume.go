@@ -61,7 +61,12 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "acquire target lease: %v\n", err)
 		return StateError
 	}
-	defer leaseStore.ReleaseLease(lease)
+	leaseReleased := false
+	defer func() {
+		if !leaseReleased {
+			_ = leaseStore.ReleaseLease(lease)
+		}
+	}()
 	if err := appendAudit(args[1], run.ID, "resume_started"); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
@@ -113,6 +118,11 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
+	if err := leaseStore.ReleaseLease(lease); err != nil {
+		fmt.Fprintf(stderr, "release target lease: %v\n", err)
+		return StateError
+	}
+	leaseReleased = true
 	if err := json.NewEncoder(stdout).Encode(result); err != nil {
 		fmt.Fprintf(stderr, "write result: %v\n", err)
 		return FileError

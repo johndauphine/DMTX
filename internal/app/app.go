@@ -95,7 +95,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "acquire target lease: %v\n", err)
 		return StateError
 	}
-	defer leaseStore.ReleaseLease(lease)
+	leaseReleased := false
+	defer func() {
+		if !leaseReleased {
+			_ = leaseStore.ReleaseLease(lease)
+		}
+	}()
 	if err := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Running, Resumable: true, Reason: "migration in progress", StartedAt: started}); err != nil {
 		fmt.Fprintf(stderr, "record migration state: %v\n", err)
 		return StateError
@@ -135,6 +140,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
+	if err := leaseStore.ReleaseLease(lease); err != nil {
+		fmt.Fprintf(stderr, "release target lease: %v\n", err)
+		return StateError
+	}
+	leaseReleased = true
 	if err := json.NewEncoder(stdout).Encode(result); err != nil {
 		fmt.Fprintf(stderr, "write result: %v\n", err)
 		return FileError
