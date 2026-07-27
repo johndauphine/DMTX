@@ -10,9 +10,9 @@ import (
 
 func TestExecuteRejectsUnsupportedEnginePair(t *testing.T) {
 	_, err := Execute(context.Background(), config.Config{
-		Source: config.Endpoint{Type: "sqlite"}, Target: config.Endpoint{Type: "postgres"},
+		Source: config.Endpoint{Type: "sqlite"}, Target: config.Endpoint{Type: "mysql"},
 	}, nil)
-	if err == nil || !strings.Contains(err.Error(), "sqlite-to-postgres") {
+	if err == nil || !strings.Contains(err.Error(), "sqlite-to-mysql") {
 		t.Fatalf("error = %v", err)
 	}
 }
