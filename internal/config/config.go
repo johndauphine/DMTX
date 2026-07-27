@@ -43,6 +43,15 @@ func Parse(data []byte) (Config, error) {
 	if value.Target.Type == "" {
 		value.Target.Type = "postgres"
 	}
+	var err error
+	value.Source.Type, err = CanonicalEngine(value.Source.Type)
+	if err != nil {
+		return Config{}, fmt.Errorf("source.type: %w", err)
+	}
+	value.Target.Type, err = CanonicalEngine(value.Target.Type)
+	if err != nil {
+		return Config{}, fmt.Errorf("target.type: %w", err)
+	}
 	if value.Migration.TargetMode == "" {
 		value.Migration.TargetMode = "drop_recreate"
 	}
@@ -56,6 +65,25 @@ func Parse(data []byte) (Config, error) {
 		return Config{}, err
 	}
 	return value, nil
+}
+
+// CanonicalEngine normalizes the public engine aliases before they reach
+// connection, state, lease, or capability code.
+func CanonicalEngine(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "postgres", "postgresql", "pg":
+		return "postgres", nil
+	case "mssql", "sqlserver", "sql-server":
+		return "mssql", nil
+	case "mysql", "mariadb", "maria":
+		return "mysql", nil
+	case "sqlite", "sqlite3", "sqlitedb":
+		return "sqlite", nil
+	case "clickhouse", "ch":
+		return "clickhouse", nil
+	default:
+		return "", fmt.Errorf("unsupported engine %q", value)
+	}
 }
 
 // SelectTables applies path-style glob patterns in the source's existing,

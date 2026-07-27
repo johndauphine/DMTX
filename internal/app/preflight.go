@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/johndauphine/DMTX/internal/config"
+	"github.com/johndauphine/DMTX/internal/engine"
 	_ "modernc.org/sqlite"
 )
 
@@ -33,8 +34,8 @@ func preflight(args []string, stdout, stderr io.Writer) int {
 		return ConfigurationError
 	}
 	findings := []preflightFinding{}
-	if cfg.Source.Type != "sqlite" || cfg.Target.Type != "sqlite" {
-		findings = append(findings, preflightFinding{"unsupported_engine", "error", "this stage supports SQLite-to-SQLite only"})
+	if err := engine.ValidateMigration(cfg); err != nil {
+		findings = append(findings, preflightFinding{"unsupported_capability", "error", err.Error()})
 	}
 	if cfg.Source.Database == "" || cfg.Target.Database == "" {
 		findings = append(findings, preflightFinding{"missing_database_path", "error", "source and target database paths are required"})
