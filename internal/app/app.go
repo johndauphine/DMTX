@@ -52,9 +52,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return showState(args[1:], stdout, true)
 	case "history":
 		return showState(args[1:], stdout, false)
-	case "health-check":
-		fmt.Fprintln(stdout, "preflight is planned")
-		return Success
+	case "preflight", "health-check":
+		return preflight(args[1:], stdout, stderr)
 	default:
 		for _, command := range contract.Commands {
 			if command.Name == args[0] {
