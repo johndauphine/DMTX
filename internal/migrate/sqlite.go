@@ -26,6 +26,18 @@ type TableObserver interface {
 	AfterTable(context.Context, string, int) error
 }
 
+// PageObserver records only a target-acknowledged integer-keyset frontier.
+// It is optional so table-level observers remain compatible.
+type PageObserver interface {
+	AfterIntegerKeysetPage(context.Context, string, int, int64) error
+}
+
+// TableProgress is the durable, reusable portion of an incomplete table.
+type TableProgress struct {
+	RowsDone         int
+	IntegerWatermark *int64
+}
+
 func SQLiteToSQLite(ctx context.Context, cfg config.Config) (Result, error) {
 	return SQLiteToSQLiteWithObserver(ctx, cfg, nil)
 }
@@ -65,7 +77,7 @@ func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer
 				return Result{}, fmt.Errorf("checkpoint before %s: %w", name, err)
 			}
 		}
-		copied, err := copyTable(ctx, source, target, name, cfg.Migration.TargetMode)
+		copied, err := copyTable(ctx, source, target, name, cfg.Migration.TargetMode, observer, TableProgress{})
 		if err != nil {
 			return Result{}, err
 		}
@@ -114,7 +126,7 @@ func userTables(ctx context.Context, database *sql.DB) ([]string, error) {
 	return names, nil
 }
 
-func copyTable(ctx context.Context, source, target *sql.DB, name, mode string) (int, error) {
+func copyTable(ctx context.Context, source, target *sql.DB, name, mode string, observer TableObserver, progress TableProgress) (int, error) {
 	table, columns, err := inspectTable(ctx, source, name)
 	if err != nil {
 		return 0, err
@@ -126,19 +138,22 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, mode string) (
 		return 0, err
 	}
 	if key, ok := integerPrimaryKey(table); ok {
-		return copyIntegerKeyset(ctx, source, target, table, columns, key, mode)
+		return copyIntegerKeyset(ctx, source, target, table, columns, key, mode, observer, progress)
 	}
 	return copyOrderedRows(ctx, source, target, table, columns, mode)
 }
 
-func copyIntegerKeyset(ctx context.Context, source, target *sql.DB, table schema.Table, columns []string, key string, mode string) (int, error) {
+func copyIntegerKeyset(ctx context.Context, source, target *sql.DB, table schema.Table, columns []string, key string, mode string, observer TableObserver, progress TableProgress) (int, error) {
 	keyIndex := columnIndex(columns, key)
 	if keyIndex == -1 {
 		return 0, fmt.Errorf("integer primary key %s is not a selected column", key)
 	}
 
 	var lowerBound int64
-	hasLowerBound := false
+	hasLowerBound := progress.IntegerWatermark != nil
+	if hasLowerBound {
+		lowerBound = *progress.IntegerWatermark
+	}
 	count := 0
 	for {
 		query := "SELECT " + quotedColumns(columns) + " FROM " + quote(table.Name)
@@ -166,6 +181,11 @@ func copyIntegerKeyset(ctx context.Context, source, target *sql.DB, table schema
 			return 0, err
 		}
 		count += len(batch)
+		if pageObserver, ok := observer.(PageObserver); ok {
+			if err := pageObserver.AfterIntegerKeysetPage(ctx, table.Name, progress.RowsDone+count, lastKey); err != nil {
+				return 0, fmt.Errorf("checkpoint page for %s: %w", table.Name, err)
+			}
+		}
 		lowerBound = lastKey
 		hasLowerBound = true
 	}

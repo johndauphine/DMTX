@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -18,12 +19,34 @@ type SQLiteStore struct {
 
 // Task is a durable table-level migration checkpoint.
 type Task struct {
-	RunID       string    `json:"run_id"`
-	Table       string    `json:"table"`
-	Status      string    `json:"status"`
-	RowsDone    int       `json:"rows_done"`
-	StartedAt   time.Time `json:"started_at"`
-	CompletedAt time.Time `json:"completed_at,omitempty"`
+	RunID            string    `json:"run_id"`
+	Table            string    `json:"table"`
+	Status           string    `json:"status"`
+	RowsDone         int       `json:"rows_done"`
+	IntegerWatermark *int64    `json:"integer_watermark,omitempty"`
+	StartedAt        time.Time `json:"started_at"`
+	CompletedAt      time.Time `json:"completed_at,omitempty"`
+}
+
+// AdvanceIntegerKeysetTask records a target-acknowledged page frontier.
+func (store SQLiteStore) AdvanceIntegerKeysetTask(runID, table string, rowsDone int, watermark int64) error {
+	database, err := store.Open()
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	result, err := database.Exec(`UPDATE tasks SET rows_done = ?, integer_watermark = ? WHERE run_id = ? AND table_name = ? AND status = 'running'`, rowsDone, watermark, runID, table)
+	if err != nil {
+		return fmt.Errorf("advance table checkpoint: %w", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("verify table checkpoint: %w", err)
+	}
+	if updated != 1 {
+		return fmt.Errorf("advance table checkpoint: unknown or non-running task %q", table)
+	}
+	return nil
 }
 
 // Append records a state transition for a migration run.
@@ -97,7 +120,7 @@ func (store SQLiteStore) ListTasks(runID string) ([]Task, error) {
 	defer database.Close()
 
 	rows, err := database.Query(`
-		SELECT run_id, table_name, status, rows_done, started_at, completed_at
+		SELECT run_id, table_name, status, rows_done, integer_watermark, started_at, completed_at
 		FROM tasks WHERE run_id = ? ORDER BY table_name
 	`, runID)
 	if err != nil {
@@ -109,11 +132,16 @@ func (store SQLiteStore) ListTasks(runID string) ([]Task, error) {
 	for rows.Next() {
 		var task Task
 		var completedAt sql.NullTime
-		if err := rows.Scan(&task.RunID, &task.Table, &task.Status, &task.RowsDone, &task.StartedAt, &completedAt); err != nil {
+		var watermark sql.NullInt64
+		if err := rows.Scan(&task.RunID, &task.Table, &task.Status, &task.RowsDone, &watermark, &task.StartedAt, &completedAt); err != nil {
 			return nil, fmt.Errorf("read table checkpoint: %w", err)
 		}
 		if completedAt.Valid {
 			task.CompletedAt = completedAt.Time
+		}
+		if watermark.Valid {
+			value := watermark.Int64
+			task.IntegerWatermark = &value
 		}
 		tasks = append(tasks, task)
 	}
@@ -191,12 +219,16 @@ func (store SQLiteStore) Open() (*sql.DB, error) {
 		);
 		CREATE TABLE IF NOT EXISTS tasks (
 			run_id TEXT NOT NULL, table_name TEXT NOT NULL, status TEXT NOT NULL,
-			rows_done INTEGER NOT NULL, started_at DATETIME NOT NULL, completed_at DATETIME,
+			rows_done INTEGER NOT NULL, integer_watermark INTEGER, started_at DATETIME NOT NULL, completed_at DATETIME,
 			PRIMARY KEY (run_id, table_name)
 		);
 	`); err != nil {
 		database.Close()
 		return nil, fmt.Errorf("initialize state database: %w", err)
+	}
+	if _, err := database.Exec(`ALTER TABLE tasks ADD COLUMN integer_watermark INTEGER`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		database.Close()
+		return nil, fmt.Errorf("upgrade task checkpoints: %w", err)
 	}
 	return database, nil
 }

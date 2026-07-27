@@ -69,14 +69,17 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		return StateError
 	}
 	completed, existing := make(map[string]bool), make(map[string]bool)
+	progress := make(map[string]migrate.TableProgress)
 	for _, task := range tasks {
 		existing[task.Table] = true
 		if task.Status == "completed" {
 			completed[task.Table] = true
+		} else {
+			progress[task.Table] = migrate.TableProgress{RowsDone: task.RowsDone, IntegerWatermark: task.IntegerWatermark}
 		}
 	}
 	observer := resumeCheckpointObserver{tableCheckpointObserver: tableCheckpointObserver{store: store, runID: run.ID}, existing: existing}
-	result, err := migrate.SQLiteToSQLiteResume(context.Background(), cfg, completed, observer)
+	result, err := migrate.SQLiteToSQLiteResumeWithProgress(context.Background(), cfg, completed, progress, observer)
 	if err != nil {
 		if stateErr := store.UpdateFailure(run.ID, err.Error(), time.Now().UTC()); stateErr != nil {
 			fmt.Fprintf(stderr, "record failed resume state: %v\n", stateErr)

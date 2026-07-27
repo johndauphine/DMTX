@@ -11,6 +11,12 @@ import (
 
 // SQLiteToSQLiteResume reuses only validated, completed table checkpoints.
 func SQLiteToSQLiteResume(ctx context.Context, cfg config.Config, completed map[string]bool, observer TableObserver) (Result, error) {
+	return SQLiteToSQLiteResumeWithProgress(ctx, cfg, completed, nil, observer)
+}
+
+// SQLiteToSQLiteResumeWithProgress resumes integer-keyset pages only in
+// upsert mode. Rebuild mode restarts incomplete tables intentionally.
+func SQLiteToSQLiteResumeWithProgress(ctx context.Context, cfg config.Config, completed map[string]bool, progress map[string]TableProgress, observer TableObserver) (Result, error) {
 	if cfg.Source.Type != "sqlite" || cfg.Target.Type != "sqlite" {
 		return Result{}, fmt.Errorf("SQLite first pass requires source.type and target.type to be sqlite")
 	}
@@ -55,7 +61,11 @@ func SQLiteToSQLiteResume(ctx context.Context, cfg config.Config, completed map[
 				return Result{}, fmt.Errorf("checkpoint before %s: %w", name, err)
 			}
 		}
-		copied, err := copyTable(ctx, source, target, name, cfg.Migration.TargetMode)
+		tableProgress := progress[name]
+		if cfg.Migration.TargetMode != "upsert" {
+			tableProgress = TableProgress{}
+		}
+		copied, err := copyTable(ctx, source, target, name, cfg.Migration.TargetMode, observer, tableProgress)
 		if err != nil {
 			return Result{}, err
 		}
@@ -63,12 +73,12 @@ func SQLiteToSQLiteResume(ctx context.Context, cfg config.Config, completed map[
 			return Result{}, err
 		}
 		if observer != nil {
-			if err := observer.AfterTable(ctx, name, copied); err != nil {
+			if err := observer.AfterTable(ctx, name, tableProgress.RowsDone+copied); err != nil {
 				return Result{}, fmt.Errorf("checkpoint after %s: %w", name, err)
 			}
 		}
 		result.Tables++
-		result.Rows += copied
+		result.Rows += tableProgress.RowsDone + copied
 	}
 	return result, nil
 }

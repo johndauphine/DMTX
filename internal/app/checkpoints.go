@@ -24,3 +24,7 @@ func (observer tableCheckpointObserver) BeforeTable(_ context.Context, table str
 func (observer tableCheckpointObserver) AfterTable(_ context.Context, table string, rowsDone int) error {
 	return observer.store.CompleteTask(observer.runID, table, rowsDone, time.Now().UTC())
 }
+
+func (observer tableCheckpointObserver) AfterIntegerKeysetPage(_ context.Context, table string, rowsDone int, watermark int64) error {
+	return observer.store.AdvanceIntegerKeysetTask(observer.runID, table, rowsDone, watermark)
+}
