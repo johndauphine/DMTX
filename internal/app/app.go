@@ -46,6 +46,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return Success
 	case "run":
 		return run(args[1:], stdout, stderr)
+	case "resume":
+		return resume(args[1:], stdout, stderr)
 	case "status":
 		return showState(args[1:], stdout, true)
 	case "history":
@@ -88,7 +90,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "record migration state: %v\n", err)
 		return StateError
 	}
-
 	observer := tableCheckpointObserver{store: store, runID: runID}
 	result, err := migrate.SQLiteToSQLiteWithObserver(context.Background(), cfg, observer)
 	if err != nil {
