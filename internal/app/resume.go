@@ -28,7 +28,6 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}
-
 	store := state.SQLiteStore{Path: args[1] + ".state.db"}
 	run, found, err := store.LatestResumableForTarget(cfg.Target.Database)
 	if err != nil {
@@ -43,6 +42,12 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "resumable run source does not match the supplied configuration")
 		return ConfigurationError
 	}
+	leaseStore, lease, err := acquireSQLiteTargetLease(cfg.Target.Database, run.ID)
+	if err != nil {
+		fmt.Fprintf(stderr, "acquire target lease: %v\n", err)
+		return StateError
+	}
+	defer leaseStore.ReleaseLease(lease)
 
 	tasks, err := store.ListTasks(run.ID)
 	if err != nil {
@@ -56,10 +61,7 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			completed[task.Table] = true
 		}
 	}
-	observer := resumeCheckpointObserver{
-		tableCheckpointObserver: tableCheckpointObserver{store: store, runID: run.ID},
-		existing:                existing,
-	}
+	observer := resumeCheckpointObserver{tableCheckpointObserver: tableCheckpointObserver{store: store, runID: run.ID}, existing: existing}
 	result, err := migrate.SQLiteToSQLiteResume(context.Background(), cfg, completed, observer)
 	if err != nil {
 		if stateErr := store.UpdateFailure(run.ID, err.Error(), time.Now().UTC()); stateErr != nil {

@@ -86,6 +86,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	store := state.SQLiteStore{Path: args[1] + ".state.db"}
 	started := time.Now().UTC()
 	runID := started.Format("20060102T150405.000000000Z")
+	leaseStore, lease, err := acquireSQLiteTargetLease(cfg.Target.Database, runID)
+	if err != nil {
+		fmt.Fprintf(stderr, "acquire target lease: %v\n", err)
+		return StateError
+	}
+	defer leaseStore.ReleaseLease(lease)
 	if err := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Running, Resumable: true, Reason: "migration in progress", StartedAt: started}); err != nil {
 		fmt.Fprintf(stderr, "record migration state: %v\n", err)
 		return StateError
