@@ -115,7 +115,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	migrationContext, heartbeat := startLeaseHeartbeat(context.Background(), leaseStore, lease, 30*time.Second)
 	observer := tableCheckpointObserver{store: store, runID: runID}
-	result, err := migrate.SQLiteToSQLiteWithObserver(migrationContext, cfg, observer)
+	result, err := migrate.Execute(migrationContext, cfg, observer)
 	if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
 		fmt.Fprintf(stderr, "renew target lease: %v\n", heartbeatErr)
 		return StateError
