@@ -33,6 +33,9 @@ func DryRun(ctx context.Context, cfg config.Config) (Plan, error) {
 	if cfg.Source.Type == "postgres" {
 		return postgresDryRun(ctx, cfg)
 	}
+	if cfg.Source.Type == "mysql" {
+		return mySQLDryRun(ctx, cfg)
+	}
 	if cfg.Source.Type != "sqlite" {
 		return Plan{}, fmt.Errorf("dry run discovery is currently implemented for SQLite sources")
 	}
@@ -64,6 +67,39 @@ func DryRun(ctx context.Context, cfg config.Config) (Plan, error) {
 		rows, err := countRows(ctx, source, name)
 		if err != nil {
 			return Plan{}, fmt.Errorf("count source table %s: %w", name, err)
+		}
+		plan.Tables = append(plan.Tables, PlannedTable{Name: name, Rows: rows})
+	}
+	return plan, nil
+}
+
+func mySQLDryRun(ctx context.Context, cfg config.Config) (Plan, error) {
+	endpoint, err := resolvedEndpoint(cfg.Source)
+	if err != nil {
+		return Plan{}, err
+	}
+	source, err := engine.OpenMySQL(ctx, endpoint)
+	if err != nil {
+		return Plan{}, err
+	}
+	defer source.Close()
+	namespace := cfg.Source.Schema
+	if namespace == "" {
+		namespace = cfg.Source.Database
+	}
+	names, err := engine.ListMySQLTables(ctx, source, namespace)
+	if err != nil {
+		return Plan{}, err
+	}
+	names, err = selectedTables(names, cfg)
+	if err != nil {
+		return Plan{}, err
+	}
+	plan := Plan{SourceType: cfg.Source.Type, TargetType: cfg.Target.Type, TargetMode: cfg.Migration.TargetMode, Tables: make([]PlannedTable, 0, len(names))}
+	for _, name := range names {
+		var rows int
+		if err := source.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+mySQLQualified(namespace, name)).Scan(&rows); err != nil {
+			return Plan{}, fmt.Errorf("count MySQL source table %s: %w", name, err)
 		}
 		plan.Tables = append(plan.Tables, PlannedTable{Name: name, Rows: rows})
 	}
