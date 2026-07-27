@@ -26,6 +26,9 @@ func Execute(ctx context.Context, cfg config.Config, observer TableObserver) (Re
 	if cfg.Source.Type == "sqlite" && cfg.Target.Type == "mssql" {
 		return SQLiteToSQLServerWithObserver(ctx, cfg, observer)
 	}
+	if cfg.Source.Type == "sqlite" && cfg.Target.Type == "clickhouse" {
+		return SQLiteToClickHouseWithObserver(ctx, cfg, observer)
+	}
 	if cfg.Source.Type == "postgres" && cfg.Target.Type == "sqlite" {
 		return PostgresToSQLiteWithObserver(ctx, cfg, observer)
 	}

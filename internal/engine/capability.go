@@ -58,6 +58,7 @@ func implementedPair(source, target string) bool {
 		(source == "sqlite" && target == "postgres") ||
 		(source == "sqlite" && target == "mysql") ||
 		(source == "sqlite" && target == "mssql") ||
+		(source == "sqlite" && target == "clickhouse") ||
 		(source == "postgres" && target == "sqlite") ||
 		(source == "mysql" && target == "sqlite") ||
 		(source == "mssql" && target == "sqlite")

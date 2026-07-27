@@ -10,9 +10,9 @@ import (
 
 func TestExecuteRejectsUnsupportedEnginePair(t *testing.T) {
 	_, err := Execute(context.Background(), config.Config{
-		Source: config.Endpoint{Type: "sqlite"}, Target: config.Endpoint{Type: "clickhouse"},
+		Source: config.Endpoint{Type: "clickhouse"}, Target: config.Endpoint{Type: "sqlite"},
 	}, nil)
-	if err == nil || !strings.Contains(err.Error(), "sqlite-to-clickhouse") {
+	if err == nil || !strings.Contains(err.Error(), "clickhouse-to-sqlite") {
 		t.Fatalf("error = %v", err)
 	}
 }

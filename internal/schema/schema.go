@@ -99,6 +99,13 @@ func CreateTable(target Dialect, table Table) (string, error) {
 			pk = append(pk, quote(target, column.Name))
 		}
 	}
+	if target == ClickHouse {
+		orderBy := "tuple()"
+		if len(pk) > 0 {
+			orderBy = "(" + strings.Join(pk, ", ") + ")"
+		}
+		return "CREATE TABLE " + qualified(target, table.Schema, table.Name) + " (" + strings.Join(parts, ", ") + ") ENGINE = MergeTree ORDER BY " + orderBy + ";", nil
+	}
 	if len(pk) > 0 {
 		parts = append(parts, "PRIMARY KEY ("+strings.Join(pk, ", ")+")")
 	}
