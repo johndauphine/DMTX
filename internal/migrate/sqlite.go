@@ -17,6 +17,7 @@ type Result struct {
 	Rows      int  `json:"rows"`
 	Validated bool `json:"validated"`
 }
+
 type TableObserver interface {
 	BeforeTable(context.Context, string) error
 	AfterTable(context.Context, string, int) error
@@ -25,6 +26,7 @@ type TableObserver interface {
 func SQLiteToSQLite(ctx context.Context, cfg config.Config) (Result, error) {
 	return SQLiteToSQLiteWithObserver(ctx, cfg, nil)
 }
+
 func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer TableObserver) (Result, error) {
 	if cfg.Source.Type != "sqlite" || cfg.Target.Type != "sqlite" {
 		return Result{}, fmt.Errorf("SQLite first pass requires source.type and target.type to be sqlite")
@@ -73,24 +75,29 @@ func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer
 	}
 	return result, nil
 }
-func userTables(ctx context.Context, db *sql.DB) ([]string, error) {
-	rows, err := db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+
+func userTables(ctx context.Context, database *sql.DB) ([]string, error) {
+	rows, err := database.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("list source tables: %w", err)
 	}
 	defer rows.Close()
-	var n []string
+	var names []string
 	for rows.Next() {
-		var x string
-		if err := rows.Scan(&x); err != nil {
+		var name string
+		if err := rows.Scan(&name); err != nil {
 			return nil, err
 		}
-		n = append(n, x)
+		names = append(names, name)
 	}
-	return n, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate source tables: %w", err)
+	}
+	return names, nil
 }
+
 func copyTable(ctx context.Context, source, target *sql.DB, name, mode string) (int, error) {
-	table, names, err := inspectTable(ctx, source, name)
+	table, columns, err := inspectTable(ctx, source, name)
 	if err != nil {
 		return 0, err
 	}
@@ -100,7 +107,7 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, mode string) (
 	if err := prepareTarget(ctx, target, table, mode); err != nil {
 		return 0, err
 	}
-	rows, err := source.QueryContext(ctx, "SELECT "+quotedColumns(names)+" FROM "+quote(name))
+	rows, err := source.QueryContext(ctx, "SELECT "+quotedColumns(columns)+" FROM "+quote(name))
 	if err != nil {
 		return 0, fmt.Errorf("read %s: %w", name, err)
 	}
@@ -110,22 +117,21 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, mode string) (
 		return 0, fmt.Errorf("begin write for %s: %w", name, err)
 	}
 	defer tx.Rollback()
-	stmt, err := tx.PrepareContext(ctx, writeStatement(table, names, mode))
+	statement, err := tx.PrepareContext(ctx, writeStatement(table, columns, mode))
 	if err != nil {
 		return 0, fmt.Errorf("prepare write for %s: %w", name, err)
 	}
-	defer stmt.Close()
-	count := 0
-	values := make([]any, len(names))
-	ptrs := make([]any, len(names))
+	defer statement.Close()
+	values, pointers := make([]any, len(columns)), make([]any, len(columns))
 	for i := range values {
-		ptrs[i] = &values[i]
+		pointers[i] = &values[i]
 	}
+	count := 0
 	for rows.Next() {
-		if err := rows.Scan(ptrs...); err != nil {
+		if err := rows.Scan(pointers...); err != nil {
 			return 0, fmt.Errorf("scan %s: %w", name, err)
 		}
-		if _, err := stmt.ExecContext(ctx, values...); err != nil {
+		if _, err := statement.ExecContext(ctx, values...); err != nil {
 			return 0, fmt.Errorf("write %s: %w", name, err)
 		}
 		count++
@@ -138,6 +144,7 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, mode string) (
 	}
 	return count, nil
 }
+
 func writeStatement(table schema.Table, columns []string, mode string) string {
 	statement := "INSERT INTO " + quote(table.Name) + " (" + quotedColumns(columns) + ") VALUES (" + placeholders(len(columns)) + ")"
 	if mode != "upsert" {
@@ -155,24 +162,25 @@ func writeStatement(table schema.Table, columns []string, mode string) string {
 	}
 	return statement + " ON CONFLICT (" + quotedColumns(keys) + ") DO UPDATE SET " + strings.Join(updates, ", ")
 }
+
 func primaryKeyColumns(table schema.Table) []string {
 	var keys []string
-	for _, c := range table.Columns {
-		if c.PrimaryKey {
-			keys = append(keys, c.Name)
+	for _, column := range table.Columns {
+		if column.PrimaryKey {
+			keys = append(keys, column.Name)
 		}
 	}
 	return keys
 }
+func hasPrimaryKey(table schema.Table) bool { return len(primaryKeyColumns(table)) > 0 }
 func contains(values []string, value string) bool {
-	for _, v := range values {
-		if v == value {
+	for _, candidate := range values {
+		if candidate == value {
 			return true
 		}
 	}
 	return false
 }
-func hasPrimaryKey(table schema.Table) bool { return len(primaryKeyColumns(table)) > 0 }
 func prepareTarget(ctx context.Context, target *sql.DB, table schema.Table, mode string) error {
 	if mode == "drop_recreate" {
 		drop, err := schema.DropTable(schema.SQLite, table)
@@ -199,32 +207,32 @@ func prepareTarget(ctx context.Context, target *sql.DB, table schema.Table, mode
 	}
 	return nil
 }
-func tableExists(ctx context.Context, db *sql.DB, name string) (bool, error) {
+func tableExists(ctx context.Context, database *sql.DB, name string) (bool, error) {
 	var count int
-	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&count)
+	err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&count)
 	return count > 0, err
 }
 func validateCount(ctx context.Context, source, target *sql.DB, name string) error {
-	a, err := countRows(ctx, source, name)
+	sourceCount, err := countRows(ctx, source, name)
 	if err != nil {
 		return err
 	}
-	b, err := countRows(ctx, target, name)
+	targetCount, err := countRows(ctx, target, name)
 	if err != nil {
 		return err
 	}
-	if a != b {
-		return fmt.Errorf("validation failed for %s: source has %d rows, target has %d", name, a, b)
+	if sourceCount != targetCount {
+		return fmt.Errorf("validation failed for %s: source has %d rows, target has %d", name, sourceCount, targetCount)
 	}
 	return nil
 }
-func countRows(ctx context.Context, db *sql.DB, name string) (int, error) {
+func countRows(ctx context.Context, database *sql.DB, name string) (int, error) {
 	var count int
-	err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+quote(name)).Scan(&count)
+	err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+quote(name)).Scan(&count)
 	return count, err
 }
-func inspectTable(ctx context.Context, db *sql.DB, name string) (schema.Table, []string, error) {
-	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+quote(name)+")")
+func inspectTable(ctx context.Context, database *sql.DB, name string) (schema.Table, []string, error) {
+	rows, err := database.QueryContext(ctx, "PRAGMA table_info("+quote(name)+")")
 	if err != nil {
 		return schema.Table{}, nil, fmt.Errorf("inspect %s: %w", name, err)
 	}
@@ -232,29 +240,29 @@ func inspectTable(ctx context.Context, db *sql.DB, name string) (schema.Table, [
 	table := schema.Table{Name: name}
 	var names []string
 	for rows.Next() {
-		var pos, notNull, pk int
+		var pos, notNull, primaryKey int
 		var columnName, columnType string
-		var def any
-		if err := rows.Scan(&pos, &columnName, &columnType, &notNull, &def, &pk); err != nil {
+		var defaultValue any
+		if err := rows.Scan(&pos, &columnName, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
 			return schema.Table{}, nil, err
 		}
-		table.Columns = append(table.Columns, schema.Column{Name: columnName, Type: columnType, Nullable: notNull == 0, PrimaryKey: pk > 0})
+		table.Columns = append(table.Columns, schema.Column{Name: columnName, Type: columnType, Nullable: notNull == 0, PrimaryKey: primaryKey > 0})
 		names = append(names, columnName)
 	}
 	return table, names, rows.Err()
 }
 func quote(name string) string { return `"` + strings.ReplaceAll(name, `"`, `""`) + `"` }
 func quotedColumns(columns []string) string {
-	q := make([]string, len(columns))
-	for i, c := range columns {
-		q[i] = quote(c)
+	quoted := make([]string, len(columns))
+	for i, column := range columns {
+		quoted[i] = quote(column)
 	}
-	return strings.Join(q, ", ")
+	return strings.Join(quoted, ", ")
 }
 func placeholders(count int) string {
-	v := make([]string, count)
-	for i := range v {
-		v[i] = "?"
+	values := make([]string, count)
+	for i := range values {
+		values[i] = "?"
 	}
-	return strings.Join(v, ", ")
+	return strings.Join(values, ", ")
 }
