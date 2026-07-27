@@ -16,6 +16,28 @@ func TestCreateTableIsDeterministicAcrossDialects(t *testing.T) {
 	}
 }
 
+func TestMapTypeSupportsCommonPortableTypes(t *testing.T) {
+	cases := []struct {
+		source string
+		target Dialect
+		want   string
+	}{
+		{"decimal", Postgres, "DECIMAL(38, 10)"},
+		{"decimal", ClickHouse, "Decimal(38, 10)"},
+		{"double precision", SQLite, "REAL"},
+		{"uuid", SQLServer, "UNIQUEIDENTIFIER"},
+		{"bytea", Postgres, "BYTEA"},
+		{"jsonb", MySQL, "JSON"},
+		{"date", ClickHouse, "DATE"},
+	}
+	for _, test := range cases {
+		got, err := MapType(test.source, test.target)
+		if err != nil || got != test.want {
+			t.Fatalf("MapType(%q, %q) = %q, %v; want %q", test.source, test.target, got, err, test.want)
+		}
+	}
+}
+
 func TestUnknownTypeIsClassifiable(t *testing.T) {
 	_, err := MapType("mystery", Postgres)
 	if _, ok := err.(*PolicyError); !ok {

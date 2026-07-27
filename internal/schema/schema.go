@@ -60,8 +60,67 @@ func MapType(source string, target Dialect) (string, error) {
 			return "Int64", nil
 		}
 		return "BIGINT", nil
+	case "real", "float", "float4", "double", "double precision", "float8":
+		switch target {
+		case Postgres:
+			return "DOUBLE PRECISION", nil
+		case SQLServer:
+			return "FLOAT", nil
+		case MySQL:
+			return "DOUBLE", nil
+		case ClickHouse:
+			return "Float64", nil
+		default:
+			return "REAL", nil
+		}
+	case "decimal", "numeric":
+		switch target {
+		case ClickHouse:
+			return "Decimal(38, 10)", nil
+		case SQLite:
+			return "NUMERIC", nil
+		default:
+			return "DECIMAL(38, 10)", nil
+		}
 	case "text", "varchar", "character varying":
 		return "TEXT", nil
+	case "uuid":
+		switch target {
+		case Postgres, ClickHouse:
+			return "UUID", nil
+		case SQLServer:
+			return "UNIQUEIDENTIFIER", nil
+		case MySQL:
+			return "CHAR(36)", nil
+		default:
+			return "TEXT", nil
+		}
+	case "blob", "binary", "varbinary", "bytea":
+		switch target {
+		case Postgres:
+			return "BYTEA", nil
+		case SQLServer:
+			return "VARBINARY(MAX)", nil
+		case MySQL:
+			return "LONGBLOB", nil
+		case ClickHouse:
+			return "String", nil
+		default:
+			return "BLOB", nil
+		}
+	case "json", "jsonb":
+		switch target {
+		case Postgres:
+			return "JSONB", nil
+		case SQLServer:
+			return "NVARCHAR(MAX)", nil
+		case MySQL:
+			return "JSON", nil
+		case ClickHouse:
+			return "String", nil
+		default:
+			return "TEXT", nil
+		}
 	case "bool", "boolean":
 		if target == SQLServer {
 			return "BIT", nil
@@ -75,6 +134,8 @@ func MapType(source string, target Dialect) (string, error) {
 			return "DATETIME2", nil
 		}
 		return "TIMESTAMP", nil
+	case "date":
+		return "DATE", nil
 	default:
 		return "", &PolicyError{Operation: "map type", Type: source, Target: string(target)}
 	}
