@@ -73,3 +73,19 @@ func TestPreflightRejectsSameDatabase(t *testing.T) {
 		t.Fatalf("output = %q", output.String())
 	}
 }
+
+func TestPreflightRejectsIncompleteNetworkSource(t *testing.T) {
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "migration.yaml")
+	contents := "source:\n  type: postgres\n  database: source\n  user: dmtx\ntarget:\n  type: sqlite\n  database: " + filepath.Join(directory, "target.db") + "\n"
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var output, errors bytes.Buffer
+	if code := Run([]string{"preflight", "--config", configPath}, &output, &errors); code != ConfigurationError {
+		t.Fatalf("code = %d", code)
+	}
+	if !bytes.Contains(output.Bytes(), []byte(`"class":"source_connect"`)) || !bytes.Contains(output.Bytes(), []byte("PostgreSQL host")) {
+		t.Fatalf("output = %q", output.String())
+	}
+}

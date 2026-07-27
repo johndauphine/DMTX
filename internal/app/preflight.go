@@ -1,11 +1,13 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/johndauphine/DMTX/internal/config"
 	"github.com/johndauphine/DMTX/internal/engine"
@@ -62,6 +64,11 @@ func preflight(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 	}
+	if cfg.Source.Type != "sqlite" {
+		if err := preflightNetworkSource(cfg.Source); err != nil {
+			findings = append(findings, preflightFinding{"source_connect", "error", "source database cannot be reached: " + err.Error()})
+		}
+	}
 	if err := json.NewEncoder(stdout).Encode(findings); err != nil {
 		fmt.Fprintf(stderr, "write preflight: %v\n", err)
 		return FileError
@@ -72,4 +79,31 @@ func preflight(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	return Success
+}
+
+func preflightNetworkSource(endpoint config.Endpoint) error {
+	password, err := config.ExpandSecret(endpoint.Password)
+	if err != nil {
+		return fmt.Errorf("resolve source password: %w", err)
+	}
+	endpoint.Password = password
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var database *sql.DB
+	switch endpoint.Type {
+	case "postgres":
+		database, err = engine.OpenPostgres(ctx, endpoint)
+	case "mysql":
+		database, err = engine.OpenMySQL(ctx, endpoint)
+	case "mssql":
+		database, err = engine.OpenSQLServer(ctx, endpoint)
+	case "clickhouse":
+		database, err = engine.OpenClickHouse(ctx, endpoint)
+	default:
+		return fmt.Errorf("unsupported source engine %q", endpoint.Type)
+	}
+	if err != nil {
+		return err
+	}
+	return database.Close()
 }
