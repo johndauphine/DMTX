@@ -40,7 +40,6 @@ func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer
 	if cfg.Source.Database == cfg.Target.Database {
 		return Result{}, fmt.Errorf("source and target SQLite databases must differ")
 	}
-
 	source, err := sql.Open("sqlite", cfg.Source.Database)
 	if err != nil {
 		return Result{}, fmt.Errorf("open source: %w", err)
@@ -51,7 +50,6 @@ func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer
 		return Result{}, fmt.Errorf("open target: %w", err)
 	}
 	defer target.Close()
-
 	names, err := userTables(ctx, source)
 	if err != nil {
 		return Result{}, err
@@ -106,6 +104,9 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, targetMode str
 	if err != nil {
 		return 0, err
 	}
+	if !hasPrimaryKey(table) {
+		return 0, fmt.Errorf("table %s has no primary key; deterministic transfer requires a primary key", name)
+	}
 	if err := prepareTarget(ctx, target, table, targetMode); err != nil {
 		return 0, err
 	}
@@ -128,7 +129,6 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, targetMode str
 		return 0, fmt.Errorf("prepare write for %s: %w", name, err)
 	}
 	defer statement.Close()
-
 	count, values := 0, make([]any, len(names))
 	pointers := make([]any, len(names))
 	for index := range values {
@@ -150,6 +150,15 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, targetMode str
 		return 0, fmt.Errorf("commit %s: %w", name, err)
 	}
 	return count, nil
+}
+
+func hasPrimaryKey(table schema.Table) bool {
+	for _, column := range table.Columns {
+		if column.PrimaryKey {
+			return true
+		}
+	}
+	return false
 }
 
 func prepareTarget(ctx context.Context, target *sql.DB, table schema.Table, targetMode string) error {
@@ -231,7 +240,6 @@ func inspectTable(ctx context.Context, database *sql.DB, name string) (schema.Ta
 }
 
 func quote(name string) string { return `"` + strings.ReplaceAll(name, `"`, `""`) + `"` }
-
 func quotedColumns(columns []string) string {
 	quoted := make([]string, len(columns))
 	for index, column := range columns {
@@ -239,7 +247,6 @@ func quotedColumns(columns []string) string {
 	}
 	return strings.Join(quoted, ", ")
 }
-
 func placeholders(count int) string {
 	values := make([]string, count)
 	for index := range values {
