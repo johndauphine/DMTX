@@ -7,13 +7,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/johndauphine/DMTX/internal/config"
 	"github.com/johndauphine/DMTX/internal/contract"
 	"github.com/johndauphine/DMTX/internal/migrate"
+	"github.com/johndauphine/DMTX/internal/state"
 )
 
-const Version = "0.2.0-dev"
+const Version = "0.3.0-dev"
 
 const (
 	Success = iota
@@ -44,6 +46,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return Success
 	case "run":
 		return run(args[1:], stdout, stderr)
+	case "status":
+		return showState(args[1:], stdout, true)
+	case "history":
+		return showState(args[1:], stdout, false)
 	case "health-check":
 		fmt.Fprintln(stdout, "preflight is planned")
 		return Success
@@ -74,15 +80,48 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}
+	store := state.Store{Path: args[1] + ".state.json"}
+	started := time.Now().UTC()
+	_ = store.Append(state.Run{ID: started.Format("20060102T150405.000000000Z"), Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Running, Resumable: true, Reason: "migration in progress", StartedAt: started})
 	result, err := migrate.SQLiteToSQLite(context.Background(), cfg)
 	if err != nil {
+		_ = store.Append(state.Run{ID: started.Format("20060102T150405.000000000Z"), Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Failed, Resumable: true, Reason: err.Error(), StartedAt: started, EndedAt: time.Now().UTC()})
 		fmt.Fprintf(stderr, "migration: %v\n", err)
 		return TransferError
 	}
+	_ = store.Append(state.Run{ID: started.Format("20060102T150405.000000000Z"), Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Success, Resumable: false, Reason: "migration completed", StartedAt: started, EndedAt: time.Now().UTC()})
 	if err := json.NewEncoder(stdout).Encode(result); err != nil {
 		fmt.Fprintf(stderr, "write result: %v\n", err)
 		return FileError
 	}
+	return Success
+}
+
+func showState(args []string, stdout io.Writer, latest bool) int {
+	if len(args) != 2 || args[0] != "--state" {
+		fmt.Fprintln(stdout, "usage: dmt status --state migration.yaml.state.json")
+		return ConfigurationError
+	}
+	store := state.Store{Path: args[1]}
+	if latest {
+		run, found, err := store.Latest()
+		if err != nil {
+			fmt.Fprintln(stdout, err)
+			return StateError
+		}
+		if !found {
+			fmt.Fprintln(stdout, "no runs recorded")
+			return Success
+		}
+		_ = json.NewEncoder(stdout).Encode(run)
+		return Success
+	}
+	runs, err := store.List()
+	if err != nil {
+		fmt.Fprintln(stdout, err)
+		return StateError
+	}
+	_ = json.NewEncoder(stdout).Encode(runs)
 	return Success
 }
 
