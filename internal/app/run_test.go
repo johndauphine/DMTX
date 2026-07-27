@@ -34,4 +34,12 @@ func TestRunMigratesSQLiteConfiguration(t *testing.T) {
 	if output.String() != "{\"tables\":1,\"rows\":1,\"validated\":true}\n" {
 		t.Fatalf("result = %q", output.String())
 	}
+
+	output.Reset()
+	if code := Run([]string{"status", "--state", configPath + ".state.db"}, &output, &errors); code != Success {
+		t.Fatalf("status exit code = %d, stderr = %s", code, errors.String())
+	}
+	if !bytes.Contains(output.Bytes(), []byte("\"outcome\":\"success\"")) {
+		t.Fatalf("status result = %q", output.String())
+	}
 }

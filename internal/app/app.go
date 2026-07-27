@@ -80,16 +80,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}
-	store := state.Store{Path: args[1] + ".state.json"}
+
+	store := state.SQLiteStore{Path: args[1] + ".state.db"}
 	started := time.Now().UTC()
-	_ = store.Append(state.Run{ID: started.Format("20060102T150405.000000000Z"), Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Running, Resumable: true, Reason: "migration in progress", StartedAt: started})
+	runID := started.Format("20060102T150405.000000000Z")
+	if err := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Running, Resumable: true, Reason: "migration in progress", StartedAt: started}); err != nil {
+		fmt.Fprintf(stderr, "record migration state: %v\n", err)
+		return StateError
+	}
+
 	result, err := migrate.SQLiteToSQLite(context.Background(), cfg)
 	if err != nil {
-		_ = store.Append(state.Run{ID: started.Format("20060102T150405.000000000Z"), Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Failed, Resumable: true, Reason: err.Error(), StartedAt: started, EndedAt: time.Now().UTC()})
+		if stateErr := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Failed, Resumable: true, Reason: err.Error(), StartedAt: started, EndedAt: time.Now().UTC()}); stateErr != nil {
+			fmt.Fprintf(stderr, "record failed migration state: %v\n", stateErr)
+			return StateError
+		}
 		fmt.Fprintf(stderr, "migration: %v\n", err)
 		return TransferError
 	}
-	_ = store.Append(state.Run{ID: started.Format("20060102T150405.000000000Z"), Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Success, Resumable: false, Reason: "migration completed", StartedAt: started, EndedAt: time.Now().UTC()})
+	if err := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Success, Resumable: false, Reason: "migration completed", StartedAt: started, EndedAt: time.Now().UTC()}); err != nil {
+		fmt.Fprintf(stderr, "record completed migration state: %v\n", err)
+		return StateError
+	}
 	if err := json.NewEncoder(stdout).Encode(result); err != nil {
 		fmt.Fprintf(stderr, "write result: %v\n", err)
 		return FileError
@@ -99,10 +111,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 func showState(args []string, stdout io.Writer, latest bool) int {
 	if len(args) != 2 || args[0] != "--state" {
-		fmt.Fprintln(stdout, "usage: dmt status --state migration.yaml.state.json")
+		fmt.Fprintln(stdout, "usage: dmt status --state migration.yaml.state.db")
 		return ConfigurationError
 	}
-	store := state.Store{Path: args[1]}
+	store := state.SQLiteStore{Path: args[1]}
 	if latest {
 		run, found, err := store.Latest()
 		if err != nil {
@@ -113,7 +125,10 @@ func showState(args []string, stdout io.Writer, latest bool) int {
 			fmt.Fprintln(stdout, "no runs recorded")
 			return Success
 		}
-		_ = json.NewEncoder(stdout).Encode(run)
+		if err := json.NewEncoder(stdout).Encode(run); err != nil {
+			fmt.Fprintln(stdout, err)
+			return FileError
+		}
 		return Success
 	}
 	runs, err := store.List()
@@ -121,7 +136,10 @@ func showState(args []string, stdout io.Writer, latest bool) int {
 		fmt.Fprintln(stdout, err)
 		return StateError
 	}
-	_ = json.NewEncoder(stdout).Encode(runs)
+	if err := json.NewEncoder(stdout).Encode(runs); err != nil {
+		fmt.Fprintln(stdout, err)
+		return FileError
+	}
 	return Success
 }
 
