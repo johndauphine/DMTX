@@ -106,9 +106,13 @@ func postgresColumnNames(table schema.Table) []string {
 
 func copyPostgresRows(ctx context.Context, source, target *sql.DB, namespace string, table schema.Table, columns []string, mode string) (int, error) {
 	query := postgresReadQuery(namespace, table, columns)
+	return copyRelationalRows(ctx, source, target, table, columns, mode, query, "PostgreSQL")
+}
+
+func copyRelationalRows(ctx context.Context, source, target *sql.DB, table schema.Table, columns []string, mode, query, sourceName string) (int, error) {
 	rows, err := source.QueryContext(ctx, query)
 	if err != nil {
-		return 0, fmt.Errorf("read PostgreSQL table %s: %w", table.Name, err)
+		return 0, fmt.Errorf("read %s table %s: %w", sourceName, table.Name, err)
 	}
 	defer rows.Close()
 	count := 0
@@ -120,7 +124,7 @@ func copyPostgresRows(ctx context.Context, source, target *sql.DB, namespace str
 	}
 	for rows.Next() {
 		if err := rows.Scan(pointers...); err != nil {
-			return 0, fmt.Errorf("read PostgreSQL table %s: %w", table.Name, err)
+			return 0, fmt.Errorf("read %s table %s: %w", sourceName, table.Name, err)
 		}
 		batch = append(batch, append([]any(nil), values...))
 		if len(batch) == sqliteWriteBatchSize {
@@ -132,7 +136,7 @@ func copyPostgresRows(ctx context.Context, source, target *sql.DB, namespace str
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("read PostgreSQL table %s: %w", table.Name, err)
+		return 0, fmt.Errorf("read %s table %s: %w", sourceName, table.Name, err)
 	}
 	if len(batch) > 0 {
 		if err := writeBatch(ctx, target, table, columns, mode, batch); err != nil {

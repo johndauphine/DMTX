@@ -20,5 +20,8 @@ func Execute(ctx context.Context, cfg config.Config, observer TableObserver) (Re
 	if cfg.Source.Type == "postgres" && cfg.Target.Type == "sqlite" {
 		return PostgresToSQLiteWithObserver(ctx, cfg, observer)
 	}
+	if cfg.Source.Type == "mysql" && cfg.Target.Type == "sqlite" {
+		return MySQLToSQLiteWithObserver(ctx, cfg, observer)
+	}
 	return Result{}, fmt.Errorf("unsupported migration pair %s-to-%s", cfg.Source.Type, cfg.Target.Type)
 }
