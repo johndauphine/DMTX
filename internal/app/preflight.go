@@ -42,8 +42,16 @@ func preflight(args []string, stdout, stderr io.Writer) int {
 	if cfg.Source.Database != "" && cfg.Source.Database == cfg.Target.Database {
 		findings = append(findings, preflightFinding{"same_database", "error", "source and target SQLite databases must differ"})
 	}
-	if cfg.Source.Type == "sqlite" && cfg.Source.Database != "" {
-		if db, openErr := sql.Open("sqlite", cfg.Source.Database); openErr != nil {
+	if cfg.Source.Type == "sqlite" && cfg.Source.Database != "" && cfg.Source.Database != cfg.Target.Database {
+		if info, statErr := os.Stat(cfg.Source.Database); statErr != nil {
+			if os.IsNotExist(statErr) {
+				findings = append(findings, preflightFinding{"source_missing", "error", "source database does not exist"})
+			} else {
+				findings = append(findings, preflightFinding{"source_open", "error", "source database cannot be read"})
+			}
+		} else if info.IsDir() {
+			findings = append(findings, preflightFinding{"source_open", "error", "source database path is a directory"})
+		} else if db, openErr := sql.Open("sqlite", cfg.Source.Database); openErr != nil {
 			findings = append(findings, preflightFinding{"source_open", "error", "source database cannot be opened"})
 		} else {
 			pingErr := db.Ping()
