@@ -32,6 +32,10 @@ func SQLiteToSQLiteResume(ctx context.Context, cfg config.Config, completed map[
 	if err != nil {
 		return Result{}, err
 	}
+	names, err = selectedTables(names, cfg)
+	if err != nil {
+		return Result{}, err
+	}
 	result := Result{Validated: true}
 	for _, name := range names {
 		if completed[name] {

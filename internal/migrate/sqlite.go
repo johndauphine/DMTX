@@ -53,6 +53,10 @@ func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer
 	if err != nil {
 		return Result{}, err
 	}
+	names, err = selectedTables(names, cfg)
+	if err != nil {
+		return Result{}, err
+	}
 	result := Result{Validated: true}
 	for _, name := range names {
 		if observer != nil {
@@ -76,6 +80,17 @@ func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer
 		result.Rows += copied
 	}
 	return result, nil
+}
+
+func selectedTables(names []string, cfg config.Config) ([]string, error) {
+	selected, err := config.SelectTables(names, cfg.Migration.IncludeTables, cfg.Migration.ExcludeTables)
+	if err != nil {
+		return nil, fmt.Errorf("select source tables: %w", err)
+	}
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("no source tables match migration filters")
+	}
+	return selected, nil
 }
 
 func userTables(ctx context.Context, database *sql.DB) ([]string, error) {

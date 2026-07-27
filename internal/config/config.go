@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path"
 	"regexp"
 	"strings"
 
@@ -21,7 +22,9 @@ type Endpoint struct {
 }
 
 type Migration struct {
-	TargetMode string `yaml:"target_mode"`
+	TargetMode    string   `yaml:"target_mode"`
+	IncludeTables []string `yaml:"include_tables"`
+	ExcludeTables []string `yaml:"exclude_tables"`
 }
 type Config struct {
 	Source    Endpoint  `yaml:"source"`
@@ -46,7 +49,66 @@ func Parse(data []byte) (Config, error) {
 	if value.Migration.TargetMode != "drop_recreate" && value.Migration.TargetMode != "upsert" {
 		return Config{}, fmt.Errorf("invalid target_mode %q", value.Migration.TargetMode)
 	}
+	if err := validatePatterns("include_tables", value.Migration.IncludeTables); err != nil {
+		return Config{}, err
+	}
+	if err := validatePatterns("exclude_tables", value.Migration.ExcludeTables); err != nil {
+		return Config{}, err
+	}
 	return value, nil
+}
+
+// SelectTables applies path-style glob patterns in the source's existing,
+// deterministic order. An empty include list selects every table; exclusions
+// always take precedence over inclusions.
+func SelectTables(names, include, exclude []string) ([]string, error) {
+	if err := validatePatterns("include_tables", include); err != nil {
+		return nil, err
+	}
+	if err := validatePatterns("exclude_tables", exclude); err != nil {
+		return nil, err
+	}
+
+	selected := make([]string, 0, len(names))
+	for _, name := range names {
+		included, err := matchesAny(name, include)
+		if err != nil {
+			return nil, err
+		}
+		if len(include) > 0 && !included {
+			continue
+		}
+		excluded, err := matchesAny(name, exclude)
+		if err != nil {
+			return nil, err
+		}
+		if !excluded {
+			selected = append(selected, name)
+		}
+	}
+	return selected, nil
+}
+
+func validatePatterns(field string, patterns []string) error {
+	for _, pattern := range patterns {
+		if _, err := path.Match(pattern, ""); err != nil {
+			return fmt.Errorf("invalid %s glob %q: %w", field, pattern, err)
+		}
+	}
+	return nil
+}
+
+func matchesAny(name string, patterns []string) (bool, error) {
+	for _, pattern := range patterns {
+		matched, err := path.Match(pattern, name)
+		if err != nil {
+			return false, err
+		}
+		if matched {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 var template = regexp.MustCompile(`^\$\{(env:|file:)?([^}]+)\}$`)
