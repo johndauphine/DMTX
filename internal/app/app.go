@@ -108,8 +108,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
+	migrationContext, heartbeat := startLeaseHeartbeat(context.Background(), leaseStore, lease, 30*time.Second)
 	observer := tableCheckpointObserver{store: store, runID: runID}
-	result, err := migrate.SQLiteToSQLiteWithObserver(context.Background(), cfg, observer)
+	result, err := migrate.SQLiteToSQLiteWithObserver(migrationContext, cfg, observer)
+	if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
+		fmt.Fprintf(stderr, "renew target lease: %v\n", heartbeatErr)
+		return StateError
+	}
 	if err != nil {
 		if stateErr := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Failed, Resumable: true, Reason: err.Error(), StartedAt: started, EndedAt: time.Now().UTC()}); stateErr != nil {
 			fmt.Fprintf(stderr, "record failed migration state: %v\n", stateErr)

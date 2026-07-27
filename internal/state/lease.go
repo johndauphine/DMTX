@@ -78,6 +78,27 @@ func (store SQLiteStore) AcquireLease(target, runID string, ttl time.Duration) (
 	return Lease{Target: target, OwnerToken: token, Generation: generation}, nil
 }
 
+// RenewLease extends a lease only while this owner still holds its generation.
+func (store SQLiteStore) RenewLease(lease Lease) error {
+	database, err := store.Open()
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	result, err := database.Exec(`UPDATE leases SET heartbeat_at = ? WHERE target = ? AND owner_token = ? AND generation = ?`, time.Now().UTC(), lease.Target, lease.OwnerToken, lease.Generation)
+	if err != nil {
+		return fmt.Errorf("renew target lease: %w", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("verify target lease renewal: %w", err)
+	}
+	if updated != 1 {
+		return fmt.Errorf("target lease is no longer owned by this migration")
+	}
+	return nil
+}
+
 // ReleaseLease removes a lease only when the owner token and generation match.
 func (store SQLiteStore) ReleaseLease(lease Lease) error {
 	database, err := store.Open()

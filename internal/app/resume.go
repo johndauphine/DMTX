@@ -87,7 +87,12 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	observer := resumeCheckpointObserver{tableCheckpointObserver: tableCheckpointObserver{store: store, runID: run.ID}, existing: existing}
-	result, err := migrate.SQLiteToSQLiteResumeWithProgress(context.Background(), cfg, completed, progress, observer)
+	migrationContext, heartbeat := startLeaseHeartbeat(context.Background(), leaseStore, lease, 30*time.Second)
+	result, err := migrate.SQLiteToSQLiteResumeWithProgress(migrationContext, cfg, completed, progress, observer)
+	if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
+		fmt.Fprintf(stderr, "renew target lease: %v\n", heartbeatErr)
+		return StateError
+	}
 	if err != nil {
 		if stateErr := store.UpdateFailure(run.ID, err.Error(), time.Now().UTC()); stateErr != nil {
 			fmt.Fprintf(stderr, "record failed resume state: %v\n", stateErr)
