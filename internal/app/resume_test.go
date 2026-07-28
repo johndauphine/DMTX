@@ -2,13 +2,16 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/johndauphine/DMTX/internal/config"
+	"github.com/johndauphine/DMTX/internal/migrate"
 	"github.com/johndauphine/DMTX/internal/state"
 	_ "modernc.org/sqlite"
 )
@@ -58,6 +61,72 @@ func TestResumeReusesValidatedCompletedTable(t *testing.T) {
 	if err != nil || !found || latest.Outcome != state.Success {
 		t.Fatalf("latest = %#v, found = %v, error = %v", latest, found, err)
 	}
+}
+
+func TestResumeCompletesAfterDurablePageCheckpointInterruption(t *testing.T) {
+	directory := t.TempDir()
+	sourcePath, targetPath := filepath.Join(directory, "source.db"), filepath.Join(directory, "target.db")
+	configPath := filepath.Join(directory, "migration.yaml")
+	createResumableDatabase(t, sourcePath)
+	source, err := sql.Open("sqlite", sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id := 2; id <= 501; id++ {
+		if _, err := source.Exec(`INSERT INTO users VALUES (?)`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source.Close()
+	configuration := "source:\n  type: sqlite\n  database: " + sourcePath + "\ntarget:\n  type: sqlite\n  database: " + targetPath + "\nmigration:\n  target_mode: upsert\n"
+	if err := os.WriteFile(configPath, []byte(configuration), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(configuration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := state.SQLiteStore{Path: configPath + ".state.db"}
+	started := time.Now().UTC()
+	if err := store.Append(state.Run{ID: "interrupted", Source: sourcePath, Target: targetPath, Outcome: state.Failed, Resumable: true, Reason: "injected interruption", StartedAt: started, EndedAt: started}); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := config.Hash(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveConfigHash("interrupted", hash); err != nil {
+		t.Fatal(err)
+	}
+	observer := failAfterDurablePage{tableCheckpointObserver: tableCheckpointObserver{store: store, runID: "interrupted"}}
+	if _, err := migrate.SQLiteToSQLiteWithObserver(context.Background(), cfg, observer); err == nil {
+		t.Fatal("expected interruption after durable checkpoint")
+	}
+	var output, errors bytes.Buffer
+	if code := Run([]string{"resume", "--config", configPath}, &output, &errors); code != Success {
+		t.Fatalf("resume code = %d, stderr = %s", code, errors.String())
+	}
+	target, err := sql.Open("sqlite", targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	var rows, distinct int
+	if err := target.QueryRow(`SELECT COUNT(*), COUNT(DISTINCT id) FROM users`).Scan(&rows, &distinct); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 501 || distinct != 501 {
+		t.Fatalf("target rows = %d, distinct = %d", rows, distinct)
+	}
+}
+
+type failAfterDurablePage struct{ tableCheckpointObserver }
+
+func (observer failAfterDurablePage) AfterIntegerKeysetPage(ctx context.Context, table string, rows int, watermark int64) error {
+	if err := observer.tableCheckpointObserver.AfterIntegerKeysetPage(ctx, table, rows, watermark); err != nil {
+		return err
+	}
+	return fmt.Errorf("injected interruption")
 }
 
 func createResumableDatabase(t *testing.T, path string) {
