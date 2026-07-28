@@ -14,6 +14,7 @@ import (
 
 	"github.com/johndauphine/DMTX/internal/config"
 	"github.com/johndauphine/DMTX/internal/contract"
+	"github.com/johndauphine/DMTX/internal/engine"
 	"github.com/johndauphine/DMTX/internal/migrate"
 	"github.com/johndauphine/DMTX/internal/state"
 )
@@ -72,9 +73,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
-	configPath, dryRun, ok := runArguments(args)
+	configPath, statePath, dryRun, destructiveAcknowledged, ok := runArguments(args)
 	if !ok {
-		fmt.Fprintln(stderr, "usage: dmt run --config migration.yaml [--dry-run]")
+		fmt.Fprintln(stderr, "usage: dmt run --config migration.yaml [--state migration.state.yaml] [--dry-run] [--acknowledge-destructive]")
 		return ConfigurationError
 	}
 	data, err := os.ReadFile(configPath)
@@ -87,6 +88,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}
+	if err := engine.ValidateMigration(cfg); err != nil {
+		fmt.Fprintf(stderr, "configuration: %v\n", err)
+		return ConfigurationError
+	}
+	cfg.Migration.DestructiveAcknowledged = destructiveAcknowledged
 	if dryRun {
 		plan, err := migrate.DryRun(context.Background(), cfg)
 		if err != nil {
@@ -104,10 +110,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration hash: %v\n", err)
 		return StateError
 	}
+	resumeCompatibilityHash, err := config.ResumeCompatibilityHash(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "resume compatibility hash: %v\n", err)
+		return StateError
+	}
 	migrationContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
-	store := state.SQLiteStore{Path: configPath + ".state.db"}
+	store, err := state.NewBackend(statePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "state backend: %v\n", err)
+		return StateError
+	}
 	started := time.Now().UTC()
 	runID := started.Format("20060102T150405.000000000Z")
 	leaseStore, lease, err := acquireTargetLease(cfg.Target, runID)
@@ -115,56 +130,93 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "acquire target lease: %v\n", err)
 		return StateError
 	}
+	guard := state.NewLeaseGuard(leaseStore, lease)
+	store = state.FenceBackend(store, guard)
 	leaseReleased := false
 	defer func() {
 		if !leaseReleased {
-			_ = leaseStore.ReleaseLease(lease)
+			_ = guard.Release()
 		}
 	}()
-	if err := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Running, Resumable: true, Reason: "migration in progress", StartedAt: started}); err != nil {
+	if err := store.InitializeRun(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Running, Resumable: true, Reason: "migration in progress", StartedAt: started}, configHash); err != nil {
 		fmt.Fprintf(stderr, "record migration state: %v\n", err)
 		return StateError
 	}
-	if err := store.SaveConfigHash(runID, configHash); err != nil {
-		fmt.Fprintf(stderr, "record configuration hash: %v\n", err)
+	if err := store.SaveResumeCompatibilityHash(runID, resumeCompatibilityHash); err != nil {
+		fmt.Fprintf(stderr, "record resume compatibility: %v\n", err)
 		return StateError
 	}
 	if err := appendAudit(configPath, runID, "run_started"); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
-	migrationContext, heartbeat := startLeaseHeartbeat(migrationContext, leaseStore, lease, 30*time.Second)
-	observer := tableCheckpointObserver{store: store, runID: runID}
-	result, err := migrate.Execute(migrationContext, cfg, observer)
-	if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
-		fmt.Fprintf(stderr, "renew target lease: %v\n", heartbeatErr)
+	if err := appLifecycleBoundary("run_initialized"); err != nil {
+		fmt.Fprintf(stderr, "run lifecycle: %v\n", err)
 		return StateError
 	}
+	migrationContext, heartbeat := startLeaseHeartbeat(migrationContext, guard, 30*time.Second)
+	observer := tableCheckpointObserver{store: store, runID: runID, guard: guard}
+	result, err := migrate.Execute(migrationContext, cfg, observer)
+	if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
+		err = fmt.Errorf("%w: renew target lease: %v", state.ErrState, heartbeatErr)
+	}
+	if err == nil {
+		if ownershipErr := guard.Renew(); ownershipErr != nil {
+			err = fmt.Errorf("%w: verify final target lease: %v", state.ErrState, ownershipErr)
+		}
+	}
 	if err != nil {
-		if stateErr := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Failed, Resumable: true, Reason: err.Error(), StartedAt: started, EndedAt: time.Now().UTC()}); stateErr != nil {
-			fmt.Fprintf(stderr, "record failed migration state: %v\n", stateErr)
+		disposition := migrationAttemptDisposition(result, err, cfg.Migration)
+		endedAt := time.Now().UTC()
+		if stateErr := persistAttemptDisposition(
+			store, runID, disposition, err.Error(), endedAt,
+		); stateErr != nil {
+			fmt.Fprintf(stderr, "record migration outcome: %v\n", stateErr)
 			return StateError
 		}
-		if auditErr := appendAudit(configPath, runID, "run_failed"); auditErr != nil {
+		if auditErr := appendAudit(configPath, runID, "run_"+disposition.auditSuffix); auditErr != nil {
 			fmt.Fprintf(stderr, "%v\n", auditErr)
 			return StateError
 		}
+		if releaseErr := guard.Release(); releaseErr != nil {
+			fmt.Fprintf(stderr, "release target lease: %v\n", releaseErr)
+			return StateError
+		}
+		leaseReleased = true
+		if disposition.acceptedPartial {
+			result.Validated = false
+			if encodeErr := json.NewEncoder(stdout).Encode(acceptedPartialResult{
+				Result: result, Outcome: state.Partial, Resumable: false,
+			}); encodeErr != nil {
+				fmt.Fprintf(stderr, "write partial result: %v\n", encodeErr)
+				return FileError
+			}
+			return Success
+		}
 		fmt.Fprintf(stderr, "migration: %v\n", err)
-		return migrationExitCode(err)
+		return disposition.exitCode
 	}
-	if err := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Success, Resumable: false, Reason: "migration completed", StartedAt: started, EndedAt: time.Now().UTC()}); err != nil {
-		fmt.Fprintf(stderr, "record completed migration state: %v\n", err)
-		return StateError
-	}
-	if err := appendAudit(configPath, runID, "run_succeeded"); err != nil {
+	if err := appendAudit(configPath, runID, "validation_completed"); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
-	if err := leaseStore.ReleaseLease(lease); err != nil {
+	if err := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Success, Resumable: false, Reason: runSuccessReason, StartedAt: started, EndedAt: time.Now().UTC()}); err != nil {
+		fmt.Fprintf(stderr, "record completed migration state: %v\n", err)
+		return StateError
+	}
+	if err := appLifecycleBoundary("run_success_persisted"); err != nil {
+		fmt.Fprintf(stderr, "run lifecycle: %v\n", err)
+		return StateError
+	}
+	if err := guard.Release(); err != nil {
 		fmt.Fprintf(stderr, "release target lease: %v\n", err)
 		return StateError
 	}
 	leaseReleased = true
+	if err := appendAudit(configPath, runID, "run_succeeded"); err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return StateError
+	}
 	if err := json.NewEncoder(stdout).Encode(result); err != nil {
 		fmt.Fprintf(stderr, "write result: %v\n", err)
 		return FileError
@@ -173,34 +225,54 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func migrationExitCode(err error) int {
-	if errors.Is(err, context.Canceled) {
+	if isStateOrLeaseFailure(err) {
+		return StateError
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return Cancelled
+	}
+	if errors.Is(err, migrate.ErrDestructiveAcknowledgement) {
+		return ConfigurationError
 	}
 	return TransferError
 }
 
-func runArguments(args []string) (configPath string, dryRun, ok bool) {
-	if len(args) < 2 || len(args) > 3 {
-		return "", false, false
-	}
+func runArguments(args []string) (configPath, statePath string, dryRun, destructiveAcknowledged, ok bool) {
 	for index := 0; index < len(args); index++ {
 		switch args[index] {
 		case "--config":
 			if index+1 >= len(args) || configPath != "" {
-				return "", false, false
+				return "", "", false, false, false
 			}
 			configPath = args[index+1]
 			index++
+		case "--state":
+			if index+1 >= len(args) || statePath != "" {
+				return "", "", false, false, false
+			}
+			statePath = args[index+1]
+			index++
 		case "--dry-run":
 			if dryRun {
-				return "", false, false
+				return "", "", false, false, false
 			}
 			dryRun = true
+		case "--acknowledge-destructive":
+			if destructiveAcknowledged {
+				return "", "", false, false, false
+			}
+			destructiveAcknowledged = true
 		default:
-			return "", false, false
+			return "", "", false, false, false
 		}
 	}
-	return configPath, dryRun, configPath != ""
+	if configPath == "" {
+		return "", "", false, false, false
+	}
+	if statePath == "" {
+		statePath = configPath + ".state.db"
+	}
+	return configPath, statePath, dryRun, destructiveAcknowledged, true
 }
 
 func showState(args []string, stdout io.Writer, latest bool) int {
@@ -208,7 +280,12 @@ func showState(args []string, stdout io.Writer, latest bool) int {
 		fmt.Fprintln(stdout, "usage: dmt status --state migration.yaml.state.db")
 		return ConfigurationError
 	}
-	store := state.SQLiteStore{Path: args[1]}
+	store, err := state.NewBackend(args[1])
+	if err != nil {
+		fmt.Fprintln(stdout, err)
+		return StateError
+	}
+
 	if latest {
 		run, found, err := store.Latest()
 		if err != nil {

@@ -3,9 +3,10 @@
 DMTX is a clean-room Go reimplementation of DMT, guided by the reconstruction
 specification in [docs/RECREATE_DMT.md](docs/RECREATE_DMT.md).
 
-The implemented migration slice currently supports SQLite-to-SQLite transfers.
-It is intentionally small, but it is executable and safety-oriented rather
-than a mock interface.
+The Stage 2-supported migration path is SQLite-to-SQLite. It is executable,
+bounded, fenced, and restartable rather than a mock interface. Preliminary
+fresh-run network paths also exist in the codebase, but they do not receive the
+Stage 2 guarantees described below.
 
 ## Current SQLite workflow
 
@@ -36,6 +37,26 @@ Run the migration:
 ./dmt run --config migration.yaml
 ```
 
+If a selected target table already contains rows, rebuild mode stops before
+target mutation. After confirming a backup and the destructive replacement,
+acknowledge it explicitly:
+
+```sh
+./dmt run --config migration.yaml --acknowledge-destructive
+```
+
+The default state database is `migration.yaml.state.db`. For headless workflows,
+select the YAML state backend explicitly:
+
+```sh
+./dmt run --config migration.yaml --state migration.state.yaml
+```
+
+Files ending in `.yaml` or `.yml` select the YAML backend; other state paths
+select SQLite. YAML mutations hold a cross-process operating-system lock across
+the read/compare/write cycle, flush a complete temporary file, and atomically
+replace the prior state.
+
 The command emits a JSON result containing table and row totals. `drop_recreate`
 recreates each migrated table. `upsert` retains an existing compatible target
 table and applies SQLite upsert-mode writes.
@@ -49,34 +70,83 @@ source tables fails before target mutation.
 
 - Source and target SQLite files must differ.
 - Source tables require a primary key before DMTX changes the target.
+- The complete selected schema is planned before target mutation. Unsupported
+  SQLite semantics, including table triggers, generated columns, and
+  expression/partial indexes, fail with a schema-policy error.
 - Target operations are protected by a local exclusive lease.
+  Generation fencing prevents a stale owner from mutating the target or state
+  after takeover.
 - Each table is checkpointed before target mutation and marked complete only
   after row-count validation succeeds.
-- Run history and checkpoints are stored in a local SQLite state database next
-  to the configuration file.
-- Single-integer primary keys transfer through bounded, ascending keyset pages.
-  A target-acknowledged page records its signed integer frontier locally.
-- Text and composite primary keys use deterministic `ROW_NUMBER()` pages in
-  primary-key order rather than an unbounded source read. A
-  target-acknowledged page records its row-number frontier locally.
+- Run history and checkpoints use a local SQLite state database next to the
+  configuration file by default, or a user-selected atomic YAML state file for
+  headless operation.
+- Safe single-integer primary keys use bounded integer-keyset pages. Safe
+  composite keys use typed tuple-keyset pages. Keys whose binding, type, NULL,
+  or ordering behavior is not proven safe use deterministic `ROW_NUMBER()`
+  pages in complete primary-key order.
+- Range bounds, topology, typed frontiers, issued chunk identity, attempt and
+  retry counts, and the lowest contiguous durable acknowledgement are stored
+  before progress can advance.
+- A target write requires a durable intent and attempt authorization. A hard
+  stop after target commit but before state acknowledgement replays that exact
+  chunk through insert-only conflict handling, so replay cannot overwrite a
+  changed row.
+- One migration-wide byte budget accounts for retained scanned rows before
+  they are materialized. Reader count, queue depth, and SQLite writers are
+  bounded; persistent heap pressure serializes forced collection and reduces
+  future chunks only at chunk boundaries.
+- SQLite lock retries are bounded and cancellation-aware. Unknown commit
+  outcomes, state failures, lease loss, validation failures, and policy errors
+  are not retried as transient writes.
 - `dmt resume --config migration.yaml` reuses the interrupted run, verifies a
   completed table before skipping it, and rejects changed data-plane settings.
-  In upsert mode, an interrupted table resumes after its last acknowledged
-  keyset or row-number page; drop-recreate restarts an incomplete table safely.
+  Both target modes restore exact range state; a possibly committed rebuild
+  chunk uses duplicate-safe insert-only replay.
 
-Inspect state with:
+Resume with the explicit YAML state file and inspect its current or full run
+history with:
 
 ```sh
-./dmt status --state migration.yaml.state.db
-./dmt history --state migration.yaml.state.db
+./dmt resume --config migration.yaml --state migration.state.yaml
+./dmt status --state migration.state.yaml
+./dmt history --state migration.state.yaml
 ```
+
+Every rebuild resume reruns the destructive-target gate. A populated target
+requires explicit operator confirmation:
+
+```sh
+./dmt resume --config migration.yaml --acknowledge-destructive
+```
+
+The same inspection commands accept the default SQLite path
+`migration.yaml.state.db`.
+
+## Preliminary network paths
+
+The dispatcher currently contains fresh-run implementations for:
+
+- SQLite to PostgreSQL, MySQL/MariaDB, SQL Server, and ClickHouse;
+- PostgreSQL to PostgreSQL or SQLite;
+- MySQL/MariaDB to PostgreSQL or SQLite; and
+- SQL Server to SQLite.
+
+These paths are pre-Stage 3 implementation scaffolding. They do not yet share
+SQLite's range checkpoint, replay, fencing, resume, and fault-injection matrix,
+and they have not passed the Stage 3 native-bulk and live-engine conformance
+suite. Treat them as experimental, not as Stage 2-certified migrations.
+
+Stage 3 will consolidate network behavior behind source and target adapter
+roles with explicit capabilities, rather than promising correctness through a
+separate hand-maintained pipeline for every source/target pair.
 
 ## Scope and roadmap
 
-This is not yet the full DMT compatibility target. Network engines, richer
-schema evolution, deep validation, WebUI/TUI, and release hardening remain
-staged work. The complete specification and staged acceptance requirements are
-in [docs/RECREATE_DMT.md](docs/RECREATE_DMT.md).
+This is not yet the full DMT compatibility target. Network-engine conformance,
+richer schema evolution, deep validation, WebUI/TUI, and release hardening
+remain staged work. The complete specification and staged acceptance
+requirements are in [docs/RECREATE_DMT.md](docs/RECREATE_DMT.md).
 
 ## Development
 

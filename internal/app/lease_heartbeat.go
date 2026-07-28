@@ -15,7 +15,7 @@ type leaseHeartbeat struct {
 	err    error
 }
 
-func startLeaseHeartbeat(parent context.Context, store state.SQLiteStore, lease state.Lease, ttl time.Duration) (context.Context, *leaseHeartbeat) {
+func startLeaseHeartbeat(parent context.Context, guard *state.LeaseGuard, ttl time.Duration) (context.Context, *leaseHeartbeat) {
 	ctx, cancel := context.WithCancel(parent)
 	heartbeat := &leaseHeartbeat{cancel: cancel, done: make(chan struct{})}
 	interval := ttl / 3
@@ -31,7 +31,7 @@ func startLeaseHeartbeat(parent context.Context, store state.SQLiteStore, lease 
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := store.RenewLease(lease); err != nil {
+				if err := guard.Renew(); err != nil {
 					heartbeat.mu.Lock()
 					heartbeat.err = err
 					heartbeat.mu.Unlock()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/johndauphine/DMTX/internal/config"
@@ -24,6 +25,15 @@ func (observer *recordingObserver) AfterTable(_ context.Context, table string, _
 	return nil
 }
 
+type tableSetRecordingObserver struct {
+	recordingObserver
+}
+
+func (observer *tableSetRecordingObserver) BeforeTables(_ context.Context, tables []string) error {
+	observer.events = append(observer.events, "tables:"+strings.Join(tables, ","))
+	return nil
+}
+
 func TestSQLiteToSQLiteNotifiesTableCheckpointBoundaries(t *testing.T) {
 	directory := t.TempDir()
 	sourcePath := filepath.Join(directory, "source.db")
@@ -39,7 +49,7 @@ func TestSQLiteToSQLiteNotifiesTableCheckpointBoundaries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	observer := &recordingObserver{}
+	observer := &tableSetRecordingObserver{}
 	_, err = SQLiteToSQLiteWithObserver(context.Background(), config.Config{
 		Source: config.Endpoint{Type: "sqlite", Database: sourcePath},
 		Target: config.Endpoint{Type: "sqlite", Database: targetPath},
@@ -47,7 +57,7 @@ func TestSQLiteToSQLiteNotifiesTableCheckpointBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(observer.events) != 2 || observer.events[0] != "before:users" || observer.events[1] != "after:users" {
+	if len(observer.events) != 3 || observer.events[0] != "tables:users" || observer.events[1] != "before:users" || observer.events[2] != "after:users" {
 		t.Fatalf("events = %#v", observer.events)
 	}
 }

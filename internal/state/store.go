@@ -1,4 +1,4 @@
-// Package state persists operator-visible run history in a local JSON file.
+// Package state persists durable migration run history and restart checkpoints.
 package state
 
 import (

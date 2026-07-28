@@ -29,4 +29,5 @@ func normalizeDefaults(value *Config) {
 	if value.Migration.TargetMode == "" {
 		value.Migration.TargetMode = "drop_recreate"
 	}
+	applyTransferDefaults(&value.Migration)
 }

@@ -45,7 +45,7 @@ func TestMigrationExitCodeClassifiesCancellation(t *testing.T) {
 	if got := migrationExitCode(context.Canceled); got != Cancelled {
 		t.Fatalf("cancelled exit code = %d", got)
 	}
-	if got := migrationExitCode(context.DeadlineExceeded); got != TransferError {
-		t.Fatalf("ordinary transfer exit code = %d", got)
+	if got := migrationExitCode(context.DeadlineExceeded); got != Cancelled {
+		t.Fatalf("deadline exit code = %d", got)
 	}
 }

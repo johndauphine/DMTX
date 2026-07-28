@@ -76,7 +76,7 @@ func TestSQLiteKeysetHandlesSignedIntegerExtremes(t *testing.T) {
 	}
 }
 
-func TestSQLiteRowNumberFallbackPagesTextPrimaryKeys(t *testing.T) {
+func TestSQLiteRowNumberFallbackPagesUnsafePrimaryKeys(t *testing.T) {
 	directory := t.TempDir()
 	sourcePath := filepath.Join(directory, "source.db")
 	targetPath := filepath.Join(directory, "target.db")
@@ -84,7 +84,7 @@ func TestSQLiteRowNumberFallbackPagesTextPrimaryKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := source.Exec(`CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT)`); err != nil {
+	if _, err := source.Exec(`CREATE TABLE items (id REAL PRIMARY KEY NOT NULL, name TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	for id := 0; id <= sqliteWriteBatchSize; id++ {

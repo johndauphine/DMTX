@@ -3,6 +3,7 @@ package schema
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -17,13 +18,68 @@ const (
 )
 
 type Column struct {
-	Name, Type string
-	Nullable   bool
-	PrimaryKey bool
+	Name, Type         string
+	Nullable           bool
+	PrimaryKey         bool
+	PrimaryKeyPosition int
+	DeclaredType       *DeclaredType
+	Default            *Expression
 }
+
+// DeclaredType preserves a validated catalog type declaration without carrying
+// executable catalog text. Arguments are numeric SQLite type modifiers such as
+// VARCHAR(40) or DECIMAL(12,2).
+type DeclaredType struct {
+	Base      string
+	Arguments []int
+}
+
+// Expression is SQL text accepted by a dialect-specific conservative parser.
+type Expression struct {
+	sql string
+}
+
+func (expression Expression) CanonicalSQL() string {
+	return expression.sql
+}
+
+type IndexColumn struct {
+	Name       string
+	Descending bool
+	Collation  string
+}
+
+type Index struct {
+	Name    string
+	Unique  bool
+	Inline  bool
+	Columns []IndexColumn
+}
+
+type ForeignKey struct {
+	Columns           []string
+	ReferencedTable   string
+	ReferencedColumns []string
+	OnUpdate          string
+	OnDelete          string
+	Match             string
+}
+
+type CheckConstraint struct {
+	Name       string
+	Expression Expression
+}
+
 type Table struct {
-	Schema, Name string
-	Columns      []Column
+	Schema, Name        string
+	Columns             []Column
+	Indexes             []Index
+	ForeignKeys         []ForeignKey
+	Checks              []CheckConstraint
+	AutoIncrementColumn string
+	SQLiteSequence      *int64
+	SQLiteWithoutRowID  bool
+	SQLiteStrict        bool
 }
 
 type PolicyError struct{ Operation, Type, Target string }
@@ -145,9 +201,14 @@ func CreateTable(target Dialect, table Table) (string, error) {
 	if len(table.Columns) == 0 {
 		return "", &PolicyError{Operation: "create table", Type: "empty table", Target: string(target)}
 	}
+	if target != SQLite {
+		if err := rejectSQLiteOnlySchema(target, table); err != nil {
+			return "", err
+		}
+	}
 	parts, pk := make([]string, 0, len(table.Columns)+1), make([]string, 0)
 	for _, column := range table.Columns {
-		typ, err := MapType(column.Type, target)
+		typ, err := renderColumnType(column, target)
 		if err != nil {
 			return "", err
 		}
@@ -155,10 +216,20 @@ func CreateTable(target Dialect, table Table) (string, error) {
 		if column.Nullable {
 			nullability = ""
 		}
-		parts = append(parts, quote(target, column.Name)+" "+typ+nullability)
-		if column.PrimaryKey {
-			pk = append(pk, quote(target, column.Name))
+		definition := quote(target, column.Name) + " " + typ + nullability
+		if target == SQLite && column.Default != nil {
+			definition += " DEFAULT " + column.Default.sql
 		}
+		if target == SQLite && column.Name == table.AutoIncrementColumn {
+			definition += " PRIMARY KEY AUTOINCREMENT"
+		}
+		parts = append(parts, definition)
+	}
+	for _, column := range orderedPrimaryKeyColumns(table) {
+		if target == SQLite && column.Name == table.AutoIncrementColumn {
+			continue
+		}
+		pk = append(pk, quote(target, column.Name))
 	}
 	if target == ClickHouse {
 		orderBy := "tuple()"
@@ -170,5 +241,68 @@ func CreateTable(target Dialect, table Table) (string, error) {
 	if len(pk) > 0 {
 		parts = append(parts, "PRIMARY KEY ("+strings.Join(pk, ", ")+")")
 	}
-	return "CREATE TABLE " + qualified(target, table.Schema, table.Name) + " (" + strings.Join(parts, ", ") + ");", nil
+	if target == SQLite {
+		for _, index := range table.Indexes {
+			if !index.Inline {
+				continue
+			}
+			columns, err := renderSQLiteIndexColumns(index.Columns)
+			if err != nil {
+				return "", err
+			}
+			constraint := ""
+			if index.Name != "" {
+				constraint = "CONSTRAINT " + quote(SQLite, index.Name) + " "
+			}
+			parts = append(parts, constraint+"UNIQUE ("+columns+")")
+		}
+		for _, foreignKey := range table.ForeignKeys {
+			rendered, err := renderSQLiteForeignKey(foreignKey)
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, rendered)
+		}
+		for _, check := range table.Checks {
+			constraint := ""
+			if check.Name != "" {
+				constraint = "CONSTRAINT " + quote(SQLite, check.Name) + " "
+			}
+			parts = append(parts, constraint+"CHECK ("+check.Expression.sql+")")
+		}
+	}
+	statement := "CREATE TABLE " + qualified(target, table.Schema, table.Name) + " (" + strings.Join(parts, ", ") + ")"
+	if target == SQLite {
+		options := make([]string, 0, 2)
+		if table.SQLiteStrict {
+			options = append(options, "STRICT")
+		}
+		if table.SQLiteWithoutRowID {
+			options = append(options, "WITHOUT ROWID")
+		}
+		if len(options) > 0 {
+			statement += " " + strings.Join(options, ", ")
+		}
+	}
+	return statement + ";", nil
+}
+
+func orderedPrimaryKeyColumns(table Table) []Column {
+	columns := make([]Column, 0)
+	fallback := len(table.Columns) + 1
+	for _, column := range table.Columns {
+		if column.PrimaryKeyPosition > 0 {
+			columns = append(columns, column)
+			continue
+		}
+		if column.PrimaryKey {
+			column.PrimaryKeyPosition = fallback
+			fallback++
+			columns = append(columns, column)
+		}
+	}
+	sort.SliceStable(columns, func(left, right int) bool {
+		return columns[left].PrimaryKeyPosition < columns[right].PrimaryKeyPosition
+	})
+	return columns
 }

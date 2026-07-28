@@ -4,9 +4,12 @@ package migrate
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/johndauphine/DMTX/internal/config"
 	"github.com/johndauphine/DMTX/internal/schema"
@@ -21,9 +24,18 @@ type Result struct {
 
 const sqliteWriteBatchSize = 500
 
+const sqliteInsertOnlyReplayMode = "sqlite_insert_only_replay"
+
 type TableObserver interface {
 	BeforeTable(context.Context, string) error
 	AfterTable(context.Context, string, int) error
+}
+
+// TableSetObserver receives the complete deterministic table set before the
+// first target mutation. It is optional so existing per-table observers remain
+// source compatible.
+type TableSetObserver interface {
+	BeforeTables(context.Context, []string) error
 }
 
 // PageObserver records target-acknowledged page frontiers. It is optional so
@@ -31,6 +43,35 @@ type TableObserver interface {
 type PageObserver interface {
 	AfterIntegerKeysetPage(context.Context, string, int, int64) error
 	AfterRowNumberPage(context.Context, string, int, int64) error
+}
+
+// SQLiteWriteBoundary identifies a durable SQLite target or checkpoint write.
+// Boundary observers are optional and are used by fault-injection validation.
+type SQLiteWriteBoundary string
+
+const (
+	SQLiteBoundaryTableSetCheckpoint SQLiteWriteBoundary = "table_set_checkpointed"
+	SQLiteBoundaryTableDropped       SQLiteWriteBoundary = "table_dropped"
+	SQLiteBoundaryTableCreated       SQLiteWriteBoundary = "table_created"
+	SQLiteBoundaryPageCommitted      SQLiteWriteBoundary = "page_committed"
+	SQLiteBoundaryPageCheckpointed   SQLiteWriteBoundary = "page_checkpointed"
+	SQLiteBoundaryIndexCreated       SQLiteWriteBoundary = "index_created"
+	SQLiteBoundarySequenceCommitted  SQLiteWriteBoundary = "sequence_committed"
+)
+
+// SQLiteWriteBoundaryObserver receives a synchronous notification immediately
+// after a durable SQLite write boundary. Returning an error stops the migration.
+type SQLiteWriteBoundaryObserver interface {
+	AfterSQLiteWriteBoundary(context.Context, SQLiteWriteBoundary, string) error
+}
+
+func notifySQLiteWriteBoundary(ctx context.Context, observer TableObserver, boundary SQLiteWriteBoundary, table string) error {
+	if boundaryObserver, ok := observer.(SQLiteWriteBoundaryObserver); ok {
+		if err := boundaryObserver.AfterSQLiteWriteBoundary(ctx, boundary, table); err != nil {
+			return fmt.Errorf("observe SQLite write boundary %s for %s: %w", boundary, table, err)
+		}
+	}
+	return nil
 }
 
 // TableProgress is the durable, reusable portion of an incomplete table.
@@ -45,13 +86,17 @@ func SQLiteToSQLite(ctx context.Context, cfg config.Config) (Result, error) {
 }
 
 func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer TableObserver) (Result, error) {
+	return runSQLiteToSQLite(ctx, cfg, nil, nil, observer, false)
+}
+
+func sqliteToSQLiteLegacyWithObserver(ctx context.Context, cfg config.Config, observer TableObserver) (Result, error) {
 	if cfg.Source.Type != "sqlite" || cfg.Target.Type != "sqlite" {
 		return Result{}, fmt.Errorf("SQLite first pass requires source.type and target.type to be sqlite")
 	}
 	if cfg.Source.Database == "" || cfg.Target.Database == "" {
 		return Result{}, fmt.Errorf("SQLite source and target database paths are required")
 	}
-	if cfg.Source.Database == cfg.Target.Database {
+	if config.SameEndpoint(cfg.Source, cfg.Target) {
 		return Result{}, fmt.Errorf("source and target SQLite databases must differ")
 	}
 	source, err := sql.Open("sqlite", cfg.Source.Database)
@@ -72,6 +117,21 @@ func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer
 	if err != nil {
 		return Result{}, err
 	}
+	if err := requireSQLiteDestructiveAcknowledgement(ctx, target, names, cfg.Migration); err != nil {
+		return Result{}, err
+	}
+	if err := validateSQLiteSchemaBeforeMutation(ctx, source, target, names, cfg.Migration.TargetMode); err != nil {
+		return Result{}, err
+	}
+	if setObserver, ok := observer.(TableSetObserver); ok {
+		tables := append([]string(nil), names...)
+		if err := setObserver.BeforeTables(ctx, tables); err != nil {
+			return Result{}, fmt.Errorf("checkpoint table set: %w", err)
+		}
+		if err := notifySQLiteWriteBoundary(ctx, observer, SQLiteBoundaryTableSetCheckpoint, ""); err != nil {
+			return Result{}, err
+		}
+	}
 	result := Result{Validated: true}
 	for _, name := range names {
 		if observer != nil {
@@ -79,11 +139,11 @@ func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer
 				return Result{}, fmt.Errorf("checkpoint before %s: %w", name, err)
 			}
 		}
-		copied, err := copyTable(ctx, source, target, name, cfg.Migration.TargetMode, observer, TableProgress{})
+		copied, err := copyTable(ctx, source, target, name, cfg.Migration.TargetMode, observer, TableProgress{}, false)
 		if err != nil {
 			return Result{}, err
 		}
-		if err := validateCount(ctx, source, target, name); err != nil {
+		if err := validateCount(ctx, source, target, name, cfg.Migration.TargetMode); err != nil {
 			return Result{}, err
 		}
 		if observer != nil {
@@ -128,7 +188,7 @@ func userTables(ctx context.Context, database *sql.DB) ([]string, error) {
 	return names, nil
 }
 
-func copyTable(ctx context.Context, source, target *sql.DB, name, mode string, observer TableObserver, progress TableProgress) (int, error) {
+func copyTable(ctx context.Context, source, target *sql.DB, name, mode string, observer TableObserver, progress TableProgress, resumeExisting bool) (int, error) {
 	table, columns, err := inspectTable(ctx, source, name)
 	if err != nil {
 		return 0, err
@@ -136,13 +196,32 @@ func copyTable(ctx context.Context, source, target *sql.DB, name, mode string, o
 	if !hasPrimaryKey(table) {
 		return 0, fmt.Errorf("table %s has no primary key; deterministic transfer requires a primary key", name)
 	}
-	if err := prepareTarget(ctx, target, table, mode); err != nil {
+	created, err := prepareTargetWithStatus(ctx, target, table, mode, observer)
+	if err != nil {
 		return 0, err
 	}
-	if key, ok := integerPrimaryKey(table); ok {
-		return copyIntegerKeyset(ctx, source, target, table, columns, key, mode, observer, progress)
+	finalizeExisting := false
+	if !created && resumeExisting {
+		finalizeExisting, err = sqliteTableMatchesPlannedDefinition(ctx, target, table)
+		if err != nil {
+			return 0, err
+		}
 	}
-	return copyOrderedRows(ctx, source, target, table, columns, mode, observer, progress)
+	var copied int
+	if key, ok := integerPrimaryKey(table); ok {
+		copied, err = copyIntegerKeyset(ctx, source, target, table, columns, key, mode, observer, progress)
+	} else {
+		copied, err = copyOrderedRows(ctx, source, target, table, columns, mode, observer, progress)
+	}
+	if err != nil {
+		return 0, err
+	}
+	if created || finalizeExisting {
+		if err := finalizeSQLiteTarget(ctx, target, table, observer); err != nil {
+			return 0, err
+		}
+	}
+	return copied, nil
 }
 
 func copyIntegerKeyset(ctx context.Context, source, target *sql.DB, table schema.Table, columns []string, key string, mode string, observer TableObserver, progress TableProgress) (int, error) {
@@ -179,13 +258,16 @@ func copyIntegerKeyset(ctx context.Context, source, target *sql.DB, table schema
 		if len(batch) == 0 {
 			return count, nil
 		}
-		if err := writeBatch(ctx, target, table, columns, mode, batch); err != nil {
+		if err := writeBatchWithObserver(ctx, target, table, columns, mode, batch, observer); err != nil {
 			return 0, err
 		}
 		count += len(batch)
 		if pageObserver, ok := observer.(PageObserver); ok {
 			if err := pageObserver.AfterIntegerKeysetPage(ctx, table.Name, progress.RowsDone+count, lastKey); err != nil {
 				return 0, fmt.Errorf("checkpoint page for %s: %w", table.Name, err)
+			}
+			if err := notifySQLiteWriteBoundary(ctx, observer, SQLiteBoundaryPageCheckpointed, table.Name); err != nil {
+				return 0, err
 			}
 		}
 		lowerBound = lastKey
@@ -207,7 +289,7 @@ func copyOrderedRows(ctx context.Context, source, target *sql.DB, table schema.T
 		if len(batch) == 0 {
 			return count, nil
 		}
-		if err := writeBatch(ctx, target, table, columns, mode, batch); err != nil {
+		if err := writeBatchWithObserver(ctx, target, table, columns, mode, batch, observer); err != nil {
 			return 0, err
 		}
 		count += len(batch)
@@ -215,6 +297,9 @@ func copyOrderedRows(ctx context.Context, source, target *sql.DB, table schema.T
 		if pageObserver, ok := observer.(PageObserver); ok {
 			if err := pageObserver.AfterRowNumberPage(ctx, table.Name, progress.RowsDone+count, lowerRow); err != nil {
 				return 0, fmt.Errorf("checkpoint page for %s: %w", table.Name, err)
+			}
+			if err := notifySQLiteWriteBoundary(ctx, observer, SQLiteBoundaryPageCheckpointed, table.Name); err != nil {
+				return 0, err
 			}
 		}
 	}
@@ -254,13 +339,27 @@ func scanPage(rows *sql.Rows, columnCount, keyIndex int) ([][]any, int64, error)
 				return nil, 0, conversionErr
 			}
 		}
-		batch = append(batch, append([]any(nil), values...))
+		rowValues := make([]any, len(values))
+		for index, value := range values {
+			rowValues[index] = cloneSQLiteValue(value)
+		}
+		batch = append(batch, rowValues)
 		lastKey = key
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
 	}
 	return batch, lastKey, nil
+}
+
+func cloneSQLiteValue(value any) any {
+	bytes, ok := value.([]byte)
+	if !ok {
+		return value
+	}
+	cloned := make([]byte, len(bytes))
+	copy(cloned, bytes)
+	return cloned
 }
 
 func integerPrimaryKey(table schema.Table) (string, bool) {
@@ -303,30 +402,283 @@ func sqliteIntegerValue(value any) (int64, error) {
 	}
 }
 
-func writeBatch(ctx context.Context, target *sql.DB, table schema.Table, columns []string, mode string, rows [][]any) error {
-	tx, err := target.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin write for %s: %w", table.Name, err)
+type sqliteErrorCoder interface {
+	Code() int
+}
+
+func sqliteRetryPolicy(maxRetries int) RetryPolicy {
+	policy := DefaultRetryPolicy()
+	policy.MaxRetries = maxRetries
+	return policy
+}
+
+func sqliteDefinitelyNotCommittedError(err error) error {
+	if err == nil || ClassifyTransferError(err) == ErrorClassCanceled {
+		return err
 	}
-	defer tx.Rollback()
-	statement, err := tx.PrepareContext(ctx, writeStatement(table, columns, mode))
-	if err != nil {
-		return fmt.Errorf("prepare write for %s: %w", table.Name, err)
+	var classified transferErrorClassifier
+	if errors.As(err, &classified) {
+		return err
 	}
-	defer statement.Close()
-	for _, values := range rows {
-		if _, err := statement.ExecContext(ctx, values...); err != nil {
-			return fmt.Errorf("write %s: %w", table.Name, err)
+	var coded sqliteErrorCoder
+	if errors.As(err, &coded) {
+		// SQLite extended result codes retain the primary result in the low byte.
+		switch coded.Code() & 0xff {
+		case 5, 6: // SQLITE_BUSY, SQLITE_LOCKED
+			return NewTransferError(ErrorClassTransient, err)
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit %s: %w", table.Name, err)
+	return err
+}
+
+func retrySQLiteDefinitelyNotCommitted(
+	ctx context.Context,
+	policy RetryPolicy,
+	operation RetryOperation,
+) error {
+	return RetryWithPolicy(ctx, policy, func(ctx context.Context, attempt int) error {
+		return sqliteDefinitelyNotCommittedError(operation(ctx, attempt))
+	})
+}
+
+func querySQLiteRowsWithRetry(
+	ctx context.Context,
+	database *sql.DB,
+	policy RetryPolicy,
+	query string,
+	arguments ...any,
+) (*sql.Rows, error) {
+	var rows *sql.Rows
+	err := retrySQLiteDefinitelyNotCommitted(ctx, policy, func(ctx context.Context, _ int) error {
+		result, queryErr := database.QueryContext(ctx, query, arguments...)
+		if queryErr != nil {
+			return queryErr
+		}
+		rows = result
+		return nil
+	})
+	return rows, err
+}
+
+type sqliteWriteAttempt func(context.Context, int) (WriteReceipt, error)
+
+func retrySQLiteWriteAttempts(
+	ctx context.Context,
+	policy RetryPolicy,
+	operation sqliteWriteAttempt,
+) (WriteReceipt, error) {
+	if operation == nil {
+		return WriteReceipt{}, ErrNilRetryOperation
+	}
+	var receipt WriteReceipt
+	err := RetryWithPolicy(ctx, policy, func(ctx context.Context, attempt int) error {
+		current, attemptErr := operation(ctx, attempt)
+		receipt = current
+		if err := current.Validate(); err != nil {
+			return NewTransferError(ErrorClassState, fmt.Errorf("invalid SQLite write attempt receipt: %w", err))
+		}
+		if attemptErr == nil {
+			if current.Certainty != CommitDurable {
+				return NewTransferError(ErrorClassState, fmt.Errorf(
+					"successful SQLite write reported commit certainty %s", current.Certainty,
+				))
+			}
+			return nil
+		}
+		switch current.Certainty {
+		case CommitNotCommitted:
+			return sqliteDefinitelyNotCommittedError(attemptErr)
+		case CommitUnknown:
+			return NewTransferError(ErrorClassState, fmt.Errorf(
+				"SQLite write commit outcome is unknown; refusing retry: %w", attemptErr,
+			))
+		default:
+			return NewTransferError(ErrorClassState, fmt.Errorf(
+				"SQLite write failed after reporting commit certainty %s; refusing retry: %w",
+				current.Certainty, attemptErr,
+			))
+		}
+	})
+	return receipt, err
+}
+
+func writeBatch(ctx context.Context, target *sql.DB, table schema.Table, columns []string, mode string, rows [][]any) error {
+	return writeBatchWithObserver(ctx, target, table, columns, mode, rows, nil)
+}
+
+func writeBatchWithObserver(ctx context.Context, target *sql.DB, table schema.Table, columns []string, mode string, rows [][]any, observer TableObserver) error {
+	_, err := writeSQLiteBatchReceipt(ctx, target, table, columns, mode, rows, observer, nil)
+	return err
+}
+
+func writeSQLiteBatchReceipt(
+	ctx context.Context,
+	target *sql.DB,
+	table schema.Table,
+	columns []string,
+	mode string,
+	rows [][]any,
+	observer TableObserver,
+	observerMu *sync.Mutex,
+) (WriteReceipt, error) {
+	return writeSQLiteBatchReceiptWithPolicy(
+		ctx, target, table, columns, mode, rows, observer, observerMu,
+		RetryPolicy{MaxRetries: 0},
+	)
+}
+
+func writeSQLiteBatchReceiptWithPolicy(
+	ctx context.Context,
+	target *sql.DB,
+	table schema.Table,
+	columns []string,
+	mode string,
+	rows [][]any,
+	observer TableObserver,
+	observerMu *sync.Mutex,
+	policy RetryPolicy,
+) (WriteReceipt, error) {
+	return writeSQLiteBatchReceiptWithRangePolicy(
+		ctx, target, table, columns, mode, rows, nil, observer, observerMu, policy,
+	)
+}
+
+func writeSQLiteRangeBatchReceiptWithPolicy(
+	ctx context.Context,
+	target *sql.DB,
+	table schema.Table,
+	columns []string,
+	mode string,
+	rows [][]any,
+	chunk SQLiteRangeChunk,
+	observer TableObserver,
+	observerMu *sync.Mutex,
+	policy RetryPolicy,
+) (WriteReceipt, error) {
+	cloned := cloneSQLiteRangeChunk(chunk)
+	return writeSQLiteBatchReceiptWithRangePolicy(
+		ctx, target, table, columns, mode, rows, &cloned, observer, observerMu, policy,
+	)
+}
+
+func writeSQLiteBatchReceiptWithRangePolicy(
+	ctx context.Context,
+	target *sql.DB,
+	table schema.Table,
+	columns []string,
+	mode string,
+	rows [][]any,
+	chunk *SQLiteRangeChunk,
+	observer TableObserver,
+	observerMu *sync.Mutex,
+	policy RetryPolicy,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	zero := WriteReceipt{
+		Certainty:     CommitNotCommitted,
+		AttemptedRows: attempted,
+	}
+	receipt, err := retrySQLiteWriteAttempts(ctx, policy, func(ctx context.Context, _ int) (WriteReceipt, error) {
+		current := zero
+		if chunk != nil {
+			if err := notifySQLiteRangeAttempt(ctx, observer, observerMu, *chunk); err != nil {
+				return zero, err
+			}
+		}
+		mutationCalled := false
+		guardErr := protectSQLiteTargetMutation(ctx, observer, func() error {
+			mutationCalled = true
+			var attemptErr error
+			current, attemptErr = writeSQLiteTransactionAttempt(ctx, target, table, columns, mode, rows)
+			return attemptErr
+		})
+		if guardErr == nil {
+			return current, nil
+		}
+		if !mutationCalled {
+			return zero, guardErr
+		}
+		return current, guardErr
+	})
+	if err != nil {
+		return receipt, err
+	}
+	if observerMu != nil {
+		observerMu.Lock()
+		defer observerMu.Unlock()
+	}
+	if err := notifySQLiteWriteBoundary(ctx, observer, SQLiteBoundaryPageCommitted, table.Name); err != nil {
+		return receipt, err
+	}
+	return receipt, nil
+}
+
+func notifySQLiteRangeAttempt(
+	ctx context.Context,
+	observer TableObserver,
+	observerMu *sync.Mutex,
+	chunk SQLiteRangeChunk,
+) error {
+	attemptObserver, ok := observer.(SQLiteRangeAttemptObserver)
+	if !ok {
+		return nil
+	}
+	if observerMu != nil {
+		observerMu.Lock()
+		defer observerMu.Unlock()
+	}
+	if err := attemptObserver.BeforeSQLiteRangeAttempt(
+		ctx, cloneSQLiteRangeChunk(chunk),
+	); err != nil {
+		return NewTransferError(ErrorClassState, fmt.Errorf(
+			"record SQLite range attempt %s range %d sequence %d: %w",
+			chunk.Table, chunk.Range.ID, chunk.Sequence, err,
+		))
 	}
 	return nil
 }
 
+func writeSQLiteTransactionAttempt(
+	ctx context.Context,
+	target *sql.DB,
+	table schema.Table,
+	columns []string,
+	mode string,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	notCommitted := WriteReceipt{Certainty: CommitNotCommitted, AttemptedRows: attempted}
+	unknown := WriteReceipt{Certainty: CommitUnknown, AttemptedRows: attempted}
+	tx, err := target.BeginTx(ctx, nil)
+	if err != nil {
+		return notCommitted, fmt.Errorf("begin write for %s: %w", table.Name, err)
+	}
+	defer tx.Rollback()
+	statement, err := tx.PrepareContext(ctx, writeStatement(table, columns, mode))
+	if err != nil {
+		return notCommitted, fmt.Errorf("prepare write for %s: %w", table.Name, err)
+	}
+	defer statement.Close()
+	for _, values := range rows {
+		if _, err := statement.ExecContext(ctx, values...); err != nil {
+			return notCommitted, fmt.Errorf("write %s: %w", table.Name, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return unknown, fmt.Errorf("commit %s: %w", table.Name, err)
+	}
+	return WriteReceipt{
+		Certainty:     CommitDurable,
+		AttemptedRows: attempted,
+		CommittedRows: attempted,
+	}, nil
+}
+
 func writeStatement(table schema.Table, columns []string, mode string) string {
 	statement := "INSERT INTO " + quote(table.Name) + " (" + quotedColumns(columns) + ") VALUES (" + placeholders(len(columns)) + ")"
+	if mode == sqliteInsertOnlyReplayMode {
+		return statement + " ON CONFLICT (" + quotedColumns(primaryKeyColumns(table)) + ") DO NOTHING"
+	}
 	if mode != "upsert" {
 		return statement
 	}
@@ -344,13 +696,28 @@ func writeStatement(table schema.Table, columns []string, mode string) string {
 }
 
 func primaryKeyColumns(table schema.Table) []string {
-	var keys []string
+	type orderedKey struct {
+		name     string
+		position int
+	}
+	keys := make([]orderedKey, 0)
+	fallback := len(table.Columns) + 1
 	for _, column := range table.Columns {
 		if column.PrimaryKey {
-			keys = append(keys, column.Name)
+			position := column.PrimaryKeyPosition
+			if position == 0 {
+				position = fallback
+				fallback++
+			}
+			keys = append(keys, orderedKey{name: column.Name, position: position})
 		}
 	}
-	return keys
+	sort.SliceStable(keys, func(left, right int) bool { return keys[left].position < keys[right].position })
+	names := make([]string, len(keys))
+	for index, key := range keys {
+		names[index] = key.name
+	}
+	return names
 }
 func hasPrimaryKey(table schema.Table) bool { return len(primaryKeyColumns(table)) > 0 }
 func contains(values []string, value string) bool {
@@ -362,28 +729,132 @@ func contains(values []string, value string) bool {
 	return false
 }
 func prepareTarget(ctx context.Context, target *sql.DB, table schema.Table, mode string) error {
+	_, err := prepareTargetWithStatus(ctx, target, table, mode, nil)
+	return err
+}
+
+func prepareTargetWithStatus(ctx context.Context, target *sql.DB, table schema.Table, mode string, observer TableObserver) (bool, error) {
 	if mode == "drop_recreate" {
 		drop, err := schema.DropTable(schema.SQLite, table)
 		if err != nil {
-			return err
+			return false, err
 		}
-		if _, err := target.ExecContext(ctx, drop); err != nil {
-			return fmt.Errorf("drop %s: %w", table.Name, err)
+		err = protectSQLiteTargetMutation(ctx, observer, func() error {
+			_, mutationErr := target.ExecContext(ctx, drop)
+			return mutationErr
+		})
+		if err != nil {
+			return false, fmt.Errorf("drop %s: %w", table.Name, err)
+		}
+		if err := notifySQLiteWriteBoundary(ctx, observer, SQLiteBoundaryTableDropped, table.Name); err != nil {
+			return false, err
 		}
 	}
 	exists, err := tableExists(ctx, target, table.Name)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if exists {
-		return nil
+		return false, nil
 	}
 	ddl, err := schema.CreateTable(schema.SQLite, table)
 	if err != nil {
-		return fmt.Errorf("plan %s: %w", table.Name, err)
+		return false, fmt.Errorf("plan %s: %w", table.Name, err)
 	}
-	if _, err := target.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("create %s: %w", table.Name, err)
+	err = protectSQLiteTargetMutation(ctx, observer, func() error {
+		_, mutationErr := target.ExecContext(ctx, ddl)
+		return mutationErr
+	})
+	if err != nil {
+		return false, fmt.Errorf("create %s: %w", table.Name, err)
+	}
+	if err := notifySQLiteWriteBoundary(ctx, observer, SQLiteBoundaryTableCreated, table.Name); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func finalizeSQLiteTarget(ctx context.Context, target *sql.DB, table schema.Table, observer TableObserver) error {
+	indexes, err := schema.CreateIndexes(schema.SQLite, table)
+	if err != nil {
+		return fmt.Errorf("plan indexes for %s: %w", table.Name, err)
+	}
+	existing, err := inspectSQLiteIndexes(ctx, target, table.Name)
+	if err != nil {
+		return fmt.Errorf("inspect target indexes for %s: %w", table.Name, err)
+	}
+	byName := make(map[string]schema.Index, len(existing))
+	for _, index := range existing {
+		if !index.Inline {
+			byName[index.Name] = index
+		}
+	}
+	position := 0
+	for _, index := range table.Indexes {
+		if index.Inline {
+			continue
+		}
+		statement := indexes[position]
+		position++
+		if targetIndex, ok := byName[index.Name]; ok {
+			if !sameSQLiteIndex(index, targetIndex) {
+				return &schema.PolicyError{Operation: "finalize SQLite index", Type: table.Name + "." + index.Name, Target: string(schema.SQLite)}
+			}
+			continue
+		}
+		err = protectSQLiteTargetMutation(ctx, observer, func() error {
+			_, mutationErr := target.ExecContext(ctx, statement)
+			return mutationErr
+		})
+		if err != nil {
+			return fmt.Errorf("create index for %s: %w", table.Name, err)
+		}
+		if err := notifySQLiteWriteBoundary(ctx, observer, SQLiteBoundaryIndexCreated, table.Name); err != nil {
+			return err
+		}
+	}
+	return resetSQLiteSequence(ctx, target, table, observer)
+}
+
+func resetSQLiteSequence(ctx context.Context, target *sql.DB, table schema.Table, observer TableObserver) error {
+	if table.AutoIncrementColumn == "" || table.SQLiteSequence == nil {
+		return nil
+	}
+	current, err := inspectSQLiteSequence(ctx, target, table.Name)
+	if err != nil {
+		return err
+	}
+	desired := *table.SQLiteSequence
+	if current != nil && *current >= desired {
+		return nil
+	}
+	plannedTable := table
+	plannedTable.SQLiteSequence = &desired
+	plan, err := schema.SQLiteSequencePlan(plannedTable)
+	if err != nil {
+		return err
+	}
+	err = protectSQLiteTargetMutation(ctx, observer, func() error {
+		tx, mutationErr := target.BeginTx(ctx, nil)
+		if mutationErr != nil {
+			return fmt.Errorf("begin sequence reset for %s: %w", table.Name, mutationErr)
+		}
+		defer tx.Rollback()
+		for _, statement := range plan {
+			if _, mutationErr := tx.ExecContext(ctx, statement.SQL, statement.Args...); mutationErr != nil {
+				return fmt.Errorf("reset sequence for %s: %w", table.Name, mutationErr)
+			}
+		}
+		if mutationErr := tx.Commit(); mutationErr != nil {
+			return fmt.Errorf("commit sequence reset for %s: %w", table.Name, mutationErr)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if err := notifySQLiteWriteBoundary(ctx, observer, SQLiteBoundarySequenceCommitted, table.Name); err != nil {
+		return err
 	}
 	return nil
 }
@@ -392,7 +863,7 @@ func tableExists(ctx context.Context, database *sql.DB, name string) (bool, erro
 	err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&count)
 	return count > 0, err
 }
-func validateCount(ctx context.Context, source, target *sql.DB, name string) error {
+func validateCount(ctx context.Context, source, target *sql.DB, name, mode string) error {
 	sourceCount, err := countRows(ctx, source, name)
 	if err != nil {
 		return err
@@ -401,7 +872,7 @@ func validateCount(ctx context.Context, source, target *sql.DB, name string) err
 	if err != nil {
 		return err
 	}
-	if sourceCount != targetCount {
+	if !countsMatch(mode, sourceCount, targetCount) {
 		return fmt.Errorf("validation failed for %s: source has %d rows, target has %d", name, sourceCount, targetCount)
 	}
 	return nil
@@ -412,24 +883,7 @@ func countRows(ctx context.Context, database *sql.DB, name string) (int, error) 
 	return count, err
 }
 func inspectTable(ctx context.Context, database *sql.DB, name string) (schema.Table, []string, error) {
-	rows, err := database.QueryContext(ctx, "PRAGMA table_info("+quote(name)+")")
-	if err != nil {
-		return schema.Table{}, nil, fmt.Errorf("inspect %s: %w", name, err)
-	}
-	defer rows.Close()
-	table := schema.Table{Name: name}
-	var names []string
-	for rows.Next() {
-		var pos, notNull, primaryKey int
-		var columnName, columnType string
-		var defaultValue any
-		if err := rows.Scan(&pos, &columnName, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
-			return schema.Table{}, nil, err
-		}
-		table.Columns = append(table.Columns, schema.Column{Name: columnName, Type: columnType, Nullable: notNull == 0, PrimaryKey: primaryKey > 0})
-		names = append(names, columnName)
-	}
-	return table, names, rows.Err()
+	return inspectSQLiteSchema(ctx, database, name)
 }
 func quote(name string) string { return `"` + strings.ReplaceAll(name, `"`, `""`) + `"` }
 func quotedColumns(columns []string) string {
@@ -439,10 +893,38 @@ func quotedColumns(columns []string) string {
 	}
 	return strings.Join(quoted, ", ")
 }
+
+func sqliteTableMatchesPlannedDefinition(ctx context.Context, target *sql.DB, table schema.Table) (bool, error) {
+	existing, err := sqliteCreateTableSQL(ctx, target, table.Name)
+	if err != nil {
+		return false, fmt.Errorf("inspect resumable target table %s: %w", table.Name, err)
+	}
+	planned, err := schema.CreateTable(schema.SQLite, table)
+	if err != nil {
+		return false, fmt.Errorf("plan resumable target table %s: %w", table.Name, err)
+	}
+	normalize := func(statement string) string {
+		return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(statement), ";"))
+	}
+	return normalize(existing) == normalize(planned), nil
+}
 func placeholders(count int) string {
 	values := make([]string, count)
 	for i := range values {
 		values[i] = "?"
 	}
 	return strings.Join(values, ", ")
+}
+
+func sameSQLiteIndex(left, right schema.Index) bool {
+	if left.Name != right.Name || left.Unique != right.Unique || left.Inline != right.Inline || len(left.Columns) != len(right.Columns) {
+		return false
+	}
+	for position := range left.Columns {
+		leftColumn, rightColumn := left.Columns[position], right.Columns[position]
+		if leftColumn.Name != rightColumn.Name || leftColumn.Descending != rightColumn.Descending || !strings.EqualFold(leftColumn.Collation, rightColumn.Collation) {
+			return false
+		}
+	}
+	return true
 }

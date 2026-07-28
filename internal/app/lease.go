@@ -32,11 +32,21 @@ func acquireTargetLease(target config.Endpoint, runID string) (state.SQLiteStore
 
 func targetLeaseLocation(target config.Endpoint) (identity, storePath string, err error) {
 	if target.Type == "sqlite" {
-		canonicalTarget, err := filepath.Abs(target.Database)
+		canonicalTarget, err := config.CanonicalSQLitePath(target.Database)
 		if err != nil {
 			return "", "", fmt.Errorf("canonicalize SQLite target: %w", err)
 		}
-		return "sqlite:" + canonicalTarget, canonicalTarget + ".dmtx-lease.db", nil
+		fileIdentity, multipleLinks, err := sqliteLeaseFileIdentity(canonicalTarget)
+		if err != nil {
+			return "", "", fmt.Errorf("identify SQLite target: %w", err)
+		}
+		if !multipleLinks {
+			identity = "sqlite:path:" + canonicalTarget
+			return identity, canonicalTarget + ".dmtx-lease.db", nil
+		}
+		identity = "sqlite:" + fileIdentity
+		storePath, err = cachedLeasePath(identity)
+		return identity, storePath, err
 	}
 	if target.Host == "" || target.Database == "" {
 		return "", "", fmt.Errorf("network target host and database are required for lease")
@@ -46,16 +56,21 @@ func targetLeaseLocation(target config.Endpoint) (identity, storePath string, er
 		port = defaultLeasePort(target.Type)
 	}
 	identity = strings.Join([]string{target.Type, strings.ToLower(target.Host), strconv.Itoa(port), target.Database, target.Schema}, ":")
+	storePath, err = cachedLeasePath(identity)
+	return identity, storePath, err
+}
+
+func cachedLeasePath(identity string) (string, error) {
 	cache, err := os.UserCacheDir()
 	if err != nil {
-		return "", "", fmt.Errorf("locate DMTX lease cache: %w", err)
+		return "", fmt.Errorf("locate DMTX lease cache: %w", err)
 	}
 	directory := filepath.Join(cache, "dmtx", "leases")
 	if err := os.MkdirAll(directory, 0700); err != nil {
-		return "", "", fmt.Errorf("create DMTX lease cache: %w", err)
+		return "", fmt.Errorf("create DMTX lease cache: %w", err)
 	}
 	digest := sha256.Sum256([]byte(identity))
-	return identity, filepath.Join(directory, hex.EncodeToString(digest[:])+".db"), nil
+	return filepath.Join(directory, hex.EncodeToString(digest[:])+".db"), nil
 }
 
 func defaultLeasePort(engine string) int {

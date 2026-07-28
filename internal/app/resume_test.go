@@ -51,7 +51,7 @@ func TestResumeReusesValidatedCompletedTable(t *testing.T) {
 	}
 
 	var output, errors bytes.Buffer
-	if code := Run([]string{"resume", "--config", configPath}, &output, &errors); code != Success {
+	if code := Run([]string{"resume", "--config", configPath, "--acknowledge-destructive"}, &output, &errors); code != Success {
 		t.Fatalf("exit code = %d, stderr = %s", code, errors.String())
 	}
 	if output.String() != "{\"tables\":1,\"rows\":1,\"validated\":true}\n" {
@@ -63,7 +63,7 @@ func TestResumeReusesValidatedCompletedTable(t *testing.T) {
 	}
 }
 
-func TestResumeCompletesAfterDurablePageCheckpointInterruption(t *testing.T) {
+func TestResumeCompletesAfterDurableRangeIntentInterruption(t *testing.T) {
 	directory := t.TempDir()
 	sourcePath, targetPath := filepath.Join(directory, "source.db"), filepath.Join(directory, "target.db")
 	configPath := filepath.Join(directory, "migration.yaml")
@@ -98,9 +98,18 @@ func TestResumeCompletesAfterDurablePageCheckpointInterruption(t *testing.T) {
 	if err := store.SaveConfigHash("interrupted", hash); err != nil {
 		t.Fatal(err)
 	}
-	observer := failAfterDurablePage{tableCheckpointObserver: tableCheckpointObserver{store: store, runID: "interrupted"}}
+	observer := failBeforeDurableRangeAcknowledgement{
+		tableCheckpointObserver: tableCheckpointObserver{
+			store: store,
+			runID: "interrupted",
+		},
+	}
 	if _, err := migrate.SQLiteToSQLiteWithObserver(context.Background(), cfg, observer); err == nil {
-		t.Fatal("expected interruption after durable checkpoint")
+		t.Fatal("expected interruption before durable range acknowledgement")
+	}
+	assertStage2PendingRangeIntent(t, store, "interrupted", 500)
+	if rows := stage1TargetRowCount(t, targetPath); rows != 500 {
+		t.Fatalf("committed target rows before resume = %d, want 500", rows)
 	}
 	var output, errors bytes.Buffer
 	if code := Run([]string{"resume", "--config", configPath}, &output, &errors); code != Success {
@@ -118,15 +127,18 @@ func TestResumeCompletesAfterDurablePageCheckpointInterruption(t *testing.T) {
 	if rows != 501 || distinct != 501 {
 		t.Fatalf("target rows = %d, distinct = %d", rows, distinct)
 	}
+	assertStage2CompletedRange(t, store, "interrupted", 501)
 }
 
-type failAfterDurablePage struct{ tableCheckpointObserver }
+type failBeforeDurableRangeAcknowledgement struct{ tableCheckpointObserver }
 
-func (observer failAfterDurablePage) AfterIntegerKeysetPage(ctx context.Context, table string, rows int, watermark int64) error {
-	if err := observer.tableCheckpointObserver.AfterIntegerKeysetPage(ctx, table, rows, watermark); err != nil {
-		return err
-	}
-	return fmt.Errorf("injected interruption")
+func (observer failBeforeDurableRangeAcknowledgement) AfterSQLiteRangeChunk(
+	context.Context,
+	migrate.SQLiteRangeChunk,
+	migrate.WriteReceipt,
+	migrate.AckFrontier,
+) error {
+	return fmt.Errorf("injected interruption before durable range acknowledgement")
 }
 
 func createResumableDatabase(t *testing.T, path string) {

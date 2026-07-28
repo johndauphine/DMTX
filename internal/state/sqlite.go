@@ -234,7 +234,13 @@ func (store SQLiteStore) Open() (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open state database: %w", err)
 	}
-	if _, err := database.Exec(`PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;`); err != nil {
+	// Configure waiting before journal mode because concurrent openers can
+	// otherwise fail immediately while another state transaction is committing.
+	if _, err := database.Exec(`PRAGMA busy_timeout = 5000;`); err != nil {
+		database.Close()
+		return nil, fmt.Errorf("configure state database timeout: %w", err)
+	}
+	if _, err := database.Exec(`PRAGMA journal_mode = WAL;`); err != nil {
 		database.Close()
 		return nil, fmt.Errorf("configure state database: %w", err)
 	}

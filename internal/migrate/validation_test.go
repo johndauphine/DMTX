@@ -31,3 +31,21 @@ func TestValidateSQLiteReturnsStableMismatchFinding(t *testing.T) {
 		t.Fatalf("result = %#v", result)
 	}
 }
+
+func TestValidateSQLiteAllowsTargetSupersetForUpsert(t *testing.T) {
+	directory := t.TempDir()
+	sourcePath, targetPath := filepath.Join(directory, "source.db"), filepath.Join(directory, "target.db")
+	createDatabase(t, sourcePath, `CREATE TABLE users (id INTEGER PRIMARY KEY); INSERT INTO users VALUES (1)`)
+	createDatabase(t, targetPath, `CREATE TABLE users (id INTEGER PRIMARY KEY); INSERT INTO users VALUES (1), (2)`)
+	result, err := ValidateSQLite(context.Background(), config.Config{
+		Source:    config.Endpoint{Type: "sqlite", Database: sourcePath},
+		Target:    config.Endpoint{Type: "sqlite", Database: targetPath},
+		Migration: config.Migration{TargetMode: "upsert"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Passed || len(result.Tables) != 1 || !result.Tables[0].Match || result.Tables[0].SourceRows != 1 || result.Tables[0].TargetRows != 2 {
+		t.Fatalf("result = %#v", result)
+	}
+}

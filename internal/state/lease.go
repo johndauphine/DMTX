@@ -106,7 +106,10 @@ func (store SQLiteStore) ReleaseLease(lease Lease) error {
 		return err
 	}
 	defer database.Close()
-	result, err := database.Exec(`DELETE FROM leases WHERE target = ? AND owner_token = ? AND generation = ?`, lease.Target, lease.OwnerToken, lease.Generation)
+	result, err := database.Exec(`
+		UPDATE leases SET owner_token = '', run_id = '', heartbeat_at = ?
+		WHERE target = ? AND owner_token = ? AND generation = ?
+	`, time.Unix(0, 0).UTC(), lease.Target, lease.OwnerToken, lease.Generation)
 	if err != nil {
 		return fmt.Errorf("release target lease: %w", err)
 	}

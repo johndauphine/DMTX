@@ -58,9 +58,16 @@ func ValidateSQLite(ctx context.Context, cfg config.Config) (ValidationResult, e
 		if err != nil {
 			return ValidationResult{}, fmt.Errorf("count target table %s: %w", name, err)
 		}
-		match := sourceRows == targetRows
+		match := countsMatch(cfg.Migration.TargetMode, sourceRows, targetRows)
 		result.Tables = append(result.Tables, ValidationFinding{Table: name, SourceRows: sourceRows, TargetRows: targetRows, Match: match})
 		result.Passed = result.Passed && match
 	}
 	return result, nil
+}
+
+func countsMatch(mode string, sourceRows, targetRows int) bool {
+	if mode == "upsert" {
+		return targetRows >= sourceRows
+	}
+	return targetRows == sourceRows
 }

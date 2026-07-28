@@ -72,7 +72,7 @@ func TestSQLiteUpsertResumeReusesRowNumberFrontier(t *testing.T) {
 	source := openPageResumeDatabase(t, sourcePath)
 	target := openPageResumeDatabase(t, targetPath)
 	for _, database := range []*sql.DB{source, target} {
-		if _, err := database.Exec(`CREATE TABLE items (id TEXT PRIMARY KEY, value TEXT)`); err != nil {
+		if _, err := database.Exec(`CREATE TABLE items (id REAL PRIMARY KEY NOT NULL, value TEXT)`); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -124,7 +124,7 @@ func TestSQLiteUpsertReplaysAfterRowNumberCheckpointFailure(t *testing.T) {
 	sourcePath := filepath.Join(directory, "source.db")
 	targetPath := filepath.Join(directory, "target.db")
 	source := openPageResumeDatabase(t, sourcePath)
-	if _, err := source.Exec(`CREATE TABLE items (id TEXT PRIMARY KEY, value TEXT)`); err != nil {
+	if _, err := source.Exec(`CREATE TABLE items (id REAL PRIMARY KEY NOT NULL, value TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	for id := 0; id <= sqliteWriteBatchSize; id++ {

@@ -44,3 +44,30 @@ func TestUnknownTypeIsClassifiable(t *testing.T) {
 		t.Fatalf("expected policy error, got %T", err)
 	}
 }
+
+func TestSQLiteForeignKeyClauseOrderIsDeterministic(t *testing.T) {
+	table := Table{
+		Name: "children",
+		Columns: []Column{
+			{Name: "id", Type: "integer", PrimaryKey: true},
+			{Name: "parent_id", Type: "integer"},
+		},
+		ForeignKeys: []ForeignKey{{
+			Columns:           []string{"parent_id"},
+			ReferencedTable:   "parents",
+			ReferencedColumns: []string{"id"},
+			OnUpdate:          "CASCADE",
+			OnDelete:          "RESTRICT",
+		}},
+	}
+	const want = `CREATE TABLE "children" ("id" INTEGER NOT NULL, "parent_id" INTEGER NOT NULL, PRIMARY KEY ("id"), FOREIGN KEY ("parent_id") REFERENCES "parents" ("id") ON UPDATE CASCADE ON DELETE RESTRICT);`
+	for attempt := 0; attempt < 100; attempt++ {
+		got, err := CreateTable(SQLite, table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("attempt %d:\n got: %s\nwant: %s", attempt, got, want)
+		}
+	}
+}

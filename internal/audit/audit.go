@@ -55,6 +55,45 @@ func Append(path, runID, eventType string, at time.Time) error {
 	return nil
 }
 
+// HasEvent reports whether a verified audit stream contains an event for the
+// supplied run. A malformed or broken stream is an error rather than evidence
+// that terminal audit is absent.
+func HasEvent(path, runID, eventType string) (bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return false, fmt.Errorf("read audit stream: %w", err)
+	}
+	defer file.Close()
+
+	found := false
+	previous := ""
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var event Event
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			return false, fmt.Errorf("decode audit stream: %w", err)
+		}
+		if event.Previous != previous {
+			return false, errors.New("audit stream chain is broken")
+		}
+		if event.Hash != eventHash(event) {
+			return false, errors.New("audit stream integrity check failed")
+		}
+		if event.RunID == runID && event.Type == eventType {
+			found = true
+		}
+		previous = event.Hash
+	}
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("scan audit stream: %w", err)
+	}
+	return found, nil
+}
+
 func lastHash(path string) (string, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
