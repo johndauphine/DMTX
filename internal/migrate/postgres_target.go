@@ -160,11 +160,11 @@ func writePostgresBatch(
 	mode string,
 	rows [][]any,
 ) error {
-	_, err := writePostgresBatchReceipt(ctx, target, table, columns, mode, rows)
+	_, err := writePostgresLegacyBatchReceipt(ctx, target, table, columns, mode, rows)
 	return err
 }
 
-func writePostgresBatchReceipt(
+func writePostgresLegacyBatchReceipt(
 	ctx context.Context,
 	target *sql.DB,
 	table schema.Table,

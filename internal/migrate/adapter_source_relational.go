@@ -19,6 +19,7 @@ type relationalSourceSpec struct {
 	inspectTable     func(context.Context, *sql.DB, string, string) (schema.Table, error)
 	readQuery        func(string, schema.Table, []string) string
 	qualifiedTable   func(string, string) string
+	wrapRows         func(adapterRows, schema.Table, []string) adapterRows
 }
 
 type relationalSourceAdapter struct {
@@ -60,6 +61,7 @@ func openMySQLSourceAdapter(
 		inspectTable:   engine.InspectMySQLTable,
 		readQuery:      mySQLReadQuery,
 		qualifiedTable: mySQLQualified,
+		wrapRows:       wrapMySQLSourceRows,
 	})
 }
 
@@ -157,7 +159,11 @@ func (adapter *relationalSourceAdapter) OpenRows(
 			err,
 		)
 	}
-	return rows, nil
+	var result adapterRows = rows
+	if adapter.spec.wrapRows != nil {
+		result = adapter.spec.wrapRows(result, table, columns)
+	}
+	return result, nil
 }
 
 func (adapter *relationalSourceAdapter) CountRows(

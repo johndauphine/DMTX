@@ -28,12 +28,30 @@ func TestMapTypeSupportsCommonPortableTypes(t *testing.T) {
 		{"uuid", SQLServer, "UNIQUEIDENTIFIER"},
 		{"bytea", Postgres, "BYTEA"},
 		{"jsonb", MySQL, "JSON"},
+		{"json", Postgres, "JSON"},
+		{"jsonb", Postgres, "JSONB"},
 		{"date", ClickHouse, "DATE"},
+		{"timestamptz", Postgres, "TIMESTAMP WITH TIME ZONE"},
 	}
 	for _, test := range cases {
 		got, err := MapType(test.source, test.target)
 		if err != nil || got != test.want {
 			t.Fatalf("MapType(%q, %q) = %q, %v; want %q", test.source, test.target, got, err, test.want)
+		}
+	}
+}
+
+func TestMapTypeRejectsTimestamptzOutsidePostgres(t *testing.T) {
+	for _, target := range []Dialect{
+		SQLite,
+		MySQL,
+		SQLServer,
+		ClickHouse,
+	} {
+		if _, err := MapType("timestamptz", target); err == nil {
+			t.Fatalf("timestamptz unexpectedly mapped to %s", target)
+		} else if _, ok := err.(*PolicyError); !ok {
+			t.Fatalf("timestamptz to %s error type = %T", target, err)
 		}
 	}
 }

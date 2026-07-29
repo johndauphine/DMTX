@@ -164,8 +164,10 @@ func buildPostgresTable(namespace, name string, columns []schema.Column, primary
 
 func normalizePostgresType(value string) string {
 	switch strings.ToLower(value) {
-	case "timestamp without time zone", "timestamp with time zone":
+	case "timestamp without time zone":
 		return "timestamp"
+	case "timestamp with time zone":
+		return "timestamptz"
 	case "character varying":
 		return "varchar"
 	default:

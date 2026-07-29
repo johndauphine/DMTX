@@ -11,8 +11,9 @@ import (
 )
 
 type postgresTargetAdapter struct {
-	database  *sql.DB
-	namespace string
+	database    *sql.DB
+	batchWriter postgresBatchWriter
+	namespace   string
 }
 
 func validatePostgresTargetEndpoint(endpoint config.Endpoint) error {
@@ -38,8 +39,9 @@ func openPostgresTargetAdapter(
 		return nil, err
 	}
 	return &postgresTargetAdapter{
-		database:  database,
-		namespace: postgresTargetNamespace(resolved),
+		database:    database,
+		batchWriter: newPostgresNativeWriter(database),
+		namespace:   postgresTargetNamespace(resolved),
 	}, nil
 }
 
@@ -87,9 +89,14 @@ func (adapter *postgresTargetAdapter) WriteBatch(
 	mode string,
 	rows [][]any,
 ) (WriteReceipt, error) {
-	return writePostgresBatchReceipt(
+	if adapter.batchWriter == nil {
+		return WriteReceipt{
+			Certainty:     CommitNotCommitted,
+			AttemptedRows: int64(len(rows)),
+		}, fmt.Errorf("PostgreSQL native batch writer is not configured")
+	}
+	return adapter.batchWriter.WriteBatch(
 		ctx,
-		adapter.database,
 		table,
 		columns,
 		mode,

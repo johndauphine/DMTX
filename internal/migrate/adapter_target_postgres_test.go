@@ -2,13 +2,10 @@ package migrate
 
 import (
 	"context"
-	"database/sql"
-	"strings"
 	"testing"
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/schema"
-	_ "modernc.org/sqlite"
 )
 
 func TestPostgresTargetEndpointValidationDoesNotResolveSecrets(t *testing.T) {
@@ -59,76 +56,64 @@ func TestPostgresTargetSchemaMappingDoesNotMutateSource(t *testing.T) {
 	}
 }
 
-func TestPostgresTargetWriteBatchReturnsDurableReceipt(t *testing.T) {
-	database := newPostgresTargetTestDatabase(t)
-	adapter := &postgresTargetAdapter{
-		database:  database,
-		namespace: "main",
+func TestPostgresTargetWriteBatchDelegatesToConfiguredWriter(t *testing.T) {
+	writer := &postgresTargetWriterRecorder{
+		receipt: WriteReceipt{
+			Certainty:     CommitDurable,
+			AttemptedRows: 1,
+			CommittedRows: 1,
+		},
 	}
-	table := postgresTargetTestTable()
-	rows := [][]any{{int64(1), "first"}, {int64(2), "second"}}
-
+	adapter := &postgresTargetAdapter{
+		batchWriter: writer,
+		namespace:   "public",
+	}
+	table := schema.Table{
+		Schema: "public",
+		Name:   "events",
+		Columns: []schema.Column{
+			{Name: "id", Type: "integer", PrimaryKey: true},
+		},
+	}
+	rows := [][]any{{int64(1)}}
 	receipt, err := adapter.WriteBatch(
 		context.Background(),
 		table,
-		[]string{"id", "payload"},
+		[]string{"id"},
 		"drop_recreate",
 		rows,
 	)
 	if err != nil {
 		t.Fatalf("WriteBatch: %v", err)
 	}
-	wantRows := int64(len(rows))
-	if receipt.Certainty != CommitDurable ||
-		receipt.AttemptedRows != wantRows ||
-		receipt.CommittedRows != wantRows {
-		t.Fatalf("receipt = %#v", receipt)
+	if writer.calls != 1 ||
+		writer.table.Name != "events" ||
+		writer.mode != "drop_recreate" ||
+		len(writer.rows) != 1 {
+		t.Fatalf("delegated write = %#v", writer)
 	}
-	if err := receipt.Validate(); err != nil {
-		t.Fatalf("receipt.Validate: %v", err)
-	}
-	count, err := adapter.CountRows(context.Background(), table)
-	if err != nil {
-		t.Fatalf("CountRows: %v", err)
-	}
-	if count != len(rows) {
-		t.Fatalf("count = %d, want %d", count, len(rows))
+	if receipt != writer.receipt {
+		t.Fatalf("receipt = %#v, want %#v", receipt, writer.receipt)
 	}
 }
 
-func TestPostgresTargetWriteBatchRollsBackFailedBatch(t *testing.T) {
-	database := newPostgresTargetTestDatabase(t)
-	adapter := &postgresTargetAdapter{
-		database:  database,
-		namespace: "main",
-	}
-	table := postgresTargetTestTable()
-	rows := [][]any{{int64(1), "first"}, {int64(1), "duplicate"}}
-
+func TestPostgresTargetWriteBatchRejectsMissingWriter(t *testing.T) {
+	adapter := &postgresTargetAdapter{namespace: "public"}
 	receipt, err := adapter.WriteBatch(
 		context.Background(),
-		table,
-		[]string{"id", "payload"},
+		schema.Table{Schema: "public", Name: "events"},
+		[]string{"id"},
 		"drop_recreate",
-		rows,
+		[][]any{{int64(1)}},
 	)
-	if err == nil || !strings.Contains(err.Error(), "write PostgreSQL table events") {
+	if err == nil ||
+		err.Error() != "PostgreSQL native batch writer is not configured" {
 		t.Fatalf("error = %v", err)
 	}
 	if receipt.Certainty != CommitNotCommitted ||
-		receipt.AttemptedRows != int64(len(rows)) ||
+		receipt.AttemptedRows != 1 ||
 		receipt.CommittedRows != 0 {
-		t.Fatalf("failure receipt = %#v", receipt)
-	}
-	if err := receipt.Validate(); err != nil {
-		t.Fatalf("receipt.Validate: %v", err)
-	}
-	count, countErr := adapter.CountRows(context.Background(), table)
-	if countErr != nil {
-		t.Fatalf("CountRows: %v", countErr)
-	}
-	if count != 0 {
-		t.Fatalf("rolled-back count = %d, want 0", count)
+		t.Fatalf("receipt = %#v", receipt)
 	}
 }
 
@@ -186,33 +171,27 @@ func TestPostgresPairWrappersRejectWrongTypes(t *testing.T) {
 	}
 }
 
-func newPostgresTargetTestDatabase(t *testing.T) *sql.DB {
-	t.Helper()
-	database, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
-	database.SetMaxOpenConns(1)
-	t.Cleanup(func() {
-		if err := database.Close(); err != nil {
-			t.Errorf("close test database: %v", err)
-		}
-	})
-	if _, err := database.Exec(
-		`CREATE TABLE "events" ("id" INTEGER PRIMARY KEY, "payload" TEXT)`,
-	); err != nil {
-		t.Fatalf("create test table: %v", err)
-	}
-	return database
+type postgresTargetWriterRecorder struct {
+	calls   int
+	table   schema.Table
+	columns []string
+	mode    string
+	rows    [][]any
+	receipt WriteReceipt
+	err     error
 }
 
-func postgresTargetTestTable() schema.Table {
-	return schema.Table{
-		Schema: "main",
-		Name:   "events",
-		Columns: []schema.Column{
-			{Name: "id", PrimaryKey: true},
-			{Name: "payload"},
-		},
-	}
+func (writer *postgresTargetWriterRecorder) WriteBatch(
+	_ context.Context,
+	table schema.Table,
+	columns []string,
+	mode string,
+	rows [][]any,
+) (WriteReceipt, error) {
+	writer.calls++
+	writer.table = table
+	writer.columns = append([]string(nil), columns...)
+	writer.mode = mode
+	writer.rows = rows
+	return writer.receipt, writer.err
 }

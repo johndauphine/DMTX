@@ -35,7 +35,9 @@ func TestBuildPostgresTableMarksCompositePrimaryKeyAndNormalizesTypes(t *testing
 	if table.Schema != "public" || table.Name != "events" || !table.Columns[0].PrimaryKey || !table.Columns[1].PrimaryKey || table.Columns[2].PrimaryKey {
 		t.Fatalf("table = %#v", table)
 	}
-	if table.Columns[1].Type != "timestamp" || table.Columns[2].Type != "varchar" {
+	if table.Columns[1].Type != "timestamptz" ||
+		table.Columns[2].Type != "varchar" ||
+		normalizePostgresType("timestamp without time zone") != "timestamp" {
 		t.Fatalf("columns = %#v", table.Columns)
 	}
 }

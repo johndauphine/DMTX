@@ -38,9 +38,31 @@ func mySQLReadQuery(
 	table schema.Table,
 	columns []string,
 ) string {
-	return "SELECT " + mySQLQuotedColumns(columns) +
+	return "SELECT " + mySQLReadProjection(table, columns) +
 		" FROM " + mySQLQualified(namespace, table.Name) +
 		" ORDER BY " + mySQLQuotedColumns(primaryKeyColumns(table))
+}
+
+// mySQLReadProjection retains temporal catalog text until the MySQL source
+// adapter has validated it. Without this projection go-sql-driver/mysql may
+// normalize zero dates to time.Time{}, making them indistinguishable from a
+// legitimate finite value in another engine.
+func mySQLReadProjection(table schema.Table, columns []string) string {
+	types := make(map[string]string, len(table.Columns))
+	for _, column := range table.Columns {
+		types[column.Name] = column.Type
+	}
+	projected := make([]string, len(columns))
+	for index, column := range columns {
+		identifier := mySQLIdentifier(column)
+		if isMySQLTemporalType(types[column]) {
+			projected[index] = "CAST(" + identifier + " AS CHAR) AS " +
+				identifier
+			continue
+		}
+		projected[index] = identifier
+	}
+	return strings.Join(projected, ", ")
 }
 
 func mySQLQualified(namespace, name string) string {

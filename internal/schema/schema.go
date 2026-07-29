@@ -164,7 +164,20 @@ func MapType(source string, target Dialect) (string, error) {
 		default:
 			return "BLOB", nil
 		}
-	case "json", "jsonb":
+	case "json":
+		switch target {
+		case Postgres:
+			return "JSON", nil
+		case SQLServer:
+			return "NVARCHAR(MAX)", nil
+		case MySQL:
+			return "JSON", nil
+		case ClickHouse:
+			return "String", nil
+		default:
+			return "TEXT", nil
+		}
+	case "jsonb":
 		switch target {
 		case Postgres:
 			return "JSONB", nil
@@ -190,6 +203,12 @@ func MapType(source string, target Dialect) (string, error) {
 			return "DATETIME2", nil
 		}
 		return "TIMESTAMP", nil
+	case "timestamptz":
+		if target == Postgres {
+			return "TIMESTAMP WITH TIME ZONE", nil
+		}
+		return "", &PolicyError{
+			Operation: "map type", Type: source, Target: string(target)}
 	case "date":
 		return "DATE", nil
 	default:
