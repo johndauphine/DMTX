@@ -66,7 +66,7 @@ func TestPostgresTargetPlansSQLiteTypesWithoutMutatingSource(t *testing.T) {
 	}
 
 	adapter := &postgresTargetAdapter{namespace: "archive"}
-	planned, err := adapter.PlanTable("sqlite", source, "")
+	planned, err := planSingleTargetTable(adapter, "sqlite", source, "")
 	if err != nil {
 		t.Fatalf("PlanTable: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestPostgresTargetRejectsSQLiteImplicitRowIDIdentityWithoutMutation(
 	}
 
 	adapter := &postgresTargetAdapter{namespace: "public"}
-	_, err := adapter.PlanTable("sqlite", source, "drop_recreate")
+	_, err := planSingleTargetTable(adapter, "sqlite", source, "drop_recreate")
 	var policy *schema.PolicyError
 	if !errors.As(err, &policy) ||
 		policy.Operation != "map SQLite implicit rowid identity" ||
@@ -174,7 +174,7 @@ func TestPostgresTargetPlansNetworkSourceWithoutMutation(t *testing.T) {
 	before.Columns = append([]schema.Column(nil), source.Columns...)
 
 	adapter := &postgresTargetAdapter{namespace: "target_namespace"}
-	planned, err := adapter.PlanTable("postgres", source, "upsert")
+	planned, err := planSingleTargetTable(adapter, "postgres", source, "upsert")
 	if err != nil {
 		t.Fatalf("PlanTable: %v", err)
 	}
@@ -188,10 +188,6 @@ func TestPostgresTargetPlansNetworkSourceWithoutMutation(t *testing.T) {
 }
 
 func TestPostgresTargetRejectsUnmappedSQLiteSchemaSemantics(t *testing.T) {
-	literalDefault, err := schema.ParseSQLiteDefault("0")
-	if err != nil {
-		t.Fatalf("ParseSQLiteDefault: %v", err)
-	}
 	sequence := int64(7)
 	tests := []struct {
 		name      string
@@ -255,13 +251,6 @@ func TestPostgresTargetRejectsUnmappedSQLiteSchemaSemantics(t *testing.T) {
 			},
 		},
 		{
-			name:      "default",
-			operation: "map SQLite default",
-			mutate: func(table *schema.Table) {
-				table.Columns[0].Default = literalDefault
-			},
-		},
-		{
 			name:      "missing declared type",
 			operation: "map SQLite declared type",
 			mutate: func(table *schema.Table) {
@@ -297,9 +286,188 @@ func TestPostgresTargetRejectsUnmappedSQLiteSchemaSemantics(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			source := basicSQLiteProjectionTable()
 			test.mutate(&source)
-			_, err := adapter.PlanTable(
+			_, err := planSingleTargetTable(adapter,
 				"sqlite",
 				source,
+				"drop_recreate",
+			)
+			var policy *schema.PolicyError
+			if !errors.As(err, &policy) ||
+				policy.Operation != test.operation {
+				t.Fatalf(
+					"error = %v, want policy operation %q",
+					err,
+					test.operation,
+				)
+			}
+		})
+	}
+}
+
+func TestPostgresTargetPlansSQLiteScalarModifiersAndDefaultsWithoutMutation(
+	t *testing.T,
+) {
+	parseDefault := func(value string) *schema.Expression {
+		t.Helper()
+		expression, err := schema.ParseSQLiteDefault(value)
+		if err != nil {
+			t.Fatalf("ParseSQLiteDefault(%q): %v", value, err)
+		}
+		return expression
+	}
+	column := func(
+		name string,
+		columnType string,
+		arguments []int,
+		defaultSQL string,
+	) schema.Column {
+		value := sqliteProjectionColumn(name, columnType)
+		value.DeclaredType.Arguments = append([]int(nil), arguments...)
+		value.Default = parseDefault(defaultSQL)
+		return value
+	}
+	source := schema.Table{
+		Name: "scalar_defaults",
+		Columns: []schema.Column{
+			column("code", "CHAR", []int{4}, "'AB'"),
+			column("name", "VARCHAR", []int{12}, "'guest'"),
+			column("amount", "DECIMAL", []int{7, 2}, "(0.00)"),
+			column("enabled", "BOOLEAN", nil, "TRUE"),
+			column("payload", "BLOB", nil, "X'00FF'"),
+			column("event_day", "DATE", nil, "CURRENT_DATE"),
+			column(
+				"created_at",
+				"DATETIME",
+				nil,
+				"CURRENT_TIMESTAMP",
+			),
+		},
+	}
+	before := source
+	before.Columns = append([]schema.Column(nil), source.Columns...)
+	for index, sourceColumn := range source.Columns {
+		declaration := *sourceColumn.DeclaredType
+		declaration.Arguments = append(
+			[]int(nil),
+			sourceColumn.DeclaredType.Arguments...,
+		)
+		before.Columns[index].DeclaredType = &declaration
+	}
+
+	adapter := &postgresTargetAdapter{namespace: "archive"}
+	planned, err := planSingleTargetTable(adapter, "sqlite", source, "drop_recreate")
+	if err != nil {
+		t.Fatalf("PlanTable: %v", err)
+	}
+	if planned.Schema != "archive" {
+		t.Fatalf("planned schema = %q", planned.Schema)
+	}
+	wantTypes := []string{
+		"text",
+		"text",
+		"numeric",
+		"boolean",
+		"bytea",
+		"date",
+		"timestamp",
+	}
+	wantDeclarations := []*schema.DeclaredType{
+		{Base: "varchar", Arguments: []int{4}},
+		{Base: "varchar", Arguments: []int{12}},
+		{Base: "numeric", Arguments: []int{7, 2}},
+		nil,
+		nil,
+		nil,
+		nil,
+	}
+	for index, column := range planned.Columns {
+		if column.Type != wantTypes[index] ||
+			!reflect.DeepEqual(
+				column.DeclaredType,
+				wantDeclarations[index],
+			) {
+			t.Fatalf("planned column %s = %#v", column.Name, column)
+		}
+		if column.Default == nil {
+			t.Fatalf("planned column %s lost its default", column.Name)
+		}
+	}
+	if !reflect.DeepEqual(source, before) {
+		t.Fatalf("source table mutated: got %#v, want %#v", source, before)
+	}
+	planned.Columns[0].DeclaredType.Arguments[0] = 99
+	if source.Columns[0].DeclaredType.Arguments[0] != 4 {
+		t.Fatal("planned character modifiers alias the source declaration")
+	}
+}
+
+func TestPostgresTargetRejectsUnsafeSQLiteScalarMappings(t *testing.T) {
+	parseDefault := func(value string) *schema.Expression {
+		t.Helper()
+		expression, err := schema.ParseSQLiteDefault(value)
+		if err != nil {
+			t.Fatalf("ParseSQLiteDefault(%q): %v", value, err)
+		}
+		return expression
+	}
+	tests := []struct {
+		name       string
+		columnType string
+		arguments  []int
+		defaultSQL string
+		operation  string
+	}{
+		{
+			name:       "zero varchar length",
+			columnType: "VARCHAR",
+			arguments:  []int{0},
+			defaultSQL: "'x'",
+			operation:  "map SQLite type modifier",
+		},
+		{
+			name:       "numeric scale beyond precision",
+			columnType: "DECIMAL",
+			arguments:  []int{4, 5},
+			defaultSQL: "0",
+			operation:  "map SQLite type modifier",
+		},
+		{
+			name:       "overlong varchar default",
+			columnType: "VARCHAR",
+			arguments:  []int{2},
+			defaultSQL: "'abc'",
+			operation:  "render PostgreSQL default",
+		},
+		{
+			name:       "numeric default would round",
+			columnType: "DECIMAL",
+			arguments:  []int{4, 2},
+			defaultSQL: "1.234",
+			operation:  "render PostgreSQL default",
+		},
+		{
+			name:       "current timestamp on text",
+			columnType: "TEXT",
+			defaultSQL: "CURRENT_TIMESTAMP",
+			operation:  "render PostgreSQL default",
+		},
+	}
+
+	adapter := &postgresTargetAdapter{namespace: "public"}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			column := sqliteProjectionColumn("value", test.columnType)
+			column.DeclaredType.Arguments = append(
+				[]int(nil),
+				test.arguments...,
+			)
+			column.Default = parseDefault(test.defaultSQL)
+			_, err := planSingleTargetTable(adapter,
+				"sqlite",
+				schema.Table{
+					Name:    "unsafe_scalar",
+					Columns: []schema.Column{column},
+				},
 				"drop_recreate",
 			)
 			var policy *schema.PolicyError
@@ -325,7 +493,7 @@ func TestPostgresTargetPlanRejectsUnsupportedSourceAndNativeShape(
 			{Name: "id", Type: "bigint", PrimaryKey: true},
 		},
 	}
-	if _, err := adapter.PlanTable(
+	if _, err := planSingleTargetTable(adapter,
 		"oracle",
 		table,
 		"drop_recreate",
@@ -337,7 +505,7 @@ func TestPostgresTargetPlanRejectsUnsupportedSourceAndNativeShape(
 		table.Columns,
 		schema.Column{Name: "id", Type: "text"},
 	)
-	if _, err := adapter.PlanTable(
+	if _, err := planSingleTargetTable(adapter,
 		"postgres",
 		table,
 		"drop_recreate",

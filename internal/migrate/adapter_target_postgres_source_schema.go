@@ -80,12 +80,6 @@ func projectSQLiteTableForPostgres(
 	projected := sourceTable
 	projected.Columns = append([]schema.Column(nil), sourceTable.Columns...)
 	for index, sourceColumn := range sourceTable.Columns {
-		if sourceColumn.Default != nil {
-			return schema.Table{}, postgresSQLitePolicy(
-				"map SQLite default",
-				sourceTable.Name+"."+sourceColumn.Name,
-			)
-		}
 		if sourceColumn.DeclaredType == nil {
 			return schema.Table{}, postgresSQLitePolicy(
 				"map SQLite declared type",
@@ -102,12 +96,6 @@ func projectSQLiteTableForPostgres(
 				sourceTable.Name+"."+sourceColumn.Name,
 			)
 		}
-		if len(sourceColumn.DeclaredType.Arguments) != 0 {
-			return schema.Table{}, postgresSQLitePolicy(
-				"map SQLite type modifier",
-				sourceTable.Name+"."+sourceColumn.Name,
-			)
-		}
 		mapped, ok := postgresSQLiteType(base)
 		if !ok {
 			return schema.Table{}, postgresSQLitePolicy(
@@ -116,9 +104,64 @@ func projectSQLiteTableForPostgres(
 			)
 		}
 		projected.Columns[index].Type = mapped
-		projected.Columns[index].DeclaredType = nil
+		declaration, err := projectSQLiteDeclaredTypeForPostgres(
+			*sourceColumn.DeclaredType,
+		)
+		if err != nil {
+			return schema.Table{}, postgresSQLitePolicy(
+				"map SQLite type modifier",
+				sourceTable.Name+"."+sourceColumn.Name,
+			)
+		}
+		projected.Columns[index].DeclaredType = declaration
 	}
 	return projected, nil
+}
+
+// projectSQLiteDeclaredTypeForPostgres retains only modifiers whose source
+// values can be checked exactly before COPY. SQLite ignores character and
+// decimal modifiers, so the writer must reject values that PostgreSQL would
+// otherwise truncate or round. CHAR-family declarations use VARCHAR to avoid
+// PostgreSQL's trailing-space padding while preserving the declared limit.
+func projectSQLiteDeclaredTypeForPostgres(
+	value schema.DeclaredType,
+) (*schema.DeclaredType, error) {
+	if len(value.Arguments) == 0 {
+		return nil, nil
+	}
+	base := strings.ToLower(strings.TrimSpace(value.Base))
+	arguments := append([]int(nil), value.Arguments...)
+	switch base {
+	case "char", "character", "character varying", "varchar",
+		"varying character", "nchar", "native character", "nvarchar":
+		if len(arguments) != 1 ||
+			arguments[0] <= 0 ||
+			arguments[0] > 10_485_760 {
+			return nil, fmt.Errorf("invalid character length")
+		}
+		return &schema.DeclaredType{
+			Base:      "varchar",
+			Arguments: arguments,
+		}, nil
+	case "numeric", "decimal":
+		if len(arguments) < 1 || len(arguments) > 2 ||
+			arguments[0] < 1 || arguments[0] > 1000 {
+			return nil, fmt.Errorf("invalid numeric precision")
+		}
+		scale := 0
+		if len(arguments) == 2 {
+			scale = arguments[1]
+		}
+		if scale < 0 || scale > arguments[0] {
+			return nil, fmt.Errorf("invalid numeric scale")
+		}
+		return &schema.DeclaredType{
+			Base:      "numeric",
+			Arguments: arguments,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported modifier")
+	}
 }
 
 func sqliteImplicitRowIDAlias(table schema.Table) (string, bool) {

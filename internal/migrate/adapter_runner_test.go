@@ -145,48 +145,76 @@ func (rows *reusingAdapterRows) Close() error {
 }
 
 type recordingAdapterTarget struct {
-	events    *[]string
-	captured  [][]any
-	prepared  []string
-	written   []string
-	planned   []string
-	batches   []int
-	receipt   *WriteReceipt
-	writeErr  error
-	protected *bool
+	events       *[]string
+	captured     [][]any
+	rowsByTable  map[string]int
+	prepared     []string
+	preflighted  []string
+	written      []string
+	planned      []string
+	finalized    []string
+	batches      []int
+	receipt      *WriteReceipt
+	writeErr     error
+	preflightErr error
+	prepareErr   error
+	finalizeErr  error
+	protected    *bool
 }
 
 func (target *recordingAdapterTarget) Engine() string {
 	return "sqlite"
 }
 
-func (target *recordingAdapterTarget) PlanTable(
+func (target *recordingAdapterTarget) PlanTables(
 	sourceEngine string,
-	sourceTable schema.Table,
+	sourceTables []schema.Table,
 	mode string,
-) (schema.Table, error) {
+) ([]schema.Table, error) {
 	*target.events = append(*target.events, "target_plan")
-	target.planned = append(target.planned, mode)
 	if sourceEngine != "postgres" {
-		return schema.Table{}, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"unexpected source engine %q",
 			sourceEngine,
 		)
 	}
-	if sourceTable.Schema != "public" {
-		return schema.Table{}, fmt.Errorf(
-			"plan received source schema %q",
-			sourceTable.Schema,
-		)
+	targetTables := make([]schema.Table, 0, len(sourceTables))
+	for _, sourceTable := range sourceTables {
+		target.planned = append(target.planned, mode)
+		if sourceTable.Schema != "public" {
+			return nil, fmt.Errorf(
+				"plan received source schema %q",
+				sourceTable.Schema,
+			)
+		}
+		targetTable := sourceTable
+		targetTable.Schema = ""
+		targetTables = append(targetTables, targetTable)
 	}
-	targetTable := sourceTable
-	targetTable.Schema = ""
-	return targetTable, nil
+	return targetTables, nil
 }
 
-func (target *recordingAdapterTarget) PrepareTable(
+func (target *recordingAdapterTarget) PreflightTables(
 	_ context.Context,
-	targetTable schema.Table,
+	targetTables []schema.Table,
+	mode string,
+) error {
+	*target.events = append(*target.events, "target_preflight")
+	target.preflighted = append(target.preflighted, mode)
+	for _, targetTable := range targetTables {
+		if targetTable.Schema != "" {
+			return fmt.Errorf(
+				"target schema was not cleared: %q",
+				targetTable.Schema,
+			)
+		}
+	}
+	return target.preflightErr
+}
+
+func (target *recordingAdapterTarget) PrepareTables(
+	_ context.Context,
+	targetTables []schema.Table,
 	mode string,
 ) error {
 	*target.events = append(*target.events, "target_prepare")
@@ -194,13 +222,15 @@ func (target *recordingAdapterTarget) PrepareTable(
 	if target.protected != nil && !*target.protected {
 		return fmt.Errorf("prepare was not protected")
 	}
-	if targetTable.Schema != "" {
-		return fmt.Errorf(
-			"target schema was not cleared: %q",
-			targetTable.Schema,
-		)
+	for _, targetTable := range targetTables {
+		if targetTable.Schema != "" {
+			return fmt.Errorf(
+				"target schema was not cleared: %q",
+				targetTable.Schema,
+			)
+		}
 	}
-	return nil
+	return target.prepareErr
 }
 
 func (target *recordingAdapterTarget) WriteBatch(
@@ -223,6 +253,10 @@ func (target *recordingAdapterTarget) WriteBatch(
 		)
 	}
 	target.captured = append(target.captured, rows...)
+	if target.rowsByTable == nil {
+		target.rowsByTable = make(map[string]int)
+	}
+	target.rowsByTable[table.Name] += len(rows)
 	if target.receipt != nil {
 		return *target.receipt, target.writeErr
 	}
@@ -235,11 +269,27 @@ func (target *recordingAdapterTarget) WriteBatch(
 }
 
 func (target *recordingAdapterTarget) CountRows(
-	context.Context,
-	schema.Table,
+	_ context.Context,
+	table schema.Table,
 ) (int, error) {
 	*target.events = append(*target.events, "target_count")
-	return len(target.captured), nil
+	if target.rowsByTable == nil {
+		return 0, nil
+	}
+	return target.rowsByTable[table.Name], nil
+}
+
+func (target *recordingAdapterTarget) FinalizeTables(
+	_ context.Context,
+	_ []schema.Table,
+	mode string,
+) error {
+	*target.events = append(*target.events, "target_finalize")
+	target.finalized = append(target.finalized, mode)
+	if target.protected != nil && !*target.protected {
+		return fmt.Errorf("finalize was not protected")
+	}
+	return target.finalizeErr
 }
 
 func (target *recordingAdapterTarget) Close() error {
@@ -345,11 +395,13 @@ func TestExecuteComposesIndependentSourceAndTargetAdapters(t *testing.T) {
 		t.Fatalf("result = %#v", result)
 	}
 	if fmt.Sprint(target.prepared) != "[drop_recreate]" ||
-		fmt.Sprint(target.written) != "[drop_recreate]" {
+		fmt.Sprint(target.written) != "[drop_recreate]" ||
+		fmt.Sprint(target.finalized) != "[drop_recreate]" {
 		t.Fatalf(
-			"target modes: prepare=%v write=%v",
+			"target modes: prepare=%v write=%v finalize=%v",
 			target.prepared,
 			target.written,
+			target.finalized,
 		)
 	}
 	if got := string(target.captured[0][1].([]byte)); got != "first" {
@@ -364,14 +416,16 @@ func TestExecuteComposesIndependentSourceAndTargetAdapters(t *testing.T) {
 		"source_list",
 		"source_inspect",
 		"target_plan",
+		"target_preflight",
 		"before_tables:items",
-		"before:items",
 		"target_prepare",
+		"before:items",
 		"source_rows",
 		"target_write",
 		"rows_close",
 		"source_count",
 		"target_count",
+		"target_finalize",
 		"after:items",
 		"target_close",
 		"source_close",
@@ -439,11 +493,15 @@ func TestAdapterRunnerForwardsUpsertMode(t *testing.T) {
 		t.Fatalf("migrateWithAdapters: %v", err)
 	}
 	if fmt.Sprint(target.prepared) != "[upsert]" ||
-		fmt.Sprint(target.written) != "[upsert]" {
+		fmt.Sprint(target.preflighted) != "[upsert]" ||
+		fmt.Sprint(target.written) != "[upsert]" ||
+		fmt.Sprint(target.finalized) != "[upsert]" {
 		t.Fatalf(
-			"target modes: prepare=%v write=%v",
+			"target modes: preflight=%v prepare=%v write=%v finalize=%v",
+			target.preflighted,
 			target.prepared,
 			target.written,
+			target.finalized,
 		)
 	}
 }
@@ -553,8 +611,8 @@ func TestAdapterRunnerPlansAllTablesBeforeTargetMutation(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "invalid has no primary key") {
 		t.Fatalf("error = %v", err)
 	}
-	if len(target.planned) != 1 {
-		t.Fatalf("planned tables = %v, want first table only", target.planned)
+	if len(target.planned) != 0 {
+		t.Fatalf("target planning ran before source inspection completed: %v", target.planned)
 	}
 	if len(target.prepared) != 0 || len(target.written) != 0 {
 		t.Fatalf(
@@ -642,7 +700,7 @@ func TestAdapterRunnerFencesPrepareAndWrite(t *testing.T) {
 	if result != (Result{Tables: 1, Rows: 2, Validated: true}) {
 		t.Fatalf("result = %#v", result)
 	}
-	if observer.calls != 2 || observer.after != 1 {
+	if observer.calls != 3 || observer.after != 1 {
 		t.Fatalf(
 			"observer calls = %d, after = %d",
 			observer.calls,

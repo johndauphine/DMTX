@@ -34,9 +34,29 @@ type DeclaredType struct {
 	Arguments []int
 }
 
-// Expression is SQL text accepted by a dialect-specific conservative parser.
+type expressionKind uint8
+
+const (
+	expressionUnknown expressionKind = iota
+	expressionNull
+	expressionBoolean
+	expressionNumber
+	expressionString
+	expressionBlob
+	expressionCurrentTime
+	expressionCurrentDate
+	expressionCurrentTimestamp
+	expressionCheck
+)
+
+// Expression is a value accepted by a dialect-specific conservative parser.
+// The original SQL is retained for same-dialect rendering while kind and
+// literal keep cross-dialect rendering structural instead of copying catalog
+// text into target DDL.
 type Expression struct {
-	sql string
+	sql     string
+	kind    expressionKind
+	literal string
 }
 
 func (expression Expression) CanonicalSQL() string {
@@ -236,8 +256,12 @@ func CreateTable(target Dialect, table Table) (string, error) {
 			nullability = ""
 		}
 		definition := quote(target, column.Name) + " " + typ + nullability
-		if target == SQLite && column.Default != nil {
-			definition += " DEFAULT " + column.Default.sql
+		if column.Default != nil {
+			renderedDefault, err := renderDefault(target, column)
+			if err != nil {
+				return "", err
+			}
+			definition += " DEFAULT " + renderedDefault
 		}
 		if target == SQLite && column.Name == table.AutoIncrementColumn {
 			definition += " PRIMARY KEY AUTOINCREMENT"

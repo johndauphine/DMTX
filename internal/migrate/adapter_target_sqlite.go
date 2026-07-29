@@ -39,61 +39,105 @@ func (adapter *sqliteTargetAdapter) Engine() string {
 	return "sqlite"
 }
 
-func (adapter *sqliteTargetAdapter) PlanTable(
+func (adapter *sqliteTargetAdapter) PlanTables(
 	sourceEngine string,
-	sourceTable schema.Table,
+	sourceTables []schema.Table,
 	mode string,
-) (schema.Table, error) {
+) ([]schema.Table, error) {
 	if _, err := normalizeAdapterTargetMode(mode); err != nil {
-		return schema.Table{}, err
+		return nil, err
 	}
 	switch sourceEngine {
 	case "postgres", "mysql", "mssql", "sqlite":
 	default:
-		return schema.Table{}, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"SQLite target does not support source engine %q",
 			sourceEngine,
 		)
 	}
-	targetTable := sourceTable
-	targetTable.Schema = ""
-	if _, err := schema.DropTable(schema.SQLite, targetTable); err != nil {
-		return schema.Table{}, fmt.Errorf(
-			"plan SQLite table %s: %w",
-			targetTable.Name,
-			err,
-		)
+	targetTables := make([]schema.Table, 0, len(sourceTables))
+	for _, sourceTable := range sourceTables {
+		targetTable := sourceTable
+		targetTable.Schema = ""
+		if _, err := schema.DropTable(schema.SQLite, targetTable); err != nil {
+			return nil, fmt.Errorf(
+				"plan SQLite table %s: %w",
+				targetTable.Name,
+				err,
+			)
+		}
+		if _, err := schema.CreateTable(schema.SQLite, targetTable); err != nil {
+			return nil, fmt.Errorf(
+				"plan SQLite table %s: %w",
+				targetTable.Name,
+				err,
+			)
+		}
+		if _, err := schema.CreateIndexes(schema.SQLite, targetTable); err != nil {
+			return nil, fmt.Errorf(
+				"plan SQLite indexes for %s: %w",
+				targetTable.Name,
+				err,
+			)
+		}
+		if _, err := schema.SQLiteSequencePlan(targetTable); err != nil {
+			return nil, fmt.Errorf(
+				"plan SQLite sequence for %s: %w",
+				targetTable.Name,
+				err,
+			)
+		}
+		targetTables = append(targetTables, targetTable)
 	}
-	if _, err := schema.CreateTable(schema.SQLite, targetTable); err != nil {
-		return schema.Table{}, fmt.Errorf(
-			"plan SQLite table %s: %w",
-			targetTable.Name,
-			err,
-		)
-	}
-	if _, err := schema.CreateIndexes(schema.SQLite, targetTable); err != nil {
-		return schema.Table{}, fmt.Errorf(
-			"plan SQLite indexes for %s: %w",
-			targetTable.Name,
-			err,
-		)
-	}
-	if _, err := schema.SQLiteSequencePlan(targetTable); err != nil {
-		return schema.Table{}, fmt.Errorf(
-			"plan SQLite sequence for %s: %w",
-			targetTable.Name,
-			err,
-		)
-	}
-	return targetTable, nil
+	return targetTables, nil
 }
 
-func (adapter *sqliteTargetAdapter) PrepareTable(
+func (adapter *sqliteTargetAdapter) PreflightTables(
 	ctx context.Context,
-	targetTable schema.Table,
+	targetTables []schema.Table,
 	mode string,
 ) error {
-	return prepareTarget(ctx, adapter.database, targetTable, mode)
+	mode, err := normalizeAdapterTargetMode(mode)
+	if err != nil {
+		return err
+	}
+	for _, targetTable := range targetTables {
+		exists, err := tableExists(ctx, adapter.database, targetTable.Name)
+		if err != nil {
+			return fmt.Errorf(
+				"preflight SQLite table %s: %w",
+				targetTable.Name,
+				err,
+			)
+		}
+		if mode == "upsert" && !exists {
+			return fmt.Errorf(
+				"preflight SQLite table %s: upsert requires an existing target table",
+				targetTable.Name,
+			)
+		}
+	}
+	return nil
+}
+
+func (adapter *sqliteTargetAdapter) PrepareTables(
+	ctx context.Context,
+	targetTables []schema.Table,
+	mode string,
+) error {
+	mode, err := normalizeAdapterTargetMode(mode)
+	if err != nil {
+		return err
+	}
+	if mode == "upsert" {
+		return nil
+	}
+	for _, targetTable := range targetTables {
+		if err := prepareTarget(ctx, adapter.database, targetTable, mode); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (adapter *sqliteTargetAdapter) WriteBatch(
@@ -120,6 +164,31 @@ func (adapter *sqliteTargetAdapter) CountRows(
 	table schema.Table,
 ) (int, error) {
 	return countRows(ctx, adapter.database, table.Name)
+}
+
+func (adapter *sqliteTargetAdapter) FinalizeTables(
+	ctx context.Context,
+	targetTables []schema.Table,
+	mode string,
+) error {
+	mode, err := normalizeAdapterTargetMode(mode)
+	if err != nil {
+		return err
+	}
+	if mode == "upsert" {
+		return nil
+	}
+	for _, targetTable := range targetTables {
+		if err := finalizeSQLiteTarget(
+			ctx,
+			adapter.database,
+			targetTable,
+			nil,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (adapter *sqliteTargetAdapter) Close() error {

@@ -69,10 +69,11 @@ func TestAdapterRunnerRejectsInvalidMutationProtectorInvocationCounts(
 	t *testing.T,
 ) {
 	tests := []struct {
-		name         string
-		invocations  []int
-		wantPrepared int
-		wantCaptured int
+		name          string
+		invocations   []int
+		wantPrepared  int
+		wantCaptured  int
+		wantFinalized int
 	}{
 		{
 			name:        "prepare omitted",
@@ -93,6 +94,20 @@ func TestAdapterRunnerRejectsInvalidMutationProtectorInvocationCounts(
 			invocations:  []int{1, 2},
 			wantPrepared: 1,
 			wantCaptured: 2,
+		},
+		{
+			name:          "finalize omitted",
+			invocations:   []int{1, 1, 0},
+			wantPrepared:  1,
+			wantCaptured:  2,
+			wantFinalized: 0,
+		},
+		{
+			name:          "finalize repeated",
+			invocations:   []int{1, 1, 2},
+			wantPrepared:  1,
+			wantCaptured:  2,
+			wantFinalized: 1,
 		},
 	}
 
@@ -129,6 +144,13 @@ func TestAdapterRunnerRejectsInvalidMutationProtectorInvocationCounts(
 					"captured = %d, want %d",
 					len(target.captured),
 					test.wantCaptured,
+				)
+			}
+			if len(target.finalized) != test.wantFinalized {
+				t.Fatalf(
+					"finalized = %d, want %d",
+					len(target.finalized),
+					test.wantFinalized,
 				)
 			}
 			if protector.after != 0 {

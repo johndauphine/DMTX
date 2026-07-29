@@ -166,6 +166,13 @@ func migrateWithAdapters(
 	if err != nil {
 		return Result{}, err
 	}
+	targetTables := make([]schema.Table, len(plans))
+	for index, plan := range plans {
+		targetTables[index] = plan.target
+	}
+	if err := target.PreflightTables(ctx, targetTables, mode); err != nil {
+		return Result{}, fmt.Errorf("preflight target tables: %w", err)
+	}
 	if setObserver, ok := observer.(TableSetObserver); ok {
 		if err := setObserver.BeforeTables(
 			ctx,
@@ -175,8 +182,19 @@ func migrateWithAdapters(
 		}
 	}
 
-	result := Result{}
-	for _, plan := range plans {
+	if _, err := protectAdapterTargetMutationOnce(
+		ctx,
+		observer,
+		"prepare tables",
+		func() error {
+			return target.PrepareTables(ctx, targetTables, mode)
+		},
+	); err != nil {
+		return Result{}, err
+	}
+
+	copiedRows := make([]int, len(plans))
+	for index, plan := range plans {
 		name := plan.source.Name
 		if observer != nil {
 			if err := observer.BeforeTable(ctx, name); err != nil {
@@ -186,16 +204,6 @@ func migrateWithAdapters(
 					err,
 				)
 			}
-		}
-		if _, err := protectAdapterTargetMutationOnce(
-			ctx,
-			observer,
-			"prepare table "+name,
-			func() error {
-				return target.PrepareTable(ctx, plan.target, mode)
-			},
-		); err != nil {
-			return Result{}, err
 		}
 		copied, err := copyAdapterRows(
 			ctx,
@@ -216,12 +224,31 @@ func migrateWithAdapters(
 			target,
 			plan.source,
 			plan.target,
+			mode,
 		); err != nil {
 			return Result{}, err
 		}
+		copiedRows[index] = copied
+	}
+
+	if _, err := protectAdapterTargetMutationOnce(
+		ctx,
+		observer,
+		"finalize tables",
+		func() error {
+			return target.FinalizeTables(ctx, targetTables, mode)
+		},
+	); err != nil {
+		return Result{}, err
+	}
+
+	result := Result{}
+	for index, plan := range plans {
+		name := plan.source.Name
+		copied := copiedRows[index]
 		if observer != nil {
 			if err := observer.AfterTable(ctx, name, copied); err != nil {
-				return Result{}, fmt.Errorf(
+				return result, fmt.Errorf(
 					"checkpoint after %s: %w",
 					name,
 					err,
@@ -256,7 +283,7 @@ func planAdapterTables(
 	if sourceEngine == "" || target.Engine() == "" {
 		return nil, fmt.Errorf("source and target adapter engines are required")
 	}
-	plans := make([]adapterTablePlan, 0, len(names))
+	sourceTables := make([]schema.Table, 0, len(names))
 	for _, name := range names {
 		sourceTable, err := source.InspectTable(ctx, name)
 		if err != nil {
@@ -276,15 +303,23 @@ func planAdapterTables(
 				name,
 			)
 		}
-		columns := adapterColumnNames(sourceTable)
-		targetTable, err := target.PlanTable(
-			sourceEngine,
-			sourceTable,
-			mode,
+		sourceTables = append(sourceTables, sourceTable)
+	}
+	targetTables, err := target.PlanTables(sourceEngine, sourceTables, mode)
+	if err != nil {
+		return nil, err
+	}
+	if len(targetTables) != len(sourceTables) {
+		return nil, fmt.Errorf(
+			"target adapter %s planned %d tables for %d source tables",
+			target.Engine(),
+			len(targetTables),
+			len(sourceTables),
 		)
-		if err != nil {
-			return nil, err
-		}
+	}
+	plans := make([]adapterTablePlan, 0, len(sourceTables))
+	for index, sourceTable := range sourceTables {
+		targetTable := targetTables[index]
 		if targetTable.Name != sourceTable.Name {
 			return nil, fmt.Errorf(
 				"target adapter %s changed table name %s to %s",
@@ -296,7 +331,7 @@ func planAdapterTables(
 		plans = append(plans, adapterTablePlan{
 			source:  sourceTable,
 			target:  targetTable,
-			columns: columns,
+			columns: adapterColumnNames(sourceTable),
 		})
 	}
 	return plans, nil
@@ -488,6 +523,7 @@ func validateAdapterCount(
 	target targetAdapter,
 	sourceTable schema.Table,
 	targetTable schema.Table,
+	mode string,
 ) error {
 	sourceCount, err := source.CountRows(ctx, sourceTable)
 	if err != nil {
@@ -496,6 +532,17 @@ func validateAdapterCount(
 	targetCount, err := target.CountRows(ctx, targetTable)
 	if err != nil {
 		return err
+	}
+	if mode == "upsert" {
+		if targetCount < sourceCount {
+			return fmt.Errorf(
+				"validation failed for %s: source has %d rows, target has only %d after upsert",
+				sourceTable.Name,
+				sourceCount,
+				targetCount,
+			)
+		}
+		return nil
 	}
 	if sourceCount != targetCount {
 		return fmt.Errorf(

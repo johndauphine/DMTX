@@ -65,50 +65,74 @@ func (adapter *postgresTargetAdapter) Engine() string {
 	return "postgres"
 }
 
-func (adapter *postgresTargetAdapter) PlanTable(
+func (adapter *postgresTargetAdapter) PlanTables(
 	sourceEngine string,
-	sourceTable schema.Table,
+	sourceTables []schema.Table,
 	mode string,
-) (schema.Table, error) {
+) ([]schema.Table, error) {
 	mode, err := normalizeAdapterTargetMode(mode)
 	if err != nil {
-		return schema.Table{}, err
+		return nil, err
 	}
-	projected, err := projectPostgresSourceTable(sourceEngine, sourceTable)
-	if err != nil {
-		return schema.Table{}, err
-	}
-	targetTable := postgresTargetTable(projected, adapter.namespace)
-	if _, err := schema.DropTable(schema.Postgres, targetTable); err != nil {
-		return schema.Table{}, fmt.Errorf(
-			"plan PostgreSQL table %s: %w",
-			targetTable.Name,
-			err,
+	targetTables := make([]schema.Table, 0, len(sourceTables))
+	for _, sourceTable := range sourceTables {
+		projected, err := projectPostgresSourceTable(
+			sourceEngine,
+			sourceTable,
 		)
+		if err != nil {
+			return nil, err
+		}
+		targetTable := postgresTargetTable(projected, adapter.namespace)
+		if _, err := schema.DropTable(schema.Postgres, targetTable); err != nil {
+			return nil, fmt.Errorf(
+				"plan PostgreSQL table %s: %w",
+				targetTable.Name,
+				err,
+			)
+		}
+		if _, err := schema.CreateTable(schema.Postgres, targetTable); err != nil {
+			return nil, fmt.Errorf(
+				"plan PostgreSQL table %s: %w",
+				targetTable.Name,
+				err,
+			)
+		}
+		if err := validatePostgresWriteShape(
+			targetTable,
+			adapterColumnNames(targetTable),
+			mode,
+		); err != nil {
+			return nil, err
+		}
+		targetTables = append(targetTables, targetTable)
 	}
-	if _, err := schema.CreateTable(schema.Postgres, targetTable); err != nil {
-		return schema.Table{}, fmt.Errorf(
-			"plan PostgreSQL table %s: %w",
-			targetTable.Name,
-			err,
-		)
-	}
-	if err := validatePostgresWriteShape(
-		targetTable,
-		adapterColumnNames(targetTable),
-		mode,
-	); err != nil {
-		return schema.Table{}, err
-	}
-	return targetTable, nil
+	return targetTables, nil
 }
 
-func (adapter *postgresTargetAdapter) PrepareTable(
+func (adapter *postgresTargetAdapter) PrepareTables(
 	ctx context.Context,
-	targetTable schema.Table,
+	targetTables []schema.Table,
 	mode string,
 ) error {
-	return preparePostgresTarget(ctx, adapter.database, targetTable, mode)
+	mode, err := normalizeAdapterTargetMode(mode)
+	if err != nil {
+		return err
+	}
+	if mode == "upsert" {
+		return nil
+	}
+	for _, targetTable := range targetTables {
+		if err := preparePostgresTarget(
+			ctx,
+			adapter.database,
+			targetTable,
+			mode,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (adapter *postgresTargetAdapter) WriteBatch(
@@ -150,6 +174,20 @@ func (adapter *postgresTargetAdapter) CountRows(
 		)
 	}
 	return count, nil
+}
+
+func (adapter *postgresTargetAdapter) FinalizeTables(
+	_ context.Context,
+	_ []schema.Table,
+	mode string,
+) error {
+	if _, err := normalizeAdapterTargetMode(mode); err != nil {
+		return err
+	}
+	// PostgreSQL post-load schema objects are added by the schema-fidelity
+	// slice. The all-table lifecycle calls this hook now so that work can be
+	// introduced without moving checkpoint boundaries again.
+	return nil
 }
 
 func (adapter *postgresTargetAdapter) Close() error {

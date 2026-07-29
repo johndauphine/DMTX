@@ -90,8 +90,11 @@ func renderColumnType(column Column, target Dialect) (string, error) {
 	if column.DeclaredType == nil {
 		return MapType(column.Type, target)
 	}
-	if target == SQLite {
+	switch target {
+	case SQLite:
 		return renderSQLiteDeclaredType(*column.DeclaredType)
+	case Postgres:
+		return renderPostgresDeclaredType(*column.DeclaredType)
 	}
 	if len(column.DeclaredType.Arguments) > 0 {
 		return "", &PolicyError{Operation: "map declared type modifiers", Type: column.Type, Target: string(target)}
@@ -129,21 +132,54 @@ func ParseSQLiteDefault(value string) (*Expression, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Expression{sql: "(" + inner.sql + ")"}, nil
+		return &Expression{
+			sql:     "(" + inner.sql + ")",
+			kind:    inner.kind,
+			literal: inner.literal,
+		}, nil
 	}
 	upper := strings.ToUpper(trimmed)
 	switch upper {
-	case "NULL", "TRUE", "FALSE", "CURRENT_TIME", "CURRENT_DATE", "CURRENT_TIMESTAMP":
-		return &Expression{sql: upper}, nil
+	case "NULL":
+		return &Expression{sql: upper, kind: expressionNull}, nil
+	case "TRUE", "FALSE":
+		return &Expression{
+			sql:     upper,
+			kind:    expressionBoolean,
+			literal: upper,
+		}, nil
+	case "CURRENT_TIME":
+		return &Expression{sql: upper, kind: expressionCurrentTime}, nil
+	case "CURRENT_DATE":
+		return &Expression{sql: upper, kind: expressionCurrentDate}, nil
+	case "CURRENT_TIMESTAMP":
+		return &Expression{sql: upper, kind: expressionCurrentTimestamp}, nil
 	}
 	if sqliteNumberPattern.MatchString(trimmed) {
-		return &Expression{sql: trimmed}, nil
+		return &Expression{
+			sql:     trimmed,
+			kind:    expressionNumber,
+			literal: trimmed,
+		}, nil
 	}
 	if sqliteBlobPattern.MatchString(trimmed) {
-		return &Expression{sql: "X" + trimmed[1:]}, nil
+		canonical := "X" + trimmed[1:]
+		return &Expression{
+			sql:     canonical,
+			kind:    expressionBlob,
+			literal: canonical[2 : len(canonical)-1],
+		}, nil
 	}
 	if validSingleQuotedLiteral(trimmed) {
-		return &Expression{sql: trimmed}, nil
+		return &Expression{
+			sql:  trimmed,
+			kind: expressionString,
+			literal: strings.ReplaceAll(
+				trimmed[1:len(trimmed)-1],
+				"''",
+				"'",
+			),
+		}, nil
 	}
 	return nil, &PolicyError{Operation: "parse SQLite default expression", Type: value, Target: string(SQLite)}
 }
@@ -160,7 +196,10 @@ func ParseSQLiteCheckExpression(value string) (Expression, error) {
 	if err := validateSQLiteExpression(trimmed); err != nil {
 		return Expression{}, err
 	}
-	return Expression{sql: trimmed}, nil
+	return Expression{
+		sql:  trimmed,
+		kind: expressionCheck,
+	}, nil
 }
 
 func rejectSQLiteOnlySchema(target Dialect, table Table) error {
@@ -168,11 +207,33 @@ func rejectSQLiteOnlySchema(target Dialect, table Table) error {
 		return &PolicyError{Operation: "map SQLite schema objects", Type: table.Name, Target: string(target)}
 	}
 	for _, column := range table.Columns {
-		if column.Default != nil {
+		if target != Postgres && column.Default != nil {
 			return &PolicyError{Operation: "map SQLite default", Type: column.Name, Target: string(target)}
 		}
 	}
 	return nil
+}
+
+func renderDefault(target Dialect, column Column) (string, error) {
+	if column.Default == nil {
+		return "", &PolicyError{
+			Operation: "render default",
+			Type:      column.Name,
+			Target:    string(target),
+		}
+	}
+	switch target {
+	case SQLite:
+		return column.Default.sql, nil
+	case Postgres:
+		return renderPostgresDefault(column)
+	default:
+		return "", &PolicyError{
+			Operation: "render default",
+			Type:      column.Name,
+			Target:    string(target),
+		}
+	}
 }
 
 // CreateIndexes renders deterministic standalone index statements. Inline

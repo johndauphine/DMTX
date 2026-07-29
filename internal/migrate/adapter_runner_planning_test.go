@@ -16,21 +16,23 @@ type rejectingAdapterPlanTarget struct {
 	err    error
 }
 
-func (target *rejectingAdapterPlanTarget) PlanTable(
+func (target *rejectingAdapterPlanTarget) PlanTables(
 	sourceEngine string,
-	sourceTable schema.Table,
+	sourceTables []schema.Table,
 	mode string,
-) (schema.Table, error) {
-	planned, err := target.recordingAdapterTarget.PlanTable(
+) ([]schema.Table, error) {
+	planned, err := target.recordingAdapterTarget.PlanTables(
 		sourceEngine,
-		sourceTable,
+		sourceTables,
 		mode,
 	)
 	if err != nil {
-		return schema.Table{}, err
+		return nil, err
 	}
-	if sourceTable.Name == target.reject {
-		return schema.Table{}, target.err
+	for _, sourceTable := range sourceTables {
+		if sourceTable.Name == target.reject {
+			return nil, target.err
+		}
 	}
 	return planned, nil
 }
@@ -80,11 +82,13 @@ func TestAdapterRunnerPlanFailurePreventsAllTargetMutation(t *testing.T) {
 		t.Fatalf("planned tables = %v, want both tables", recordingTarget.planned)
 	}
 	if len(recordingTarget.prepared) != 0 ||
-		len(recordingTarget.written) != 0 {
+		len(recordingTarget.written) != 0 ||
+		len(recordingTarget.finalized) != 0 {
 		t.Fatalf(
-			"target mutated after failed preflight: prepare=%v write=%v",
+			"target mutated after failed planning: prepare=%v write=%v finalize=%v",
 			recordingTarget.prepared,
 			recordingTarget.written,
+			recordingTarget.finalized,
 		)
 	}
 	for _, event := range events {

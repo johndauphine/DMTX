@@ -64,7 +64,7 @@ func normalizePostgresRows(
 				}
 				continue
 			}
-			converted, err := normalizePostgresValue(column.Type, value)
+			converted, err := normalizePostgresColumnValue(column, value)
 			if err != nil {
 				return nil, fmt.Errorf(
 					"normalize PostgreSQL table %s row %d column %s as %s: %w",
@@ -82,7 +82,15 @@ func normalizePostgresRows(
 }
 
 func normalizePostgresValue(columnType string, value any) (any, error) {
-	switch strings.ToLower(strings.TrimSpace(columnType)) {
+	return normalizePostgresColumnValue(
+		schema.Column{Type: columnType},
+		value,
+	)
+}
+
+func normalizePostgresColumnValue(column schema.Column, value any) (any, error) {
+	columnType := strings.ToLower(strings.TrimSpace(column.Type))
+	switch columnType {
 	case "int", "integer", "int4":
 		integer, err := exactPostgresInteger(value)
 		if err != nil || !integer.IsInt64() {
@@ -102,9 +110,31 @@ func normalizePostgresValue(columnType string, value any) (any, error) {
 	case "real", "float", "float4", "double", "double precision", "float8":
 		return normalizePostgresFloat(value)
 	case "decimal", "numeric":
-		return normalizePostgresNumeric(value)
-	case "text", "varchar", "character varying":
-		return normalizePostgresText(value)
+		precision, scale, err := postgresNumericColumnModifiers(column)
+		if err != nil {
+			return nil, err
+		}
+		return normalizePostgresNumericWithModifiers(
+			value,
+			precision,
+			scale,
+		)
+	case "text", "char", "character", "varchar", "character varying":
+		normalized, err := normalizePostgresText(value)
+		if err != nil {
+			return nil, err
+		}
+		length, constrained, err := postgresCharacterColumnLength(column)
+		if err != nil {
+			return nil, err
+		}
+		if constrained && utf8.RuneCountInString(normalized) > length {
+			return nil, fmt.Errorf(
+				"text exceeds PostgreSQL character length %d",
+				length,
+			)
+		}
+		return normalized, nil
 	case "uuid":
 		return normalizePostgresUUID(value)
 	case "blob", "binary", "varbinary", "bytea":
@@ -131,6 +161,63 @@ func normalizePostgresValue(columnType string, value any) (any, error) {
 			columnType,
 		)
 	}
+}
+
+func postgresCharacterColumnLength(
+	column schema.Column,
+) (int, bool, error) {
+	if column.DeclaredType == nil {
+		return 0, false, nil
+	}
+	base := strings.ToLower(strings.TrimSpace(column.DeclaredType.Base))
+	switch base {
+	case "char", "character", "varchar", "character varying":
+	default:
+		return 0, false, nil
+	}
+	if len(column.DeclaredType.Arguments) != 1 {
+		return 0, false, fmt.Errorf(
+			"invalid PostgreSQL character length modifiers",
+		)
+	}
+	length := column.DeclaredType.Arguments[0]
+	if length <= 0 || length > 10_485_760 {
+		return 0, false, fmt.Errorf(
+			"invalid PostgreSQL character length %d",
+			length,
+		)
+	}
+	return length, true, nil
+}
+
+func postgresNumericColumnModifiers(
+	column schema.Column,
+) (int64, int32, error) {
+	if column.DeclaredType == nil {
+		return postgresDecimalPrecision, postgresDecimalScale, nil
+	}
+	base := strings.ToLower(strings.TrimSpace(column.DeclaredType.Base))
+	if base != "numeric" && base != "decimal" {
+		return 0, 0, fmt.Errorf(
+			"invalid PostgreSQL numeric declaration %q",
+			column.DeclaredType.Base,
+		)
+	}
+	arguments := column.DeclaredType.Arguments
+	if len(arguments) < 1 || len(arguments) > 2 ||
+		arguments[0] < 1 || arguments[0] > 1000 {
+		return 0, 0, fmt.Errorf(
+			"invalid PostgreSQL numeric precision",
+		)
+	}
+	scale := 0
+	if len(arguments) == 2 {
+		scale = arguments[1]
+	}
+	if scale < 0 || scale > arguments[0] {
+		return 0, 0, fmt.Errorf("invalid PostgreSQL numeric scale")
+	}
+	return int64(arguments[0]), int32(scale), nil
 }
 
 func exactPostgresInteger(value any) (*big.Int, error) {
@@ -181,6 +268,18 @@ const (
 )
 
 func normalizePostgresNumeric(value any) (pgtype.Numeric, error) {
+	return normalizePostgresNumericWithModifiers(
+		value,
+		postgresDecimalPrecision,
+		postgresDecimalScale,
+	)
+}
+
+func normalizePostgresNumericWithModifiers(
+	value any,
+	precision int64,
+	scale int32,
+) (pgtype.Numeric, error) {
 	if numeric, ok := value.(pgtype.Numeric); ok {
 		if !numeric.Valid ||
 			numeric.InfinityModifier != pgtype.Finite {
@@ -197,7 +296,7 @@ func normalizePostgresNumeric(value any) (pgtype.Numeric, error) {
 				Valid: true,
 			}, nil
 		}
-		return fitPostgresDecimal(numeric)
+		return fitPostgresDecimalTo(numeric, precision, scale)
 	}
 
 	var source string
@@ -213,10 +312,10 @@ func normalizePostgresNumeric(value any) (pgtype.Numeric, error) {
 				"expected an exact numeric string, bytes, or integer",
 			)
 		}
-		return fitPostgresDecimal(pgtype.Numeric{
+		return fitPostgresDecimalTo(pgtype.Numeric{
 			Int:   integer,
 			Valid: true,
-		})
+		}, precision, scale)
 	}
 	if source == "NaN" {
 		return pgtype.Numeric{
@@ -228,7 +327,7 @@ func normalizePostgresNumeric(value any) (pgtype.Numeric, error) {
 	if err != nil {
 		return pgtype.Numeric{}, err
 	}
-	return fitPostgresDecimal(numeric)
+	return fitPostgresDecimalTo(numeric, precision, scale)
 }
 
 func parseExactPostgresNumeric(value string) (pgtype.Numeric, error) {
@@ -275,6 +374,18 @@ func parseExactPostgresNumeric(value string) (pgtype.Numeric, error) {
 // value without rounding. Fractional zeros are removed only when necessary to
 // fit the target scale, so every accepted conversion is exact.
 func fitPostgresDecimal(numeric pgtype.Numeric) (pgtype.Numeric, error) {
+	return fitPostgresDecimalTo(
+		numeric,
+		postgresDecimalPrecision,
+		postgresDecimalScale,
+	)
+}
+
+func fitPostgresDecimalTo(
+	numeric pgtype.Numeric,
+	precision int64,
+	scale int32,
+) (pgtype.Numeric, error) {
 	if !numeric.Valid ||
 		numeric.NaN ||
 		numeric.InfinityModifier != pgtype.Finite ||
@@ -285,8 +396,8 @@ func fitPostgresDecimal(numeric pgtype.Numeric) (pgtype.Numeric, error) {
 	exponent := numeric.Exp
 
 	if coefficient.Sign() == 0 {
-		if exponent < -postgresDecimalScale {
-			exponent = -postgresDecimalScale
+		if exponent < -scale {
+			exponent = -scale
 		}
 		return pgtype.Numeric{
 			Int:   coefficient,
@@ -296,13 +407,14 @@ func fitPostgresDecimal(numeric pgtype.Numeric) (pgtype.Numeric, error) {
 	}
 
 	ten := big.NewInt(10)
-	for exponent < -postgresDecimalScale {
+	for exponent < -scale {
 		quotient := new(big.Int)
 		remainder := new(big.Int)
 		quotient.QuoRem(coefficient, ten, remainder)
 		if remainder.Sign() != 0 {
 			return pgtype.Numeric{}, fmt.Errorf(
-				"exact numeric exceeds PostgreSQL DECIMAL(38,10) scale",
+				"exact numeric exceeds PostgreSQL DECIMAL(%d,%d) scale",
+				precision, scale,
 			)
 		}
 		coefficient = quotient
@@ -314,10 +426,10 @@ func fitPostgresDecimal(numeric pgtype.Numeric) (pgtype.Numeric, error) {
 	if integerDigits < 0 {
 		integerDigits = 0
 	}
-	if integerDigits >
-		postgresDecimalPrecision-int64(postgresDecimalScale) {
+	if integerDigits > precision-int64(scale) {
 		return pgtype.Numeric{}, fmt.Errorf(
-			"exact numeric exceeds PostgreSQL DECIMAL(38,10) integer precision",
+			"exact numeric exceeds PostgreSQL DECIMAL(%d,%d) integer precision",
+			precision, scale,
 		)
 	}
 

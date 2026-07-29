@@ -31,13 +31,16 @@ type sourceAdapter interface {
 	Close() error
 }
 
-// targetAdapter owns target schema planning, preparation, durable writes, and
-// target-side counts. PlanTable is deliberately context-free: it must remain a
-// pure transformation that performs no I/O or target mutation.
+// targetAdapter owns target schema planning, preflight, lifecycle mutations,
+// durable writes, and target-side counts. PlanTables is deliberately
+// context-free: it must remain a pure all-table transformation that performs
+// no I/O or target mutation. PreflightTables is read-only. PrepareTables and
+// FinalizeTables are each invoked once for the complete selected table set.
 type targetAdapter interface {
 	Engine() string
-	PlanTable(string, schema.Table, string) (schema.Table, error)
-	PrepareTable(context.Context, schema.Table, string) error
+	PlanTables(string, []schema.Table, string) ([]schema.Table, error)
+	PreflightTables(context.Context, []schema.Table, string) error
+	PrepareTables(context.Context, []schema.Table, string) error
 	WriteBatch(
 		context.Context,
 		schema.Table,
@@ -46,6 +49,7 @@ type targetAdapter interface {
 		[][]any,
 	) (WriteReceipt, error)
 	CountRows(context.Context, schema.Table) (int, error)
+	FinalizeTables(context.Context, []schema.Table, string) error
 	Close() error
 }
 
