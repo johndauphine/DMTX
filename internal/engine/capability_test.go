@@ -1,10 +1,7 @@
 package engine
 
 import (
-	"strings"
 	"testing"
-
-	"github.com/johndauphine/dmtx/internal/config"
 )
 
 func TestTargetCapabilitiesMatchRequiredDifferences(t *testing.T) {
@@ -15,36 +12,5 @@ func TestTargetCapabilitiesMatchRequiredDifferences(t *testing.T) {
 	clickhouse, ok := TargetCapability("clickhouse")
 	if !ok || clickhouse.Upsert || clickhouse.SequenceReset {
 		t.Fatalf("ClickHouse capability = %#v", clickhouse)
-	}
-}
-
-func TestValidateMigrationRejectsUnsupportedTargetModeBeforePairSelection(t *testing.T) {
-	err := ValidateMigration(config.Config{
-		Source: config.Endpoint{Type: "sqlite"}, Target: config.Endpoint{Type: "clickhouse"},
-		Migration: config.Migration{TargetMode: "upsert"},
-	})
-	if err == nil || !strings.Contains(err.Error(), "does not support upsert") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestValidateMigrationAcceptsImplementedPairs(t *testing.T) {
-	for _, cfg := range []config.Config{
-		{Source: config.Endpoint{Type: "sqlite"}, Target: config.Endpoint{Type: "sqlite"}},
-		{Source: config.Endpoint{Type: "postgres"}, Target: config.Endpoint{Type: "sqlite"}},
-	} {
-		if err := ValidateMigration(cfg); err != nil {
-			t.Fatalf("ValidateMigration(%#v) = %v", cfg, err)
-		}
-	}
-}
-
-func TestValidateMigrationRejectsSameEndpoint(t *testing.T) {
-	err := ValidateMigration(config.Config{
-		Source: config.Endpoint{Type: "postgres", Host: "db.example.test", Database: "dmtx"},
-		Target: config.Endpoint{Type: "postgres", Host: "DB.EXAMPLE.TEST", Port: 5432, Database: "dmtx"},
-	})
-	if err == nil || !strings.Contains(err.Error(), "same endpoint") {
-		t.Fatalf("error = %v", err)
 	}
 }

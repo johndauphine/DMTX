@@ -125,21 +125,24 @@ The same inspection commands accept the default SQLite path
 
 ## Preliminary network paths
 
-The dispatcher currently contains fresh-run implementations for:
+The Stage 3 adapter registry currently certifies these fresh-run
+implementations:
 
 - SQLite to PostgreSQL, MySQL/MariaDB, SQL Server, and ClickHouse;
 - PostgreSQL to PostgreSQL or SQLite;
 - MySQL/MariaDB to PostgreSQL or SQLite; and
 - SQL Server to SQLite.
 
-These paths are pre-Stage 3 implementation scaffolding. They do not yet share
-SQLite's range checkpoint, replay, fencing, resume, and fault-injection matrix,
-and they have not passed the Stage 3 native-bulk and live-engine conformance
-suite. Treat them as experimental, not as Stage 2-certified migrations.
+These paths remain incomplete Stage 3 implementations. They do not yet share
+SQLite's full range checkpoint, replay, fencing, resume, and fault-injection
+matrix, and they have not passed the Stage 3 native-bulk and live-engine
+conformance suite. Treat them as experimental, not as Stage 2-certified
+migrations.
 
-Stage 3 will consolidate network behavior behind source and target adapter
-roles with explicit capabilities, rather than promising correctness through a
-separate hand-maintained pipeline for every source/target pair.
+PostgreSQL, MySQL/MariaDB, and SQL Server sources now compose independently
+with the SQLite target behind shared source and target contracts. The remaining
+Stage 3 work will migrate the other routes and prove each combination with
+common and live-engine fixtures.
 
 ## Scope and roadmap
 

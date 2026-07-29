@@ -12,7 +12,6 @@ import (
 
 	"github.com/johndauphine/dmtx/internal/audit"
 	"github.com/johndauphine/dmtx/internal/config"
-	"github.com/johndauphine/dmtx/internal/engine"
 	"github.com/johndauphine/dmtx/internal/migrate"
 	"github.com/johndauphine/dmtx/internal/state"
 )
@@ -54,7 +53,7 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "resume is currently supported only for SQLite-to-SQLite migrations")
 		return ConfigurationError
 	}
-	if err := engine.ValidateMigration(cfg); err != nil {
+	if err := migrate.ValidateMigration(cfg); err != nil {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}

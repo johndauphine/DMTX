@@ -2,47 +2,29 @@ package migrate
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/johndauphine/dmtx/internal/config"
-	"github.com/johndauphine/dmtx/internal/engine"
 )
 
-// Execute selects the implemented engine pair without allowing an unsupported
-// configuration to silently run a different migration path.
-func Execute(ctx context.Context, cfg config.Config, observer TableObserver) (Result, error) {
-	if err := engine.ValidateMigration(cfg); err != nil {
+// Execute resolves one certified source and target adapter route without
+// allowing an unsupported configuration to run a different migration path.
+func Execute(
+	ctx context.Context,
+	cfg config.Config,
+	observer TableObserver,
+) (Result, error) {
+	return executeWithRegistry(ctx, cfg, observer, builtInAdapters)
+}
+
+func executeWithRegistry(
+	ctx context.Context,
+	cfg config.Config,
+	observer TableObserver,
+	registry adapterRegistry,
+) (Result, error) {
+	route, err := resolveMigration(cfg, registry)
+	if err != nil {
 		return Result{}, err
 	}
-	if cfg.Source.Type == "sqlite" && cfg.Target.Type == "sqlite" {
-		return SQLiteToSQLiteWithObserver(ctx, cfg, observer)
-	}
-	if cfg.Source.Type == "sqlite" && cfg.Target.Type == "postgres" {
-		return SQLiteToPostgresWithObserver(ctx, cfg, observer)
-	}
-	if cfg.Source.Type == "sqlite" && cfg.Target.Type == "mysql" {
-		return SQLiteToMySQLWithObserver(ctx, cfg, observer)
-	}
-	if cfg.Source.Type == "sqlite" && cfg.Target.Type == "mssql" {
-		return SQLiteToSQLServerWithObserver(ctx, cfg, observer)
-	}
-	if cfg.Source.Type == "sqlite" && cfg.Target.Type == "clickhouse" {
-		return SQLiteToClickHouseWithObserver(ctx, cfg, observer)
-	}
-	if cfg.Source.Type == "postgres" && cfg.Target.Type == "postgres" {
-		return PostgresToPostgresWithObserver(ctx, cfg, observer)
-	}
-	if cfg.Source.Type == "mysql" && cfg.Target.Type == "postgres" {
-		return MySQLToPostgresWithObserver(ctx, cfg, observer)
-	}
-	if cfg.Source.Type == "postgres" && cfg.Target.Type == "sqlite" {
-		return PostgresToSQLiteWithObserver(ctx, cfg, observer)
-	}
-	if cfg.Source.Type == "mysql" && cfg.Target.Type == "sqlite" {
-		return MySQLToSQLiteWithObserver(ctx, cfg, observer)
-	}
-	if cfg.Source.Type == "mssql" && cfg.Target.Type == "sqlite" {
-		return SQLServerToSQLiteWithObserver(ctx, cfg, observer)
-	}
-	return Result{}, fmt.Errorf("unsupported migration pair %s-to-%s", cfg.Source.Type, cfg.Target.Type)
+	return route.execute(ctx, cfg, observer)
 }

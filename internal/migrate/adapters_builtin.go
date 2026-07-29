@@ -1,0 +1,81 @@
+package migrate
+
+import "github.com/johndauphine/dmtx/internal/engine"
+
+// builtInAdapters contains the recognized source and target roles and the
+// routes whose current implementations are certified for execution.
+//
+// PostgreSQL, MySQL/MariaDB, and SQL Server sources now compose independently
+// with the SQLite target. Compatibility overrides preserve the other existing
+// routes until their source or target side moves behind the shared contracts.
+var builtInAdapters = mustBuildAdapterRegistry(
+	[]sourceRole{
+		{engine: "sqlite"},
+		{engine: "postgres", open: openPostgresSourceAdapter},
+		{engine: "mysql", open: openMySQLSourceAdapter},
+		{engine: "mssql", open: openSQLServerSourceAdapter},
+		{engine: "clickhouse"},
+	},
+	[]targetRole{
+		builtInTargetRole(
+			"sqlite",
+			validateSQLiteTargetEndpoint,
+			openSQLiteTargetAdapter,
+		),
+		builtInTargetRole("postgres", nil, nil),
+		builtInTargetRole("mysql", nil, nil),
+		builtInTargetRole("mssql", nil, nil),
+		builtInTargetRole("clickhouse", nil, nil),
+	},
+	[]adapterPair{
+		{source: "sqlite", target: "sqlite"},
+		{source: "sqlite", target: "postgres"},
+		{source: "sqlite", target: "mysql"},
+		{source: "sqlite", target: "mssql"},
+		{source: "sqlite", target: "clickhouse"},
+		{source: "postgres", target: "postgres"},
+		{source: "postgres", target: "sqlite"},
+		{source: "mysql", target: "postgres"},
+		{source: "mysql", target: "sqlite"},
+		{source: "mssql", target: "sqlite"},
+	},
+	[]adapterOverride{
+		{pair: adapterPair{source: "sqlite", target: "sqlite"}, run: SQLiteToSQLiteWithObserver},
+		{pair: adapterPair{source: "sqlite", target: "postgres"}, run: SQLiteToPostgresWithObserver},
+		{pair: adapterPair{source: "sqlite", target: "mysql"}, run: SQLiteToMySQLWithObserver},
+		{pair: adapterPair{source: "sqlite", target: "mssql"}, run: SQLiteToSQLServerWithObserver},
+		{pair: adapterPair{source: "sqlite", target: "clickhouse"}, run: SQLiteToClickHouseWithObserver},
+		{pair: adapterPair{source: "postgres", target: "postgres"}, run: PostgresToPostgresWithObserver},
+		{pair: adapterPair{source: "mysql", target: "postgres"}, run: MySQLToPostgresWithObserver},
+	},
+)
+
+func builtInTargetRole(
+	name string,
+	validate endpointValidator,
+	open targetAdapterFactory,
+) targetRole {
+	capability, ok := engine.TargetCapability(name)
+	if !ok {
+		panic("target adapter " + name + " has no capability declaration")
+	}
+	return targetRole{
+		engine:     name,
+		capability: capability,
+		validate:   validate,
+		open:       open,
+	}
+}
+
+func mustBuildAdapterRegistry(
+	sources []sourceRole,
+	targets []targetRole,
+	certified []adapterPair,
+	overrides []adapterOverride,
+) adapterRegistry {
+	registry, err := newAdapterRegistry(sources, targets, certified, overrides)
+	if err != nil {
+		panic("build production adapter registry: " + err.Error())
+	}
+	return registry
+}

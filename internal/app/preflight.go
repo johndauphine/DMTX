@@ -11,6 +11,7 @@ import (
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/engine"
+	"github.com/johndauphine/dmtx/internal/migrate"
 	_ "modernc.org/sqlite"
 )
 
@@ -37,7 +38,7 @@ func preflight(args []string, stdout, stderr io.Writer) int {
 	}
 	findings := []preflightFinding{}
 	sameSQLiteDatabase := cfg.Source.Type == "sqlite" && cfg.Target.Type == "sqlite" && cfg.Source.Database != "" && cfg.Source.Database == cfg.Target.Database
-	if err := engine.ValidateMigration(cfg); err != nil && !sameSQLiteDatabase {
+	if err := migrate.ValidateMigration(cfg); err != nil && !sameSQLiteDatabase {
 		findings = append(findings, preflightFinding{"unsupported_capability", "error", err.Error()})
 	}
 	if cfg.Source.Database == "" || cfg.Target.Database == "" {

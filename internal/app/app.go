@@ -14,7 +14,6 @@ import (
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/contract"
-	"github.com/johndauphine/dmtx/internal/engine"
 	"github.com/johndauphine/dmtx/internal/migrate"
 	"github.com/johndauphine/dmtx/internal/state"
 )
@@ -88,7 +87,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}
-	if err := engine.ValidateMigration(cfg); err != nil {
+	if err := migrate.ValidateMigration(cfg); err != nil {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}

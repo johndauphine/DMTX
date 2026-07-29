@@ -27,7 +27,7 @@ type PlannedTable struct {
 // DryRun validates the implemented pair and discovers SQLite source tables.
 // It deliberately does not open the target, state store, lease, or audit log.
 func DryRun(ctx context.Context, cfg config.Config) (Plan, error) {
-	if err := engine.ValidateMigration(cfg); err != nil {
+	if err := ValidateMigration(cfg); err != nil {
 		return Plan{}, err
 	}
 	if cfg.Source.Type == "postgres" {
