@@ -374,6 +374,17 @@ func TestNormalizePostgresTextJSONAndByteaAreStrictAndOwned(t *testing.T) {
 	if !bytes.Equal(binaryCopy, []byte{0, 1, 2, 3}) {
 		t.Fatalf("normalized bytea aliases input: %#v", binaryCopy)
 	}
+
+	empty := make([]byte, 0)
+	normalizedEmpty, err := normalizePostgresValue("bytea", empty)
+	if err != nil {
+		t.Fatalf("empty bytea: %v", err)
+	}
+	emptyCopy, ok := normalizedEmpty.([]byte)
+	if !ok || emptyCopy == nil || len(emptyCopy) != 0 {
+		t.Fatalf("normalized empty bytea = %#v (%T)", normalizedEmpty, normalizedEmpty)
+	}
+
 	if _, err := normalizePostgresValue("bytea", "not bytes"); err == nil {
 		t.Fatal("string bytea unexpectedly succeeded")
 	}

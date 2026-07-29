@@ -2,6 +2,7 @@ package migrate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -13,7 +14,15 @@ import (
 type recordingAdapterSource struct {
 	events *[]string
 	table  schema.Table
+	tables []schema.Table
 	rows   []string
+}
+
+func (source *recordingAdapterSource) definitions() []schema.Table {
+	if source.tables != nil {
+		return source.tables
+	}
+	return []schema.Table{source.table}
 }
 
 func (source *recordingAdapterSource) payloads() []string {
@@ -35,7 +44,12 @@ func (source *recordingAdapterSource) ListTables(
 	context.Context,
 ) ([]string, error) {
 	*source.events = append(*source.events, "source_list")
-	return []string{source.table.Name}, nil
+	tables := source.definitions()
+	names := make([]string, len(tables))
+	for index, table := range tables {
+		names[index] = table.Name
+	}
+	return names, nil
 }
 
 func (source *recordingAdapterSource) InspectTable(
@@ -43,10 +57,12 @@ func (source *recordingAdapterSource) InspectTable(
 	name string,
 ) (schema.Table, error) {
 	*source.events = append(*source.events, "source_inspect")
-	if name != source.table.Name {
-		return schema.Table{}, fmt.Errorf("unexpected table %s", name)
+	for _, table := range source.definitions() {
+		if name == table.Name {
+			return table, nil
+		}
 	}
-	return source.table, nil
+	return schema.Table{}, fmt.Errorf("unexpected table %s", name)
 }
 
 func (source *recordingAdapterSource) OpenRows(
@@ -129,34 +145,62 @@ func (rows *reusingAdapterRows) Close() error {
 }
 
 type recordingAdapterTarget struct {
-	events   *[]string
-	captured [][]any
-	prepared []string
-	written  []string
-	batches  []int
-	receipt  *WriteReceipt
+	events    *[]string
+	captured  [][]any
+	prepared  []string
+	written   []string
+	planned   []string
+	batches   []int
+	receipt   *WriteReceipt
+	writeErr  error
+	protected *bool
 }
 
 func (target *recordingAdapterTarget) Engine() string {
 	return "sqlite"
 }
 
-func (target *recordingAdapterTarget) PrepareTable(
-	_ context.Context,
+func (target *recordingAdapterTarget) PlanTable(
+	sourceEngine string,
 	sourceTable schema.Table,
 	mode string,
 ) (schema.Table, error) {
-	*target.events = append(*target.events, "target_prepare")
-	target.prepared = append(target.prepared, mode)
+	*target.events = append(*target.events, "target_plan")
+	target.planned = append(target.planned, mode)
+	if sourceEngine != "postgres" {
+		return schema.Table{}, fmt.Errorf(
+			"unexpected source engine %q",
+			sourceEngine,
+		)
+	}
 	if sourceTable.Schema != "public" {
 		return schema.Table{}, fmt.Errorf(
-			"prepare received source schema %q",
+			"plan received source schema %q",
 			sourceTable.Schema,
 		)
 	}
 	targetTable := sourceTable
 	targetTable.Schema = ""
 	return targetTable, nil
+}
+
+func (target *recordingAdapterTarget) PrepareTable(
+	_ context.Context,
+	targetTable schema.Table,
+	mode string,
+) error {
+	*target.events = append(*target.events, "target_prepare")
+	target.prepared = append(target.prepared, mode)
+	if target.protected != nil && !*target.protected {
+		return fmt.Errorf("prepare was not protected")
+	}
+	if targetTable.Schema != "" {
+		return fmt.Errorf(
+			"target schema was not cleared: %q",
+			targetTable.Schema,
+		)
+	}
+	return nil
 }
 
 func (target *recordingAdapterTarget) WriteBatch(
@@ -169,6 +213,9 @@ func (target *recordingAdapterTarget) WriteBatch(
 	*target.events = append(*target.events, "target_write")
 	target.written = append(target.written, mode)
 	target.batches = append(target.batches, len(rows))
+	if target.protected != nil && !*target.protected {
+		return WriteReceipt{}, fmt.Errorf("write was not protected")
+	}
 	if table.Schema != "" {
 		return WriteReceipt{}, fmt.Errorf(
 			"target schema was not cleared: %q",
@@ -177,14 +224,14 @@ func (target *recordingAdapterTarget) WriteBatch(
 	}
 	target.captured = append(target.captured, rows...)
 	if target.receipt != nil {
-		return *target.receipt, nil
+		return *target.receipt, target.writeErr
 	}
 	count := int64(len(rows))
 	return WriteReceipt{
 		Certainty:     CommitDurable,
 		AttemptedRows: count,
 		CommittedRows: count,
-	}, nil
+	}, target.writeErr
 }
 
 func (target *recordingAdapterTarget) CountRows(
@@ -202,6 +249,17 @@ func (target *recordingAdapterTarget) Close() error {
 
 type recordingTableObserver struct {
 	events *[]string
+}
+
+func (observer recordingTableObserver) BeforeTables(
+	_ context.Context,
+	tables []string,
+) error {
+	*observer.events = append(
+		*observer.events,
+		"before_tables:"+strings.Join(tables, ","),
+	)
+	return nil
 }
 
 func (observer recordingTableObserver) BeforeTable(
@@ -304,8 +362,10 @@ func TestExecuteComposesIndependentSourceAndTargetAdapters(t *testing.T) {
 		"source_open",
 		"target_open",
 		"source_list",
-		"before:items",
 		"source_inspect",
+		"target_plan",
+		"before_tables:items",
+		"before:items",
 		"target_prepare",
 		"source_rows",
 		"target_write",
@@ -460,5 +520,236 @@ func TestAdapterRunnerRejectsNonDurableReceipt(t *testing.T) {
 	}
 	if result != (Result{}) {
 		t.Fatalf("partial result = %#v", result)
+	}
+}
+
+func TestAdapterRunnerPlansAllTablesBeforeTargetMutation(t *testing.T) {
+	events := make([]string, 0)
+	source := &recordingAdapterSource{
+		events: &events,
+		tables: []schema.Table{
+			{
+				Schema: "public",
+				Name:   "first",
+				Columns: []schema.Column{
+					{Name: "id", PrimaryKey: true},
+				},
+			},
+			{
+				Schema:  "public",
+				Name:    "invalid",
+				Columns: []schema.Column{{Name: "id"}},
+			},
+		},
+	}
+	target := &recordingAdapterTarget{events: &events}
+	_, err := migrateWithAdapters(
+		context.Background(),
+		config.Config{},
+		recordingTableObserver{events: &events},
+		source,
+		target,
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid has no primary key") {
+		t.Fatalf("error = %v", err)
+	}
+	if len(target.planned) != 1 {
+		t.Fatalf("planned tables = %v, want first table only", target.planned)
+	}
+	if len(target.prepared) != 0 || len(target.written) != 0 {
+		t.Fatalf(
+			"target mutated during preflight: prepare=%v write=%v",
+			target.prepared,
+			target.written,
+		)
+	}
+	for _, event := range events {
+		if strings.HasPrefix(event, "before") {
+			t.Fatalf("checkpoint created before preflight completed: %v", events)
+		}
+	}
+}
+
+type adapterMutationTestObserver struct {
+	active   bool
+	calls    int
+	after    int
+	failCall int
+	failErr  error
+}
+
+func (*adapterMutationTestObserver) BeforeTable(
+	context.Context,
+	string,
+) error {
+	return nil
+}
+
+func (observer *adapterMutationTestObserver) AfterTable(
+	context.Context,
+	string,
+	int,
+) error {
+	observer.after++
+	return nil
+}
+
+func (observer *adapterMutationTestObserver) ProtectTargetMutation(
+	_ context.Context,
+	mutation func() error,
+) error {
+	observer.calls++
+	observer.active = true
+	err := mutation()
+	observer.active = false
+	if err != nil {
+		return err
+	}
+	if observer.calls == observer.failCall {
+		return observer.failErr
+	}
+	return nil
+}
+
+func TestAdapterRunnerFencesPrepareAndWrite(t *testing.T) {
+	events := make([]string, 0)
+	observer := &adapterMutationTestObserver{}
+	source := &recordingAdapterSource{
+		events: &events,
+		table: schema.Table{
+			Schema: "public",
+			Name:   "items",
+			Columns: []schema.Column{
+				{Name: "id", PrimaryKey: true},
+				{Name: "payload"},
+			},
+		},
+	}
+	target := &recordingAdapterTarget{
+		events:    &events,
+		protected: &observer.active,
+	}
+	result, err := migrateWithAdapters(
+		context.Background(),
+		config.Config{},
+		observer,
+		source,
+		target,
+	)
+	if err != nil {
+		t.Fatalf("migrateWithAdapters: %v", err)
+	}
+	if result != (Result{Tables: 1, Rows: 2, Validated: true}) {
+		t.Fatalf("result = %#v", result)
+	}
+	if observer.calls != 2 || observer.after != 1 {
+		t.Fatalf(
+			"observer calls = %d, after = %d",
+			observer.calls,
+			observer.after,
+		)
+	}
+}
+
+func TestAdapterRunnerUnknownReceiptPreservesCauseWithoutCheckpoint(
+	t *testing.T,
+) {
+	events := make([]string, 0)
+	forced := errors.New("forced commit response loss")
+	receipt := WriteReceipt{
+		Certainty:     CommitUnknown,
+		AttemptedRows: 2,
+	}
+	source := &recordingAdapterSource{
+		events: &events,
+		table: schema.Table{
+			Schema: "public",
+			Name:   "items",
+			Columns: []schema.Column{
+				{Name: "id", PrimaryKey: true},
+				{Name: "payload"},
+			},
+		},
+	}
+	target := &recordingAdapterTarget{
+		events:   &events,
+		receipt:  &receipt,
+		writeErr: forced,
+	}
+	result, err := migrateWithAdapters(
+		context.Background(),
+		config.Config{},
+		recordingTableObserver{events: &events},
+		source,
+		target,
+	)
+	if !errors.Is(err, forced) ||
+		ClassifyTransferError(err) != ErrorClassState ||
+		!strings.Contains(err.Error(), "commit outcome is unknown") {
+		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+	if result != (Result{}) {
+		t.Fatalf("partial result = %#v", result)
+	}
+	for _, event := range events {
+		if event == "after:items" {
+			t.Fatalf("unknown commit was checkpointed: %v", events)
+		}
+	}
+}
+
+func TestAdapterRunnerFenceFailureAfterDurableWriteDoesNotCheckpoint(
+	t *testing.T,
+) {
+	events := make([]string, 0)
+	forced := errors.New("forced lease coordinator commit failure")
+	observer := &adapterMutationTestObserver{
+		failCall: 2,
+		failErr:  forced,
+	}
+	source := &recordingAdapterSource{
+		events: &events,
+		table: schema.Table{
+			Schema: "public",
+			Name:   "items",
+			Columns: []schema.Column{
+				{Name: "id", PrimaryKey: true},
+				{Name: "payload"},
+			},
+		},
+	}
+	target := &recordingAdapterTarget{
+		events:    &events,
+		protected: &observer.active,
+	}
+	result, err := migrateWithAdapters(
+		context.Background(),
+		config.Config{},
+		observer,
+		source,
+		target,
+	)
+	if !errors.Is(err, forced) ||
+		ClassifyTransferError(err) != ErrorClassState ||
+		!strings.Contains(err.Error(), "after reporting commit certainty durable") {
+		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+	if observer.after != 0 {
+		t.Fatalf("durable write with failed fence was checkpointed")
+	}
+	if len(target.captured) != 2 {
+		t.Fatalf("captured rows = %d, want durable target write", len(target.captured))
+	}
+}
+
+func TestCloneAdapterRowPreservesNonNullEmptyBlob(t *testing.T) {
+	source := make([]byte, 0)
+	cloned := cloneAdapterRow([]any{source, nil})
+	blob, ok := cloned[0].([]byte)
+	if !ok || blob == nil || len(blob) != 0 {
+		t.Fatalf("cloned empty blob = %#v (%T)", cloned[0], cloned[0])
+	}
+	if cloned[1] != nil {
+		t.Fatalf("SQL NULL changed to %#v", cloned[1])
 	}
 }

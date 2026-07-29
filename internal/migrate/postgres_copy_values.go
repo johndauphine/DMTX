@@ -112,7 +112,9 @@ func normalizePostgresValue(columnType string, value any) (any, error) {
 		if !ok {
 			return nil, fmt.Errorf("expected binary bytes")
 		}
-		return append([]byte(nil), bytes...), nil
+		owned := make([]byte, len(bytes))
+		copy(owned, bytes)
+		return owned, nil
 	case "json", "jsonb":
 		return normalizePostgresJSON(value)
 	case "bool", "boolean":
@@ -500,8 +502,18 @@ func normalizePostgresTimestamp(value any) (pgtype.Timestamp, error) {
 				"expected a valid PostgreSQL timestamp",
 			)
 		}
+		if timestamp.InfinityModifier == pgtype.Finite {
+			if err := requirePostgresMicrosecondPrecision(
+				timestamp.Time,
+			); err != nil {
+				return pgtype.Timestamp{}, err
+			}
+		}
 		return timestamp, nil
 	case time.Time:
+		if err := requirePostgresMicrosecondPrecision(timestamp); err != nil {
+			return pgtype.Timestamp{}, err
+		}
 		return pgtype.Timestamp{Time: timestamp, Valid: true}, nil
 	}
 	text, err := postgresTemporalText(value)
@@ -515,12 +527,17 @@ func normalizePostgresTimestamp(value any) (pgtype.Timestamp, error) {
 		}, nil
 	}
 	for _, layout := range []string{
-		time.RFC3339Nano,
-		"2006-01-02 15:04:05.999999999Z07:00",
 		"2006-01-02 15:04:05.999999999",
+		"2006-01-02T15:04:05.999999999",
 		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05",
 	} {
 		if timestamp, parseErr := time.Parse(layout, text); parseErr == nil {
+			if err := requirePostgresMicrosecondPrecision(
+				timestamp,
+			); err != nil {
+				return pgtype.Timestamp{}, err
+			}
 			return pgtype.Timestamp{
 				Time:  timestamp,
 				Valid: true,
@@ -541,8 +558,18 @@ func normalizePostgresTimestamptz(value any) (pgtype.Timestamptz, error) {
 				"expected a valid PostgreSQL timestamptz",
 			)
 		}
+		if timestamp.InfinityModifier == pgtype.Finite {
+			if err := requirePostgresMicrosecondPrecision(
+				timestamp.Time,
+			); err != nil {
+				return pgtype.Timestamptz{}, err
+			}
+		}
 		return timestamp, nil
 	case time.Time:
+		if err := requirePostgresMicrosecondPrecision(timestamp); err != nil {
+			return pgtype.Timestamptz{}, err
+		}
 		return pgtype.Timestamptz{Time: timestamp, Valid: true}, nil
 	}
 	text, err := postgresTemporalText(value)
@@ -560,6 +587,11 @@ func normalizePostgresTimestamptz(value any) (pgtype.Timestamptz, error) {
 		"2006-01-02 15:04:05.999999999Z07:00",
 	} {
 		if timestamp, parseErr := time.Parse(layout, text); parseErr == nil {
+			if err := requirePostgresMicrosecondPrecision(
+				timestamp,
+			); err != nil {
+				return pgtype.Timestamptz{}, err
+			}
 			return pgtype.Timestamptz{
 				Time:  timestamp,
 				Valid: true,
@@ -569,6 +601,15 @@ func normalizePostgresTimestamptz(value any) (pgtype.Timestamptz, error) {
 	return pgtype.Timestamptz{}, fmt.Errorf(
 		"expected a valid timestamptz",
 	)
+}
+
+func requirePostgresMicrosecondPrecision(value time.Time) error {
+	if value.Nanosecond()%int(time.Microsecond) != 0 {
+		return fmt.Errorf(
+			"timestamp precision exceeds PostgreSQL microseconds",
+		)
+	}
+	return nil
 }
 
 func normalizePostgresDate(value any) (pgtype.Date, error) {

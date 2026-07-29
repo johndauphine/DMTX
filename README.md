@@ -139,10 +139,11 @@ matrix, and they have not passed the Stage 3 native-bulk and live-engine
 conformance suite. Treat them as experimental, not as Stage 2-certified
 migrations.
 
-PostgreSQL, MySQL/MariaDB, and SQL Server sources now compose independently
-with the SQLite target behind shared source and target contracts. The remaining
-Stage 3 work will migrate the other routes and prove each combination with
-common and live-engine fixtures.
+SQLite, PostgreSQL, and MySQL/MariaDB sources now compose independently with
+the PostgreSQL target. PostgreSQL, MySQL/MariaDB, and SQL Server sources
+compose independently with the SQLite target behind shared source and target
+contracts. The remaining Stage 3 work will migrate the other routes and prove
+each combination with common and live-engine fixtures.
 
 ## Scope and roadmap
 

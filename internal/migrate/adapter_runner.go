@@ -2,6 +2,7 @@ package migrate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/johndauphine/dmtx/internal/config"
@@ -60,6 +61,19 @@ func executeBuiltInComposedRoute(
 	if err != nil {
 		return Result{}, err
 	}
+	resolvedPair := adapterPair{
+		source: route.source.engine,
+		target: route.target.engine,
+	}
+	if resolvedPair != pair {
+		return Result{}, fmt.Errorf(
+			"resolved migration pair %s-to-%s does not match requested pair %s-to-%s",
+			resolvedPair.source,
+			resolvedPair.target,
+			pair.source,
+			pair.target,
+		)
+	}
 	if route.override != nil {
 		return Result{}, fmt.Errorf(
 			"migration pair %s-to-%s is not a composed adapter route",
@@ -70,6 +84,65 @@ func executeBuiltInComposedRoute(
 	return route.execute(ctx, cfg, observer)
 }
 
+type adapterTablePlan struct {
+	source  schema.Table
+	target  schema.Table
+	columns []string
+}
+
+type adapterTargetMutationProtector interface {
+	ProtectTargetMutation(context.Context, func() error) error
+}
+
+func protectAdapterTargetMutation(
+	ctx context.Context,
+	observer TableObserver,
+	mutation func() error,
+) error {
+	if protector, ok := observer.(adapterTargetMutationProtector); ok {
+		return protector.ProtectTargetMutation(ctx, mutation)
+	}
+	return mutation()
+}
+
+func protectAdapterTargetMutationOnce(
+	ctx context.Context,
+	observer TableObserver,
+	operation string,
+	mutation func() error,
+) (int, error) {
+	calls := 0
+	err := protectAdapterTargetMutation(
+		ctx,
+		observer,
+		func() error {
+			calls++
+			if calls != 1 {
+				return fmt.Errorf(
+					"target mutation protector invoked %s multiple times",
+					operation,
+				)
+			}
+			return mutation()
+		},
+	)
+	if calls == 1 {
+		return calls, err
+	}
+	violation := fmt.Errorf(
+		"target mutation protector invoked %s %d times; expected exactly once",
+		operation,
+		calls,
+	)
+	if err != nil {
+		violation = errors.Join(violation, err)
+	}
+	return calls, NewTransferError(
+		ErrorClassState,
+		fmt.Errorf("protect target mutation: %w", violation),
+	)
+}
+
 func migrateWithAdapters(
 	ctx context.Context,
 	cfg config.Config,
@@ -77,6 +150,10 @@ func migrateWithAdapters(
 	source sourceAdapter,
 	target targetAdapter,
 ) (Result, error) {
+	mode, err := normalizeAdapterTargetMode(cfg.Migration.TargetMode)
+	if err != nil {
+		return Result{}, err
+	}
 	names, err := source.ListTables(ctx)
 	if err != nil {
 		return Result{}, err
@@ -85,40 +162,50 @@ func migrateWithAdapters(
 	if err != nil {
 		return Result{}, err
 	}
-	result := Result{Validated: true}
-	for _, name := range names {
+	plans, err := planAdapterTables(ctx, source, target, names, mode)
+	if err != nil {
+		return Result{}, err
+	}
+	if setObserver, ok := observer.(TableSetObserver); ok {
+		if err := setObserver.BeforeTables(
+			ctx,
+			append([]string(nil), names...),
+		); err != nil {
+			return Result{}, fmt.Errorf("checkpoint table set: %w", err)
+		}
+	}
+
+	result := Result{}
+	for _, plan := range plans {
+		name := plan.source.Name
 		if observer != nil {
 			if err := observer.BeforeTable(ctx, name); err != nil {
-				return Result{}, fmt.Errorf("checkpoint before %s: %w", name, err)
+				return Result{}, fmt.Errorf(
+					"checkpoint before %s: %w",
+					name,
+					err,
+				)
 			}
 		}
-		sourceTable, err := source.InspectTable(ctx, name)
-		if err != nil {
-			return Result{}, err
-		}
-		if !hasPrimaryKey(sourceTable) {
-			return Result{}, fmt.Errorf(
-				"table %s has no primary key; deterministic transfer requires a primary key",
-				name,
-			)
-		}
-		columns := adapterColumnNames(sourceTable)
-		targetTable, err := target.PrepareTable(
+		if _, err := protectAdapterTargetMutationOnce(
 			ctx,
-			sourceTable,
-			cfg.Migration.TargetMode,
-		)
-		if err != nil {
+			observer,
+			"prepare table "+name,
+			func() error {
+				return target.PrepareTable(ctx, plan.target, mode)
+			},
+		); err != nil {
 			return Result{}, err
 		}
 		copied, err := copyAdapterRows(
 			ctx,
+			observer,
 			source,
 			target,
-			sourceTable,
-			targetTable,
-			columns,
-			cfg.Migration.TargetMode,
+			plan.source,
+			plan.target,
+			plan.columns,
+			mode,
 		)
 		if err != nil {
 			return Result{}, err
@@ -127,24 +214,97 @@ func migrateWithAdapters(
 			ctx,
 			source,
 			target,
-			sourceTable,
-			targetTable,
+			plan.source,
+			plan.target,
 		); err != nil {
 			return Result{}, err
 		}
 		if observer != nil {
 			if err := observer.AfterTable(ctx, name, copied); err != nil {
-				return Result{}, fmt.Errorf("checkpoint after %s: %w", name, err)
+				return Result{}, fmt.Errorf(
+					"checkpoint after %s: %w",
+					name,
+					err,
+				)
 			}
 		}
 		result.Tables++
 		result.Rows += copied
 	}
+	result.Validated = true
 	return result, nil
+}
+
+func normalizeAdapterTargetMode(mode string) (string, error) {
+	if mode == "" {
+		return "drop_recreate", nil
+	}
+	if mode != "drop_recreate" && mode != "upsert" {
+		return "", fmt.Errorf("unsupported target mode %q", mode)
+	}
+	return mode, nil
+}
+
+func planAdapterTables(
+	ctx context.Context,
+	source sourceAdapter,
+	target targetAdapter,
+	names []string,
+	mode string,
+) ([]adapterTablePlan, error) {
+	sourceEngine := source.Engine()
+	if sourceEngine == "" || target.Engine() == "" {
+		return nil, fmt.Errorf("source and target adapter engines are required")
+	}
+	plans := make([]adapterTablePlan, 0, len(names))
+	for _, name := range names {
+		sourceTable, err := source.InspectTable(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		if sourceTable.Name != name {
+			return nil, fmt.Errorf(
+				"source adapter %s inspected table %q as %q",
+				sourceEngine,
+				name,
+				sourceTable.Name,
+			)
+		}
+		if !hasPrimaryKey(sourceTable) {
+			return nil, fmt.Errorf(
+				"table %s has no primary key; deterministic transfer requires a primary key",
+				name,
+			)
+		}
+		columns := adapterColumnNames(sourceTable)
+		targetTable, err := target.PlanTable(
+			sourceEngine,
+			sourceTable,
+			mode,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if targetTable.Name != sourceTable.Name {
+			return nil, fmt.Errorf(
+				"target adapter %s changed table name %s to %s",
+				target.Engine(),
+				sourceTable.Name,
+				targetTable.Name,
+			)
+		}
+		plans = append(plans, adapterTablePlan{
+			source:  sourceTable,
+			target:  targetTable,
+			columns: columns,
+		})
+	}
+	return plans, nil
 }
 
 func copyAdapterRows(
 	ctx context.Context,
+	observer TableObserver,
 	source sourceAdapter,
 	target targetAdapter,
 	sourceTable schema.Table,
@@ -165,8 +325,10 @@ func copyAdapterRows(
 	batch := make([][]any, 0, sqliteWriteBatchSize)
 	copied := 0
 	flush := func() error {
-		receipt, err := target.WriteBatch(
+		receipt, err := writeAdapterBatch(
 			ctx,
+			observer,
+			target,
 			targetTable,
 			columns,
 			mode,
@@ -174,20 +336,6 @@ func copyAdapterRows(
 		)
 		if err != nil {
 			return err
-		}
-		if err := receipt.Validate(); err != nil {
-			return fmt.Errorf(
-				"write %s returned an invalid receipt: %w",
-				targetTable.Name,
-				err,
-			)
-		}
-		if receipt.Certainty != CommitDurable ||
-			receipt.AttemptedRows != int64(len(batch)) {
-			return fmt.Errorf(
-				"write %s did not durably commit the complete batch",
-				targetTable.Name,
-			)
 		}
 		copied += int(receipt.CommittedRows)
 		batch = batch[:0]
@@ -225,11 +373,100 @@ func copyAdapterRows(
 	return copied, nil
 }
 
+func writeAdapterBatch(
+	ctx context.Context,
+	observer TableObserver,
+	target targetAdapter,
+	table schema.Table,
+	columns []string,
+	mode string,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	receipt := WriteReceipt{
+		Certainty:     CommitNotCommitted,
+		AttemptedRows: attempted,
+	}
+	mutationCalls, writeErr := protectAdapterTargetMutationOnce(
+		ctx,
+		observer,
+		"write table "+table.Name,
+		func() error {
+			var err error
+			receipt, err = target.WriteBatch(
+				ctx,
+				table,
+				columns,
+				mode,
+				rows,
+			)
+			return err
+		},
+	)
+	if mutationCalls != 1 {
+		return receipt, writeErr
+	}
+	if receiptErr := receipt.Validate(); receiptErr != nil {
+		cause := error(receiptErr)
+		if writeErr != nil {
+			cause = errors.Join(receiptErr, writeErr)
+		}
+		return receipt, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"write %s returned an invalid receipt: %w",
+				table.Name,
+				cause,
+			),
+		)
+	}
+	if writeErr != nil {
+		switch receipt.Certainty {
+		case CommitNotCommitted:
+			return receipt, writeErr
+		case CommitUnknown:
+			return receipt, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"write %s commit outcome is unknown; refusing checkpoint: %w",
+					table.Name,
+					writeErr,
+				),
+			)
+		default:
+			return receipt, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"write %s failed after reporting commit certainty %s; refusing checkpoint: %w",
+					table.Name,
+					receipt.Certainty,
+					writeErr,
+				),
+			)
+		}
+	}
+	if receipt.Certainty != CommitDurable ||
+		receipt.AttemptOffset != 0 ||
+		receipt.AttemptedRows != attempted ||
+		receipt.CommittedRows != attempted {
+		return receipt, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"write %s did not durably commit the complete batch; refusing checkpoint",
+				table.Name,
+			),
+		)
+	}
+	return receipt, nil
+}
+
 func cloneAdapterRow(values []any) []any {
 	row := make([]any, len(values))
 	for index, value := range values {
 		if bytes, ok := value.([]byte); ok {
-			row[index] = append([]byte(nil), bytes...)
+			owned := make([]byte, len(bytes))
+			copy(owned, bytes)
+			row[index] = owned
 			continue
 		}
 		row[index] = value

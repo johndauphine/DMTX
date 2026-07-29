@@ -65,21 +65,50 @@ func (adapter *postgresTargetAdapter) Engine() string {
 	return "postgres"
 }
 
-func (adapter *postgresTargetAdapter) PrepareTable(
-	ctx context.Context,
+func (adapter *postgresTargetAdapter) PlanTable(
+	sourceEngine string,
 	sourceTable schema.Table,
 	mode string,
 ) (schema.Table, error) {
-	targetTable := postgresTargetTable(sourceTable, adapter.namespace)
-	if err := preparePostgresTarget(
-		ctx,
-		adapter.database,
+	mode, err := normalizeAdapterTargetMode(mode)
+	if err != nil {
+		return schema.Table{}, err
+	}
+	projected, err := projectPostgresSourceTable(sourceEngine, sourceTable)
+	if err != nil {
+		return schema.Table{}, err
+	}
+	targetTable := postgresTargetTable(projected, adapter.namespace)
+	if _, err := schema.DropTable(schema.Postgres, targetTable); err != nil {
+		return schema.Table{}, fmt.Errorf(
+			"plan PostgreSQL table %s: %w",
+			targetTable.Name,
+			err,
+		)
+	}
+	if _, err := schema.CreateTable(schema.Postgres, targetTable); err != nil {
+		return schema.Table{}, fmt.Errorf(
+			"plan PostgreSQL table %s: %w",
+			targetTable.Name,
+			err,
+		)
+	}
+	if err := validatePostgresWriteShape(
 		targetTable,
+		adapterColumnNames(targetTable),
 		mode,
 	); err != nil {
 		return schema.Table{}, err
 	}
 	return targetTable, nil
+}
+
+func (adapter *postgresTargetAdapter) PrepareTable(
+	ctx context.Context,
+	targetTable schema.Table,
+	mode string,
+) error {
+	return preparePostgresTarget(ctx, adapter.database, targetTable, mode)
 }
 
 func (adapter *postgresTargetAdapter) WriteBatch(

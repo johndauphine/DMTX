@@ -39,17 +39,61 @@ func (adapter *sqliteTargetAdapter) Engine() string {
 	return "sqlite"
 }
 
-func (adapter *sqliteTargetAdapter) PrepareTable(
-	ctx context.Context,
+func (adapter *sqliteTargetAdapter) PlanTable(
+	sourceEngine string,
 	sourceTable schema.Table,
 	mode string,
 ) (schema.Table, error) {
-	targetTable := sourceTable
-	targetTable.Schema = ""
-	if err := prepareTarget(ctx, adapter.database, targetTable, mode); err != nil {
+	if _, err := normalizeAdapterTargetMode(mode); err != nil {
 		return schema.Table{}, err
 	}
+	switch sourceEngine {
+	case "postgres", "mysql", "mssql", "sqlite":
+	default:
+		return schema.Table{}, fmt.Errorf(
+			"SQLite target does not support source engine %q",
+			sourceEngine,
+		)
+	}
+	targetTable := sourceTable
+	targetTable.Schema = ""
+	if _, err := schema.DropTable(schema.SQLite, targetTable); err != nil {
+		return schema.Table{}, fmt.Errorf(
+			"plan SQLite table %s: %w",
+			targetTable.Name,
+			err,
+		)
+	}
+	if _, err := schema.CreateTable(schema.SQLite, targetTable); err != nil {
+		return schema.Table{}, fmt.Errorf(
+			"plan SQLite table %s: %w",
+			targetTable.Name,
+			err,
+		)
+	}
+	if _, err := schema.CreateIndexes(schema.SQLite, targetTable); err != nil {
+		return schema.Table{}, fmt.Errorf(
+			"plan SQLite indexes for %s: %w",
+			targetTable.Name,
+			err,
+		)
+	}
+	if _, err := schema.SQLiteSequencePlan(targetTable); err != nil {
+		return schema.Table{}, fmt.Errorf(
+			"plan SQLite sequence for %s: %w",
+			targetTable.Name,
+			err,
+		)
+	}
 	return targetTable, nil
+}
+
+func (adapter *sqliteTargetAdapter) PrepareTable(
+	ctx context.Context,
+	targetTable schema.Table,
+	mode string,
+) error {
+	return prepareTarget(ctx, adapter.database, targetTable, mode)
 }
 
 func (adapter *sqliteTargetAdapter) WriteBatch(

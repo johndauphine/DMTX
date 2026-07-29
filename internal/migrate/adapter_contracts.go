@@ -31,11 +31,13 @@ type sourceAdapter interface {
 	Close() error
 }
 
-// targetAdapter owns target schema preparation, durable writes, and
-// target-side counts. It never discovers or reads source tables.
+// targetAdapter owns target schema planning, preparation, durable writes, and
+// target-side counts. PlanTable is deliberately context-free: it must remain a
+// pure transformation that performs no I/O or target mutation.
 type targetAdapter interface {
 	Engine() string
-	PrepareTable(context.Context, schema.Table, string) (schema.Table, error)
+	PlanTable(string, schema.Table, string) (schema.Table, error)
+	PrepareTable(context.Context, schema.Table, string) error
 	WriteBatch(
 		context.Context,
 		schema.Table,
