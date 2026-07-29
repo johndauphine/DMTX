@@ -38,7 +38,12 @@ func TestPostgresRetainedIndexAndForeignKeyPreflightLive(t *testing.T) {
 		name   string
 		object string
 		mutate postgresRetainedObjectLiveMutation
+		accept bool
 	}{
+		{
+			name:   "ordinary unique index",
+			accept: true,
+		},
 		{
 			name:   "missing secondary index",
 			object: "secondary index",
@@ -103,6 +108,36 @@ func TestPostgresRetainedIndexAndForeignKeyPreflightLive(t *testing.T) {
 						postgresQualified(namespace, "accounts")+
 						" ("+postgresIdentifier("balance")+", "+
 						postgresIdentifier("status")+")",
+				)
+				return err
+			},
+		},
+		{
+			name:   "changed unique null semantics",
+			object: "secondary index",
+			mutate: func(
+				ctx context.Context,
+				database *sql.DB,
+				namespace string,
+			) error {
+				if _, err := database.ExecContext(
+					ctx,
+					"DROP INDEX "+
+						postgresQualified(
+							namespace,
+							"accounts_external_id_uq",
+						),
+				); err != nil {
+					return err
+				}
+				_, err := database.ExecContext(
+					ctx,
+					"CREATE UNIQUE INDEX "+
+						postgresIdentifier("accounts_external_id_uq")+
+						" ON "+postgresQualified(namespace, "accounts")+
+						" ("+postgresIdentifier("external_id")+
+						` COLLATE "pg_catalog"."C" ASC NULLS FIRST)`+
+						" NULLS NOT DISTINCT",
 				)
 				return err
 			},
@@ -198,12 +233,13 @@ func TestPostgresRetainedIndexAndForeignKeyPreflightLive(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			runPostgresRetainedObjectPreflightLiveCase(
+			runPostgresRetainedObjectPreflightLiveCaseWithExpectation(
 				t,
 				dsn,
 				parsed,
 				test.object,
 				test.mutate,
+				test.accept,
 			)
 		})
 	}
@@ -215,6 +251,25 @@ func runPostgresRetainedObjectPreflightLiveCase(
 	parsed *pgx.ConnConfig,
 	object string,
 	mutate postgresRetainedObjectLiveMutation,
+) {
+	t.Helper()
+	runPostgresRetainedObjectPreflightLiveCaseWithExpectation(
+		t,
+		dsn,
+		parsed,
+		object,
+		mutate,
+		false,
+	)
+}
+
+func runPostgresRetainedObjectPreflightLiveCaseWithExpectation(
+	t *testing.T,
+	dsn string,
+	parsed *pgx.ConnConfig,
+	object string,
+	mutate postgresRetainedObjectLiveMutation,
+	accept bool,
 ) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -275,17 +330,33 @@ func runPostgresRetainedObjectPreflightLiveCase(
 	); err != nil {
 		t.Fatalf("prepare retained-object target: %v", err)
 	}
-	if err := mutate(ctx, database, namespace); err != nil {
-		t.Fatalf("mutate retained PostgreSQL %s fixture: %v", object, err)
+	if mutate != nil {
+		if err := mutate(ctx, database, namespace); err != nil {
+			t.Fatalf("mutate retained PostgreSQL %s fixture: %v", object, err)
+		}
 	}
 	updateSQLitePostgresRichSource(t, ctx, sourcePath)
 
 	observer := &sqlitePostgresLiveObserver{}
-	_, err = SQLiteToPostgresWithObserver(
+	result, err := SQLiteToPostgresWithObserver(
 		ctx,
 		sqlitePostgresRichConfig(sourcePath, endpoint, "upsert"),
 		observer,
 	)
+	if accept {
+		if err != nil {
+			t.Fatalf("ordinary retained unique index preflight: %v", err)
+		}
+		if result.Tables != 2 ||
+			result.Rows != 7 ||
+			!result.Validated {
+			t.Fatalf(
+				"ordinary retained unique index result = %+v",
+				result,
+			)
+		}
+		return
+	}
 	if err == nil || !strings.Contains(err.Error(), object) {
 		t.Fatalf("retained %s preflight error = %v", object, err)
 	}

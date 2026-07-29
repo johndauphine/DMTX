@@ -164,6 +164,80 @@ func TestRenderSQLiteCheckForPostgresUsesDeclaredTypeFamily(t *testing.T) {
 	}
 }
 
+func TestRenderPortableCheckFailsClosedOnIntegerDecimalsAndFixedChar(
+	t *testing.T,
+) {
+	tests := []struct {
+		name       string
+		expression string
+		column     Column
+	}{
+		{
+			name:       "integer decimal comparison",
+			expression: `id >= 0.5`,
+			column:     Column{Name: "id", Type: "integer"},
+		},
+		{
+			name:       "integer decimal IN",
+			expression: `id IN (1, 2.0)`,
+			column:     Column{Name: "id", Type: "integer"},
+		},
+		{
+			name:       "fixed char equality",
+			expression: `code = 'A'`,
+			column: Column{
+				Name: "code",
+				Type: "char",
+				DeclaredType: &DeclaredType{
+					Base:      "char",
+					Arguments: []int{4},
+				},
+			},
+		},
+		{
+			name:       "fixed char IN",
+			expression: `code IN ('A', 'B')`,
+			column: Column{
+				Name: "code",
+				Type: "char",
+				DeclaredType: &DeclaredType{
+					Base:      "char",
+					Arguments: []int{4},
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			expression, err := ParseSQLiteCheckExpression(test.expression)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := RenderSQLiteCheckForPostgres(
+				expression,
+				[]Column{test.column},
+			); err == nil {
+				t.Fatal("expected CHECK to fail closed")
+			}
+		})
+	}
+
+	nullCheck, err := ParseSQLiteCheckExpression(`code IS NULL`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RenderSQLiteCheckForPostgres(nullCheck, []Column{{
+		Name: "code",
+		Type: "char",
+		DeclaredType: &DeclaredType{
+			Base:      "char",
+			Arguments: []int{4},
+		},
+	}}); err != nil {
+		t.Fatalf("fixed CHAR IS NULL should remain portable: %v", err)
+	}
+}
+
 func TestRenderSQLiteCheckForPostgresQuotesUntrustedStructure(t *testing.T) {
 	columnName := `x"; DROP TABLE accounts; --`
 	source := `"x""; DROP TABLE accounts; --" = 1`

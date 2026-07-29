@@ -22,6 +22,7 @@ func TestPlanPostgresRetainedIndexesAndForeignKeys(t *testing.T) {
 	index := accountIndexes[0]
 	if index.name != "accounts_external_id_uq" ||
 		!index.unique ||
+		index.nullsNotDistinct ||
 		index.method != "btree" ||
 		index.keyColumns != 1 ||
 		index.totalColumns != 1 ||
@@ -87,6 +88,15 @@ func TestValidatePostgresRetainedIndexesRejectsMissingExtraAndChanged(
 			actual: func() []postgresRetainedIndex {
 				changed := clonePostgresRetainedIndex(expected)
 				changed.unique = false
+				return []postgresRetainedIndex{changed}
+			}(),
+			want: "differs from the planned shape",
+		},
+		{
+			name: "changed unique null semantics",
+			actual: func() []postgresRetainedIndex {
+				changed := clonePostgresRetainedIndex(expected)
+				changed.nullsNotDistinct = true
 				return []postgresRetainedIndex{changed}
 			}(),
 			want: "differs from the planned shape",
@@ -258,6 +268,7 @@ func TestValidatePostgresRetainedObjectsAcceptsExactShapes(t *testing.T) {
 func TestPostgresRetainedObjectQueriesUseStructuralCatalogFields(t *testing.T) {
 	indexFragments := []string{
 		"index_metadata.indisunique",
+		"index_metadata.indnullsnotdistinct",
 		"index_metadata.indoption",
 		"index_metadata.indcollation",
 		"index_metadata.indclass",

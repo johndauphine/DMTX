@@ -35,19 +35,33 @@ func ParsePostgresCheckSignature(
 	catalogExpression string,
 	targetColumns []Column,
 ) (PostgresCheckSignature, error) {
-	resolver, err := newPortableCheckColumnResolver(targetColumns)
-	if err != nil {
-		return "", err
-	}
-	textRelabelColumns, err := postgresCheckCatalogTextRelabelColumns(
+	root, err := parsePostgresCatalogCheckRoot(
+		catalogExpression,
 		targetColumns,
 	)
 	if err != nil {
 		return "", err
 	}
+	return makePostgresCheckSignature(root), nil
+}
+
+func parsePostgresCatalogCheckRoot(
+	catalogExpression string,
+	targetColumns []Column,
+) (*portableCheckNode, error) {
+	resolver, err := newPortableCheckColumnResolver(targetColumns)
+	if err != nil {
+		return nil, err
+	}
+	textRelabelColumns, err := postgresCheckCatalogTextRelabelColumns(
+		targetColumns,
+	)
+	if err != nil {
+		return nil, err
+	}
 	tokens, err := lexPostgresCheckCatalog(catalogExpression)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	parser := postgresCheckCatalogParser{
 		tokens:             tokens,
@@ -59,19 +73,19 @@ func ParsePostgresCheckSignature(
 	}
 	root, err := parser.parseExpression()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if parser.current().kind != postgresCheckCatalogTokenEOF {
-		return "", postgresCheckSignaturePolicy(
+		return nil, postgresCheckSignaturePolicy(
 			"unexpected catalog CHECK token",
 		)
 	}
 	if root.family != portableCheckBoolean {
-		return "", postgresCheckSignaturePolicy(
+		return nil, postgresCheckSignaturePolicy(
 			"catalog CHECK root is not boolean",
 		)
 	}
-	return makePostgresCheckSignature(root), nil
+	return root, nil
 }
 
 func postgresCheckCatalogTextRelabelColumns(
@@ -766,16 +780,19 @@ func (parser *postgresCheckCatalogParser) parsePrimary() (
 			return nil, err
 		}
 		node = &portableCheckNode{
-			kind:   portableCheckNodeColumn,
-			family: column.family,
-			text:   column.name,
+			kind:        portableCheckNodeColumn,
+			family:      column.family,
+			numericKind: column.numericKind,
+			integral:    column.integral,
+			text:        column.name,
 		}
 	case postgresCheckCatalogTokenNumber:
 		parser.advance()
 		node = &portableCheckNode{
-			kind:   portableCheckNodeNumber,
-			family: portableCheckNumeric,
-			text:   token.text,
+			kind:        portableCheckNodeNumber,
+			family:      portableCheckNumeric,
+			numericKind: portableCheckNumericUntyped,
+			text:        token.text,
 		}
 	case postgresCheckCatalogTokenString:
 		parser.advance()
@@ -881,6 +898,15 @@ func (parser *postgresCheckCatalogParser) parseCast(
 				"numeric literal has incompatible catalog cast",
 			)
 		}
+		if node.numericKind != portableCheckNumericUntyped {
+			return nil, postgresCheckSignaturePolicy(
+				"repeated numeric literal casts are unsupported",
+			)
+		}
+		node.numericKind = postgresCatalogNumericKind(name)
+		if node.numericKind == portableCheckNumericInvalid {
+			return nil, postgresCheckSignaturePolicy("unsupported numeric cast")
+		}
 	case portableCheckNodeString:
 		if family == portableCheckNumeric {
 			canonical, err := canonicalPostgresCatalogNumber(node.text)
@@ -888,9 +914,10 @@ func (parser *postgresCheckCatalogParser) parseCast(
 				return nil, err
 			}
 			replacement := &portableCheckNode{
-				kind:   portableCheckNodeNumber,
-				family: portableCheckNumeric,
-				text:   canonical,
+				kind:        portableCheckNodeNumber,
+				family:      portableCheckNumeric,
+				numericKind: postgresCatalogNumericKind(name),
+				text:        canonical,
 			}
 			if parser.collated[node] {
 				parser.collated[replacement] = true
@@ -910,6 +937,9 @@ func (parser *postgresCheckCatalogParser) parseCast(
 		}
 	case portableCheckNodeNull:
 		parser.nullCastFamily[node] = family
+		if family == portableCheckNumeric {
+			node.numericKind = postgresCatalogNumericKind(name)
+		}
 	case portableCheckNodeColumn:
 		if name != "text" || family != portableCheckText ||
 			!parser.textRelabelColumns[node.text] ||
@@ -991,6 +1021,25 @@ func (parser *postgresCheckCatalogParser) parseTypeName() (
 		return portableCheckInvalid, "", postgresCheckSignaturePolicy(
 			"unsupported catalog cast type",
 		)
+	}
+}
+
+func postgresCatalogNumericKind(name string) portableCheckNumericKind {
+	switch name {
+	case "smallint":
+		return portableCheckNumericInt16
+	case "integer":
+		return portableCheckNumericInt32
+	case "bigint":
+		return portableCheckNumericInt64
+	case "numeric", "decimal":
+		return portableCheckNumericExact
+	case "real":
+		return portableCheckNumericFloat32
+	case "double precision":
+		return portableCheckNumericFloat64
+	default:
+		return portableCheckNumericInvalid
 	}
 }
 
@@ -1111,10 +1160,21 @@ func (parser *postgresCheckCatalogParser) parseAny(
 					"ANY NULL cast is incompatible",
 				)
 			}
+			if cast, ok := parser.nullCastFamily[value]; ok &&
+				cast == portableCheckNumeric &&
+				left.family == portableCheckNumeric &&
+				value.numericKind != left.numericKind {
+				return nil, postgresCheckSignaturePolicy(
+					"ANY numeric NULL cast does not match its column",
+				)
+			}
 		} else if value.family != left.family {
 			return nil, postgresCheckSignaturePolicy(
 				"ANY contains a cross-family literal",
 			)
+		}
+		if err := validatePortableCheckNumericOperands(left, value); err != nil {
+			return nil, err
 		}
 		values = append(values, value)
 		if !parser.match(postgresCheckCatalogTokenComma) {
@@ -1217,12 +1277,28 @@ func (parser *postgresCheckCatalogParser) validateNullCast(
 				"NULL cast is incompatible with comparison",
 			)
 		}
+		if cast, ok := parser.nullCastFamily[left]; ok &&
+			cast == portableCheckNumeric &&
+			right.family == portableCheckNumeric &&
+			left.numericKind != right.numericKind {
+			return postgresCheckSignaturePolicy(
+				"numeric NULL cast does not match column subtype",
+			)
+		}
 	}
 	if right.family == portableCheckNull {
 		if cast, ok := parser.nullCastFamily[right]; ok &&
 			left.family != portableCheckNull && cast != left.family {
 			return postgresCheckSignaturePolicy(
 				"NULL cast is incompatible with comparison",
+			)
+		}
+		if cast, ok := parser.nullCastFamily[right]; ok &&
+			cast == portableCheckNumeric &&
+			left.family == portableCheckNumeric &&
+			right.numericKind != left.numericKind {
+			return postgresCheckSignaturePolicy(
+				"numeric NULL cast does not match column subtype",
 			)
 		}
 	}

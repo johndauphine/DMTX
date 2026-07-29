@@ -87,7 +87,7 @@ func (adapter *postgresTargetAdapter) PreflightTables(
 				err,
 			)
 		}
-		if targetTable.AutoIncrementColumn != "" {
+		if targetTable.Identity != nil {
 			if err := preflightPostgresIdentitySequence(
 				ctx,
 				adapter.database,
@@ -386,7 +386,8 @@ func validatePostgresUpsertCatalogShape(
 			)
 		}
 		expectedIdentity := ""
-		if plannedColumn.Name == planned.AutoIncrementColumn {
+		if planned.Identity != nil &&
+			plannedColumn.Name == planned.Identity.Column {
 			expectedIdentity = "d"
 		}
 		if actualColumn.identity != expectedIdentity {

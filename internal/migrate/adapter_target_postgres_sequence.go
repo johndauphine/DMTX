@@ -102,19 +102,20 @@ func readPostgresIdentitySequenceState(
 	database postgresQueryRower,
 	table schema.Table,
 ) (postgresIdentitySequenceState, error) {
-	if table.AutoIncrementColumn == "" {
+	if table.Identity == nil {
 		return postgresIdentitySequenceState{}, fmt.Errorf(
 			"PostgreSQL identity column is not configured for table %s",
 			table.Name,
 		)
 	}
+	identityColumn := table.Identity.Column
 	var state postgresIdentitySequenceState
 	err := database.QueryRowContext(
 		ctx,
 		postgresIdentitySequenceCatalogQuery,
 		table.Schema,
 		table.Name,
-		table.AutoIncrementColumn,
+		identityColumn,
 	).Scan(
 		&state.objectID,
 		&state.namespace,
@@ -136,7 +137,7 @@ func readPostgresIdentitySequenceState(
 		return postgresIdentitySequenceState{}, fmt.Errorf(
 			"PostgreSQL table %s identity sequence is missing or is not owned by column %s",
 			table.Name,
-			table.AutoIncrementColumn,
+			identityColumn,
 		)
 	}
 	if err != nil {
@@ -213,7 +214,7 @@ func postgresIdentitySequenceFrontier(
 ) (int64, bool, error) {
 	if sourceSequence != nil && *sourceSequence < 0 {
 		return 0, false, fmt.Errorf(
-			"SQLite AUTOINCREMENT sequence cannot be negative",
+			"source identity frontier cannot be negative",
 		)
 	}
 	frontier := int64(0)
@@ -263,7 +264,7 @@ func finalizePostgresIdentitySequences(
 ) error {
 	identityTables := make([]schema.Table, 0, len(tables))
 	for _, table := range tables {
-		if table.AutoIncrementColumn != "" {
+		if table.Identity != nil {
 			identityTables = append(identityTables, table)
 		}
 	}
@@ -337,7 +338,7 @@ func finalizePostgresIdentitySequences(
 		var targetMaximum sql.NullInt64
 		if err := transaction.QueryRowContext(
 			ctx,
-			"SELECT MAX("+postgresIdentifier(table.AutoIncrementColumn)+
+			"SELECT MAX("+postgresIdentifier(table.Identity.Column)+
 				") FROM "+postgresQualified(table.Schema, table.Name),
 		).Scan(&targetMaximum); err != nil {
 			return fmt.Errorf(
@@ -347,7 +348,7 @@ func finalizePostgresIdentitySequences(
 			)
 		}
 		frontier, set, err := postgresIdentitySequenceFrontier(
-			table.SQLiteSequence,
+			table.Identity.Frontier,
 			targetMaximum,
 			state.lastValue,
 		)

@@ -17,6 +17,25 @@ const (
 	ClickHouse Dialect = "clickhouse"
 )
 
+// IdentityGeneration describes how a target generates values when an
+// identity column is omitted from an INSERT. Stage 3 supports only BY DEFAULT
+// identities because migrations must remain able to load explicit source keys.
+type IdentityGeneration string
+
+const (
+	IdentityByDefault IdentityGeneration = "by_default"
+)
+
+// Identity is engine-neutral metadata for the narrow identity shape DMTX can
+// preserve exactly across supported engines. Frontier is the greatest value
+// already allocated by the source generator, even when no row currently owns
+// that value.
+type Identity struct {
+	Column     string
+	Generation IdentityGeneration
+	Frontier   *int64
+}
+
 type Column struct {
 	Name, Type         string
 	Nullable           bool
@@ -91,15 +110,14 @@ type CheckConstraint struct {
 }
 
 type Table struct {
-	Schema, Name        string
-	Columns             []Column
-	Indexes             []Index
-	ForeignKeys         []ForeignKey
-	Checks              []CheckConstraint
-	AutoIncrementColumn string
-	SQLiteSequence      *int64
-	SQLiteWithoutRowID  bool
-	SQLiteStrict        bool
+	Schema, Name       string
+	Identity           *Identity
+	Columns            []Column
+	Indexes            []Index
+	ForeignKeys        []ForeignKey
+	Checks             []CheckConstraint
+	SQLiteWithoutRowID bool
+	SQLiteStrict       bool
 }
 
 type PolicyError struct{ Operation, Type, Target string }
@@ -253,11 +271,25 @@ func CreateTable(target Dialect, table Table) (string, error) {
 			return "", err
 		}
 	}
-	parts, pk := make([]string, 0, len(table.Columns)+1), make([]string, 0)
-	for _, column := range table.Columns {
-		typ, err := renderColumnType(column, target)
+	sqliteIdentity := ""
+	if target == SQLite {
+		var err error
+		sqliteIdentity, err = sqliteIdentityColumn(table)
 		if err != nil {
 			return "", err
+		}
+	}
+	parts, pk := make([]string, 0, len(table.Columns)+1), make([]string, 0)
+	for _, column := range table.Columns {
+		var typ string
+		if target == SQLite && column.Name == sqliteIdentity {
+			typ = "INTEGER"
+		} else {
+			var err error
+			typ, err = renderColumnType(column, target)
+			if err != nil {
+				return "", err
+			}
 		}
 		nullability := " NOT NULL"
 		if column.Nullable {
@@ -275,13 +307,13 @@ func CreateTable(target Dialect, table Table) (string, error) {
 			}
 			definition += " DEFAULT " + renderedDefault
 		}
-		if target == SQLite && column.Name == table.AutoIncrementColumn {
+		if target == SQLite && column.Name == sqliteIdentity {
 			definition += " PRIMARY KEY AUTOINCREMENT"
 		}
 		parts = append(parts, definition)
 	}
 	for _, column := range orderedPrimaryKeyColumns(table) {
-		if target == SQLite && column.Name == table.AutoIncrementColumn {
+		if target == SQLite && column.Name == sqliteIdentity {
 			continue
 		}
 		pk = append(pk, quote(target, column.Name))

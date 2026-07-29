@@ -14,6 +14,11 @@ func TestPlanPostgresDropRecreateRelationNamesIncludesAllRelations(
 	planned, err := planPostgresDropRecreateRelationNames([]schema.Table{{
 		Schema: "archive",
 		Name:   "accounts",
+		Identity: &schema.Identity{
+			Column:     "id",
+			Generation: schema.IdentityByDefault,
+			Frontier:   &sequence,
+		},
 		Columns: []schema.Column{
 			{
 				Name:               "id",
@@ -31,8 +36,6 @@ func TestPlanPostgresDropRecreateRelationNamesIncludesAllRelations(
 				Collation: "BINARY",
 			}},
 		}},
-		AutoIncrementColumn: "id",
-		SQLiteSequence:      &sequence,
 	}})
 	if err != nil {
 		t.Fatal(err)

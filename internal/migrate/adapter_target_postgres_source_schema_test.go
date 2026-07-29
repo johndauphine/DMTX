@@ -188,7 +188,7 @@ func TestPostgresTargetPlansNetworkSourceWithoutMutation(t *testing.T) {
 }
 
 func TestPostgresTargetRejectsUnmappedSQLiteSchemaSemantics(t *testing.T) {
-	sequence := int64(7)
+	negative := int64(-1)
 	tests := []struct {
 		name      string
 		operation string
@@ -202,17 +202,24 @@ func TestPostgresTargetRejectsUnmappedSQLiteSchemaSemantics(t *testing.T) {
 			},
 		},
 		{
-			name:      "autoincrement",
-			operation: "map SQLite AUTOINCREMENT",
+			name:      "invalid identity generation",
+			operation: "render PostgreSQL identity",
 			mutate: func(table *schema.Table) {
-				table.AutoIncrementColumn = "id"
+				table.Identity = &schema.Identity{
+					Column:     "id",
+					Generation: "always",
+				}
 			},
 		},
 		{
-			name:      "sequence",
-			operation: "map SQLite AUTOINCREMENT",
+			name:      "negative identity frontier",
+			operation: "render PostgreSQL identity",
 			mutate: func(table *schema.Table) {
-				table.SQLiteSequence = &sequence
+				table.Identity = &schema.Identity{
+					Column:     "id",
+					Generation: schema.IdentityByDefault,
+					Frontier:   &negative,
+				}
 			},
 		},
 		{
@@ -533,9 +540,12 @@ func TestPostgresTargetPlansSQLiteObjectsAndIdentityWithoutMutation(
 				}},
 			},
 			{
-				Name:                "accounts",
-				AutoIncrementColumn: "id",
-				SQLiteSequence:      &sequence,
+				Name: "accounts",
+				Identity: &schema.Identity{
+					Column:     "id",
+					Generation: schema.IdentityByDefault,
+					Frontier:   &sequence,
+				},
 				Columns: []schema.Column{
 					{
 						Name:               "id",
@@ -593,9 +603,11 @@ func TestPostgresTargetPlansSQLiteObjectsAndIdentityWithoutMutation(
 	if len(planned) != 2 ||
 		planned[0].Schema != "archive" ||
 		planned[1].Schema != "archive" ||
-		planned[1].AutoIncrementColumn != "id" ||
-		planned[1].SQLiteSequence == nil ||
-		*planned[1].SQLiteSequence != 50 ||
+		planned[1].Identity == nil ||
+		planned[1].Identity.Column != "id" ||
+		planned[1].Identity.Generation != schema.IdentityByDefault ||
+		planned[1].Identity.Frontier == nil ||
+		*planned[1].Identity.Frontier != 50 ||
 		planned[1].Columns[0].Type != "bigint" ||
 		len(planned[1].Indexes) != 1 ||
 		len(planned[1].Checks) != 1 ||

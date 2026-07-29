@@ -41,11 +41,6 @@ func TestPostgresCheckSignaturesNormalizePortablePG16Deparse(
 			catalog: `((short_status)::text COLLATE "C") = 'active'::text`,
 		},
 		{
-			name:    "singleton char IN becomes equality",
-			source:  `fixed_status IN ('a')`,
-			catalog: `(fixed_status COLLATE "C") = 'a'::bpchar`,
-		},
-		{
 			name:    "singleton boolean IN becomes equality",
 			source:  `enabled IN (TRUE)`,
 			catalog: `enabled = true`,

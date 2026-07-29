@@ -10,7 +10,13 @@ import (
 )
 
 func TestValidatePostgresIdentitySequenceStateAcceptsExactShape(t *testing.T) {
-	table := schema.Table{Name: "accounts", AutoIncrementColumn: "id"}
+	table := schema.Table{
+		Name: "accounts",
+		Identity: &schema.Identity{
+			Column:     "id",
+			Generation: schema.IdentityByDefault,
+		},
+	}
 	if err := validatePostgresIdentitySequenceState(
 		table,
 		exactPostgresIdentitySequenceState(),
@@ -70,7 +76,13 @@ func TestValidatePostgresIdentitySequenceStateFailsClosed(t *testing.T) {
 			state.lastValue = sql.NullInt64{Int64: 0, Valid: true}
 		}},
 	}
-	table := schema.Table{Name: "accounts", AutoIncrementColumn: "id"}
+	table := schema.Table{
+		Name: "accounts",
+		Identity: &schema.Identity{
+			Column:     "id",
+			Generation: schema.IdentityByDefault,
+		},
+	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			state := exactPostgresIdentitySequenceState()
@@ -227,7 +239,10 @@ func TestPostgresIdentitySequenceRestartUsesTransactionalSequenceLock(
 
 func TestValidatePostgresUpsertCatalogShapeAcceptsOnlyPlannedIdentity(t *testing.T) {
 	planned := postgresUpsertPreflightPlannedTable()
-	planned.AutoIncrementColumn = "id"
+	planned.Identity = &schema.Identity{
+		Column:     "id",
+		Generation: schema.IdentityByDefault,
+	}
 	actual := postgresUpsertPreflightCatalogShape()
 	actual.columns[0].identity = "d"
 	if err := validatePostgresUpsertCatalogShape(planned, actual); err != nil {

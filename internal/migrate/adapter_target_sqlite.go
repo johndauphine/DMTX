@@ -59,6 +59,7 @@ func (adapter *sqliteTargetAdapter) PlanTables(
 	for _, sourceTable := range sourceTables {
 		targetTable := sourceTable
 		targetTable.Schema = ""
+		targetTable.Identity = cloneSchemaIdentity(sourceTable.Identity)
 		if _, err := schema.DropTable(schema.SQLite, targetTable); err != nil {
 			return nil, fmt.Errorf(
 				"plan SQLite table %s: %w",
@@ -115,6 +116,29 @@ func (adapter *sqliteTargetAdapter) PreflightTables(
 				"preflight SQLite table %s: upsert requires an existing target table",
 				targetTable.Name,
 			)
+		}
+		if mode == "upsert" {
+			discovered, _, err := inspectSQLiteSchema(
+				ctx,
+				adapter.database,
+				targetTable.Name,
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"preflight SQLite table %s identity: %w",
+					targetTable.Name,
+					err,
+				)
+			}
+			if !sameSQLiteIdentityShape(
+				targetTable.Identity,
+				discovered.Identity,
+			) {
+				return fmt.Errorf(
+					"preflight SQLite table %s: target identity does not match the planned identity",
+					targetTable.Name,
+				)
+			}
 		}
 	}
 	return nil
@@ -176,6 +200,13 @@ func (adapter *sqliteTargetAdapter) FinalizeTables(
 		return err
 	}
 	if mode == "upsert" {
+		for _, targetTable := range targetTables {
+			if err := resetSQLiteSequence(
+				ctx, adapter.database, targetTable, nil,
+			); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	for _, targetTable := range targetTables {
@@ -189,6 +220,17 @@ func (adapter *sqliteTargetAdapter) FinalizeTables(
 		}
 	}
 	return nil
+}
+
+func sameSQLiteIdentityShape(
+	planned *schema.Identity,
+	discovered *schema.Identity,
+) bool {
+	if planned == nil || discovered == nil {
+		return planned == nil && discovered == nil
+	}
+	return planned.Column == discovered.Column &&
+		planned.Generation == discovered.Generation
 }
 
 func (adapter *sqliteTargetAdapter) Close() error {

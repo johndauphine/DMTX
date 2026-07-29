@@ -817,19 +817,21 @@ func finalizeSQLiteTarget(ctx context.Context, target *sql.DB, table schema.Tabl
 }
 
 func resetSQLiteSequence(ctx context.Context, target *sql.DB, table schema.Table, observer TableObserver) error {
-	if table.AutoIncrementColumn == "" || table.SQLiteSequence == nil {
+	if table.Identity == nil || table.Identity.Frontier == nil {
 		return nil
 	}
 	current, err := inspectSQLiteSequence(ctx, target, table.Name)
 	if err != nil {
 		return err
 	}
-	desired := *table.SQLiteSequence
+	desired := *table.Identity.Frontier
 	if current != nil && *current >= desired {
 		return nil
 	}
 	plannedTable := table
-	plannedTable.SQLiteSequence = &desired
+	identity := *table.Identity
+	identity.Frontier = &desired
+	plannedTable.Identity = &identity
 	plan, err := schema.SQLiteSequencePlan(plannedTable)
 	if err != nil {
 		return err

@@ -6,13 +6,16 @@ import (
 	"testing"
 )
 
-func TestCreatePostgresTableRendersSQLiteAutoIncrementIdentity(t *testing.T) {
+func TestCreatePostgresTableRendersNeutralIdentity(t *testing.T) {
 	frontier := int64(50)
 	table := Table{
-		Schema:              "archive",
-		Name:                "accounts",
-		AutoIncrementColumn: "id",
-		SQLiteSequence:      &frontier,
+		Schema: "archive",
+		Name:   "accounts",
+		Identity: &Identity{
+			Column:     "id",
+			Generation: IdentityByDefault,
+			Frontier:   &frontier,
+		},
 		Columns: []Column{
 			{
 				Name:               "id",
@@ -35,12 +38,15 @@ func TestCreatePostgresTableRendersSQLiteAutoIncrementIdentity(t *testing.T) {
 	}
 }
 
-func TestCreatePostgresTableRejectsInvalidSQLiteIdentityShapes(t *testing.T) {
+func TestCreatePostgresTableRejectsInvalidIdentityShapes(t *testing.T) {
 	frontier, negative := int64(50), int64(-1)
 	base := Table{
-		Name:                "accounts",
-		AutoIncrementColumn: "id",
-		SQLiteSequence:      &frontier,
+		Name: "accounts",
+		Identity: &Identity{
+			Column:     "id",
+			Generation: IdentityByDefault,
+			Frontier:   &frontier,
+		},
 		Columns: []Column{
 			{
 				Name:               "id",
@@ -56,21 +62,21 @@ func TestCreatePostgresTableRejectsInvalidSQLiteIdentityShapes(t *testing.T) {
 		mutate func(*Table)
 	}{
 		{
-			name: "sequence without identity",
+			name: "unsupported generation",
 			mutate: func(table *Table) {
-				table.AutoIncrementColumn = ""
+				table.Identity.Generation = "always"
 			},
 		},
 		{
-			name: "negative sequence",
+			name: "negative frontier",
 			mutate: func(table *Table) {
-				table.SQLiteSequence = &negative
+				table.Identity.Frontier = &negative
 			},
 		},
 		{
 			name: "missing column",
 			mutate: func(table *Table) {
-				table.AutoIncrementColumn = "missing"
+				table.Identity.Column = "missing"
 			},
 		},
 		{
@@ -101,13 +107,15 @@ func TestCreatePostgresTableRejectsInvalidSQLiteIdentityShapes(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			table := base
 			table.Columns = append([]Column(nil), base.Columns...)
+			identity := *base.Identity
+			table.Identity = &identity
 			test.mutate(&table)
 			_, err := CreateTable(Postgres, table)
 			var policy *PolicyError
 			if !errors.As(err, &policy) {
 				t.Fatalf("error = %v, want PolicyError", err)
 			}
-			if policy.Operation != "map SQLite AUTOINCREMENT" ||
+			if policy.Operation != "render PostgreSQL identity" ||
 				!strings.Contains(err.Error(), "accounts") {
 				t.Fatalf("unexpected identity policy error: %v", err)
 			}

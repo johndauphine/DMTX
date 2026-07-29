@@ -2,24 +2,24 @@ package schema
 
 import "strings"
 
-// postgresIdentityColumn validates the narrow identity shape that preserves
-// SQLite AUTOINCREMENT semantics on PostgreSQL. Explicit source keys remain
-// loadable through BY DEFAULT identity generation, while the migration layer
-// restores the sequence frontier after row transfer.
+// postgresIdentityColumn validates the engine-neutral identity shape supported
+// by PostgreSQL. Explicit source keys remain loadable through BY DEFAULT
+// identity generation, while the migration layer restores the source frontier
+// after row transfer.
 func postgresIdentityColumn(table Table) (string, error) {
-	if table.AutoIncrementColumn == "" {
-		if table.SQLiteSequence != nil {
-			return "", postgresIdentityPolicy(table.Name)
-		}
+	if table.Identity == nil {
 		return "", nil
 	}
-	if table.SQLiteSequence != nil && *table.SQLiteSequence < 0 {
+	identity := table.Identity
+	if identity.Generation != IdentityByDefault ||
+		identity.Column == "" ||
+		identity.Frontier != nil && *identity.Frontier < 0 {
 		return "", postgresIdentityPolicy(table.Name)
 	}
 
 	columnIndex := -1
 	for index, column := range table.Columns {
-		if column.Name == table.AutoIncrementColumn {
+		if column.Name == identity.Column {
 			columnIndex = index
 			break
 		}
@@ -29,7 +29,7 @@ func postgresIdentityColumn(table Table) (string, error) {
 	}
 
 	keys := orderedPrimaryKeyColumns(table)
-	if len(keys) != 1 || keys[0].Name != table.AutoIncrementColumn {
+	if len(keys) != 1 || keys[0].Name != identity.Column {
 		return "", postgresIdentityPolicy(table.Name)
 	}
 	column := table.Columns[columnIndex]
@@ -45,7 +45,7 @@ func postgresIdentityColumn(table Table) (string, error) {
 
 func postgresIdentityPolicy(table string) error {
 	return &PolicyError{
-		Operation: "map SQLite AUTOINCREMENT",
+		Operation: "render PostgreSQL identity",
 		Type:      table,
 		Target:    string(Postgres),
 	}

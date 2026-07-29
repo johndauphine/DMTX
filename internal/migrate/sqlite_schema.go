@@ -78,10 +78,16 @@ func inspectSQLiteSchema(ctx context.Context, database *sql.DB, name string) (sc
 	if err != nil {
 		return schema.Table{}, nil, err
 	}
-	if table.AutoIncrementColumn != "" {
-		table.SQLiteSequence, err = inspectSQLiteSequence(ctx, database, name)
+	if table.Identity != nil {
+		table.Identity.Frontier, err = inspectSQLiteSequence(ctx, database, name)
 		if err != nil {
 			return schema.Table{}, nil, err
+		}
+		if _, err := schema.SQLiteSequencePlan(table); err != nil {
+			return schema.Table{}, nil, fmt.Errorf(
+				"inspect SQLite identity for %s: %w",
+				name, err,
+			)
 		}
 	}
 	return table, names, nil
@@ -173,7 +179,10 @@ func applySQLiteCreateTableFeatures(table *schema.Table, statement string) error
 	if len(keys) != 1 || keys[0].DeclaredType == nil || keys[0].DeclaredType.Base != "integer" {
 		return &schema.PolicyError{Operation: "discover SQLite AUTOINCREMENT", Type: table.Name, Target: string(schema.SQLite)}
 	}
-	table.AutoIncrementColumn = keys[0].Name
+	table.Identity = &schema.Identity{
+		Column:     keys[0].Name,
+		Generation: schema.IdentityByDefault,
+	}
 	return nil
 }
 

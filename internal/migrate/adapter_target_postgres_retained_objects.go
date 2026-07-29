@@ -21,21 +21,22 @@ type postgresRetainedIndexColumn struct {
 }
 
 type postgresRetainedIndex struct {
-	name            string
-	unique          bool
-	valid           bool
-	ready           bool
-	live            bool
-	exclusion       bool
-	clustered       bool
-	replicaIdentity bool
-	method          string
-	keyColumns      int
-	totalColumns    int
-	partial         bool
-	expression      bool
-	constraintType  string
-	columns         []postgresRetainedIndexColumn
+	name             string
+	unique           bool
+	nullsNotDistinct bool
+	valid            bool
+	ready            bool
+	live             bool
+	exclusion        bool
+	clustered        bool
+	replicaIdentity  bool
+	method           string
+	keyColumns       int
+	totalColumns     int
+	partial          bool
+	expression       bool
+	constraintType   string
+	columns          []postgresRetainedIndexColumn
 }
 
 type postgresRetainedForeignKeyColumn struct {
@@ -332,6 +333,7 @@ const postgresRetainedIndexesQuery = `
 		index_relation.oid::bigint,
 		index_relation.relname,
 		index_metadata.indisunique,
+		index_metadata.indnullsnotdistinct,
 		index_metadata.indisvalid,
 		index_metadata.indisready,
 		index_metadata.indislive,
@@ -425,6 +427,7 @@ func readPostgresRetainedIndexes(
 			&objectID,
 			&index.name,
 			&index.unique,
+			&index.nullsNotDistinct,
 			&index.valid,
 			&index.ready,
 			&index.live,
@@ -735,6 +738,7 @@ func samePostgresRetainedIndex(
 ) bool {
 	if left.name != right.name ||
 		left.unique != right.unique ||
+		left.nullsNotDistinct != right.nullsNotDistinct ||
 		left.valid != right.valid ||
 		left.ready != right.ready ||
 		left.live != right.live ||

@@ -13,7 +13,9 @@ func projectPostgresSourceTable(
 ) (schema.Table, error) {
 	switch sourceEngine {
 	case "postgres", "mysql", "mssql":
-		return sourceTable, nil
+		projected := sourceTable
+		projected.Identity = cloneSchemaIdentity(sourceTable.Identity)
+		return projected, nil
 	case "sqlite":
 		return projectSQLiteTableForPostgres(sourceTable)
 	default:
@@ -45,7 +47,7 @@ func projectSQLiteTableForPostgres(
 			sourceTable.Name,
 		)
 	}
-	if sourceTable.AutoIncrementColumn == "" {
+	if sourceTable.Identity == nil {
 		if column, ok := sqliteImplicitRowIDAlias(sourceTable); ok {
 			return schema.Table{}, postgresSQLitePolicy(
 				"map SQLite implicit rowid identity",
@@ -59,6 +61,7 @@ func projectSQLiteTableForPostgres(
 	projected.Indexes = clonePostgresProjectionIndexes(sourceTable.Indexes)
 	projected.ForeignKeys = clonePostgresProjectionForeignKeys(sourceTable.ForeignKeys)
 	projected.Checks = append([]schema.CheckConstraint(nil), sourceTable.Checks...)
+	projected.Identity = cloneSchemaIdentity(sourceTable.Identity)
 	for index, sourceColumn := range sourceTable.Columns {
 		if sourceColumn.DeclaredType == nil {
 			return schema.Table{}, postgresSQLitePolicy(

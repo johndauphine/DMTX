@@ -159,12 +159,12 @@ func planPostgresDropRecreateRelationNames(
 				return nil, err
 			}
 		}
-		if table.AutoIncrementColumn != "" {
+		if table.Identity != nil {
 			if err := add(postgresPlannedRelationName{
 				namespace: table.Schema,
 				name: postgresAutomaticRelationName(
 					table.Name,
-					table.AutoIncrementColumn,
+					table.Identity.Column,
 					"seq",
 				),
 				kind:  "identity sequence",

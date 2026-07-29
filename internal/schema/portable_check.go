@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -59,6 +60,19 @@ const (
 	portableCheckNull
 )
 
+type portableCheckNumericKind uint8
+
+const (
+	portableCheckNumericInvalid portableCheckNumericKind = iota
+	portableCheckNumericInt16
+	portableCheckNumericInt32
+	portableCheckNumericInt64
+	portableCheckNumericExact
+	portableCheckNumericFloat32
+	portableCheckNumericFloat64
+	portableCheckNumericUntyped
+)
+
 type portableCheckNodeKind uint8
 
 const (
@@ -77,13 +91,15 @@ const (
 )
 
 type portableCheckNode struct {
-	kind     portableCheckNodeKind
-	family   portableCheckFamily
-	text     string
-	left     *portableCheckNode
-	right    *portableCheckNode
-	children []*portableCheckNode
-	negated  bool
+	kind        portableCheckNodeKind
+	family      portableCheckFamily
+	numericKind portableCheckNumericKind
+	text        string
+	left        *portableCheckNode
+	right       *portableCheckNode
+	children    []*portableCheckNode
+	negated     bool
+	integral    bool
 }
 
 func (node *portableCheckNode) isScalar() bool {
@@ -100,8 +116,10 @@ func (node *portableCheckNode) isScalar() bool {
 }
 
 type portableCheckColumn struct {
-	name   string
-	family portableCheckFamily
+	name        string
+	family      portableCheckFamily
+	numericKind portableCheckNumericKind
+	integral    bool
 }
 
 type portableCheckColumnResolver struct {
@@ -126,8 +144,10 @@ func newPortableCheckColumnResolver(
 			}
 		}
 		resolved[index] = portableCheckColumn{
-			name:   column.Name,
-			family: portableCheckColumnFamily(column),
+			name:        column.Name,
+			family:      portableCheckColumnFamily(column),
+			numericKind: portableCheckColumnNumericKind(column),
+			integral:    portableCheckColumnIsIntegral(column),
 		}
 	}
 	return portableCheckColumnResolver{columns: resolved}, nil
@@ -153,18 +173,50 @@ func portableCheckColumnFamily(column Column) portableCheckFamily {
 	case "bool", "boolean":
 		return portableCheckBoolean
 	case "int", "integer", "tinyint", "smallint", "mediumint", "bigint",
-		"unsigned big int", "int2", "int8", "real", "double",
-		"double precision", "float", "numeric", "decimal":
+		"unsigned big int", "int2", "int4", "int8", "real",
+		"float4", "float8", "double", "double precision", "float",
+		"numeric", "decimal":
 		return portableCheckNumeric
-	case "char", "character", "character varying", "varchar",
-		"varying character", "nchar", "native character", "nvarchar",
-		"text", "clob":
+	case "character varying", "varchar", "varying character",
+		"nvarchar", "text", "clob":
 		return portableCheckText
 	default:
 		// Every SQL value supports IS NULL. Other operations on types whose
 		// SQLite and PostgreSQL comparison semantics have not been proven
 		// equivalent remain fail-closed.
 		return portableCheckOpaque
+	}
+}
+
+func portableCheckColumnNumericKind(column Column) portableCheckNumericKind {
+	base := strings.ToLower(strings.TrimSpace(column.Type))
+	if column.DeclaredType != nil {
+		base = strings.ToLower(strings.TrimSpace(column.DeclaredType.Base))
+	}
+	switch base {
+	case "smallint", "int2":
+		return portableCheckNumericInt16
+	case "int", "integer", "int4", "tinyint", "mediumint":
+		return portableCheckNumericInt32
+	case "bigint", "int8", "unsigned big int":
+		return portableCheckNumericInt64
+	case "numeric", "decimal":
+		return portableCheckNumericExact
+	case "real", "float", "float4", "double", "double precision", "float8":
+		return portableCheckNumericFloat64
+	default:
+		return portableCheckNumericInvalid
+	}
+}
+
+func portableCheckColumnIsIntegral(column Column) bool {
+	switch portableCheckColumnNumericKind(column) {
+	case portableCheckNumericInt16,
+		portableCheckNumericInt32,
+		portableCheckNumericInt64:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -638,16 +690,19 @@ func (parser *portableCheckParser) parsePrimary() (
 			return nil, err
 		}
 		return &portableCheckNode{
-			kind:   portableCheckNodeColumn,
-			family: column.family,
-			text:   column.name,
+			kind:        portableCheckNodeColumn,
+			family:      column.family,
+			numericKind: column.numericKind,
+			text:        column.name,
+			integral:    column.integral,
 		}, nil
 	case portableCheckTokenNumber:
 		parser.advance()
 		return &portableCheckNode{
-			kind:   portableCheckNodeNumber,
-			family: portableCheckNumeric,
-			text:   token.text,
+			kind:        portableCheckNodeNumber,
+			family:      portableCheckNumeric,
+			numericKind: portableCheckNumericUntyped,
+			text:        token.text,
 		}, nil
 	case portableCheckTokenString:
 		parser.advance()
@@ -726,6 +781,9 @@ func (parser *portableCheckParser) parseIn(
 				"IN contains a cross-family literal",
 			)
 		}
+		if err := validatePortableCheckNumericOperands(left, value); err != nil {
+			return nil, err
+		}
 		values = append(values, value)
 		if !parser.match(portableCheckTokenComma) {
 			break
@@ -793,6 +851,9 @@ func validatePortableCheckComparison(
 			"comparison operands must be columns or literals",
 		)
 	}
+	if err := validatePortableCheckNumericOperands(left, right); err != nil {
+		return err
+	}
 	ordering := operator == portableCheckTokenLess ||
 		operator == portableCheckTokenLessEqual ||
 		operator == portableCheckTokenGreater ||
@@ -827,6 +888,93 @@ func validatePortableCheckComparison(
 	return nil
 }
 
+func validatePortableCheckNumericOperands(
+	left *portableCheckNode,
+	right *portableCheckNode,
+) error {
+	if left.family != portableCheckNumeric ||
+		right.family != portableCheckNumeric {
+		return nil
+	}
+	if left.kind == portableCheckNodeColumn &&
+		right.kind == portableCheckNodeColumn {
+		if left.numericKind == portableCheckNumericInvalid ||
+			left.numericKind != right.numericKind {
+			return portableCheckPolicy(
+				"numeric column comparison requires matching subtypes",
+			)
+		}
+		return nil
+	}
+	if left.kind == portableCheckNodeColumn &&
+		right.kind == portableCheckNodeNumber {
+		return validatePortableCheckColumnNumber(left, right)
+	}
+	if right.kind == portableCheckNodeColumn &&
+		left.kind == portableCheckNodeNumber {
+		return validatePortableCheckColumnNumber(right, left)
+	}
+	if left.kind == portableCheckNodeNumber &&
+		right.kind == portableCheckNodeNumber &&
+		left.numericKind != portableCheckNumericUntyped &&
+		right.numericKind != portableCheckNumericUntyped &&
+		left.numericKind != right.numericKind {
+		return portableCheckPolicy(
+			"numeric literals have incompatible subtypes",
+		)
+	}
+	return nil
+}
+
+func validatePortableCheckColumnNumber(
+	column *portableCheckNode,
+	number *portableCheckNode,
+) error {
+	if column.numericKind == portableCheckNumericInvalid {
+		return portableCheckPolicy("unsupported numeric column subtype")
+	}
+	if number.numericKind != portableCheckNumericUntyped &&
+		number.numericKind != column.numericKind {
+		return portableCheckPolicy(
+			"numeric literal cast does not match column subtype",
+		)
+	}
+	switch column.numericKind {
+	case portableCheckNumericInt16:
+		return validatePortableCheckIntegerRange(number.text, 16)
+	case portableCheckNumericInt32:
+		return validatePortableCheckIntegerRange(number.text, 32)
+	case portableCheckNumericInt64:
+		return validatePortableCheckIntegerRange(number.text, 64)
+	default:
+		return nil
+	}
+}
+
+func validatePortableCheckIntegerRange(value string, bits int) error {
+	if !portableCheckIntegerLiteral(value) {
+		return portableCheckPolicy(
+			"integer comparison requires an integer literal",
+		)
+	}
+	if _, err := strconv.ParseInt(value, 10, bits); err != nil {
+		return portableCheckPolicy(
+			"integer literal is outside the column range",
+		)
+	}
+	return nil
+}
+
+func portableCheckIntegerLiteral(value string) bool {
+	if value == "" {
+		return false
+	}
+	if value[0] == '+' || value[0] == '-' {
+		value = value[1:]
+	}
+	return value != "" && decimalDigits(value)
+}
+
 func portableCheckOperator(kind portableCheckTokenKind) string {
 	switch kind {
 	case portableCheckTokenEqual:
@@ -859,6 +1007,21 @@ func renderPortableCheck(
 	node *portableCheckNode,
 	parentPrecedence int,
 ) string {
+	return renderPortableCheckMode(node, parentPrecedence, true)
+}
+
+func renderCanonicalPortableCheck(
+	node *portableCheckNode,
+	parentPrecedence int,
+) string {
+	return renderPortableCheckMode(node, parentPrecedence, false)
+}
+
+func renderPortableCheckMode(
+	node *portableCheckNode,
+	parentPrecedence int,
+	binaryTextCollation bool,
+) string {
 	precedence := portableCheckNodePrecedence(node)
 	var rendered string
 	switch node.kind {
@@ -868,25 +1031,32 @@ func renderPortableCheck(
 		portableCheckNodeNull:
 		rendered = node.text
 	case portableCheckNodeString:
-		rendered = postgresStringLiteral(node.text)
+		if binaryTextCollation {
+			rendered = postgresStringLiteral(node.text)
+		} else {
+			rendered = portableCheckStringLiteral(node.text)
+		}
 	case portableCheckNodeComparison:
 		collateLeft, collateRight := portableCheckTextCollationOperands(
 			node.left,
 			node.right,
 		)
-		rendered = renderPortableCheckOperand(
+		rendered = renderPortableCheckOperandMode(
 			node.left,
 			portableCheckPrecedencePredicate,
-			collateLeft,
-		) + " " + node.text + " " + renderPortableCheckOperand(
+			binaryTextCollation && collateLeft,
+			binaryTextCollation,
+		) + " " + node.text + " " + renderPortableCheckOperandMode(
 			node.right,
 			portableCheckPrecedencePredicate,
-			collateRight,
+			binaryTextCollation && collateRight,
+			binaryTextCollation,
 		)
 	case portableCheckNodeIsNull:
-		rendered = renderPortableCheck(
+		rendered = renderPortableCheckMode(
 			node.left,
 			portableCheckPrecedencePredicate,
+			binaryTextCollation,
 		) + " IS "
 		if node.negated {
 			rendered += "NOT "
@@ -895,40 +1065,48 @@ func renderPortableCheck(
 	case portableCheckNodeIn:
 		values := make([]string, len(node.children))
 		for index, child := range node.children {
-			values[index] = renderPortableCheck(
+			values[index] = renderPortableCheckMode(
 				child,
 				portableCheckPrecedenceLowest,
+				binaryTextCollation,
 			)
 		}
-		rendered = renderPortableCheckOperand(
+		rendered = renderPortableCheckOperandMode(
 			node.left,
 			portableCheckPrecedencePredicate,
-			node.left.family == portableCheckText,
+			binaryTextCollation &&
+				node.left.family == portableCheckText,
+			binaryTextCollation,
 		) + " IN (" + strings.Join(values, ", ") + ")"
 	case portableCheckNodeNot:
-		child := renderPortableCheck(
+		child := renderPortableCheckMode(
 			node.left,
 			portableCheckPrecedenceLowest,
+			binaryTextCollation,
 		)
 		if !node.left.isScalar() {
 			child = "(" + child + ")"
 		}
 		rendered = "NOT " + child
 	case portableCheckNodeAnd:
-		rendered = renderPortableCheck(
+		rendered = renderPortableCheckMode(
 			node.left,
 			portableCheckPrecedenceAnd,
-		) + " AND " + renderPortableCheck(
+			binaryTextCollation,
+		) + " AND " + renderPortableCheckMode(
 			node.right,
 			portableCheckPrecedenceAnd,
+			binaryTextCollation,
 		)
 	case portableCheckNodeOr:
-		rendered = renderPortableCheck(
+		rendered = renderPortableCheckMode(
 			node.left,
 			portableCheckPrecedenceOr,
-		) + " OR " + renderPortableCheck(
+			binaryTextCollation,
+		) + " OR " + renderPortableCheckMode(
 			node.right,
 			portableCheckPrecedenceOr,
+			binaryTextCollation,
 		)
 	}
 	if precedence < parentPrecedence {
@@ -937,17 +1115,24 @@ func renderPortableCheck(
 	return rendered
 }
 
-func renderPortableCheckOperand(
+func renderPortableCheckOperandMode(
 	node *portableCheckNode,
 	parentPrecedence int,
 	binaryText bool,
+	binaryTextCollation bool,
 ) string {
-	rendered := renderPortableCheck(node, parentPrecedence)
+	rendered := renderPortableCheckMode(
+		node, parentPrecedence, binaryTextCollation,
+	)
 	if binaryText {
 		rendered += " COLLATE " +
 			qualified(Postgres, "pg_catalog", "C")
 	}
 	return rendered
+}
+
+func portableCheckStringLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func portableCheckTextCollationOperands(

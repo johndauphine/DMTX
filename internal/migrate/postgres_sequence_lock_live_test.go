@@ -69,9 +69,12 @@ func TestPostgresIdentitySequenceRestartLockLive(t *testing.T) {
 	})
 
 	table := schema.Table{
-		Schema:              namespace,
-		Name:                "items",
-		AutoIncrementColumn: "id",
+		Schema: namespace,
+		Name:   "items",
+		Identity: &schema.Identity{
+			Column:     "id",
+			Generation: schema.IdentityByDefault,
+		},
 		Columns: []schema.Column{{
 			Name:       "id",
 			Type:       "bigint",

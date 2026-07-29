@@ -898,6 +898,11 @@ func TestPlanPostgresObjectsReservesIdentitySequenceName(
 	frontier := int64(9)
 	table := Table{
 		Name: "accounts",
+		Identity: &Identity{
+			Column:     "id",
+			Generation: IdentityByDefault,
+			Frontier:   &frontier,
+		},
 		Columns: []Column{
 			{Name: "id", Type: "bigint", PrimaryKey: true},
 			{Name: "label", Type: "text"},
@@ -909,8 +914,6 @@ func TestPlanPostgresObjectsReservesIdentitySequenceName(
 				Collation: "BINARY",
 			}},
 		}},
-		AutoIncrementColumn: "id",
-		SQLiteSequence:      &frontier,
 	}
 	first, err := PlanPostgresDropRecreateObjects(
 		[]Table{table},

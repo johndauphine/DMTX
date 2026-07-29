@@ -210,7 +210,9 @@ func rejectSQLiteOnlySchema(target Dialect, table Table) error {
 		_, err := postgresIdentityColumn(table)
 		return err
 	}
-	if table.AutoIncrementColumn != "" || table.SQLiteSequence != nil || table.SQLiteStrict || table.SQLiteWithoutRowID || len(table.Indexes) > 0 || len(table.ForeignKeys) > 0 || len(table.Checks) > 0 {
+	if table.Identity != nil || table.SQLiteStrict || table.SQLiteWithoutRowID ||
+		len(table.Indexes) > 0 || len(table.ForeignKeys) > 0 ||
+		len(table.Checks) > 0 {
 		return &PolicyError{Operation: "map SQLite schema objects", Type: table.Name, Target: string(target)}
 	}
 	for _, column := range table.Columns {
@@ -349,12 +351,19 @@ type Statement struct {
 // SQLiteSequencePlan restores the source AUTOINCREMENT frontier after explicit
 // primary-key values have been loaded.
 func SQLiteSequencePlan(table Table) ([]Statement, error) {
-	if table.AutoIncrementColumn == "" || table.SQLiteSequence == nil {
+	if table.Identity == nil {
 		return nil, nil
 	}
+	if _, err := sqliteIdentityColumn(table); err != nil {
+		return nil, err
+	}
+	if table.Identity.Frontier == nil {
+		return nil, nil
+	}
+	frontier := *table.Identity.Frontier
 	return []Statement{
 		{SQL: `DELETE FROM sqlite_sequence WHERE name = ?`, Args: []any{table.Name}},
-		{SQL: `INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)`, Args: []any{table.Name, *table.SQLiteSequence}},
+		{SQL: `INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)`, Args: []any{table.Name, frontier}},
 	}, nil
 }
 
