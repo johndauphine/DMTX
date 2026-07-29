@@ -29,48 +29,107 @@ func SQLiteToPostgresWithObserver(
 	)
 }
 
-func preparePostgresTarget(
+func preparePostgresTargets(
 	ctx context.Context,
 	target *sql.DB,
-	table schema.Table,
-	mode string,
+	tables []schema.Table,
 ) error {
-	if mode == "drop_recreate" {
-		drop, err := schema.DropTable(schema.Postgres, table)
+	drop, err := schema.DropTables(schema.Postgres, tables)
+	if err != nil {
+		return fmt.Errorf("plan PostgreSQL target table set: %w", err)
+	}
+	creates := make([]string, len(tables))
+	for index, table := range tables {
+		creates[index], err = schema.CreateTable(schema.Postgres, table)
 		if err != nil {
-			return err
-		}
-		if _, err := target.ExecContext(ctx, drop); err != nil {
 			return fmt.Errorf(
-				"drop PostgreSQL table %s: %w",
+				"plan PostgreSQL table %s: %w",
 				table.Name,
 				err,
 			)
 		}
 	}
-	var exists bool
-	err := target.QueryRowContext(
-		ctx,
-		`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2)`,
-		table.Schema,
-		table.Name,
-	).Scan(&exists)
+
+	transaction, err := target.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("begin PostgreSQL target preparation: %w", err)
+	}
+	defer func() {
+		_ = transaction.Rollback()
+	}()
+	if _, err := transaction.ExecContext(ctx, drop); err != nil {
+		return fmt.Errorf("drop PostgreSQL target table set: %w", err)
+	}
+	for index, statement := range creates {
+		if _, err := transaction.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf(
+				"create PostgreSQL table %s: %w",
+				tables[index].Name,
+				err,
+			)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
 		return fmt.Errorf(
-			"check PostgreSQL table %s: %w",
-			table.Name,
+			"commit PostgreSQL target preparation: %w",
 			err,
 		)
 	}
-	if exists {
-		return nil
+	return nil
+}
+
+func finalizePostgresTargets(
+	ctx context.Context,
+	target *sql.DB,
+	tables []schema.Table,
+	mode string,
+) error {
+	var objectPlan []schema.PostgresObjectStatement
+	if mode == "drop_recreate" {
+		var err error
+		objectPlan, err = schema.PlanPostgresDropRecreateObjects(
+			tables,
+			schema.PostgresObjectPlanOptions{},
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"plan PostgreSQL post-load objects: %w",
+				err,
+			)
+		}
 	}
-	ddl, err := schema.CreateTable(schema.Postgres, table)
+	transaction, err := target.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("plan PostgreSQL table %s: %w", table.Name, err)
+		return fmt.Errorf("begin PostgreSQL target finalization: %w", err)
 	}
-	if _, err := target.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("create PostgreSQL table %s: %w", table.Name, err)
+	defer func() {
+		_ = transaction.Rollback()
+	}()
+	for _, statement := range objectPlan {
+		if _, err := transaction.ExecContext(
+			ctx,
+			statement.SQL,
+		); err != nil {
+			return fmt.Errorf(
+				"create PostgreSQL post-load object %s on table %s: %w",
+				statement.Name,
+				statement.Table,
+				err,
+			)
+		}
+	}
+	if err := finalizePostgresIdentitySequences(
+		ctx,
+		transaction,
+		tables,
+	); err != nil {
+		return err
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf(
+			"commit PostgreSQL target finalization: %w",
+			err,
+		)
 	}
 	return nil
 }

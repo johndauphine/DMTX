@@ -128,7 +128,7 @@ func TestValidatePostgresUpsertCatalogShapeFailsClosed(
 		},
 		{
 			name: "identity column",
-			want: "unsupported identity generation",
+			want: "identity generation differs",
 			mutate: func(shape *postgresCatalogTableShape) {
 				shape.columns[0].identity = "d"
 			},
@@ -274,6 +274,36 @@ func TestExpectedPostgresCatalogTypeMatchesRenderedScalarTypes(
 			want: postgresCatalogTypeShape{
 				name:               "timestamptz",
 				timestampPrecision: intPointer(6),
+			},
+		},
+		{
+			name: "declared timestamp precision",
+			column: schema.Column{
+				Name: "value",
+				Type: "timestamp",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "timestamp",
+					Arguments: []int{3},
+				},
+			},
+			want: postgresCatalogTypeShape{
+				name:               "timestamp",
+				timestampPrecision: intPointer(3),
+			},
+		},
+		{
+			name: "declared timestamp with time zone precision",
+			column: schema.Column{
+				Name: "value",
+				Type: "timestamptz",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "timestamptz",
+					Arguments: []int{2},
+				},
+			},
+			want: postgresCatalogTypeShape{
+				name:               "timestamptz",
+				timestampPrecision: intPointer(2),
 			},
 		},
 	}

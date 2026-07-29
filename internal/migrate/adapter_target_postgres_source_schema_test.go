@@ -230,27 +230,6 @@ func TestPostgresTargetRejectsUnmappedSQLiteSchemaSemantics(t *testing.T) {
 			},
 		},
 		{
-			name:      "index",
-			operation: "map SQLite indexes",
-			mutate: func(table *schema.Table) {
-				table.Indexes = []schema.Index{{Name: "events_id"}}
-			},
-		},
-		{
-			name:      "foreign key",
-			operation: "map SQLite foreign keys",
-			mutate: func(table *schema.Table) {
-				table.ForeignKeys = []schema.ForeignKey{{}}
-			},
-		},
-		{
-			name:      "check",
-			operation: "map SQLite checks",
-			mutate: func(table *schema.Table) {
-				table.Checks = []schema.CheckConstraint{{Name: "positive_id"}}
-			},
-		},
-		{
 			name:      "missing declared type",
 			operation: "map SQLite declared type",
 			mutate: func(table *schema.Table) {
@@ -511,5 +490,123 @@ func TestPostgresTargetPlanRejectsUnsupportedSourceAndNativeShape(
 		"drop_recreate",
 	); err == nil || !strings.Contains(err.Error(), "duplicate column") {
 		t.Fatalf("native shape error = %v", err)
+	}
+}
+
+func TestPostgresTargetPlansSQLiteObjectsAndIdentityWithoutMutation(
+	t *testing.T,
+) {
+	fixture := func() []schema.Table {
+		check, err := schema.ParseSQLiteCheckExpression("balance >= 0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sequence := int64(50)
+		return []schema.Table{
+			{
+				Name: "account_events",
+				Columns: []schema.Column{
+					{
+						Name:               "event_id",
+						Type:               "bigint",
+						PrimaryKey:         true,
+						PrimaryKeyPosition: 1,
+						DeclaredType: &schema.DeclaredType{
+							Base: "bigint",
+						},
+					},
+					{
+						Name: "account_id",
+						Type: "integer",
+						DeclaredType: &schema.DeclaredType{
+							Base: "integer",
+						},
+					},
+				},
+				ForeignKeys: []schema.ForeignKey{{
+					Columns:           []string{"account_id"},
+					ReferencedTable:   "accounts",
+					ReferencedColumns: []string{"id"},
+					OnUpdate:          "CASCADE",
+					OnDelete:          "RESTRICT",
+					Match:             "NONE",
+				}},
+			},
+			{
+				Name:                "accounts",
+				AutoIncrementColumn: "id",
+				SQLiteSequence:      &sequence,
+				Columns: []schema.Column{
+					{
+						Name:               "id",
+						Type:               "integer",
+						PrimaryKey:         true,
+						PrimaryKeyPosition: 1,
+						DeclaredType: &schema.DeclaredType{
+							Base: "integer",
+						},
+					},
+					{
+						Name: "external_id",
+						Type: "text",
+						DeclaredType: &schema.DeclaredType{
+							Base: "text",
+						},
+					},
+					{
+						Name: "balance",
+						Type: "numeric",
+						DeclaredType: &schema.DeclaredType{
+							Base:      "numeric",
+							Arguments: []int{12, 2},
+						},
+					},
+				},
+				Indexes: []schema.Index{{
+					Name:   "accounts_external_id_uq",
+					Unique: true,
+					Columns: []schema.IndexColumn{{
+						Name:      "external_id",
+						Collation: "BINARY",
+					}},
+				}},
+				Checks: []schema.CheckConstraint{{
+					Expression: check,
+				}},
+			},
+		}
+	}
+	source := fixture()
+	before := fixture()
+	adapter := &postgresTargetAdapter{namespace: "archive"}
+	planned, err := adapter.PlanTables(
+		"sqlite",
+		source,
+		"drop_recreate",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(source, before) {
+		t.Fatalf("source metadata mutated:\n got: %#v\nwant: %#v", source, before)
+	}
+	if len(planned) != 2 ||
+		planned[0].Schema != "archive" ||
+		planned[1].Schema != "archive" ||
+		planned[1].AutoIncrementColumn != "id" ||
+		planned[1].SQLiteSequence == nil ||
+		*planned[1].SQLiteSequence != 50 ||
+		planned[1].Columns[0].Type != "bigint" ||
+		len(planned[1].Indexes) != 1 ||
+		len(planned[1].Checks) != 1 ||
+		len(planned[0].ForeignKeys) != 1 {
+		t.Fatalf("planned object metadata = %#v", planned)
+	}
+
+	planned[1].Indexes[0].Columns[0].Name = "changed"
+	planned[0].ForeignKeys[0].Columns[0] = "changed"
+	if source[1].Indexes[0].Columns[0].Name != "external_id" ||
+		source[0].ForeignKeys[0].Columns[0] != "account_id" {
+		t.Fatal("planned object metadata aliases source slices")
 	}
 }

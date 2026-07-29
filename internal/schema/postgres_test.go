@@ -151,13 +151,13 @@ func TestPostgresScalarRendererFailsClosed(t *testing.T) {
 			},
 		},
 		{
-			name: "unsupported temporal modifier",
+			name: "unsupported temporal precision",
 			column: Column{
 				Name: "value",
 				Type: "timestamp",
 				DeclaredType: &DeclaredType{
 					Base:      "timestamp",
-					Arguments: []int{3},
+					Arguments: []int{7},
 				},
 			},
 		},
@@ -251,5 +251,46 @@ func TestPostgresStringDefaultEscapesBackslashesWithoutLeakingFailures(t *testin
 	})
 	if err == nil || strings.Contains(err.Error(), secret) {
 		t.Fatalf("redacted default error = %v", err)
+	}
+}
+
+func TestCreatePostgresTableRendersExactTemporalPrecision(t *testing.T) {
+	table := Table{
+		Schema: "archive",
+		Name:   "events",
+		Columns: []Column{
+			{
+				Name: "occurred_at",
+				Type: "timestamp",
+				DeclaredType: &DeclaredType{
+					Base:      "timestamp",
+					Arguments: []int{3},
+				},
+			},
+			{
+				Name: "received_at",
+				Type: "timestamptz",
+				DeclaredType: &DeclaredType{
+					Base:      "timestamptz",
+					Arguments: []int{0},
+				},
+			},
+		},
+	}
+	got, err := CreateTable(Postgres, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `CREATE TABLE "archive"."events" ("occurred_at" TIMESTAMP(3) NOT NULL, "received_at" TIMESTAMP(0) WITH TIME ZONE NOT NULL);`
+	if got != want {
+		t.Fatalf("temporal DDL:\n got: %s\nwant: %s", got, want)
+	}
+	table.Columns[0].DeclaredType.Arguments = []int{7}
+	if _, err := CreateTable(Postgres, table); err == nil {
+		t.Fatal("precision 7 unexpectedly succeeded")
+	}
+	table.Columns[0].DeclaredType.Arguments = nil
+	if _, err := CreateTable(Postgres, table); err == nil {
+		t.Fatal("empty explicit temporal precision unexpectedly succeeded")
 	}
 }

@@ -150,9 +150,29 @@ func normalizePostgresColumnValue(column schema.Column, value any) (any, error) 
 	case "bool", "boolean":
 		return normalizePostgresBoolean(value)
 	case "timestamp", "datetime":
-		return normalizePostgresTimestamp(value)
+		normalized, err := normalizePostgresTimestamp(value)
+		if err != nil {
+			return nil, err
+		}
+		if err := validatePostgresTemporalPrecision(
+			column,
+			normalized.Time,
+		); err != nil {
+			return nil, err
+		}
+		return normalized, nil
 	case "timestamptz":
-		return normalizePostgresTimestamptz(value)
+		normalized, err := normalizePostgresTimestamptz(value)
+		if err != nil {
+			return nil, err
+		}
+		if err := validatePostgresTemporalPrecision(
+			column,
+			normalized.Time,
+		); err != nil {
+			return nil, err
+		}
+		return normalized, nil
 	case "date":
 		return normalizePostgresDate(value)
 	default:
@@ -218,6 +238,56 @@ func postgresNumericColumnModifiers(
 		return 0, 0, fmt.Errorf("invalid PostgreSQL numeric scale")
 	}
 	return int64(arguments[0]), int32(scale), nil
+}
+
+func postgresTemporalColumnPrecision(
+	column schema.Column,
+) (int, bool, error) {
+	if column.DeclaredType == nil {
+		return postgresDefaultTimestampPrecision, false, nil
+	}
+	base := strings.ToLower(strings.TrimSpace(column.DeclaredType.Base))
+	switch base {
+	case "timestamp", "datetime", "timestamptz":
+	default:
+		return 0, false, fmt.Errorf(
+			"invalid PostgreSQL temporal declaration %q",
+			column.DeclaredType.Base,
+		)
+	}
+	if len(column.DeclaredType.Arguments) != 1 {
+		return 0, false, fmt.Errorf(
+			"invalid PostgreSQL temporal precision",
+		)
+	}
+	precision := column.DeclaredType.Arguments[0]
+	if precision < 0 || precision > 6 {
+		return 0, false, fmt.Errorf(
+			"invalid PostgreSQL temporal precision",
+		)
+	}
+	return precision, true, nil
+}
+
+func validatePostgresTemporalPrecision(
+	column schema.Column,
+	value time.Time,
+) error {
+	precision, constrained, err := postgresTemporalColumnPrecision(column)
+	if err != nil || !constrained {
+		return err
+	}
+	unit := 1
+	for digits := precision; digits < 9; digits++ {
+		unit *= 10
+	}
+	if value.Nanosecond()%unit != 0 {
+		return fmt.Errorf(
+			"timestamp exceeds PostgreSQL fractional-second precision %d",
+			precision,
+		)
+	}
+	return nil
 }
 
 func exactPostgresInteger(value any) (*big.Int, error) {

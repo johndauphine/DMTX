@@ -203,6 +203,13 @@ func ParseSQLiteCheckExpression(value string) (Expression, error) {
 }
 
 func rejectSQLiteOnlySchema(target Dialect, table Table) error {
+	if target == Postgres {
+		if table.SQLiteStrict || table.SQLiteWithoutRowID {
+			return &PolicyError{Operation: "map SQLite schema objects", Type: table.Name, Target: string(target)}
+		}
+		_, err := postgresIdentityColumn(table)
+		return err
+	}
 	if table.AutoIncrementColumn != "" || table.SQLiteSequence != nil || table.SQLiteStrict || table.SQLiteWithoutRowID || len(table.Indexes) > 0 || len(table.ForeignKeys) > 0 || len(table.Checks) > 0 {
 		return &PolicyError{Operation: "map SQLite schema objects", Type: table.Name, Target: string(target)}
 	}

@@ -33,13 +33,6 @@ func projectSQLiteTableForPostgres(
 			sourceTable.Schema,
 		)
 	}
-	if sourceTable.AutoIncrementColumn != "" ||
-		sourceTable.SQLiteSequence != nil {
-		return schema.Table{}, postgresSQLitePolicy(
-			"map SQLite AUTOINCREMENT",
-			sourceTable.Name,
-		)
-	}
 	if sourceTable.SQLiteStrict {
 		return schema.Table{}, postgresSQLitePolicy(
 			"map SQLite STRICT table",
@@ -52,33 +45,20 @@ func projectSQLiteTableForPostgres(
 			sourceTable.Name,
 		)
 	}
-	if column, ok := sqliteImplicitRowIDAlias(sourceTable); ok {
-		return schema.Table{}, postgresSQLitePolicy(
-			"map SQLite implicit rowid identity",
-			sourceTable.Name+"."+column,
-		)
-	}
-	if len(sourceTable.Indexes) > 0 {
-		return schema.Table{}, postgresSQLitePolicy(
-			"map SQLite indexes",
-			sourceTable.Name,
-		)
-	}
-	if len(sourceTable.ForeignKeys) > 0 {
-		return schema.Table{}, postgresSQLitePolicy(
-			"map SQLite foreign keys",
-			sourceTable.Name,
-		)
-	}
-	if len(sourceTable.Checks) > 0 {
-		return schema.Table{}, postgresSQLitePolicy(
-			"map SQLite checks",
-			sourceTable.Name,
-		)
+	if sourceTable.AutoIncrementColumn == "" {
+		if column, ok := sqliteImplicitRowIDAlias(sourceTable); ok {
+			return schema.Table{}, postgresSQLitePolicy(
+				"map SQLite implicit rowid identity",
+				sourceTable.Name+"."+column,
+			)
+		}
 	}
 
 	projected := sourceTable
 	projected.Columns = append([]schema.Column(nil), sourceTable.Columns...)
+	projected.Indexes = clonePostgresProjectionIndexes(sourceTable.Indexes)
+	projected.ForeignKeys = clonePostgresProjectionForeignKeys(sourceTable.ForeignKeys)
+	projected.Checks = append([]schema.CheckConstraint(nil), sourceTable.Checks...)
 	for index, sourceColumn := range sourceTable.Columns {
 		if sourceColumn.DeclaredType == nil {
 			return schema.Table{}, postgresSQLitePolicy(
@@ -157,6 +137,18 @@ func projectSQLiteDeclaredTypeForPostgres(
 		}
 		return &schema.DeclaredType{
 			Base:      "numeric",
+			Arguments: arguments,
+		}, nil
+	case "datetime", "timestamp":
+		if len(arguments) != 1 ||
+			arguments[0] < 0 ||
+			arguments[0] > 6 {
+			return nil, fmt.Errorf(
+				"invalid temporal precision",
+			)
+		}
+		return &schema.DeclaredType{
+			Base:      "timestamp",
 			Arguments: arguments,
 		}, nil
 	default:

@@ -107,6 +107,26 @@ func (adapter *postgresTargetAdapter) PlanTables(
 		}
 		targetTables = append(targetTables, targetTable)
 	}
+	if mode == "drop_recreate" {
+		if _, err := schema.DropTables(
+			schema.Postgres,
+			targetTables,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"plan PostgreSQL target table set: %w",
+				err,
+			)
+		}
+	}
+	if _, err := schema.PlanPostgresDropRecreateObjects(
+		targetTables,
+		schema.PostgresObjectPlanOptions{},
+	); err != nil {
+		return nil, fmt.Errorf(
+			"plan PostgreSQL post-load objects: %w",
+			err,
+		)
+	}
 	return targetTables, nil
 }
 
@@ -122,17 +142,11 @@ func (adapter *postgresTargetAdapter) PrepareTables(
 	if mode == "upsert" {
 		return nil
 	}
-	for _, targetTable := range targetTables {
-		if err := preparePostgresTarget(
-			ctx,
-			adapter.database,
-			targetTable,
-			mode,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
+	return preparePostgresTargets(
+		ctx,
+		adapter.database,
+		targetTables,
+	)
 }
 
 func (adapter *postgresTargetAdapter) WriteBatch(
@@ -177,17 +191,20 @@ func (adapter *postgresTargetAdapter) CountRows(
 }
 
 func (adapter *postgresTargetAdapter) FinalizeTables(
-	_ context.Context,
-	_ []schema.Table,
+	ctx context.Context,
+	targetTables []schema.Table,
 	mode string,
 ) error {
-	if _, err := normalizeAdapterTargetMode(mode); err != nil {
+	mode, err := normalizeAdapterTargetMode(mode)
+	if err != nil {
 		return err
 	}
-	// PostgreSQL post-load schema objects are added by the schema-fidelity
-	// slice. The all-table lifecycle calls this hook now so that work can be
-	// introduced without moving checkpoint boundaries again.
-	return nil
+	return finalizePostgresTargets(
+		ctx,
+		adapter.database,
+		targetTables,
+		mode,
+	)
 }
 
 func (adapter *postgresTargetAdapter) Close() error {

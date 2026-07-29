@@ -166,9 +166,21 @@ func migrateWithAdapters(
 	if err != nil {
 		return Result{}, err
 	}
+	names = make([]string, len(plans))
+	for index, plan := range plans {
+		names[index] = plan.source.Name
+	}
 	targetTables := make([]schema.Table, len(plans))
 	for index, plan := range plans {
 		targetTables[index] = plan.target
+	}
+	if err := preflightAdapterTargetPlan(
+		ctx,
+		target,
+		targetTables,
+		mode,
+	); err != nil {
+		return Result{}, fmt.Errorf("preflight target plan: %w", err)
 	}
 	if err := target.PreflightTables(ctx, targetTables, mode); err != nil {
 		return Result{}, fmt.Errorf("preflight target tables: %w", err)
@@ -304,6 +316,13 @@ func planAdapterTables(
 			)
 		}
 		sourceTables = append(sourceTables, sourceTable)
+	}
+	sourceTables, err := orderAdapterSourceTablesForMode(
+		sourceTables,
+		mode,
+	)
+	if err != nil {
+		return nil, err
 	}
 	targetTables, err := target.PlanTables(sourceEngine, sourceTables, mode)
 	if err != nil {

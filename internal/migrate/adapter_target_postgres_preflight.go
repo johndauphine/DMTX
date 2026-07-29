@@ -87,6 +87,42 @@ func (adapter *postgresTargetAdapter) PreflightTables(
 				err,
 			)
 		}
+		if targetTable.AutoIncrementColumn != "" {
+			if err := preflightPostgresIdentitySequence(
+				ctx,
+				adapter.database,
+				targetTable,
+			); err != nil {
+				return fmt.Errorf(
+					"preflight PostgreSQL table %s: %w",
+					targetTable.Name,
+					err,
+				)
+			}
+		}
+	}
+	if mode == "upsert" {
+		if err := preflightPostgresRetainedIndexesAndForeignKeys(
+			ctx,
+			adapter.database,
+			targetTables,
+		); err != nil {
+			return err
+		}
+		if err := preflightPostgresRetainedChecks(
+			ctx,
+			adapter.database,
+			targetTables,
+		); err != nil {
+			return err
+		}
+		if err := preflightPostgresRetainedDefaults(
+			ctx,
+			adapter.database,
+			targetTables,
+		); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -349,9 +385,13 @@ func validatePostgresUpsertCatalogShape(
 				actualColumn.name,
 			)
 		}
-		if actualColumn.identity != "" {
+		expectedIdentity := ""
+		if plannedColumn.Name == planned.AutoIncrementColumn {
+			expectedIdentity = "d"
+		}
+		if actualColumn.identity != expectedIdentity {
 			return fmt.Errorf(
-				"upsert target column %q has unsupported identity generation",
+				"upsert target column %q identity generation differs from the planned shape",
 				actualColumn.name,
 			)
 		}
@@ -437,6 +477,36 @@ func expectedPostgresCatalogType(
 			return postgresCatalogTypeShape{
 				name:            "varchar",
 				characterLength: intPointer(length),
+			}, nil
+		case "timestamp", "datetime":
+			precision, constrained, err :=
+				postgresTemporalColumnPrecision(column)
+			if err != nil || !constrained {
+				return postgresCatalogTypeShape{}, fmt.Errorf(
+					"planned PostgreSQL column %q has invalid temporal modifiers",
+					column.Name,
+				)
+			}
+			return postgresCatalogTypeShape{
+				name: "timestamp",
+				timestampPrecision: intPointer(
+					precision,
+				),
+			}, nil
+		case "timestamptz":
+			precision, constrained, err :=
+				postgresTemporalColumnPrecision(column)
+			if err != nil || !constrained {
+				return postgresCatalogTypeShape{}, fmt.Errorf(
+					"planned PostgreSQL column %q has invalid temporal modifiers",
+					column.Name,
+				)
+			}
+			return postgresCatalogTypeShape{
+				name: "timestamptz",
+				timestampPrecision: intPointer(
+					precision,
+				),
 			}, nil
 		}
 	}
