@@ -164,14 +164,16 @@ func TestBuiltInAdaptersPreserveCertifiedRoutes(t *testing.T) {
 			override: SQLiteToClickHouseWithObserver,
 		},
 		{source: "postgres", target: "postgres"}: {
-			override: PostgresToPostgresWithObserver,
+			source: openPostgresSourceAdapter,
+			target: openPostgresTargetAdapter,
 		},
 		{source: "postgres", target: "sqlite"}: {
 			source: openPostgresSourceAdapter,
 			target: openSQLiteTargetAdapter,
 		},
 		{source: "mysql", target: "postgres"}: {
-			override: MySQLToPostgresWithObserver,
+			source: openMySQLSourceAdapter,
+			target: openPostgresTargetAdapter,
 		},
 		{source: "mysql", target: "sqlite"}: {
 			source: openMySQLSourceAdapter,

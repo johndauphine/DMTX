@@ -152,26 +152,78 @@ func copySQLiteRowsToPostgres(ctx context.Context, source, target *sql.DB, table
 	return count, nil
 }
 
-func writePostgresBatch(ctx context.Context, target *sql.DB, table schema.Table, columns []string, mode string, rows [][]any) error {
+func writePostgresBatch(
+	ctx context.Context,
+	target *sql.DB,
+	table schema.Table,
+	columns []string,
+	mode string,
+	rows [][]any,
+) error {
+	_, err := writePostgresBatchReceipt(ctx, target, table, columns, mode, rows)
+	return err
+}
+
+func writePostgresBatchReceipt(
+	ctx context.Context,
+	target *sql.DB,
+	table schema.Table,
+	columns []string,
+	mode string,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	notCommitted := WriteReceipt{
+		Certainty:     CommitNotCommitted,
+		AttemptedRows: attempted,
+	}
+	unknown := WriteReceipt{
+		Certainty:     CommitUnknown,
+		AttemptedRows: attempted,
+	}
+
 	tx, err := target.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin PostgreSQL write for %s: %w", table.Name, err)
+		return notCommitted, fmt.Errorf(
+			"begin PostgreSQL write for %s: %w",
+			table.Name,
+			err,
+		)
 	}
 	defer tx.Rollback()
-	statement, err := tx.PrepareContext(ctx, postgresWriteStatement(table, columns, mode))
+	statement, err := tx.PrepareContext(
+		ctx,
+		postgresWriteStatement(table, columns, mode),
+	)
 	if err != nil {
-		return fmt.Errorf("prepare PostgreSQL write for %s: %w", table.Name, err)
+		return notCommitted, fmt.Errorf(
+			"prepare PostgreSQL write for %s: %w",
+			table.Name,
+			err,
+		)
 	}
 	defer statement.Close()
 	for _, values := range rows {
 		if _, err := statement.ExecContext(ctx, values...); err != nil {
-			return fmt.Errorf("write PostgreSQL table %s: %w", table.Name, err)
+			return notCommitted, fmt.Errorf(
+				"write PostgreSQL table %s: %w",
+				table.Name,
+				err,
+			)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit PostgreSQL table %s: %w", table.Name, err)
+		return unknown, fmt.Errorf(
+			"commit PostgreSQL table %s: %w",
+			table.Name,
+			err,
+		)
 	}
-	return nil
+	return WriteReceipt{
+		Certainty:     CommitDurable,
+		AttemptedRows: attempted,
+		CommittedRows: attempted,
+	}, nil
 }
 
 func postgresWriteStatement(table schema.Table, columns []string, mode string) string {
