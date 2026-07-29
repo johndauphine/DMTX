@@ -3,7 +3,7 @@ package app
 import (
 	"testing"
 
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 func assertStage2PendingRangeIntent(

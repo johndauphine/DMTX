@@ -7,13 +7,13 @@ import (
 	"io"
 	"os"
 
-	"github.com/johndauphine/DMTX/internal/config"
-	"github.com/johndauphine/DMTX/internal/migrate"
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/migrate"
 )
 
 func validate(args []string, stdout, stderr io.Writer) int {
 	if len(args) != 2 || args[0] != "--config" {
-		fmt.Fprintln(stderr, "usage: dmt validate --config migration.yaml")
+		fmt.Fprintln(stderr, "usage: dmtx validate --config migration.yaml")
 		return ConfigurationError
 	}
 	data, err := os.ReadFile(args[1])

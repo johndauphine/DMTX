@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/johndauphine/DMTX/internal/schema"
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/schema"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 func TestValidateSQLiteLegacyProgressRequiresMatchingUnambiguousFrontier(t *testing.T) {

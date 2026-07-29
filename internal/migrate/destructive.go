@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/johndauphine/DMTX/internal/config"
+	"github.com/johndauphine/dmtx/internal/config"
 )
 
 // ErrDestructiveAcknowledgement classifies a rebuild that would replace

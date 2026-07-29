@@ -142,9 +142,9 @@ Defaults MUST be secure:
 
 ### 3.1 Executable and front ends
 
-The executable name MUST be `dmt`.
+The executable name MUST be `dmtx`.
 
-With no command, `dmt` MUST launch an interactive terminal UI. With `--webui`
+With no command, `dmtx` MUST launch an interactive terminal UI. With `--webui`
 and no command, it MUST launch an embedded browser UI. Ordinary subcommands
 MUST use the same application services and orchestrator as both interactive
 front ends.
@@ -1257,7 +1257,7 @@ Compatibility requirements include:
 
 Release artifacts MUST include self-contained binaries for macOS x86-64 and
 ARM64, Linux x86-64 and ARM64, and Windows x86-64, plus SHA-256 checksums.
-`dmt --version` MUST report the release version.
+`dmtx --version` MUST report the release version.
 
 ## 19. Non-goals for this reconstruction (normative boundaries)
 
@@ -1371,7 +1371,7 @@ or accompanied by a reproducible live-database test.
 
 ### 21.1 Build and public surface
 
-- [ ] One self-contained `dmt` executable starts on every release platform.
+- [ ] One self-contained `dmtx` executable starts on every release platform.
 - [ ] `--version`, help, command aliases, global flags, exit codes, JSON routing,
       TUI launch, and WebUI launch match Sections 3 and 18.
 - [ ] CLI/TUI/WebUI parity is machine-checked.

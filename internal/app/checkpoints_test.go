@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/state"
 	_ "modernc.org/sqlite"
 )
 

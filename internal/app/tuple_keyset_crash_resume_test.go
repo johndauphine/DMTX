@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/johndauphine/DMTX/internal/config"
-	"github.com/johndauphine/DMTX/internal/migrate"
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/migrate"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 type stage2TupleRow struct {

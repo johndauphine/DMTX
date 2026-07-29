@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/johndauphine/DMTX/internal/config"
+	"github.com/johndauphine/dmtx/internal/config"
 	_ "modernc.org/sqlite"
 )
 

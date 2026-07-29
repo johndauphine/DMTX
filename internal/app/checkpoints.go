@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 // tableCheckpointObserver persists table boundaries around migration mutation.

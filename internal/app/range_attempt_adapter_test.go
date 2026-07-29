@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/johndauphine/DMTX/internal/migrate"
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/migrate"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 func TestTableCheckpointObserverRecordsRangeAttemptsIncludingReplay(t *testing.T) {

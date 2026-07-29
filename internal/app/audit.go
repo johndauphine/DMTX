@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/johndauphine/DMTX/internal/audit"
+	"github.com/johndauphine/dmtx/internal/audit"
 )
 
 func appendAudit(configPath, runID, eventType string) error {

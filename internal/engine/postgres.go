@@ -10,8 +10,8 @@ import (
 	"strings"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/johndauphine/DMTX/internal/config"
-	"github.com/johndauphine/DMTX/internal/schema"
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/schema"
 )
 
 // PostgresDSN creates a URI connection string without logging or resolving

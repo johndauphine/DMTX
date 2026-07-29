@@ -5,9 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/johndauphine/DMTX/internal/config"
-	"github.com/johndauphine/DMTX/internal/engine"
-	"github.com/johndauphine/DMTX/internal/schema"
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/engine"
+	"github.com/johndauphine/dmtx/internal/schema"
 )
 
 // MySQLToPostgresWithObserver migrates deterministic MySQL metadata and rows

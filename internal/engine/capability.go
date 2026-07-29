@@ -3,7 +3,7 @@ package engine
 import (
 	"fmt"
 
-	"github.com/johndauphine/DMTX/internal/config"
+	"github.com/johndauphine/dmtx/internal/config"
 )
 
 // Capability describes the target operations DMTX may select explicitly.

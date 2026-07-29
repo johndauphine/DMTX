@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/johndauphine/DMTX/internal/config"
-	"github.com/johndauphine/DMTX/internal/engine"
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/engine"
 )
 
 // Execute selects the implemented engine pair without allowing an unsupported

@@ -1,4 +1,4 @@
-# DMTX
+# dmtx
 
 DMTX is a clean-room Go reimplementation of DMT, guided by the reconstruction
 specification in [docs/RECREATE_DMT.md](docs/RECREATE_DMT.md).
@@ -13,7 +13,7 @@ Stage 2 guarantees described below.
 Build the command:
 
 ```sh
-go build -o dmt ./cmd/dmt
+go build -o dmtx ./cmd/dmtx
 ```
 
 Create `migration.yaml`:
@@ -34,7 +34,7 @@ migration:
 Run the migration:
 
 ```sh
-./dmt run --config migration.yaml
+./dmtx run --config migration.yaml
 ```
 
 If a selected target table already contains rows, rebuild mode stops before
@@ -42,14 +42,14 @@ target mutation. After confirming a backup and the destructive replacement,
 acknowledge it explicitly:
 
 ```sh
-./dmt run --config migration.yaml --acknowledge-destructive
+./dmtx run --config migration.yaml --acknowledge-destructive
 ```
 
 The default state database is `migration.yaml.state.db`. For headless workflows,
 select the YAML state backend explicitly:
 
 ```sh
-./dmt run --config migration.yaml --state migration.state.yaml
+./dmtx run --config migration.yaml --state migration.state.yaml
 ```
 
 Files ending in `.yaml` or `.yml` select the YAML backend; other state paths
@@ -99,7 +99,7 @@ source tables fails before target mutation.
 - SQLite lock retries are bounded and cancellation-aware. Unknown commit
   outcomes, state failures, lease loss, validation failures, and policy errors
   are not retried as transient writes.
-- `dmt resume --config migration.yaml` reuses the interrupted run, verifies a
+- `dmtx resume --config migration.yaml` reuses the interrupted run, verifies a
   completed table before skipping it, and rejects changed data-plane settings.
   Both target modes restore exact range state; a possibly committed rebuild
   chunk uses duplicate-safe insert-only replay.
@@ -108,16 +108,16 @@ Resume with the explicit YAML state file and inspect its current or full run
 history with:
 
 ```sh
-./dmt resume --config migration.yaml --state migration.state.yaml
-./dmt status --state migration.state.yaml
-./dmt history --state migration.state.yaml
+./dmtx resume --config migration.yaml --state migration.state.yaml
+./dmtx status --state migration.state.yaml
+./dmtx history --state migration.state.yaml
 ```
 
 Every rebuild resume reruns the destructive-target gate. A populated target
 requires explicit operator confirmation:
 
 ```sh
-./dmt resume --config migration.yaml --acknowledge-destructive
+./dmtx resume --config migration.yaml --acknowledge-destructive
 ```
 
 The same inspection commands accept the default SQLite path
@@ -155,5 +155,5 @@ Production packages and their tests are kept under separate files in
 
 ```sh
 go test ./...
-go build ./cmd/dmt
+go build -o dmtx ./cmd/dmtx
 ```

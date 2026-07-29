@@ -11,9 +11,9 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/johndauphine/DMTX/internal/config"
-	"github.com/johndauphine/DMTX/internal/schema"
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/schema"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 // SQLiteTransferPlan is the immutable, pre-mutation execution plan exposed to

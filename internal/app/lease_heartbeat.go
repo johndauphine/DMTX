@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 type leaseHeartbeat struct {

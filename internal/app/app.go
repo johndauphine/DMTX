@@ -12,11 +12,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/johndauphine/DMTX/internal/config"
-	"github.com/johndauphine/DMTX/internal/contract"
-	"github.com/johndauphine/DMTX/internal/engine"
-	"github.com/johndauphine/DMTX/internal/migrate"
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/contract"
+	"github.com/johndauphine/dmtx/internal/engine"
+	"github.com/johndauphine/dmtx/internal/migrate"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 const Version = "0.3.0-dev"
@@ -75,7 +75,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 func run(args []string, stdout, stderr io.Writer) int {
 	configPath, statePath, dryRun, destructiveAcknowledged, ok := runArguments(args)
 	if !ok {
-		fmt.Fprintln(stderr, "usage: dmt run --config migration.yaml [--state migration.state.yaml] [--dry-run] [--acknowledge-destructive]")
+		fmt.Fprintln(stderr, "usage: dmtx run --config migration.yaml [--state migration.state.yaml] [--dry-run] [--acknowledge-destructive]")
 		return ConfigurationError
 	}
 	data, err := os.ReadFile(configPath)
@@ -277,7 +277,7 @@ func runArguments(args []string) (configPath, statePath string, dryRun, destruct
 
 func showState(args []string, stdout io.Writer, latest bool) int {
 	if len(args) != 2 || args[0] != "--state" {
-		fmt.Fprintln(stdout, "usage: dmt status --state migration.yaml.state.db")
+		fmt.Fprintln(stdout, "usage: dmtx status --state migration.yaml.state.db")
 		return ConfigurationError
 	}
 	store, err := state.NewBackend(args[1])
@@ -315,8 +315,8 @@ func showState(args []string, stdout io.Writer, latest bool) int {
 }
 
 func printHelp(output io.Writer) {
-	fmt.Fprintln(output, "dmt - deterministic database migration tool")
-	fmt.Fprintln(output, "SQLite first pass: dmt run --config migration.yaml")
+	fmt.Fprintln(output, "dmtx - deterministic database migration tool")
+	fmt.Fprintln(output, "SQLite first pass: dmtx run --config migration.yaml")
 	fmt.Fprintln(output, "Commands:")
 	for _, command := range contract.Commands {
 		fmt.Fprintf(output, "  %s\n", command.Name)

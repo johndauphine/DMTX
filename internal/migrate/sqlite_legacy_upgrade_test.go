@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/johndauphine/DMTX/internal/schema"
+	"github.com/johndauphine/dmtx/internal/schema"
 )
 
 func TestNotifySQLiteTransferPlansSkipsLegacySingleWatermarkProgress(t *testing.T) {

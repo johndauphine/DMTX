@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/johndauphine/DMTX/internal/migrate"
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/migrate"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 func (observer tableCheckpointObserver) AfterSQLiteTransferPlan(_ context.Context, plan migrate.SQLiteTransferPlan) error {

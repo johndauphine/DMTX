@@ -3,7 +3,7 @@ package migrate
 import (
 	"testing"
 
-	"github.com/johndauphine/DMTX/internal/schema"
+	"github.com/johndauphine/dmtx/internal/schema"
 )
 
 func TestMySQLReadQueryUsesQuotedDeterministicPrimaryKeyOrder(t *testing.T) {

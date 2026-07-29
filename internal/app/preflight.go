@@ -9,8 +9,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/johndauphine/DMTX/internal/config"
-	"github.com/johndauphine/DMTX/internal/engine"
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/engine"
 	_ "modernc.org/sqlite"
 )
 
@@ -22,7 +22,7 @@ type preflightFinding struct {
 
 func preflight(args []string, stdout, stderr io.Writer) int {
 	if len(args) != 2 || args[0] != "--config" {
-		fmt.Fprintln(stderr, "usage: dmt preflight --config migration.yaml")
+		fmt.Fprintln(stderr, "usage: dmtx preflight --config migration.yaml")
 		return ConfigurationError
 	}
 	data, err := os.ReadFile(args[1])

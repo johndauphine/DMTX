@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/johndauphine/DMTX/internal/config"
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 // acquireTargetLease uses the actual endpoint identity. SQLite keeps its

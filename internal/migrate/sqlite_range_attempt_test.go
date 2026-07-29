@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/johndauphine/DMTX/internal/config"
+	"github.com/johndauphine/dmtx/internal/config"
 )
 
 var errSQLiteAttemptCheckpoint = errors.New("injected attempt checkpoint failure")

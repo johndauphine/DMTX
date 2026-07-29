@@ -1,4 +1,4 @@
-module github.com/johndauphine/DMTX
+module github.com/johndauphine/dmtx
 
 go 1.25.7
 

@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
-	"github.com/johndauphine/DMTX/internal/config"
-	"github.com/johndauphine/DMTX/internal/schema"
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/schema"
 )
 
 // MySQLDSN builds a TLS-required MySQL connection string without logging or

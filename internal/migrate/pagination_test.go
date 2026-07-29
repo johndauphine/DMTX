@@ -9,7 +9,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/johndauphine/DMTX/internal/schema"
+	"github.com/johndauphine/dmtx/internal/schema"
 	_ "modernc.org/sqlite"
 )
 

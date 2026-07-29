@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/johndauphine/DMTX/internal/config"
-	"github.com/johndauphine/DMTX/internal/engine"
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/engine"
 	_ "modernc.org/sqlite"
 )
 

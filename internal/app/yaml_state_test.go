@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/johndauphine/DMTX/internal/config"
-	"github.com/johndauphine/DMTX/internal/migrate"
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/migrate"
+	"github.com/johndauphine/dmtx/internal/state"
 	_ "modernc.org/sqlite"
 )
 
@@ -145,7 +145,7 @@ func TestRunAndResumeRejectInvalidStateArguments(t *testing.T) {
 			if code := Run(test.args, &stdout, &stderr); code != ConfigurationError {
 				t.Fatalf("exit code = %d, stderr = %s", code, stderr.String())
 			}
-			if !strings.Contains(stderr.String(), "usage: dmt") {
+			if !strings.Contains(stderr.String(), "usage: dmtx") {
 				t.Fatalf("stderr = %q", stderr.String())
 			}
 		})

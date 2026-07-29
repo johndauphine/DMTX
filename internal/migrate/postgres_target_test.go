@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/johndauphine/DMTX/internal/schema"
+	"github.com/johndauphine/dmtx/internal/schema"
 )
 
 func TestPostgresWriteStatementUsesNativePlaceholdersAndUpsert(t *testing.T) {

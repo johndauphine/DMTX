@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/johndauphine/DMTX/internal/schema"
+	"github.com/johndauphine/dmtx/internal/schema"
 )
 
 // PaginationStrategy is the durable ordering algorithm chosen for a table.

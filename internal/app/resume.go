@@ -10,11 +10,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/johndauphine/DMTX/internal/audit"
-	"github.com/johndauphine/DMTX/internal/config"
-	"github.com/johndauphine/DMTX/internal/engine"
-	"github.com/johndauphine/DMTX/internal/migrate"
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/audit"
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/engine"
+	"github.com/johndauphine/dmtx/internal/migrate"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 type resumeOptions struct {
@@ -36,7 +36,7 @@ func resume(args []string, stdout, stderr io.Writer) int {
 
 	options, ok := resumeArguments(args)
 	if !ok {
-		fmt.Fprintln(stderr, "usage: dmt resume --config migration.yaml [--state migration.state.yaml] [--acknowledge-destructive] [--force-resume] [--abandon --abandon-reason TEXT]")
+		fmt.Fprintln(stderr, "usage: dmtx resume --config migration.yaml [--state migration.state.yaml] [--acknowledge-destructive] [--force-resume] [--abandon --abandon-reason TEXT]")
 		return ConfigurationError
 	}
 	configPath, statePath := options.configPath, options.statePath

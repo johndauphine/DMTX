@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/johndauphine/DMTX/internal/schema"
+	"github.com/johndauphine/dmtx/internal/schema"
 )
 
 func inspectSQLiteSchema(ctx context.Context, database *sql.DB, name string) (schema.Table, []string, error) {

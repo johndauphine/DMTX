@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/johndauphine/DMTX/internal/config"
+	"github.com/johndauphine/dmtx/internal/config"
 )
 
 func TestSQLiteCompletedCheckpointRequiresExactEndpointAgreement(t *testing.T) {

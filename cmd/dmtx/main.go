@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/johndauphine/DMTX/internal/app"
+	"github.com/johndauphine/dmtx/internal/app"
 )
 
 func main() {

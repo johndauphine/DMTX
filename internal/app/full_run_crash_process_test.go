@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/johndauphine/DMTX/internal/audit"
-	"github.com/johndauphine/DMTX/internal/state"
+	"github.com/johndauphine/dmtx/internal/audit"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 const (
