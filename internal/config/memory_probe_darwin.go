@@ -104,20 +104,17 @@ func parseDarwinVMStat(output []byte) (int64, int64, error) {
 		}
 	}
 
-	// Mach's free_count already includes speculative_count. Validate that
-	// relationship but never add speculative pages separately. Omitting
-	// purgeable and compressor statistics keeps the capacity estimate a
-	// conservative lower bound. Free plus inactive pages are the currently
+	// The vm_stat command prints "Pages free" after subtracting Mach's
+	// speculative_count, then prints speculative pages as their own list.
+	// Add both command-output categories exactly once. Omitting purgeable and
+	// compressor statistics keeps the capacity estimate a conservative lower
+	// bound. Free, speculative, and inactive pages are the currently
 	// available transfer headroom.
-	if required["Pages speculative"] > required["Pages free"] {
-		return 0, 0, fmt.Errorf(
-			"Darwin host memory speculative pages exceed free pages",
-		)
-	}
 	capacityPages, err := checkedDarwinPageSum(
 		required["Pages free"],
 		required["Pages active"],
 		required["Pages inactive"],
+		required["Pages speculative"],
 		required["Pages wired down"],
 	)
 	if err != nil {
@@ -126,6 +123,7 @@ func parseDarwinVMStat(output []byte) (int64, int64, error) {
 	availablePages, err := checkedDarwinPageSum(
 		required["Pages free"],
 		required["Pages inactive"],
+		required["Pages speculative"],
 	)
 	if err != nil {
 		return 0, 0, err

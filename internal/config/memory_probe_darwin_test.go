@@ -25,10 +25,10 @@ Pages occupied by compressor:                   8000.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := int64(650 * 16384); capacity != want {
+	if want := int64(660 * 16384); capacity != want {
 		t.Fatalf("capacity = %d, want %d", capacity, want)
 	}
-	if want := int64(400 * 16384); available != want {
+	if want := int64(410 * 16384); available != want {
 		t.Fatalf("available = %d, want %d", available, want)
 	}
 }
@@ -79,17 +79,6 @@ Pages wired down: 1.
 			want: "overflow",
 		},
 		{
-			name: "speculative exceeds free",
-			evidence: `Mach Virtual Memory Statistics: (page size of 4096 bytes)
-Pages free: 3.
-Pages active: 2.
-Pages inactive: 3.
-Pages speculative: 4.
-Pages wired down: 5.
-`,
-			want: "speculative pages exceed free",
-		},
-		{
 			name: "zero available",
 			evidence: `Mach Virtual Memory Statistics: (page size of 4096 bytes)
 Pages free: 0.
@@ -110,6 +99,25 @@ Pages wired down: 5.
 				t.Fatalf("error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestDarwinMemoryProbeAcceptsSpeculativeCountAbovePrintedFree(t *testing.T) {
+	t.Parallel()
+
+	const evidence = `Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages free: 3.
+Pages active: 2.
+Pages inactive: 3.
+Pages speculative: 4.
+Pages wired down: 5.
+`
+	capacity, available, err := parseDarwinVMStat([]byte(evidence))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capacity != 17*4096 || available != 10*4096 {
+		t.Fatalf("capacity=%d available=%d", capacity, available)
 	}
 }
 
