@@ -159,7 +159,8 @@ func TestBuiltInAdaptersPreserveCertifiedRoutes(t *testing.T) {
 			override: SQLiteToMySQLWithObserver,
 		},
 		{source: "sqlite", target: "mssql"}: {
-			override: SQLiteToSQLServerWithObserver,
+			source: openSQLiteSourceAdapter,
+			target: openSQLServerTargetAdapter,
 		},
 		{source: "sqlite", target: "clickhouse"}: {
 			source: openSQLiteSourceAdapter,

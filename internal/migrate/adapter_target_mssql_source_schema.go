@@ -21,6 +21,8 @@ func projectSQLServerTargetTable(
 		return projectPostgresTableForSQLServer(source)
 	case "mysql":
 		return projectMySQLTableForSQLServer(source)
+	case "sqlite":
+		return projectSQLiteTableForSQLServer(source)
 	default:
 		return schema.Table{}, fmt.Errorf(
 			"SQL Server target does not support source engine %q",

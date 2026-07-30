@@ -52,6 +52,12 @@ func (adapter *sqlServerTargetAdapter) PreflightSourceData(
 	}
 	switch source.Engine() {
 	case "postgres", "mysql":
+	case "sqlite":
+		return preflightSQLiteSQLServerSourceData(
+			ctx,
+			source,
+			plans,
+		)
 	default:
 		return nil
 	}

@@ -14,6 +14,7 @@ type sqlServerTargetAdapter struct {
 	database                *sql.DB
 	batchWriter             sqlServerBatchWriter
 	namespace               string
+	sourceEngine            string
 	destructiveAcknowledged bool
 }
 
@@ -77,6 +78,7 @@ func (adapter *sqlServerTargetAdapter) PlanTables(
 	if err != nil {
 		return nil, err
 	}
+	adapter.sourceEngine = ""
 	targetTables := make([]schema.Table, 0, len(sourceTables))
 	for _, sourceTable := range sourceTables {
 		targetTable, err := projectSQLServerTargetTable(
@@ -110,6 +112,14 @@ func (adapter *sqlServerTargetAdapter) PlanTables(
 		}
 		targetTables = append(targetTables, targetTable)
 	}
+	if sourceEngine == "sqlite" {
+		if err := validateSQLiteSQLServerTables(
+			sourceTables,
+			targetTables,
+		); err != nil {
+			return nil, err
+		}
+	}
 	if _, err := schema.PlanSQLServerDropRecreateObjects(
 		targetTables,
 	); err != nil {
@@ -118,6 +128,7 @@ func (adapter *sqlServerTargetAdapter) PlanTables(
 			err,
 		)
 	}
+	adapter.sourceEngine = sourceEngine
 	return targetTables, nil
 }
 
@@ -153,6 +164,20 @@ func (adapter *sqlServerTargetAdapter) WriteBatch(
 			Certainty:     CommitNotCommitted,
 			AttemptedRows: int64(len(rows)),
 		}, fmt.Errorf("SQL Server native batch writer is not configured")
+	}
+	if adapter.sourceEngine == "sqlite" {
+		normalized, err := normalizeSQLiteSQLServerBatch(
+			table,
+			columns,
+			rows,
+		)
+		if err != nil {
+			return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: int64(len(rows)),
+			}, err
+		}
+		rows = normalized
 	}
 	if err := validateSQLServerTargetBatchValues(
 		table,

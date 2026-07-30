@@ -384,6 +384,130 @@ func TestSQLiteSourceAdapterCountErrorsAreContextualAndCloseIsEffective(
 	}
 }
 
+func TestSQLiteSourceAdapterPinsWALSnapshotAcrossSQLServerPreflightAndCopy(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "wal-snapshot.db")
+	createSQLiteSourceTestDatabase(t, path, `
+		CREATE TABLE items (
+			id BIGINT NOT NULL PRIMARY KEY,
+			amount DECIMAL(18,0) NOT NULL
+		);
+		INSERT INTO items VALUES (1, 7);
+	`)
+
+	writer, err := sql.Open("sqlite", sqliteSourceTestURI(path, "rw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	var journalMode string
+	if err := writer.QueryRowContext(
+		ctx,
+		`PRAGMA journal_mode = WAL`,
+	).Scan(&journalMode); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		t.Fatalf("journal mode = %q, want WAL", journalMode)
+	}
+
+	adapter := openSQLiteSourceAdapterForTest(t, path)
+	sourceTable, err := adapter.InspectTable(ctx, "items")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetTable := sourceTable
+	targetTable.Schema = "dbo"
+	targetTable.Columns = append(
+		[]schema.Column(nil),
+		sourceTable.Columns...,
+	)
+	targetTable.Columns[1].Type = "numeric"
+	plan := adapterTablePlan{
+		source:  sourceTable,
+		target:  targetTable,
+		columns: []string{"id", "amount"},
+	}
+	if err := preflightSQLiteSQLServerSourceData(
+		ctx,
+		adapter,
+		[]adapterTablePlan{plan},
+	); err != nil {
+		t.Fatalf("initial SQL Server source preflight: %v", err)
+	}
+
+	if _, err := writer.ExecContext(ctx, `
+		UPDATE items SET amount = 1.5 WHERE id = 1;
+		INSERT INTO items VALUES (2, 8);
+	`); err != nil {
+		t.Fatalf("concurrent WAL writer: %v", err)
+	}
+	var writerCount int
+	var writerStorage string
+	if err := writer.QueryRowContext(
+		ctx,
+		`SELECT
+			(SELECT COUNT(*) FROM items),
+			typeof(amount)
+		 FROM items
+		 WHERE id = 1`,
+	).Scan(&writerCount, &writerStorage); err != nil {
+		t.Fatal(err)
+	}
+	if writerCount != 2 || writerStorage != "real" {
+		t.Fatalf(
+			"writer state = (%d, %q), want (2, real)",
+			writerCount,
+			writerStorage,
+		)
+	}
+
+	// A second preflight proves the raw typeof(...) probes use the same
+	// transaction as row reads instead of escaping through the database pool.
+	if err := preflightSQLiteSQLServerSourceData(
+		ctx,
+		adapter,
+		[]adapterTablePlan{plan},
+	); err != nil {
+		t.Fatalf("snapshot SQL Server source preflight: %v", err)
+	}
+
+	rows, err := adapter.OpenRows(
+		ctx,
+		sourceTable,
+		plan.columns,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var copied [][]any
+	for rows.Next() {
+		var id any
+		var amount any
+		if err := rows.Scan(&id, &amount); err != nil {
+			_ = rows.Close()
+			t.Fatal(err)
+		}
+		copied = append(copied, []any{id, amount})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		t.Fatal(err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if want := [][]any{{int64(1), "7"}}; !reflect.DeepEqual(copied, want) {
+		t.Fatalf("copied snapshot rows = %#v, want %#v", copied, want)
+	}
+	count, err := adapter.CountRows(ctx, sourceTable)
+	if err != nil || count != 1 {
+		t.Fatalf("snapshot count = %d, error = %v", count, err)
+	}
+}
+
 func openSQLiteSourceAdapterForTest(
 	t *testing.T,
 	path string,

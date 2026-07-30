@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -17,6 +18,7 @@ import (
 
 type sqliteSourceAdapter struct {
 	database *sql.DB
+	snapshot *sql.Tx
 }
 
 var _ sourceAdapter = (*sqliteSourceAdapter)(nil)
@@ -58,7 +60,27 @@ func openSQLiteSourceAdapter(
 		_ = database.Close()
 		return nil, fmt.Errorf("open SQLite source: %w", err)
 	}
-	return &sqliteSourceAdapter{database: database}, nil
+	snapshot, err := database.BeginTx(
+		ctx,
+		&sql.TxOptions{ReadOnly: true},
+	)
+	if err != nil {
+		_ = database.Close()
+		return nil, fmt.Errorf("begin SQLite source snapshot: %w", err)
+	}
+	var schemaEntries int
+	if err := snapshot.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM sqlite_schema`,
+	).Scan(&schemaEntries); err != nil {
+		_ = snapshot.Rollback()
+		_ = database.Close()
+		return nil, fmt.Errorf("establish SQLite source snapshot: %w", err)
+	}
+	return &sqliteSourceAdapter{
+		database: database,
+		snapshot: snapshot,
+	}, nil
 }
 
 func sqliteReadOnlyURI(path string) string {
@@ -87,7 +109,7 @@ func (adapter *sqliteSourceAdapter) DisplayName() string {
 func (adapter *sqliteSourceAdapter) ListTables(
 	ctx context.Context,
 ) ([]string, error) {
-	rows, err := adapter.database.QueryContext(ctx, `
+	rows, err := adapter.snapshot.QueryContext(ctx, `
 		SELECT name
 		FROM pragma_table_list
 		WHERE schema = 'main'
@@ -118,10 +140,10 @@ func (adapter *sqliteSourceAdapter) InspectTable(
 	ctx context.Context,
 	name string,
 ) (schema.Table, error) {
-	if err := rejectSQLiteTableTriggers(ctx, adapter.database, name); err != nil {
+	if err := rejectSQLiteTableTriggers(ctx, adapter.snapshot, name); err != nil {
 		return schema.Table{}, err
 	}
-	table, _, err := inspectSQLiteSchema(ctx, adapter.database, name)
+	table, _, err := inspectSQLiteSchema(ctx, adapter.snapshot, name)
 	if err != nil {
 		return schema.Table{}, err
 	}
@@ -149,7 +171,7 @@ func (adapter *sqliteSourceAdapter) OpenRows(
 	}
 	query := "SELECT " + projection + " FROM " + quote(table.Name) +
 		" ORDER BY " + quotedColumns(keys)
-	rows, err := adapter.database.QueryContext(ctx, query)
+	rows, err := adapter.snapshot.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("read SQLite table %s: %w", table.Name, err)
 	}
@@ -209,7 +231,7 @@ func (adapter *sqliteSourceAdapter) CountRows(
 	table schema.Table,
 ) (int, error) {
 	var count int
-	if err := adapter.database.QueryRowContext(
+	if err := adapter.snapshot.QueryRowContext(
 		ctx,
 		"SELECT COUNT(*) FROM "+quote(table.Name),
 	).Scan(&count); err != nil {
@@ -219,5 +241,23 @@ func (adapter *sqliteSourceAdapter) CountRows(
 }
 
 func (adapter *sqliteSourceAdapter) Close() error {
-	return adapter.database.Close()
+	var result error
+	if adapter != nil && adapter.snapshot != nil {
+		if err := adapter.snapshot.Rollback(); err != nil &&
+			!errors.Is(err, sql.ErrTxDone) {
+			result = errors.Join(
+				result,
+				fmt.Errorf("close SQLite source snapshot: %w", err),
+			)
+		}
+	}
+	if adapter != nil && adapter.database != nil {
+		if err := adapter.database.Close(); err != nil {
+			result = errors.Join(
+				result,
+				fmt.Errorf("close SQLite source database: %w", err),
+			)
+		}
+	}
+	return result
 }

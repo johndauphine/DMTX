@@ -69,6 +69,79 @@ func TestInspectSQLiteSchemaDiscoversNeutralIdentityFrontier(t *testing.T) {
 	}
 }
 
+func TestInspectSQLiteSchemaPromotesIdentityFrontierToPositiveRowMaximum(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name  string
+		setup string
+	}{
+		{
+			name: "sequence below row maximum",
+			setup: `
+				UPDATE sqlite_sequence
+				SET seq = 0
+				WHERE name = 'events';
+			`,
+		},
+		{
+			name: "missing sequence with positive rows",
+			setup: `
+				DELETE FROM sqlite_sequence
+				WHERE name = 'events';
+			`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database := openNeutralIdentitySQLite(t)
+			if _, err := database.ExecContext(ctx, `
+				CREATE TABLE events (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					note TEXT
+				);
+				INSERT INTO events(id, note) VALUES
+					(1, 'first'),
+					(100, 'highest');
+			`+test.setup); err != nil {
+				t.Fatal(err)
+			}
+
+			table, _, err := inspectSQLiteSchema(
+				ctx,
+				database,
+				"events",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if table.Identity == nil ||
+				table.Identity.Frontier == nil ||
+				*table.Identity.Frontier != 100 {
+				t.Fatalf(
+					"effective identity frontier = %#v, want 100",
+					table.Identity,
+				)
+			}
+
+			result, err := database.ExecContext(
+				ctx,
+				`INSERT INTO events(note) VALUES ('next')`,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next, err := result.LastInsertId()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if next != 101 {
+				t.Fatalf("next SQLite identity = %d, want 101", next)
+			}
+		})
+	}
+}
+
 func TestSQLiteTargetUpsertPreflightComparesNeutralIdentity(t *testing.T) {
 	ctx := context.Background()
 	tests := []struct {

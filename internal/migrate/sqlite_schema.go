@@ -12,7 +12,12 @@ import (
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
-func inspectSQLiteSchema(ctx context.Context, database *sql.DB, name string) (schema.Table, []string, error) {
+type sqliteQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func inspectSQLiteSchema(ctx context.Context, database sqliteQueryer, name string) (schema.Table, []string, error) {
 	createSQL, err := sqliteCreateTableSQL(ctx, database, name)
 	if err != nil {
 		return schema.Table{}, nil, err
@@ -79,7 +84,17 @@ func inspectSQLiteSchema(ctx context.Context, database *sql.DB, name string) (sc
 		return schema.Table{}, nil, err
 	}
 	if table.Identity != nil {
-		table.Identity.Frontier, err = inspectSQLiteSequence(ctx, database, name)
+		sequence, sequenceErr := inspectSQLiteSequence(ctx, database, name)
+		if sequenceErr != nil {
+			return schema.Table{}, nil, sequenceErr
+		}
+		table.Identity.Frontier, err = inspectSQLiteIdentityFrontier(
+			ctx,
+			database,
+			name,
+			table.Identity.Column,
+			sequence,
+		)
 		if err != nil {
 			return schema.Table{}, nil, err
 		}
@@ -93,7 +108,7 @@ func inspectSQLiteSchema(ctx context.Context, database *sql.DB, name string) (sc
 	return table, names, nil
 }
 
-func sqliteCreateTableSQL(ctx context.Context, database *sql.DB, name string) (string, error) {
+func sqliteCreateTableSQL(ctx context.Context, database sqliteQueryer, name string) (string, error) {
 	var statement sql.NullString
 	err := database.QueryRowContext(ctx, `SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?`, name).Scan(&statement)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -108,7 +123,7 @@ func sqliteCreateTableSQL(ctx context.Context, database *sql.DB, name string) (s
 	return statement.String, nil
 }
 
-func rejectSQLiteTableTriggers(ctx context.Context, database *sql.DB, table string) error {
+func rejectSQLiteTableTriggers(ctx context.Context, database sqliteQueryer, table string) error {
 	var trigger string
 	err := database.QueryRowContext(
 		ctx,
@@ -360,7 +375,7 @@ func extractSQLiteChecks(statement string) ([]schema.CheckConstraint, error) {
 	return checks, nil
 }
 
-func inspectSQLiteIndexes(ctx context.Context, database *sql.DB, table string) ([]schema.Index, error) {
+func inspectSQLiteIndexes(ctx context.Context, database sqliteQueryer, table string) ([]schema.Index, error) {
 	rows, err := database.QueryContext(ctx, "PRAGMA index_list("+quote(table)+")")
 	if err != nil {
 		return nil, fmt.Errorf("inspect SQLite indexes for %s: %w", table, err)
@@ -425,7 +440,7 @@ func inspectSQLiteIndexes(ctx context.Context, database *sql.DB, table string) (
 	return indexes, nil
 }
 
-func inspectSQLiteIndexColumns(ctx context.Context, database *sql.DB, indexName string) ([]schema.IndexColumn, error) {
+func inspectSQLiteIndexColumns(ctx context.Context, database sqliteQueryer, indexName string) ([]schema.IndexColumn, error) {
 	rows, err := database.QueryContext(ctx, "PRAGMA index_xinfo("+quote(indexName)+")")
 	if err != nil {
 		return nil, fmt.Errorf("inspect SQLite index columns for %s: %w", indexName, err)
@@ -472,7 +487,7 @@ func sqliteIndexSortKey(index schema.Index) string {
 	return strings.Join(parts, "\x00")
 }
 
-func inspectSQLiteForeignKeys(ctx context.Context, database *sql.DB, table string) ([]schema.ForeignKey, error) {
+func inspectSQLiteForeignKeys(ctx context.Context, database sqliteQueryer, table string) ([]schema.ForeignKey, error) {
 	rows, err := database.QueryContext(ctx, "PRAGMA foreign_key_list("+quote(table)+")")
 	if err != nil {
 		return nil, fmt.Errorf("inspect SQLite foreign keys for %s: %w", table, err)
@@ -527,7 +542,7 @@ func sqliteForeignKeySortKey(foreignKey schema.ForeignKey) string {
 	return strings.Join(append(append([]string{}, foreignKey.Columns...), append([]string{foreignKey.ReferencedTable}, foreignKey.ReferencedColumns...)...), "\x00") + "\x00" + foreignKey.OnUpdate + "\x00" + foreignKey.OnDelete + "\x00" + foreignKey.Match
 }
 
-func inspectSQLiteSequence(ctx context.Context, database *sql.DB, table string) (*int64, error) {
+func inspectSQLiteSequence(ctx context.Context, database sqliteQueryer, table string) (*int64, error) {
 	var sequence int64
 	err := database.QueryRowContext(ctx, `SELECT seq FROM sqlite_sequence WHERE name = ?`, table).Scan(&sequence)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -537,6 +552,38 @@ func inspectSQLiteSequence(ctx context.Context, database *sql.DB, table string) 
 		return nil, fmt.Errorf("inspect SQLite AUTOINCREMENT sequence for %s: %w", table, err)
 	}
 	return &sequence, nil
+}
+
+func inspectSQLiteIdentityFrontier(
+	ctx context.Context,
+	database sqliteQueryer,
+	table string,
+	column string,
+	sequence *int64,
+) (*int64, error) {
+	var maximum sql.NullInt64
+	if err := database.QueryRowContext(
+		ctx,
+		"SELECT MAX("+quote(column)+") FROM "+quote(table)+
+			" WHERE "+quote(column)+" > 0",
+	).Scan(&maximum); err != nil {
+		return nil, fmt.Errorf(
+			"inspect SQLite AUTOINCREMENT row maximum for %s: %w",
+			table,
+			err,
+		)
+	}
+	if sequence == nil && !maximum.Valid {
+		return nil, nil
+	}
+	frontier := int64(0)
+	if sequence != nil && *sequence > frontier {
+		frontier = *sequence
+	}
+	if maximum.Valid && maximum.Int64 > frontier {
+		frontier = maximum.Int64
+	}
+	return &frontier, nil
 }
 
 func containsSQLKeyword(value, keyword string) bool {
