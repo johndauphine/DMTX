@@ -116,6 +116,7 @@ func requireSQLiteRun(transaction *sql.Tx, runID string) (Run, error) {
 	}
 	row := transaction.QueryRow(`
 		SELECT id, source, target, source_engine, source_identity, target_identity,
+		       lease_target, lease_owner_token, lease_generation,
 		       outcome, resumable, reason, started_at, ended_at
 		FROM runs WHERE id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1
 	`, runID)

@@ -23,6 +23,9 @@ func TestStage4MutationsRejectStaleLeaseGeneration(t *testing.T) {
 				raw = YAMLStore{Path: filepath.Join(directory, "state.yaml")}
 			}
 			_, runID, key, started := initializeStage4Backend(t, raw)
+			if err := raw.BindRunLease(runID, firstLease); err != nil {
+				t.Fatalf("bind initial target lease: %v", err)
+			}
 			fenced := FenceBackend(raw, NewLeaseGuard(leaseStore, firstLease)).(Stage4Backend)
 			upper := TimestampWatermark{Column: "updated_at", Value: started.Add(time.Hour)}
 			incremental := IncrementalAttempt{
@@ -194,6 +197,9 @@ func TestStage4MutationsRejectDifferentRunWithCurrentLease(t *testing.T) {
 			}
 			if _, _, err := rawStage4.BeginDeleteReconciliation(deleteAttempt); err != nil {
 				t.Fatal(err)
+			}
+			if err := raw.BindRunLease("run-a", lease); err != nil {
+				t.Fatalf("bind owned run target lease: %v", err)
 			}
 
 			fenced := FenceBackend(raw, NewLeaseGuard(leaseStore, lease)).(Stage4Backend)

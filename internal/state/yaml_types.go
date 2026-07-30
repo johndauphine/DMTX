@@ -7,32 +7,38 @@ import (
 )
 
 type runYAML struct {
-	ID             string    `yaml:"id"`
-	Source         string    `yaml:"source"`
-	Target         string    `yaml:"target"`
-	SourceEngine   string    `yaml:"source_engine,omitempty"`
-	SourceIdentity string    `yaml:"source_identity,omitempty"`
-	TargetIdentity string    `yaml:"target_identity,omitempty"`
-	Outcome        Outcome   `yaml:"outcome"`
-	Resumable      bool      `yaml:"resumable"`
-	Reason         string    `yaml:"resumability_reason"`
-	StartedAt      time.Time `yaml:"started_at"`
-	EndedAt        time.Time `yaml:"ended_at,omitempty"`
+	ID              string    `yaml:"id"`
+	Source          string    `yaml:"source"`
+	Target          string    `yaml:"target"`
+	SourceEngine    string    `yaml:"source_engine,omitempty"`
+	SourceIdentity  string    `yaml:"source_identity,omitempty"`
+	TargetIdentity  string    `yaml:"target_identity,omitempty"`
+	LeaseTarget     string    `yaml:"lease_target,omitempty"`
+	LeaseOwnerToken string    `yaml:"lease_owner_token,omitempty"`
+	LeaseGeneration int64     `yaml:"lease_generation,omitempty"`
+	Outcome         Outcome   `yaml:"outcome"`
+	Resumable       bool      `yaml:"resumable"`
+	Reason          string    `yaml:"resumability_reason"`
+	StartedAt       time.Time `yaml:"started_at"`
+	EndedAt         time.Time `yaml:"ended_at,omitempty"`
 }
 
 func (run Run) MarshalYAML() (any, error) {
 	return runYAML{
-		ID:             run.ID,
-		Source:         run.Source,
-		Target:         run.Target,
-		SourceEngine:   run.SourceEngine,
-		SourceIdentity: run.SourceIdentity,
-		TargetIdentity: run.TargetIdentity,
-		Outcome:        run.Outcome,
-		Resumable:      run.Resumable,
-		Reason:         run.Reason,
-		StartedAt:      run.StartedAt,
-		EndedAt:        run.EndedAt,
+		ID:              run.ID,
+		Source:          run.Source,
+		Target:          run.Target,
+		SourceEngine:    run.SourceEngine,
+		SourceIdentity:  run.SourceIdentity,
+		TargetIdentity:  run.TargetIdentity,
+		LeaseTarget:     run.LeaseTarget,
+		LeaseOwnerToken: run.LeaseOwnerToken,
+		LeaseGeneration: run.LeaseGeneration,
+		Outcome:         run.Outcome,
+		Resumable:       run.Resumable,
+		Reason:          run.Reason,
+		StartedAt:       run.StartedAt,
+		EndedAt:         run.EndedAt,
 	}, nil
 }
 
@@ -42,17 +48,20 @@ func (run *Run) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	*run = Run{
-		ID:             encoded.ID,
-		Source:         encoded.Source,
-		Target:         encoded.Target,
-		SourceEngine:   encoded.SourceEngine,
-		SourceIdentity: encoded.SourceIdentity,
-		TargetIdentity: encoded.TargetIdentity,
-		Outcome:        encoded.Outcome,
-		Resumable:      encoded.Resumable,
-		Reason:         encoded.Reason,
-		StartedAt:      encoded.StartedAt,
-		EndedAt:        encoded.EndedAt,
+		ID:              encoded.ID,
+		Source:          encoded.Source,
+		Target:          encoded.Target,
+		SourceEngine:    encoded.SourceEngine,
+		SourceIdentity:  encoded.SourceIdentity,
+		TargetIdentity:  encoded.TargetIdentity,
+		LeaseTarget:     encoded.LeaseTarget,
+		LeaseOwnerToken: encoded.LeaseOwnerToken,
+		LeaseGeneration: encoded.LeaseGeneration,
+		Outcome:         encoded.Outcome,
+		Resumable:       encoded.Resumable,
+		Reason:          encoded.Reason,
+		StartedAt:       encoded.StartedAt,
+		EndedAt:         encoded.EndedAt,
 	}
 	return nil
 }

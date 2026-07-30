@@ -45,7 +45,7 @@ type yamlStateDocument struct {
 
 // Append records a state transition for a migration run.
 func (store YAMLStore) Append(run Run) error {
-	if err := validateRunSourceEngine(run.SourceEngine); err != nil {
+	if err := validateRunRecord(run); err != nil {
 		return err
 	}
 	return store.update(func(document *yamlStateDocument) error {
@@ -291,6 +291,11 @@ func (store YAMLStore) loadUnlocked() (yamlStateDocument, error) {
 	}
 	if document.Version < 0 || document.Version > yamlStateVersion {
 		return yamlStateDocument{}, fmt.Errorf("decode YAML state: unsupported version %d", document.Version)
+	}
+	for _, run := range document.Runs {
+		if err := validateRunRecord(run); err != nil {
+			return yamlStateDocument{}, fmt.Errorf("decode YAML state: %w", err)
+		}
 	}
 	// Older layouts are retained verbatim. Stage 2 work topology and Stage 4
 	// restartability evidence are added on the next mutation.

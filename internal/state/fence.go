@@ -137,15 +137,70 @@ func (backend *fencedBackend) protect(operation func() error) error {
 	return backend.guard.Protect(context.Background(), operation)
 }
 
-func (backend *fencedBackend) protectRun(runID string, operation func() error) error {
+func sameLease(left, right Lease) bool {
+	return left.Target == right.Target &&
+		left.RunID == right.RunID &&
+		left.OwnerToken == right.OwnerToken &&
+		left.Generation == right.Generation
+}
+
+func (backend *fencedBackend) requireBoundRunLease(runID string) error {
+	runs, err := backend.backend.List()
+	if err != nil {
+		return fmt.Errorf("verify bound target lease: %w", err)
+	}
+	expected := backend.guard.Lease()
+	found := false
+	for _, run := range runs {
+		if run.ID != runID {
+			continue
+		}
+		bound, err := run.BoundLease()
+		if err != nil || !sameLease(bound, expected) {
+			return fmt.Errorf(
+				"%w: run %q is not bound to target=%q generation=%d",
+				ErrLeaseLost,
+				runID,
+				expected.Target,
+				expected.Generation,
+			)
+		}
+		found = true
+	}
+	if !found {
+		return fmt.Errorf("%w: unknown mutation run %q", ErrLeaseLost, runID)
+	}
+	return nil
+}
+
+func (backend *fencedBackend) protectOwnedRun(
+	runID string,
+	operation func() error,
+) error {
 	if backend.guard == nil || runID == "" || backend.guard.Lease().RunID != runID {
 		return fmt.Errorf("%w: mutation run %q is not owned by the lease", ErrLeaseLost, runID)
 	}
 	return backend.protect(operation)
 }
 
+func (backend *fencedBackend) protectRun(runID string, operation func() error) error {
+	return backend.protectOwnedRun(runID, func() error {
+		if err := backend.requireBoundRunLease(runID); err != nil {
+			return err
+		}
+		return operation()
+	})
+}
+
 func (backend *fencedBackend) InitializeRun(run Run, hash string) error {
-	return backend.protectRun(run.ID, func() error { return backend.backend.InitializeRun(run, hash) })
+	lease := backend.guard.Lease()
+	bound, err := runWithBoundLease(run, lease)
+	if err != nil {
+		return fmt.Errorf("%w: initialize run lease binding: %v", ErrLeaseLost, err)
+	}
+	return backend.protectOwnedRun(run.ID, func() error {
+		return backend.backend.InitializeRun(bound, hash)
+	})
 }
 func (backend *fencedBackend) Append(run Run) error {
 	return backend.protectRun(run.ID, func() error { return backend.backend.Append(run) })
@@ -156,6 +211,14 @@ func (backend *fencedBackend) Latest() (Run, bool, error) {
 }
 func (backend *fencedBackend) LatestResumableForTarget(target string) (Run, bool, error) {
 	return backend.backend.LatestResumableForTarget(target)
+}
+func (backend *fencedBackend) BindRunLease(runID string, lease Lease) error {
+	if backend.guard == nil || !sameLease(backend.guard.Lease(), lease) {
+		return fmt.Errorf("%w: target lease rebind does not match current owner", ErrLeaseLost)
+	}
+	return backend.protectOwnedRun(runID, func() error {
+		return backend.backend.BindRunLease(runID, lease)
+	})
 }
 func (backend *fencedBackend) ReactivateRun(runID, reason string) error {
 	return backend.protectRun(runID, func() error { return backend.backend.ReactivateRun(runID, reason) })

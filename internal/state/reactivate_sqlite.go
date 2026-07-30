@@ -24,7 +24,9 @@ func (store SQLiteStore) ReactivateRun(runID, reason string) error {
 
 	var run Run
 	err = transaction.QueryRow(`
-		SELECT id, source, target, source_engine, source_identity, target_identity, outcome, resumable, started_at
+		SELECT id, source, target, source_engine, source_identity, target_identity,
+		       lease_target, lease_owner_token, lease_generation,
+		       outcome, resumable, started_at
 		FROM runs WHERE id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1
 	`, runID).Scan(
 		&run.ID,
@@ -33,6 +35,9 @@ func (store SQLiteStore) ReactivateRun(runID, reason string) error {
 		&run.SourceEngine,
 		&run.SourceIdentity,
 		&run.TargetIdentity,
+		&run.LeaseTarget,
+		&run.LeaseOwnerToken,
+		&run.LeaseGeneration,
 		&run.Outcome,
 		&run.Resumable,
 		&run.StartedAt,
@@ -41,6 +46,9 @@ func (store SQLiteStore) ReactivateRun(runID, reason string) error {
 		return fmt.Errorf("reactivate run: unknown run %q", runID)
 	}
 	if err != nil {
+		return fmt.Errorf("read run for reactivation: %w", err)
+	}
+	if err := validateRunRecord(run); err != nil {
 		return fmt.Errorf("read run for reactivation: %w", err)
 	}
 	if err := ensureResumableTransition(run, "reactivate run"); err != nil {
@@ -54,10 +62,12 @@ func (store SQLiteStore) ReactivateRun(runID, reason string) error {
 	if _, err := transaction.Exec(`
 		INSERT INTO runs (
 			id, source, target, source_engine, source_identity, target_identity,
+			lease_target, lease_owner_token, lease_generation,
 			outcome, resumable, reason, started_at, ended_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)
 	`, run.ID, run.Source, run.Target, run.SourceEngine, run.SourceIdentity, run.TargetIdentity,
+		run.LeaseTarget, run.LeaseOwnerToken, run.LeaseGeneration,
 		Running, reason, run.StartedAt.UTC()); err != nil {
 		return fmt.Errorf("record running run state: %w", err)
 	}

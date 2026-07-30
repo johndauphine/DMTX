@@ -22,19 +22,24 @@ func (store SQLiteStore) UpdateRecoverableOutcome(runID string, outcome Outcome,
 	}
 	defer transaction.Rollback()
 
-	var source, target, sourceEngine, sourceIdentity, targetIdentity string
+	var run Run
 	var startedAt time.Time
 	var latest Outcome
 	var resumable bool
 	err = transaction.QueryRow(`
-		SELECT source, target, source_engine, source_identity, target_identity, started_at, outcome, resumable
+		SELECT source, target, source_engine, source_identity, target_identity,
+		       lease_target, lease_owner_token, lease_generation,
+		       started_at, outcome, resumable
 		FROM runs WHERE id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1
 	`, runID).Scan(
-		&source,
-		&target,
-		&sourceEngine,
-		&sourceIdentity,
-		&targetIdentity,
+		&run.Source,
+		&run.Target,
+		&run.SourceEngine,
+		&run.SourceIdentity,
+		&run.TargetIdentity,
+		&run.LeaseTarget,
+		&run.LeaseOwnerToken,
+		&run.LeaseGeneration,
 		&startedAt,
 		&latest,
 		&resumable,
@@ -43,6 +48,10 @@ func (store SQLiteStore) UpdateRecoverableOutcome(runID string, outcome Outcome,
 		return fmt.Errorf("update recoverable run state: unknown run %q", runID)
 	}
 	if err != nil {
+		return fmt.Errorf("read run for recoverable state: %w", err)
+	}
+	run.ID = runID
+	if err := validateRunRecord(run); err != nil {
 		return fmt.Errorf("read run for recoverable state: %w", err)
 	}
 	if err := ensureResumableTransition(Run{
@@ -60,10 +69,12 @@ func (store SQLiteStore) UpdateRecoverableOutcome(runID string, outcome Outcome,
 	if _, err := transaction.Exec(`
 		INSERT INTO runs (
 			id, source, target, source_engine, source_identity, target_identity,
+			lease_target, lease_owner_token, lease_generation,
 			outcome, resumable, reason, started_at, ended_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-	`, runID, source, target, sourceEngine, sourceIdentity, targetIdentity,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+	`, runID, run.Source, run.Target, run.SourceEngine, run.SourceIdentity, run.TargetIdentity,
+		run.LeaseTarget, run.LeaseOwnerToken, run.LeaseGeneration,
 		outcome, reason, startedAt.UTC(), endedAt.UTC()); err != nil {
 		return fmt.Errorf("record recoverable run state: %w", err)
 	}

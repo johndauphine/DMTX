@@ -39,7 +39,10 @@ func requireYAMLRun(document yamlStateDocument, runID string) (Run, error) {
 			run.Target != selected.Target ||
 			run.SourceEngine != selected.SourceEngine ||
 			run.SourceIdentity != selected.SourceIdentity ||
-			run.TargetIdentity != selected.TargetIdentity) {
+			run.TargetIdentity != selected.TargetIdentity ||
+			run.LeaseTarget != selected.LeaseTarget ||
+			run.LeaseOwnerToken != selected.LeaseOwnerToken ||
+			run.LeaseGeneration != selected.LeaseGeneration) {
 			return Run{}, fmt.Errorf("%w: run %q endpoint identity changed", ErrImmutableEvidence, runID)
 		}
 		if !found || !run.StartedAt.Before(selected.StartedAt) {
@@ -50,7 +53,7 @@ func requireYAMLRun(document yamlStateDocument, runID string) (Run, error) {
 	if !found {
 		return Run{}, fmt.Errorf("%w: run %q", ErrUnknownWork, runID)
 	}
-	if err := validateRunSourceEngine(selected.SourceEngine); err != nil {
+	if err := validateRunRecord(selected); err != nil {
 		return Run{}, fmt.Errorf("%w: run %q: %v", ErrImmutableEvidence, runID, err)
 	}
 	return selected, nil

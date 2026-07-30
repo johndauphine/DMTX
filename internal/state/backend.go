@@ -12,6 +12,7 @@ type Backend interface {
 	List() ([]Run, error)
 	Latest() (Run, bool, error)
 	LatestResumableForTarget(string) (Run, bool, error)
+	BindRunLease(string, Lease) error
 	ReactivateRun(string, string) error
 	UpdateFailure(string, string, time.Time) error
 	UpdateRecoverableOutcome(string, Outcome, string, time.Time) error

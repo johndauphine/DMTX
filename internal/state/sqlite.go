@@ -99,7 +99,7 @@ func (store SQLiteStore) AdvanceRowNumberTask(runID, table string, rowsDone int,
 
 // Append records a state transition for a migration run.
 func (store SQLiteStore) Append(run Run) error {
-	if err := validateRunSourceEngine(run.SourceEngine); err != nil {
+	if err := validateRunRecord(run); err != nil {
 		return err
 	}
 	database, err := store.Open()
@@ -109,6 +109,7 @@ func (store SQLiteStore) Append(run Run) error {
 	defer database.Close()
 	existingRows, err := database.Query(`
 		SELECT id, source, target, source_engine, source_identity, target_identity,
+		       lease_target, lease_owner_token, lease_generation,
 		       outcome, resumable, reason, started_at, ended_at
 		FROM runs WHERE id = ? ORDER BY started_at, rowid
 	`, run.ID)
@@ -134,17 +135,19 @@ func (store SQLiteStore) Append(run Run) error {
 	); err != nil {
 		return err
 	}
-	if err := validateRunSourceEngine(run.SourceEngine); err != nil {
+	if err := validateRunRecord(run); err != nil {
 		return err
 	}
 
 	_, err = database.Exec(`
 		INSERT INTO runs (
 			id, source, target, source_engine, source_identity, target_identity,
+			lease_target, lease_owner_token, lease_generation,
 			outcome, resumable, reason, started_at, ended_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, run.ID, run.Source, run.Target, run.SourceEngine, run.SourceIdentity, run.TargetIdentity,
+		run.LeaseTarget, run.LeaseOwnerToken, run.LeaseGeneration,
 		run.Outcome, run.Resumable, run.Reason, run.StartedAt.UTC(), nullableTime(run.EndedAt))
 	if err != nil {
 		return fmt.Errorf("record run state: %w", err)
@@ -250,6 +253,7 @@ func (store SQLiteStore) Latest() (Run, bool, error) {
 	defer database.Close()
 	row := database.QueryRow(`
 		SELECT id, source, target, source_engine, source_identity, target_identity,
+		       lease_target, lease_owner_token, lease_generation,
 		       outcome, resumable, reason, started_at, ended_at
 		FROM runs ORDER BY started_at DESC, rowid DESC LIMIT 1
 	`)
@@ -272,6 +276,7 @@ func (store SQLiteStore) List() ([]Run, error) {
 	defer database.Close()
 	rows, err := database.Query(`
 		SELECT id, source, target, source_engine, source_identity, target_identity,
+		       lease_target, lease_owner_token, lease_generation,
 		       outcome, resumable, reason, started_at, ended_at
 		FROM runs ORDER BY started_at, rowid
 	`)
@@ -320,6 +325,8 @@ func (store SQLiteStore) Open() (*sql.DB, error) {
 			id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, outcome TEXT NOT NULL,
 			source_engine TEXT NOT NULL DEFAULT '',
 			source_identity TEXT NOT NULL DEFAULT '', target_identity TEXT NOT NULL DEFAULT '',
+			lease_target TEXT NOT NULL DEFAULT '', lease_owner_token TEXT NOT NULL DEFAULT '',
+			lease_generation INTEGER NOT NULL DEFAULT 0,
 			resumable INTEGER NOT NULL, reason TEXT NOT NULL, started_at DATETIME NOT NULL,
 			ended_at DATETIME, PRIMARY KEY (id, outcome)
 		);
@@ -352,6 +359,18 @@ func (store SQLiteStore) Open() (*sql.DB, error) {
 		database.Close()
 		return nil, fmt.Errorf("upgrade source engine identity: %w", err)
 	}
+	if _, err := database.Exec(`ALTER TABLE runs ADD COLUMN lease_target TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		database.Close()
+		return nil, fmt.Errorf("upgrade target lease identity: %w", err)
+	}
+	if _, err := database.Exec(`ALTER TABLE runs ADD COLUMN lease_owner_token TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		database.Close()
+		return nil, fmt.Errorf("upgrade target lease owner token: %w", err)
+	}
+	if _, err := database.Exec(`ALTER TABLE runs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		database.Close()
+		return nil, fmt.Errorf("upgrade target lease generation: %w", err)
+	}
 	return database, nil
 }
 
@@ -367,6 +386,9 @@ func scanRun(scanner rowScanner) (Run, error) {
 		&run.SourceEngine,
 		&run.SourceIdentity,
 		&run.TargetIdentity,
+		&run.LeaseTarget,
+		&run.LeaseOwnerToken,
+		&run.LeaseGeneration,
 		&run.Outcome,
 		&run.Resumable,
 		&run.Reason,
@@ -378,7 +400,7 @@ func scanRun(scanner rowScanner) (Run, error) {
 	if endedAt.Valid {
 		run.EndedAt = endedAt.Time
 	}
-	if err := validateRunSourceEngine(run.SourceEngine); err != nil {
+	if err := validateRunRecord(run); err != nil {
 		return Run{}, err
 	}
 	return run, nil

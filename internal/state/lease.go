@@ -19,6 +19,21 @@ type Lease struct {
 
 // AcquireLease claims a target unless another live owner holds it.
 func (store SQLiteStore) AcquireLease(target, runID string, ttl time.Duration) (Lease, error) {
+	return store.AcquireLeaseMatching(target, runID, ttl, nil)
+}
+
+// AcquireLeaseMatching atomically claims a target while treating any target
+// accepted by equivalent as the same physical endpoint. It is used for local
+// file aliases whose stable file identity can appear after an initially
+// missing path is opened. All acquisitions in the store are serialized before
+// equivalence is evaluated, so two different textual keys cannot both pass an
+// empty read and become live owners.
+func (store SQLiteStore) AcquireLeaseMatching(
+	target,
+	runID string,
+	ttl time.Duration,
+	equivalent func(string) (bool, error),
+) (Lease, error) {
 	if ttl <= 0 {
 		return Lease{}, fmt.Errorf("lease TTL must be positive")
 	}
@@ -34,7 +49,12 @@ func (store SQLiteStore) AcquireLease(target, runID string, ttl time.Duration) (
 		CREATE TABLE IF NOT EXISTS leases (
 			target TEXT PRIMARY KEY, owner_token TEXT NOT NULL, run_id TEXT NOT NULL,
 			generation INTEGER NOT NULL, heartbeat_at DATETIME NOT NULL
-		)
+		);
+		CREATE TABLE IF NOT EXISTS lease_acquisition_lock (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			nonce INTEGER NOT NULL
+		);
+		INSERT OR IGNORE INTO lease_acquisition_lock(id, nonce) VALUES (1, 0);
 	`); err != nil {
 		return Lease{}, fmt.Errorf("initialize target leases: %w", err)
 	}
@@ -45,24 +65,92 @@ func (store SQLiteStore) AcquireLease(target, runID string, ttl time.Duration) (
 	}
 	defer tx.Rollback()
 
-	var generation int64
-	var heartbeat time.Time
-	err = tx.QueryRow(`SELECT generation, heartbeat_at FROM leases WHERE target = ?`, target).Scan(&generation, &heartbeat)
-	now := time.Now().UTC()
-	switch {
-	case err == sql.ErrNoRows:
-		generation = 1
-	case err != nil:
-		return Lease{}, fmt.Errorf("read target lease: %w", err)
-	case heartbeat.Add(ttl).After(now):
-		return Lease{}, fmt.Errorf("target already has a live migration lease")
-	default:
-		generation++
+	// Force a write reservation before reading the alias set. A second
+	// acquisition must observe this transaction's result rather than making a
+	// decision from the same stale snapshot under a different target key.
+	if _, err := tx.Exec(`
+		UPDATE lease_acquisition_lock SET nonce = nonce + 1 WHERE id = 1
+	`); err != nil {
+		return Lease{}, fmt.Errorf("serialize lease acquisition: %w", err)
 	}
+
+	now := time.Now().UTC()
+	rows, err := tx.Query(`
+		SELECT target, generation, heartbeat_at
+		FROM leases
+		ORDER BY target
+	`)
+	if err != nil {
+		return Lease{}, fmt.Errorf("read target leases: %w", err)
+	}
+	var generation int64
+	matchedTargets := make([]string, 0, 1)
+	for rows.Next() {
+		var existingTarget string
+		var existingGeneration int64
+		var heartbeat time.Time
+		if err := rows.Scan(
+			&existingTarget,
+			&existingGeneration,
+			&heartbeat,
+		); err != nil {
+			rows.Close()
+			return Lease{}, fmt.Errorf("decode target lease: %w", err)
+		}
+		matches := existingTarget == target
+		if !matches && equivalent != nil {
+			matches, err = equivalent(existingTarget)
+			if err != nil {
+				rows.Close()
+				return Lease{}, fmt.Errorf(
+					"compare target lease alias %q: %w",
+					existingTarget,
+					err,
+				)
+			}
+		}
+		if !matches {
+			continue
+		}
+		matchedTargets = append(matchedTargets, existingTarget)
+		if heartbeat.Add(ttl).After(now) {
+			rows.Close()
+			return Lease{}, fmt.Errorf(
+				"target already has a live migration lease",
+			)
+		}
+		if existingGeneration > generation {
+			generation = existingGeneration
+		}
+	}
+	if err := finishSQLiteRows(
+		rows,
+		"iterate target leases",
+		"close target lease query",
+	); err != nil {
+		return Lease{}, err
+	}
+	generation++
 
 	token, err := randomToken()
 	if err != nil {
 		return Lease{}, err
+	}
+	for _, alias := range matchedTargets {
+		if alias == target {
+			continue
+		}
+		if _, err := tx.Exec(`
+			UPDATE leases
+			SET owner_token = '', run_id = '', generation = ?, heartbeat_at = ?
+			WHERE target = ?
+		`, generation, time.Unix(0, 0).UTC(), alias); err != nil {
+			return Lease{}, fmt.Errorf(
+				"invalidate stale target lease alias %q: %w",
+				alias,
+				err,
+			)
+		}
 	}
 	_, err = tx.Exec(`
 		INSERT INTO leases (target, owner_token, run_id, generation, heartbeat_at)
