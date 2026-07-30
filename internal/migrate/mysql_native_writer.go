@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/johndauphine/dmtx/internal/engine"
 	"github.com/johndauphine/dmtx/internal/schema"
@@ -29,6 +30,13 @@ type mysqlTransactionProvider interface {
 
 type mysqlBatchTransaction interface {
 	Prepare(context.Context, string) (mysqlBatchStatement, error)
+	Execute(context.Context, string) (int64, error)
+	Count(context.Context, string) (int64, error)
+	LocalInfileEnabled(context.Context) (bool, error)
+	LoadLocalInfile(
+		context.Context,
+		mysqlLocalInfileRequest,
+	) (int64, error)
 	WarningCount(context.Context) (int64, error)
 	Commit() error
 	Rollback() error
@@ -75,6 +83,9 @@ func newMySQLSafeOperationError(
 type mysqlNativeWriter struct {
 	transactions mysqlTransactionProvider
 	flavor       engine.MySQLServerFlavor
+	mu           sync.Mutex
+	localInfile  mysqlLocalInfileState
+	warn         func(string)
 }
 
 func newMySQLNativeWriter(database *sql.DB) *mysqlNativeWriter {
@@ -91,6 +102,7 @@ func newMySQLNativeWriterForFlavor(
 	return &mysqlNativeWriter{
 		transactions: mysqlSQLTransactionProvider{database: database},
 		flavor:       flavor,
+		warn:         defaultMySQLNativeWriterWarning,
 	}
 }
 
@@ -139,6 +151,56 @@ func (writer *mysqlNativeWriter) WriteBatch(
 		return notCommitted, err
 	}
 
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if mode == "upsert" &&
+		writer.localInfile != mysqlLocalInfileFallback {
+		writer.useMySQLStrictInsertFallback(
+			mysqlLocalInfileUpsertFallbackWarning,
+		)
+	}
+	if mode == "drop_recreate" &&
+		writer.localInfile != mysqlLocalInfileFallback {
+		localRows, normalizeErr := normalizeMySQLLocalInfileRows(rows)
+		if normalizeErr != nil {
+			return notCommitted, fmt.Errorf(
+				"prepare MySQL native bulk data for table %s: %w",
+				table.Name,
+				normalizeErr,
+			)
+		}
+		receipt, fallback, bulkErr := writer.writeMySQLLocalInfileBatch(
+			ctx,
+			table,
+			columns,
+			localRows,
+		)
+		if bulkErr != nil || !fallback {
+			return receipt, bulkErr
+		}
+	}
+
+	return writer.writeMySQLStrictBatch(
+		ctx,
+		table,
+		mode,
+		rows,
+		writeStatement,
+	)
+}
+
+func (writer *mysqlNativeWriter) writeMySQLStrictBatch(
+	ctx context.Context,
+	table schema.Table,
+	mode string,
+	rows [][]any,
+	writeStatement string,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	notCommitted := WriteReceipt{
+		Certainty:     CommitNotCommitted,
+		AttemptedRows: attempted,
+	}
 	transaction, err := writer.transactions.Begin(ctx)
 	if err != nil {
 		return notCommitted, newMySQLSafeOperationError(
@@ -486,6 +548,48 @@ func (transaction mysqlSQLBatchTransaction) Prepare(
 		return nil, err
 	}
 	return mysqlSQLBatchStatement{statement: prepared}, nil
+}
+
+func (transaction mysqlSQLBatchTransaction) Execute(
+	ctx context.Context,
+	statement string,
+) (int64, error) {
+	result, err := transaction.transaction.ExecContext(ctx, statement)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (transaction mysqlSQLBatchTransaction) Count(
+	ctx context.Context,
+	statement string,
+) (int64, error) {
+	var count int64
+	err := transaction.transaction.QueryRowContext(ctx, statement).Scan(&count)
+	return count, err
+}
+
+func (transaction mysqlSQLBatchTransaction) LocalInfileEnabled(
+	ctx context.Context,
+) (bool, error) {
+	var value string
+	if err := transaction.transaction.QueryRowContext(
+		ctx,
+		"SELECT @@GLOBAL.local_infile",
+	).Scan(&value); err != nil {
+		return false, err
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "on":
+		return true, nil
+	case "0", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf(
+			"unexpected MySQL local_infile value",
+		)
+	}
 }
 
 func (transaction mysqlSQLBatchTransaction) WarningCount(
