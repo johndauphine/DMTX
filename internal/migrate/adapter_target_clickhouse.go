@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/johndauphine/dmtx/internal/config"
@@ -416,6 +417,68 @@ func (adapter *clickHouseTargetAdapter) PreflightTables(
 	return nil
 }
 
+func (adapter *clickHouseTargetAdapter) PreflightDestructive(
+	ctx context.Context,
+	targetTables []schema.Table,
+	migration config.Migration,
+) error {
+	mode, err := normalizeAdapterTargetMode(migration.TargetMode)
+	if err != nil {
+		return err
+	}
+	if mode != "drop_recreate" ||
+		migration.DestructiveAcknowledged {
+		return nil
+	}
+	for _, table := range targetTables {
+		var exists uint64
+		if err := adapter.database.QueryRowContext(
+			ctx,
+			`SELECT count()
+			   FROM system.tables
+			  WHERE database = ? AND name = ?`,
+			table.Schema,
+			table.Name,
+		).Scan(&exists); err != nil {
+			return fmt.Errorf(
+				"inspect ClickHouse rebuild target %s: %w",
+				table.Name,
+				err,
+			)
+		}
+		if exists == 0 {
+			continue
+		}
+		if exists != 1 {
+			return fmt.Errorf(
+				"inspect ClickHouse rebuild target %s: catalog returned %d tables",
+				table.Name,
+				exists,
+			)
+		}
+		var rows uint64
+		if err := adapter.database.QueryRowContext(
+			ctx,
+			"SELECT count() FROM "+
+				clickHouseQualified(table.Schema, table.Name),
+		).Scan(&rows); err != nil {
+			return fmt.Errorf(
+				"inspect ClickHouse rebuild target rows for %s: %w",
+				table.Name,
+				err,
+			)
+		}
+		if rows != 0 {
+			return fmt.Errorf(
+				"%w: ClickHouse target table %q contains rows; rerun with --acknowledge-destructive",
+				ErrDestructiveAcknowledgement,
+				table.Name,
+			)
+		}
+	}
+	return nil
+}
+
 func (adapter *clickHouseTargetAdapter) PrepareTables(
 	ctx context.Context,
 	targetTables []schema.Table,
@@ -428,7 +491,19 @@ func (adapter *clickHouseTargetAdapter) PrepareTables(
 	if mode != "drop_recreate" {
 		return clickHouseTargetPolicy("prepare target mode", mode)
 	}
-	for _, table := range targetTables {
+	ordered := append([]schema.Table(nil), targetTables...)
+	sort.Slice(ordered, func(left, right int) bool {
+		return adapterSourceTableKey(
+			ordered[left].Schema,
+			ordered[left].Name,
+		) < adapterSourceTableKey(
+			ordered[right].Schema,
+			ordered[right].Name,
+		)
+	})
+	drops := make([]string, len(ordered))
+	creates := make([]string, len(ordered))
+	for index, table := range ordered {
 		drop, err := schema.DropTable(schema.ClickHouse, table)
 		if err != nil {
 			return fmt.Errorf(
@@ -437,13 +512,7 @@ func (adapter *clickHouseTargetAdapter) PrepareTables(
 				err,
 			)
 		}
-		if _, err := adapter.database.ExecContext(ctx, drop); err != nil {
-			return fmt.Errorf(
-				"drop ClickHouse table %s: %w",
-				table.Name,
-				err,
-			)
-		}
+		drops[index] = drop
 		create, err := schema.CreateTable(schema.ClickHouse, table)
 		if err != nil {
 			return fmt.Errorf(
@@ -452,10 +521,35 @@ func (adapter *clickHouseTargetAdapter) PrepareTables(
 				err,
 			)
 		}
-		if _, err := adapter.database.ExecContext(ctx, create); err != nil {
+		creates[index] = create
+	}
+	for index, statement := range drops {
+		if _, err := adapter.database.ExecContext(
+			ctx,
+			statement,
+		); err != nil {
+			if index == 0 {
+				return fmt.Errorf(
+					"drop ClickHouse table %s: %w",
+					ordered[index].Name,
+					err,
+				)
+			}
 			return fmt.Errorf(
-				"create ClickHouse table %s: %w",
-				table.Name,
+				"drop ClickHouse table %s: %w; target preparation is partial and rerunning drop_recreate mode is the recovery path",
+				ordered[index].Name,
+				err,
+			)
+		}
+	}
+	for index, statement := range creates {
+		if _, err := adapter.database.ExecContext(
+			ctx,
+			statement,
+		); err != nil {
+			return fmt.Errorf(
+				"create ClickHouse table %s: %w; selected target tables were dropped and rerunning drop_recreate mode is the recovery path",
+				ordered[index].Name,
 				err,
 			)
 		}

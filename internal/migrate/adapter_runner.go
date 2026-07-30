@@ -147,6 +147,18 @@ type adapterTargetSourceDataPreflighter interface {
 	) error
 }
 
+// adapterTargetDestructivePreflighter lets a target enforce backup or
+// destructive acknowledgement against its live, in-scope objects. It remains
+// read-only and runs after ordinary catalog preflight but before checkpoints
+// or target mutation.
+type adapterTargetDestructivePreflighter interface {
+	PreflightDestructive(
+		context.Context,
+		[]schema.Table,
+		config.Migration,
+	) error
+}
+
 type adapterTargetMutationProtector interface {
 	ProtectTargetMutation(context.Context, func() error) error
 }
@@ -241,6 +253,18 @@ func migrateWithAdapters(
 	}
 	if err := target.PreflightTables(ctx, targetTables, mode); err != nil {
 		return Result{}, fmt.Errorf("preflight target tables: %w", err)
+	}
+	if preflighter, ok := target.(adapterTargetDestructivePreflighter); ok {
+		if err := preflighter.PreflightDestructive(
+			ctx,
+			targetTables,
+			cfg.Migration,
+		); err != nil {
+			return Result{}, fmt.Errorf(
+				"preflight destructive target action: %w",
+				err,
+			)
+		}
 	}
 	if preflighter, ok := target.(adapterTargetSourceDataPreflighter); ok {
 		if err := preflighter.PreflightSourceData(

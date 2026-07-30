@@ -297,6 +297,25 @@ func (target *recordingAdapterTarget) Close() error {
 	return nil
 }
 
+type destructivePreflightRecordingTarget struct {
+	*recordingAdapterTarget
+	migrations []config.Migration
+	err        error
+}
+
+func (target *destructivePreflightRecordingTarget) PreflightDestructive(
+	_ context.Context,
+	_ []schema.Table,
+	migration config.Migration,
+) error {
+	*target.events = append(
+		*target.events,
+		"target_destructive_preflight",
+	)
+	target.migrations = append(target.migrations, migration)
+	return target.err
+}
+
 type recordingTableObserver struct {
 	events *[]string
 }
@@ -465,6 +484,80 @@ func TestAdapterRunnerRejectsMissingPrimaryKeyBeforeTargetMutation(t *testing.T)
 			target.prepared,
 			target.written,
 		)
+	}
+}
+
+func TestAdapterRunnerRunsDestructivePreflightBeforeCheckpointOrMutation(
+	t *testing.T,
+) {
+	events := make([]string, 0)
+	source := &recordingAdapterSource{
+		events: &events,
+		table: schema.Table{
+			Schema: "public",
+			Name:   "items",
+			Columns: []schema.Column{
+				{Name: "id", PrimaryKey: true},
+				{Name: "payload"},
+			},
+		},
+	}
+	baseTarget := &recordingAdapterTarget{events: &events}
+	target := &destructivePreflightRecordingTarget{
+		recordingAdapterTarget: baseTarget,
+		err:                    ErrDestructiveAcknowledgement,
+	}
+	cfg := config.Config{
+		Migration: config.Migration{
+			TargetMode:              "drop_recreate",
+			DestructiveAcknowledged: true,
+		},
+	}
+	_, err := migrateWithAdapters(
+		context.Background(),
+		cfg,
+		recordingTableObserver{events: &events},
+		source,
+		target,
+	)
+	if !errors.Is(err, ErrDestructiveAcknowledgement) {
+		t.Fatalf("destructive preflight error = %v", err)
+	}
+	if len(target.migrations) != 1 ||
+		target.migrations[0].TargetMode != "drop_recreate" ||
+		!target.migrations[0].DestructiveAcknowledged {
+		t.Fatalf(
+			"destructive preflight migrations = %+v",
+			target.migrations,
+		)
+	}
+	if len(baseTarget.prepared) != 0 ||
+		len(baseTarget.written) != 0 ||
+		len(baseTarget.finalized) != 0 {
+		t.Fatalf(
+			"destructive preflight failure mutated target: prepare=%v write=%v finalize=%v",
+			baseTarget.prepared,
+			baseTarget.written,
+			baseTarget.finalized,
+		)
+	}
+	for _, event := range events {
+		if strings.HasPrefix(event, "before") {
+			t.Fatalf(
+				"checkpoint ran before destructive preflight: %v",
+				events,
+			)
+		}
+	}
+	wantEvents := []string{
+		"source_list",
+		"source_inspect",
+		"target_plan",
+		"target_preflight",
+		"target_destructive_preflight",
+	}
+	if fmt.Sprint(events) != fmt.Sprint(wantEvents) {
+		t.Fatalf("events = %v, want %v", events, wantEvents)
 	}
 }
 

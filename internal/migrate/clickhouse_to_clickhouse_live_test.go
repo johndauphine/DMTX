@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -40,20 +41,13 @@ func TestClickHouse248ToClickHouse248RebuildLive(t *testing.T) {
 		targetEndpoint,
 		"target",
 	)
-	if err := requireDistinctLiveClickHouseDatabases(
-		ctx,
-		&clickHouseSourceAdapter{database: source},
-		&clickHouseTargetAdapter{database: source},
-	); err == nil || !strings.Contains(err.Error(), "distinct live") {
-		t.Fatalf("same live ClickHouse database error = %v", err)
-	}
-
 	tableName := fmt.Sprintf(
 		"dmtx_clickhouse_rebuild_%d",
 		time.Now().UnixNano(),
 	)
 	hazardName := tableName + "_hazard"
 	materializedViewName := tableName + "_mv"
+	sameDatabaseName := tableName + "_same_database"
 	for _, fixture := range []struct {
 		database  *sql.DB
 		namespace string
@@ -64,6 +58,7 @@ func TestClickHouse248ToClickHouse248RebuildLive(t *testing.T) {
 		{source, sourceEndpoint.Database, hazardName},
 		{target, targetEndpoint.Database, hazardName},
 		{target, targetEndpoint.Database, materializedViewName},
+		{source, sourceEndpoint.Database, sameDatabaseName},
 	} {
 		fixture := fixture
 		t.Cleanup(func() {
@@ -81,6 +76,54 @@ func TestClickHouse248ToClickHouse248RebuildLive(t *testing.T) {
 					),
 			)
 		})
+	}
+
+	if _, err := source.ExecContext(
+		ctx,
+		"CREATE TABLE "+
+			clickHouseQualified(
+				sourceEndpoint.Database,
+				sameDatabaseName,
+			)+
+			" (sentinel Int64) ENGINE = MergeTree ORDER BY sentinel",
+	); err != nil {
+		t.Fatalf("create same-database guard sentinel: %v", err)
+	}
+	if _, err := source.ExecContext(
+		ctx,
+		"INSERT INTO "+
+			clickHouseQualified(
+				sourceEndpoint.Database,
+				sameDatabaseName,
+			)+
+			" VALUES (7)",
+	); err != nil {
+		t.Fatalf("insert same-database guard sentinel: %v", err)
+	}
+	if err := requireDistinctLiveClickHouseDatabases(
+		ctx,
+		&clickHouseSourceAdapter{database: source},
+		&clickHouseTargetAdapter{database: source},
+	); err == nil || !strings.Contains(err.Error(), "distinct live") {
+		t.Fatalf("same live ClickHouse database error = %v", err)
+	}
+	var sameDatabaseSentinel uint64
+	if err := source.QueryRowContext(
+		ctx,
+		"SELECT count() FROM "+
+			clickHouseQualified(
+				sourceEndpoint.Database,
+				sameDatabaseName,
+			)+
+			" WHERE sentinel = 7",
+	).Scan(&sameDatabaseSentinel); err != nil {
+		t.Fatalf("inspect same-database guard sentinel: %v", err)
+	}
+	if sameDatabaseSentinel != 1 {
+		t.Fatalf(
+			"same-database guard mutated sentinel: %d",
+			sameDatabaseSentinel,
+		)
 	}
 
 	createClickHouseNativeSourceFixture(
@@ -142,6 +185,34 @@ func TestClickHouse248ToClickHouse248RebuildLive(t *testing.T) {
 	); err != nil {
 		t.Fatalf("insert target-only ClickHouse row: %v", err)
 	}
+	result, err = ClickHouseToClickHouseWithObserver(
+		ctx,
+		cfg,
+		nil,
+	)
+	if !errors.Is(err, ErrDestructiveAcknowledgement) {
+		t.Fatalf(
+			"unacknowledged ClickHouse rebuild result = %+v, error = %v",
+			result,
+			err,
+		)
+	}
+	var targetOnly uint64
+	if err := target.QueryRowContext(
+		ctx,
+		"SELECT count() FROM "+
+			clickHouseQualified(targetEndpoint.Database, tableName)+
+			" WHERE note = 'target-only'",
+	).Scan(&targetOnly); err != nil {
+		t.Fatalf("count rejected target-only row: %v", err)
+	}
+	if targetOnly != 1 {
+		t.Fatalf(
+			"unacknowledged rebuild mutated target-only rows: %d",
+			targetOnly,
+		)
+	}
+	cfg.Migration.DestructiveAcknowledged = true
 	if result, err = ClickHouseToClickHouseWithObserver(
 		ctx,
 		cfg,
@@ -152,7 +223,6 @@ func TestClickHouse248ToClickHouse248RebuildLive(t *testing.T) {
 	if result.Rows != fixtureRows || !result.Validated {
 		t.Fatalf("rerun result = %+v", result)
 	}
-	var targetOnly uint64
 	if err := target.QueryRowContext(
 		ctx,
 		"SELECT count() FROM "+

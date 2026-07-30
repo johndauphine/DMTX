@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"net/url"
@@ -155,13 +156,36 @@ func TestSQLiteToClickHouse248ComposedRouteLive(t *testing.T) {
 		t.Fatalf("insert target-only ClickHouse row: %v", err)
 	}
 	result, err = Execute(ctx, cfg, nil)
+	if !errors.Is(err, ErrDestructiveAcknowledgement) {
+		t.Fatalf(
+			"unacknowledged SQLite-to-ClickHouse rebuild result = %+v, error = %v",
+			result,
+			err,
+		)
+	}
+	var targetOnly int
+	if err := target.QueryRowContext(
+		ctx,
+		"SELECT COUNT(*) FROM "+
+			clickHouseQualified(endpoint.Database, tableName)+
+			" WHERE note = 'target-only'",
+	).Scan(&targetOnly); err != nil {
+		t.Fatalf("count rejected target-only ClickHouse rows: %v", err)
+	}
+	if targetOnly != 1 {
+		t.Fatalf(
+			"unacknowledged rebuild mutated target-only rows: %d",
+			targetOnly,
+		)
+	}
+	cfg.Migration.DestructiveAcknowledged = true
+	result, err = Execute(ctx, cfg, nil)
 	if err != nil {
 		t.Fatalf("rerun SQLite-to-ClickHouse route: %v", err)
 	}
 	if result.Rows != sqliteWriteBatchSize+1 || !result.Validated {
 		t.Fatalf("rerun result = %+v", result)
 	}
-	var targetOnly int
 	if err := target.QueryRowContext(
 		ctx,
 		"SELECT COUNT(*) FROM "+
