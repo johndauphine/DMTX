@@ -13,12 +13,86 @@ import (
 // resource controls are deliberately excluded: their concrete pagination
 // topology is checked independently against durable range state.
 func ResumeCompatibilityHash(value Config) (string, error) {
+	return resumeCompatibilityHashWithSQLiteIdentityModes(
+		value,
+		sqliteHashIdentityCanonical,
+		sqliteHashIdentityCanonical,
+	)
+}
+
+// LegacySQLitePathResumeCompatibilityHash reproduces compatibility evidence
+// written while a SQLite endpoint still had a single filesystem link. It is a
+// narrow resume bridge; new evidence must use ResumeCompatibilityHash.
+func LegacySQLitePathResumeCompatibilityHash(value Config) (string, error) {
+	return resumeCompatibilityHashWithSQLiteIdentityModes(
+		value,
+		sqliteHashIdentityPath,
+		sqliteHashIdentityPath,
+	)
+}
+
+// SQLiteFileIdentityResumeCompatibilityHash reproduces compatibility evidence
+// written while a SQLite file had multiple hardlinks. Resume may use it only
+// after endpoint ownership has been proven independently.
+func SQLiteFileIdentityResumeCompatibilityHash(value Config) (string, error) {
+	return resumeCompatibilityHashWithSQLiteIdentityModes(
+		value,
+		sqliteHashIdentityFile,
+		sqliteHashIdentityFile,
+	)
+}
+
+// SQLiteIdentityResumeCompatibilityHashCandidates returns every independent
+// source/target SQLite identity combination, with the canonical compatibility
+// hash first. Resume may use them only after proving both workload endpoints.
+func SQLiteIdentityResumeCompatibilityHashCandidates(
+	value Config,
+) ([]string, error) {
+	modes := []sqliteHashIdentityMode{
+		sqliteHashIdentityCanonical,
+		sqliteHashIdentityPath,
+		sqliteHashIdentityFile,
+	}
+	candidates := make([]string, 0, len(modes)*len(modes))
+	seen := make(map[string]struct{}, cap(candidates))
+	for _, sourceMode := range modes {
+		for _, targetMode := range modes {
+			candidate, err :=
+				resumeCompatibilityHashWithSQLiteIdentityModes(
+					value,
+					sourceMode,
+					targetMode,
+				)
+			if err != nil {
+				return nil, err
+			}
+			if _, ok := seen[candidate]; ok {
+				continue
+			}
+			seen[candidate] = struct{}{}
+			candidates = append(candidates, candidate)
+		}
+	}
+	return candidates, nil
+}
+
+func resumeCompatibilityHashWithSQLiteIdentityModes(
+	value Config,
+	sourceIdentityMode sqliteHashIdentityMode,
+	targetIdentityMode sqliteHashIdentityMode,
+) (string, error) {
 	normalizeDefaults(&value)
-	source, err := resumeEndpointFrom(value.Source)
+	source, err := resumeEndpointFrom(
+		value.Source,
+		sourceIdentityMode,
+	)
 	if err != nil {
 		return "", fmt.Errorf("canonicalize source resume identity: %w", err)
 	}
-	target, err := resumeEndpointFrom(value.Target)
+	target, err := resumeEndpointFrom(
+		value.Target,
+		targetIdentityMode,
+	)
 	if err != nil {
 		return "", fmt.Errorf("canonicalize target resume identity: %w", err)
 	}
@@ -60,7 +134,10 @@ type resumeEndpoint struct {
 	TLSCAFile string `json:"tls_ca_file"`
 }
 
-func resumeEndpointFrom(endpoint Endpoint) (resumeEndpoint, error) {
+func resumeEndpointFrom(
+	endpoint Endpoint,
+	sqliteIdentityMode sqliteHashIdentityMode,
+) (resumeEndpoint, error) {
 	engine, err := CanonicalEngine(endpoint.Type)
 	if err != nil {
 		return resumeEndpoint{}, err
@@ -68,7 +145,14 @@ func resumeEndpointFrom(endpoint Endpoint) (resumeEndpoint, error) {
 	endpoint.Type = engine
 	database := endpoint.Database
 	if engine == "sqlite" && strings.TrimSpace(database) != "" {
-		database, err = canonicalSQLiteHashIdentity(database)
+		switch sqliteIdentityMode {
+		case sqliteHashIdentityPath:
+			database, err = canonicalSQLitePathHashIdentity(database)
+		case sqliteHashIdentityFile:
+			database, err = canonicalSQLiteFileHashIdentity(database)
+		default:
+			database, err = canonicalSQLiteHashIdentity(database)
+		}
 		if err != nil {
 			return resumeEndpoint{}, err
 		}

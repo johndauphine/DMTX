@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -221,6 +222,173 @@ func TestHashCanonicalizesSQLitePathAndHardlinkAliases(t *testing.T) {
 			"equivalent SQLite endpoints differ: %s != %s",
 			firstHash,
 			secondHash,
+		)
+	}
+}
+
+func TestLegacySQLitePathHashesBridgeLaterHardlink(t *testing.T) {
+	directory := t.TempDir()
+	database := filepath.Join(directory, "target.db")
+	if err := os.WriteFile(database, []byte("sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	value := Config{
+		Source: Endpoint{
+			Type: "sqlite", Database: filepath.Join(directory, "source.db"),
+		},
+		Target:    Endpoint{Type: "sqlite", Database: database},
+		Migration: Migration{TargetMode: "upsert"},
+	}
+	beforeHash, err := Hash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeResumeHash, err := ResumeCompatibilityHash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hardlink := filepath.Join(directory, "target-hardlink.db")
+	if err := os.Link(database, hardlink); err != nil {
+		t.Skipf("hardlinks unavailable: %v", err)
+	}
+
+	afterHash, err := Hash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterResumeHash, err := ResumeCompatibilityHash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterHash == beforeHash || afterResumeHash == beforeResumeHash {
+		t.Fatal("hardlink did not exercise the SQLite path-to-file identity transition")
+	}
+	legacyHash, err := LegacySQLitePathHash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyResumeHash, err := LegacySQLitePathResumeCompatibilityHash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyHash != beforeHash || legacyResumeHash != beforeResumeHash {
+		t.Fatalf(
+			"legacy hashes = (%s, %s), want pre-hardlink (%s, %s)",
+			legacyHash,
+			legacyResumeHash,
+			beforeHash,
+			beforeResumeHash,
+		)
+	}
+	fileHash, err := SQLiteFileIdentityHash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileResumeHash, err := SQLiteFileIdentityResumeCompatibilityHash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileHash != afterHash || fileResumeHash != afterResumeHash {
+		t.Fatalf(
+			"file hashes = (%s, %s), want linked (%s, %s)",
+			fileHash,
+			fileResumeHash,
+			afterHash,
+			afterResumeHash,
+		)
+	}
+	if err := os.Remove(hardlink); err != nil {
+		t.Fatal(err)
+	}
+	afterRemovalHash, err := Hash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterRemovalResumeHash, err := ResumeCompatibilityHash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRemovalHash != beforeHash ||
+		afterRemovalResumeHash != beforeResumeHash {
+		t.Fatal("removing the alias did not restore path-based identity")
+	}
+	fileHash, err = SQLiteFileIdentityHash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileResumeHash, err =
+		SQLiteFileIdentityResumeCompatibilityHash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileHash != afterHash || fileResumeHash != afterResumeHash {
+		t.Fatalf(
+			"post-removal file hashes = (%s, %s), want prior linked (%s, %s)",
+			fileHash,
+			fileResumeHash,
+			afterHash,
+			afterResumeHash,
+		)
+	}
+}
+
+func TestSQLiteHashCandidatesCoverAsymmetricEndpointTransition(
+	t *testing.T,
+) {
+	directory := t.TempDir()
+	source := filepath.Join(directory, "source.db")
+	target := filepath.Join(directory, "target.db")
+	for _, path := range []string{source, target} {
+		if err := os.WriteFile(path, []byte("sqlite"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	targetAlias := filepath.Join(directory, "target-hardlink.db")
+	if err := os.Link(target, targetAlias); err != nil {
+		t.Skipf("hardlinks unavailable: %v", err)
+	}
+	value := Config{
+		Source:    Endpoint{Type: "sqlite", Database: source},
+		Target:    Endpoint{Type: "sqlite", Database: target},
+		Migration: Migration{TargetMode: "upsert"},
+	}
+	storedHash, err := Hash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedResumeHash, err := ResumeCompatibilityHash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(targetAlias); err != nil {
+		t.Fatal(err)
+	}
+	currentHash, err := Hash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentResumeHash, err := ResumeCompatibilityHash(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentHash == storedHash || currentResumeHash == storedResumeHash {
+		t.Fatal("fixture did not produce asymmetric path/file identity drift")
+	}
+	hashCandidates, err := SQLiteIdentityHashCandidates(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumeCandidates, err :=
+		SQLiteIdentityResumeCompatibilityHashCandidates(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(hashCandidates, storedHash) ||
+		!slices.Contains(resumeCandidates, storedResumeHash) {
+		t.Fatalf(
+			"asymmetric evidence missing: hash=%t resume=%t",
+			slices.Contains(hashCandidates, storedHash),
+			slices.Contains(resumeCandidates, storedResumeHash),
 		)
 	}
 }

@@ -105,3 +105,88 @@ func TestStage2TerminalRepairRejectsCandidateInsertedAfterPreselection(t *testin
 		})
 	}
 }
+
+func TestTerminalRepairAcceptsSQLiteHardlinkCreatedAfterSuccessHash(
+	t *testing.T,
+) {
+	directory := t.TempDir()
+	cache := filepath.Join(directory, "cache")
+	t.Setenv("XDG_CACHE_HOME", cache)
+	t.Setenv("LOCALAPPDATA", cache)
+	sourcePath := filepath.Join(directory, "source.db")
+	targetPath := filepath.Join(directory, "target.db")
+	targetAlias := filepath.Join(directory, "target-hardlink.db")
+	configPath := filepath.Join(directory, "migration.yaml")
+	statePath := filepath.Join(directory, "migration.state.db")
+	const runID = "terminal-hardlink-transition"
+
+	createStage2LifecycleSource(t, sourcePath)
+	createStage2LifecycleSource(t, targetPath)
+	cfg := writeSQLiteStateConfig(
+		t,
+		configPath,
+		sourcePath,
+		targetPath,
+	)
+	configHash, err := config.Hash(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := openStage2ResumeLifecycleBackend(t, statePath)
+	started := time.Now().Add(-time.Minute).UTC()
+	if err := store.InitializeRun(state.Run{
+		ID: runID, Source: sourcePath, Target: targetPath,
+		Outcome: state.Success, Resumable: false,
+		Reason: runSuccessReason, StartedAt: started,
+		EndedAt: started.Add(time.Second),
+	}, configHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateTask(state.Task{
+		RunID: runID, Table: "users", StartedAt: started,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteTask(
+		runID,
+		"users",
+		1,
+		started.Add(time.Second),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendAudit(configPath, runID, "validation_completed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(targetPath, targetAlias); err != nil {
+		t.Skipf("hardlinks unavailable: %v", err)
+	}
+	writeSQLiteStateConfig(
+		t,
+		configPath,
+		sourcePath,
+		targetAlias,
+	)
+
+	var stdout, stderr bytes.Buffer
+	code := Run(
+		[]string{"resume", "--config", configPath, "--state", statePath},
+		&stdout,
+		&stderr,
+	)
+	if code != Success {
+		t.Fatalf(
+			"terminal repair exit=%d stdout=%q stderr=%q",
+			code,
+			stdout.String(),
+			stderr.String(),
+		)
+	}
+	auditData, err := os.ReadFile(configPath + ".audit.ndjson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(auditData), `"type":"run_succeeded"`) {
+		t.Fatalf("terminal repair audit = %s", auditData)
+	}
+}

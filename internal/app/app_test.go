@@ -19,17 +19,17 @@ func TestVersion(t *testing.T) {
 	}
 }
 
-func TestResumeRejectsNetworkPairBeforeStateOrLeaseAccess(t *testing.T) {
+func TestResumeNetworkPairUsesCanonicalStateSelection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "migration.yaml")
 	configuration := "source:\n  type: sqlite\n  database: source.db\ntarget:\n  type: postgres\n  host: db.example\n  database: target\n  user: dmtx\n"
 	if err := os.WriteFile(path, []byte(configuration), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var output, errors bytes.Buffer
-	if code := Run([]string{"resume", "--config", path}, &output, &errors); code != ConfigurationError {
+	if code := Run([]string{"resume", "--config", path}, &output, &errors); code != StateError {
 		t.Fatalf("exit code = %d, stderr = %s", code, errors.String())
 	}
-	if !strings.Contains(errors.String(), "SQLite-to-SQLite") {
+	if !strings.Contains(errors.String(), "no resumable run exists") {
 		t.Fatalf("stderr = %q", errors.String())
 	}
 }

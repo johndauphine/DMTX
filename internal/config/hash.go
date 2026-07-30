@@ -10,15 +10,97 @@ import (
 
 const configurationHashVersion = 2
 
+type sqliteHashIdentityMode uint8
+
+const (
+	sqliteHashIdentityCanonical sqliteHashIdentityMode = iota
+	sqliteHashIdentityPath
+	sqliteHashIdentityFile
+)
+
 // Hash returns a stable fingerprint of data-plane configuration without secrets.
 func Hash(value Config) (string, error) {
+	return hashWithSQLiteIdentityModes(
+		value,
+		sqliteHashIdentityCanonical,
+		sqliteHashIdentityCanonical,
+	)
+}
+
+// LegacySQLitePathHash reproduces the configuration hash written before a
+// single-link SQLite file later gained a hardlink. It exists only to bridge
+// durable resume evidence across that safe identity transition; new evidence
+// must continue to use Hash.
+func LegacySQLitePathHash(value Config) (string, error) {
+	return hashWithSQLiteIdentityModes(
+		value,
+		sqliteHashIdentityPath,
+		sqliteHashIdentityPath,
+	)
+}
+
+// SQLiteFileIdentityHash reproduces evidence written while a SQLite file had
+// multiple hardlinks, even if aliases were later removed. Resume may use this
+// only after independently proving that the current endpoint is the persisted
+// workload.
+func SQLiteFileIdentityHash(value Config) (string, error) {
+	return hashWithSQLiteIdentityModes(
+		value,
+		sqliteHashIdentityFile,
+		sqliteHashIdentityFile,
+	)
+}
+
+// SQLiteIdentityHashCandidates returns every independently canonical, path,
+// or file-based SQLite endpoint identity combination. The canonical Hash is
+// first. Resume may compare these candidates only after separately proving
+// both persisted workload endpoints.
+func SQLiteIdentityHashCandidates(value Config) ([]string, error) {
+	modes := []sqliteHashIdentityMode{
+		sqliteHashIdentityCanonical,
+		sqliteHashIdentityPath,
+		sqliteHashIdentityFile,
+	}
+	candidates := make([]string, 0, len(modes)*len(modes))
+	seen := make(map[string]struct{}, cap(candidates))
+	for _, sourceMode := range modes {
+		for _, targetMode := range modes {
+			candidate, err := hashWithSQLiteIdentityModes(
+				value,
+				sourceMode,
+				targetMode,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if _, ok := seen[candidate]; ok {
+				continue
+			}
+			seen[candidate] = struct{}{}
+			candidates = append(candidates, candidate)
+		}
+	}
+	return candidates, nil
+}
+
+func hashWithSQLiteIdentityModes(
+	value Config,
+	sourceIdentityMode sqliteHashIdentityMode,
+	targetIdentityMode sqliteHashIdentityMode,
+) (string, error) {
 	intent := canonicalMigrationIntent(value.Migration)
 	normalizeDefaults(&value)
-	source, err := canonicalEndpointForHash(value.Source)
+	source, err := canonicalEndpointForHash(
+		value.Source,
+		sourceIdentityMode,
+	)
 	if err != nil {
 		return "", fmt.Errorf("canonicalize source configuration: %w", err)
 	}
-	target, err := canonicalEndpointForHash(value.Target)
+	target, err := canonicalEndpointForHash(
+		value.Target,
+		targetIdentityMode,
+	)
 	if err != nil {
 		return "", fmt.Errorf("canonicalize target configuration: %w", err)
 	}
@@ -42,14 +124,25 @@ func Hash(value Config) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
-func canonicalEndpointForHash(endpoint Endpoint) (Endpoint, error) {
+func canonicalEndpointForHash(
+	endpoint Endpoint,
+	sqliteIdentityMode sqliteHashIdentityMode,
+) (Endpoint, error) {
 	engine, err := CanonicalEngine(endpoint.Type)
 	if err != nil {
 		return Endpoint{}, err
 	}
 	endpoint.Type = engine
 	if engine == "sqlite" {
-		database, err := canonicalSQLiteHashIdentity(endpoint.Database)
+		var database string
+		switch sqliteIdentityMode {
+		case sqliteHashIdentityPath:
+			database, err = canonicalSQLitePathHashIdentity(endpoint.Database)
+		case sqliteHashIdentityFile:
+			database, err = canonicalSQLiteFileHashIdentity(endpoint.Database)
+		default:
+			database, err = canonicalSQLiteHashIdentity(endpoint.Database)
+		}
 		if err != nil {
 			return Endpoint{}, err
 		}
