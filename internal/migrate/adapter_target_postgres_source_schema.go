@@ -39,6 +39,14 @@ func projectMySQLTableForPostgres(
 			sourceTable.Name,
 		)
 	}
+	if !postgresCompatibleMySQLSourceCollation(
+		sourceTable.MySQLCollation,
+	) {
+		return schema.Table{}, postgresMySQLPolicy(
+			"map MySQL collation",
+			sourceTable.MySQLCollation,
+		)
+	}
 
 	projected := sourceTable
 	projected.Columns = append([]schema.Column(nil), sourceTable.Columns...)
@@ -78,6 +86,15 @@ func projectMySQLTableForPostgres(
 		)
 	}
 	return projected, nil
+}
+
+func postgresCompatibleMySQLSourceCollation(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "utf8mb4_0900_bin", "utf8mb4_nopad_bin":
+		return true
+	default:
+		return false
+	}
 }
 
 // projectMySQLColumnForPostgres accepts only the structured output of MySQL

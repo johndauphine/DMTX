@@ -108,6 +108,14 @@ type adapterTablePlan struct {
 	columns []string
 }
 
+// adapterSourceRowPreflighter permits a source to reject legacy values whose
+// invalid shape cannot be proven from catalog metadata alone. It runs after
+// every selected source table has been inspected and before target planning or
+// mutation.
+type adapterSourceRowPreflighter interface {
+	PreflightRows(context.Context, []schema.Table) error
+}
+
 // adapterTargetSourceDataPreflighter permits a target to perform bounded,
 // read-only source checks required by its narrower value or lifecycle
 // contracts. It runs after all metadata and target-catalog preflight and
@@ -367,6 +375,17 @@ func planAdapterTables(
 	)
 	if err != nil {
 		return nil, err
+	}
+	if preflighter, ok := source.(adapterSourceRowPreflighter); ok {
+		if err := preflighter.PreflightRows(
+			ctx,
+			sourceTables,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"preflight source rows: %w",
+				err,
+			)
+		}
 	}
 	targetTables, err := target.PlanTables(sourceEngine, sourceTables, mode)
 	if err != nil {

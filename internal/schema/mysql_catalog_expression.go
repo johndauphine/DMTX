@@ -166,6 +166,119 @@ func ParseMySQLCatalogDefault(
 	return nil, mysqlCatalogDefaultPolicy(column)
 }
 
+// ParseMariaDBCatalogDefault converts one MariaDB 10.11 COLUMN_DEFAULT value
+// into DMTX's structured expression contract. Unlike Oracle MySQL, MariaDB
+// returns text literals as quoted SQL strings. Those strings are decoded
+// structurally, while unquoted values are accepted only for the narrow scalar
+// and current-temporal forms appropriate for the column.
+//
+// MariaDB exposes a column without a default as SQL NULL and a nullable
+// implicit or explicit DEFAULT NULL as the text NULL. They have the same DMTX
+// planning semantics and therefore both return nil.
+func ParseMariaDBCatalogDefault(
+	column Column,
+	columnDefault *string,
+) (*Expression, error) {
+	if columnDefault == nil {
+		return nil, nil
+	}
+
+	target := mysqlCatalogDefaultTargetForColumn(column)
+	if target == mysqlCatalogDefaultUnknown {
+		return nil, mariaDBCatalogDefaultPolicy(column)
+	}
+
+	value := strings.TrimSpace(*columnDefault)
+	if value == "" {
+		return nil, mariaDBCatalogDefaultPolicy(column)
+	}
+	if strings.EqualFold(value, "NULL") {
+		// MariaDB reports an implicit or explicit nullable DEFAULT NULL as
+		// the non-SQL-NULL text NULL. A SQL NULL COLUMN_DEFAULT instead
+		// identifies a column with no default. Neither shape requires target
+		// DDL in DMTX.
+		if !column.Nullable {
+			return nil, mariaDBCatalogDefaultPolicy(column)
+		}
+		return nil, nil
+	}
+
+	if target == mysqlCatalogDefaultString {
+		if len(value) < 2 || value[0] != '\'' {
+			return nil, mariaDBCatalogDefaultPolicy(column)
+		}
+		literal, next, err := parsePlainMySQLCatalogCheckString(value, 1)
+		if err != nil || next != len(value) ||
+			!utf8.ValidString(literal) ||
+			strings.ContainsRune(literal, '\x00') {
+			return nil, mariaDBCatalogDefaultPolicy(column)
+		}
+		return &Expression{
+			sql:     portableCheckStringLiteral(literal),
+			kind:    expressionString,
+			literal: literal,
+		}, nil
+	}
+
+	switch target {
+	case mysqlCatalogDefaultBoolean:
+		switch strings.ToUpper(value) {
+		case "TRUE", "1":
+			return &Expression{
+				sql:     "TRUE",
+				kind:    expressionBoolean,
+				literal: "TRUE",
+			}, nil
+		case "FALSE", "0":
+			return &Expression{
+				sql:     "FALSE",
+				kind:    expressionBoolean,
+				literal: "FALSE",
+			}, nil
+		}
+	case mysqlCatalogDefaultInteger:
+		canonical, err := canonicalPostgresIntegerDefault(value, 64)
+		if err == nil {
+			return &Expression{
+				sql:     canonical,
+				kind:    expressionNumber,
+				literal: canonical,
+			}, nil
+		}
+	case mysqlCatalogDefaultFloat:
+		canonical, err := canonicalPostgresDoubleDefault(value)
+		if err == nil {
+			return &Expression{
+				sql:     canonical,
+				kind:    expressionNumber,
+				literal: canonical,
+			}, nil
+		}
+	case mysqlCatalogDefaultNumeric:
+		canonical, err := canonicalPostgresNumericDefault(value)
+		if err == nil {
+			return &Expression{
+				sql:     canonical,
+				kind:    expressionNumber,
+				literal: canonical,
+			}, nil
+		}
+	case mysqlCatalogDefaultTime,
+		mysqlCatalogDefaultDate,
+		mysqlCatalogDefaultTimestamp:
+		expression, err := parseMySQLCatalogCurrentDefault(
+			column,
+			target,
+			value,
+		)
+		if err == nil {
+			return expression, nil
+		}
+	}
+
+	return nil, mariaDBCatalogDefaultPolicy(column)
+}
+
 func parseMySQLCatalogCurrentDefault(
 	column Column,
 	target mysqlCatalogDefaultTarget,
@@ -309,6 +422,14 @@ func mysqlCatalogDefaultTargetForColumn(
 func mysqlCatalogDefaultPolicy(column Column) error {
 	return &PolicyError{
 		Operation: "parse MySQL catalog default",
+		Type:      column.Name,
+		Target:    string(MySQL),
+	}
+}
+
+func mariaDBCatalogDefaultPolicy(column Column) error {
+	return &PolicyError{
+		Operation: "parse MariaDB catalog default",
 		Type:      column.Name,
 		Target:    string(MySQL),
 	}

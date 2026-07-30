@@ -224,7 +224,11 @@ func validateMySQL80SourceServerCatalog(
 			)
 		}
 	}
-	for _, mode := range []string{"ANSI_QUOTES", "NO_BACKSLASH_ESCAPES"} {
+	for _, mode := range []string{
+		"ANSI_QUOTES",
+		"NO_BACKSLASH_ESCAPES",
+		"PAD_CHAR_TO_FULL_LENGTH",
+	} {
 		if modes[mode] {
 			return mysqlSourcePolicy(
 				"SQL mode",

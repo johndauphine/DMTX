@@ -127,8 +127,9 @@ func TestPostgresTargetPlansMySQLTypesObjectsAndIdentityWithoutMutation(
 		)
 		parentID.Nullable = true
 		return schema.Table{
-			Schema: "source_database",
-			Name:   "events",
+			Schema:         "source_database",
+			Name:           "events",
+			MySQLCollation: "utf8mb4_0900_bin",
 			Identity: &schema.Identity{
 				Column:     "id",
 				Generation: schema.IdentityByDefault,
@@ -359,6 +360,51 @@ func TestPostgresTargetPlansMySQLTypesObjectsAndIdentityWithoutMutation(
 	}
 }
 
+func TestPostgresTargetRequiresNoPadMySQLSourceCollation(
+	t *testing.T,
+) {
+	base := schema.Table{
+		Schema: "app",
+		Name:   "items",
+		Columns: []schema.Column{mysqlProjectionColumn(
+			"id",
+			"bigint",
+			"bigint",
+		)},
+	}
+	for _, collation := range []string{
+		"utf8mb4_0900_bin",
+		"utf8mb4_nopad_bin",
+	} {
+		t.Run("accept "+collation, func(t *testing.T) {
+			source := base
+			source.MySQLCollation = collation
+			if _, err := projectMySQLTableForPostgres(
+				source,
+			); err != nil {
+				t.Fatalf("project no-pad collation: %v", err)
+			}
+		})
+	}
+	for _, collation := range []string{
+		"",
+		"utf8mb4_bin",
+		"utf8mb4_0900_ai_ci",
+	} {
+		t.Run("reject "+collation, func(t *testing.T) {
+			source := base
+			source.MySQLCollation = collation
+			_, err := projectMySQLTableForPostgres(source)
+			var policy *schema.PolicyError
+			if !errors.As(err, &policy) ||
+				policy.Operation != "map MySQL collation" ||
+				policy.Target != string(schema.Postgres) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
 func TestPostgresTargetRejectsUnsafeMySQLMappings(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -525,8 +571,9 @@ func TestPostgresTargetRejectsUnsafeMySQLMappings(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			source := schema.Table{
-				Name:    "unsafe_mysql",
-				Columns: []schema.Column{test.column},
+				Name:           "unsafe_mysql",
+				MySQLCollation: "utf8mb4_0900_bin",
+				Columns:        []schema.Column{test.column},
 			}
 			if test.mutate != nil {
 				test.mutate(&source)

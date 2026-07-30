@@ -1,0 +1,141 @@
+package engine
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+
+	"github.com/johndauphine/dmtx/internal/config"
+)
+
+type mysqlServerFlavor uint8
+
+const (
+	mysqlServerFlavorUnknown mysqlServerFlavor = iota
+	mysqlServerFlavorOracle80
+	mysqlServerFlavorMariaDB1011
+)
+
+type mysqlServerFlavorCatalog struct {
+	version        string
+	versionComment string
+}
+
+const mysqlServerFlavorQuery = `
+	SELECT
+		VERSION(),
+		@@version_comment
+`
+
+// OpenMySQLSource opens the version-pinned source implementation selected
+// from the live server identity. Public engine aliases are deliberately not
+// trusted as flavor evidence because config canonicalization maps mysql,
+// mariadb, and maria to the same engine.
+func OpenMySQLSource(
+	ctx context.Context,
+	endpoint config.Endpoint,
+) (*sql.DB, error) {
+	probe, err := OpenMySQL(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	flavor, err := detectMySQLServerFlavor(ctx, probe)
+	if err != nil {
+		_ = probe.Close()
+		return nil, fmt.Errorf("detect MySQL source flavor: %w", err)
+	}
+	if err := probe.Close(); err != nil {
+		return nil, fmt.Errorf("close MySQL source flavor probe: %w", err)
+	}
+	switch flavor {
+	case mysqlServerFlavorOracle80:
+		return OpenMySQL80(ctx, endpoint)
+	case mysqlServerFlavorMariaDB1011:
+		return OpenMariaDB1011(ctx, endpoint)
+	default:
+		return nil, fmt.Errorf("unsupported MySQL source flavor")
+	}
+}
+
+// OpenMariaDB1011 verifies and pins a MariaDB 10.11 source connection. Unlike
+// Oracle MySQL, MariaDB must not receive information_schema_stats_expiry.
+func OpenMariaDB1011(
+	ctx context.Context,
+	endpoint config.Endpoint,
+) (*sql.DB, error) {
+	database, err := OpenMySQL(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	database.SetMaxOpenConns(1)
+	database.SetMaxIdleConns(1)
+	if err := VerifyMariaDB1011Source(ctx, database); err != nil {
+		_ = database.Close()
+		return nil, fmt.Errorf("verify MariaDB 10.11 connection: %w", err)
+	}
+	return database, nil
+}
+
+// VerifyMySQLSource dispatches source verification using the live server
+// flavor, then delegates to a version-pinned catalog contract.
+func VerifyMySQLSource(
+	ctx context.Context,
+	database *sql.DB,
+) error {
+	flavor, err := detectMySQLServerFlavor(ctx, database)
+	if err != nil {
+		return err
+	}
+	switch flavor {
+	case mysqlServerFlavorOracle80:
+		return VerifyMySQL80Source(ctx, database)
+	case mysqlServerFlavorMariaDB1011:
+		return VerifyMariaDB1011Source(ctx, database)
+	default:
+		return fmt.Errorf("unsupported MySQL source flavor")
+	}
+}
+
+func detectMySQLServerFlavor(
+	ctx context.Context,
+	database *sql.DB,
+) (mysqlServerFlavor, error) {
+	var catalog mysqlServerFlavorCatalog
+	if err := database.QueryRowContext(
+		ctx,
+		mysqlServerFlavorQuery,
+	).Scan(
+		&catalog.version,
+		&catalog.versionComment,
+	); err != nil {
+		return mysqlServerFlavorUnknown, fmt.Errorf(
+			"read MySQL server flavor: %w",
+			err,
+		)
+	}
+	return mysqlServerFlavorFromCatalog(catalog)
+}
+
+func mysqlServerFlavorFromCatalog(
+	catalog mysqlServerFlavorCatalog,
+) (mysqlServerFlavor, error) {
+	version := strings.ToLower(strings.TrimSpace(catalog.version))
+	comment := strings.ToLower(strings.TrimSpace(catalog.versionComment))
+	versionMariaDB := strings.Contains(version, "mariadb")
+	commentMariaDB := strings.Contains(comment, "mariadb")
+	switch {
+	case versionMariaDB && commentMariaDB:
+		return mysqlServerFlavorMariaDB1011, nil
+	case !versionMariaDB &&
+		!commentMariaDB &&
+		strings.Contains(comment, "mysql"):
+		return mysqlServerFlavorOracle80, nil
+	default:
+		return mysqlServerFlavorUnknown, fmt.Errorf(
+			"unsupported MySQL server flavor version=%q comment=%q",
+			catalog.version,
+			catalog.versionComment,
+		)
+	}
+}

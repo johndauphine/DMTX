@@ -46,6 +46,11 @@ func TestValidateMySQL80SourceServerCatalog(t *testing.T) {
 		"unsafe mode": func(value *mysql80SourceServerCatalog) {
 			value.sqlMode += ",NO_BACKSLASH_ESCAPES"
 		},
+		"CHAR padding changes reads": func(
+			value *mysql80SourceServerCatalog,
+		) {
+			value.sqlMode += ",PAD_CHAR_TO_FULL_LENGTH"
+		},
 		"missing strict mode": func(value *mysql80SourceServerCatalog) {
 			value.sqlMode = strings.ReplaceAll(
 				value.sqlMode,

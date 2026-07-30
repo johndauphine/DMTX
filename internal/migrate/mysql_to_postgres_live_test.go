@@ -20,22 +20,66 @@ import (
 )
 
 func TestMySQLToPostgresCommonFixtureLive(t *testing.T) {
-	mysqlDSN := os.Getenv("DMTX_TEST_MYSQL_DSN")
+	testMySQLFamilyToPostgresCommonFixtureLive(t, mysqlFamilyLiveFixture{
+		name:       "MySQL",
+		dsnEnv:     "DMTX_TEST_MYSQL_DSN",
+		caEnv:      "DMTX_TEST_MYSQL_CA",
+		tlsConfig:  "dmtx_test",
+		namePrefix: "dmtx_mc_",
+		schemaBase: "dmtx_mysql_common_",
+		collation:  "utf8mb4_0900_bin",
+	})
+}
+
+func TestMariaDBToPostgresCommonFixtureLive(t *testing.T) {
+	testMySQLFamilyToPostgresCommonFixtureLive(t, mysqlFamilyLiveFixture{
+		name:       "MariaDB",
+		dsnEnv:     "DMTX_TEST_MARIADB_DSN",
+		caEnv:      "DMTX_TEST_MARIADB_CA",
+		tlsConfig:  "dmtx_mariadb_test",
+		namePrefix: "dmtx_maria_mc_",
+		schemaBase: "dmtx_mariadb_common_",
+		collation:  "utf8mb4_nopad_bin",
+	})
+}
+
+type mysqlFamilyLiveFixture struct {
+	name       string
+	dsnEnv     string
+	caEnv      string
+	tlsConfig  string
+	namePrefix string
+	schemaBase string
+	collation  string
+}
+
+func testMySQLFamilyToPostgresCommonFixtureLive(
+	t *testing.T,
+	fixture mysqlFamilyLiveFixture,
+) {
+	t.Helper()
+	mysqlDSN := os.Getenv(fixture.dsnEnv)
 	postgresDSN := os.Getenv("DMTX_TEST_POSTGRES_DSN")
-	mysqlCA := os.Getenv("DMTX_TEST_MYSQL_CA")
+	mysqlCA := os.Getenv(fixture.caEnv)
 	if mysqlDSN == "" || postgresDSN == "" || mysqlCA == "" {
 		t.Skip(
-			"set DMTX_TEST_MYSQL_DSN, DMTX_TEST_MYSQL_CA, and DMTX_TEST_POSTGRES_DSN to run the MySQL-to-PostgreSQL common fixture",
+			"set " + fixture.dsnEnv + ", " + fixture.caEnv +
+				", and DMTX_TEST_POSTGRES_DSN to run the " +
+				fixture.name + "-to-PostgreSQL common fixture",
 		)
 	}
-	registerMySQLCommonFixtureTLS(t, mysqlCA)
+	registerMySQLCommonFixtureTLSNamed(
+		t,
+		mysqlCA,
+		fixture.tlsConfig,
+	)
 	mysqlConfig, err := mysqlDriver.ParseDSN(mysqlDSN)
 	if err != nil {
-		t.Fatalf("parse MySQL common-fixture DSN: %T", err)
+		t.Fatalf("parse %s common-fixture DSN: %T", fixture.name, err)
 	}
-	if mysqlConfig.TLSConfig != "dmtx_test" &&
+	if mysqlConfig.TLSConfig != fixture.tlsConfig &&
 		mysqlConfig.TLSConfig != "true" {
-		t.Fatal("DMTX_TEST_MYSQL_DSN must require verified TLS")
+		t.Fatalf("%s must require verified TLS", fixture.dsnEnv)
 	}
 	postgresConfig, err := pgx.ParseConfig(postgresDSN)
 	if err != nil {
@@ -63,7 +107,8 @@ func TestMySQLToPostgresCommonFixtureLive(t *testing.T) {
 		t.Fatalf("verify MySQL common-fixture source: %T", err)
 	}
 
-	prefix := "dmtx_mc_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	prefix := fixture.namePrefix +
+		strconv.FormatInt(time.Now().UnixNano(), 36)
 	accountsName := prefix + "_accounts"
 	eventsName := prefix + "_events"
 	t.Cleanup(func() {
@@ -81,13 +126,14 @@ func TestMySQLToPostgresCommonFixtureLive(t *testing.T) {
 			}
 		}
 	})
-	createMySQLCommonFixture(
+	createMySQLCommonFixtureWithCollation(
 		t,
 		ctx,
 		sourceDatabase,
 		prefix,
 		accountsName,
 		eventsName,
+		fixture.collation,
 	)
 	insertMySQLCommonFixtureRows(
 		t,
@@ -116,7 +162,7 @@ func TestMySQLToPostgresCommonFixtureLive(t *testing.T) {
 		SSLMode:   "verify-full",
 		TLSCAFile: mysqlCA,
 	}
-	namespace := "dmtx_mysql_common_" +
+	namespace := fixture.schemaBase +
 		strconv.FormatInt(time.Now().UnixNano(), 36)
 	targetEndpoint := config.Endpoint{
 		Type:     "postgres",
@@ -234,6 +280,14 @@ func TestMySQLToPostgresCommonFixtureLive(t *testing.T) {
 }
 
 func registerMySQLCommonFixtureTLS(t *testing.T, caPath string) {
+	registerMySQLCommonFixtureTLSNamed(t, caPath, "dmtx_test")
+}
+
+func registerMySQLCommonFixtureTLSNamed(
+	t *testing.T,
+	caPath string,
+	name string,
+) {
 	t.Helper()
 	pem, err := os.ReadFile(caPath)
 	if err != nil {
@@ -244,7 +298,7 @@ func registerMySQLCommonFixtureTLS(t *testing.T, caPath string) {
 		t.Fatal("DMTX_TEST_MYSQL_CA contains no certificates")
 	}
 	if err := mysqlDriver.RegisterTLSConfig(
-		"dmtx_test",
+		name,
 		&tls.Config{
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    roots,
@@ -263,10 +317,36 @@ func createMySQLCommonFixture(
 	eventsName string,
 ) {
 	t.Helper()
+	createMySQLCommonFixtureWithCollation(
+		t,
+		ctx,
+		database,
+		prefix,
+		accountsName,
+		eventsName,
+		"utf8mb4_bin",
+	)
+}
+
+func createMySQLCommonFixtureWithCollation(
+	t *testing.T,
+	ctx context.Context,
+	database *sql.DB,
+	prefix string,
+	accountsName string,
+	eventsName string,
+	collation string,
+) {
+	t.Helper()
+	if collation != "utf8mb4_bin" &&
+		collation != "utf8mb4_0900_bin" &&
+		collation != "utf8mb4_nopad_bin" {
+		t.Fatalf("unsupported MySQL-family fixture collation %q", collation)
+	}
 	accountsDDL := fmt.Sprintf(`
 		CREATE TABLE %s (
 			id BIGINT NOT NULL AUTO_INCREMENT,
-			code VARCHAR(24) COLLATE utf8mb4_bin NOT NULL DEFAULT 'guest',
+			code VARCHAR(24) COLLATE %s NOT NULL DEFAULT 'guest',
 			balance DECIMAL(12,2) NOT NULL DEFAULT 0.00,
 			enabled TINYINT(1) NOT NULL DEFAULT 1,
 			payload VARBINARY(16) NULL,
@@ -277,12 +357,14 @@ func createMySQLCommonFixture(
 			CONSTRAINT %s CHECK (balance >= 0 AND code <> '')
 		) ENGINE=InnoDB
 		  DEFAULT CHARACTER SET=utf8mb4
-		  COLLATE=utf8mb4_bin
+		  COLLATE=%s
 		  ROW_FORMAT=DYNAMIC
 	`,
 		mySQLIdentifier(accountsName),
+		collation,
 		mySQLIdentifier(prefix+"_code_uq"),
 		mySQLIdentifier(prefix+"_account_ck"),
+		collation,
 	)
 	if _, err := database.ExecContext(ctx, accountsDDL); err != nil {
 		t.Fatalf("create MySQL common-fixture accounts: %v", err)
@@ -292,7 +374,7 @@ func createMySQLCommonFixture(
 			tenant_id INT NOT NULL,
 			event_id BIGINT NOT NULL,
 			account_id BIGINT NOT NULL,
-			note VARCHAR(80) COLLATE utf8mb4_bin NOT NULL DEFAULT 'created',
+			note VARCHAR(80) COLLATE %s NOT NULL DEFAULT 'created',
 			amount DECIMAL(12,3) NOT NULL DEFAULT 0.000,
 			occurred_at DATETIME(6) NOT NULL,
 			observed_on DATE NOT NULL DEFAULT (CURRENT_DATE),
@@ -306,14 +388,16 @@ func createMySQLCommonFixture(
 			CONSTRAINT %s CHECK (event_id > 0)
 		) ENGINE=InnoDB
 		  DEFAULT CHARACTER SET=utf8mb4
-		  COLLATE=utf8mb4_bin
+		  COLLATE=%s
 		  ROW_FORMAT=DYNAMIC
 	`,
 		mySQLIdentifier(eventsName),
+		collation,
 		mySQLIdentifier(prefix+"_occurred_idx"),
 		mySQLIdentifier(prefix+"_account_fk"),
 		mySQLIdentifier(accountsName),
 		mySQLIdentifier(prefix+"_event_ck"),
+		collation,
 	)
 	if _, err := database.ExecContext(ctx, eventsDDL); err != nil {
 		t.Fatalf("create MySQL common-fixture events: %v", err)

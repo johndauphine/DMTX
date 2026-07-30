@@ -21,6 +21,7 @@ type relationalSourceSpec struct {
 	readQuery        func(string, schema.Table, []string) string
 	qualifiedTable   func(string, string) string
 	wrapRows         func(adapterRows, schema.Table, []string) adapterRows
+	preflightRows    func(context.Context, *sql.DB, string, []schema.Table) error
 }
 
 type relationalSourceAdapter struct {
@@ -68,17 +69,18 @@ func openMySQLSourceAdapter(
 ) (sourceAdapter, error) {
 	return openRelationalSourceAdapter(ctx, endpoint, relationalSourceSpec{
 		engine:      "mysql",
-		displayName: "MySQL",
+		displayName: "MySQL/MariaDB",
 		defaultNamespace: func(endpoint config.Endpoint) string {
 			return endpoint.Database
 		},
-		open:           engine.OpenMySQL80,
-		verify:         engine.VerifyMySQL80Source,
+		open:           engine.OpenMySQLSource,
+		verify:         engine.VerifyMySQLSource,
 		listTables:     engine.ListMySQLTables,
 		inspectTable:   engine.InspectMySQLTable,
 		readQuery:      mySQLReadQuery,
 		qualifiedTable: mySQLQualified,
 		wrapRows:       wrapMySQLSourceRows,
+		preflightRows:  preflightMySQLSourceRows,
 	})
 }
 
@@ -200,6 +202,21 @@ func (adapter *relationalSourceAdapter) OpenRows(
 		result = adapter.spec.wrapRows(result, table, columns)
 	}
 	return result, nil
+}
+
+func (adapter *relationalSourceAdapter) PreflightRows(
+	ctx context.Context,
+	tables []schema.Table,
+) error {
+	if adapter.spec.preflightRows == nil {
+		return nil
+	}
+	return adapter.spec.preflightRows(
+		ctx,
+		adapter.database,
+		adapter.namespace,
+		tables,
+	)
 }
 
 func (adapter *relationalSourceAdapter) CountRows(

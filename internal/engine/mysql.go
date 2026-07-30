@@ -280,8 +280,24 @@ func ListMySQLTables(ctx context.Context, database *sql.DB, namespace string) ([
 	return tables, nil
 }
 
-// InspectMySQLTable discovers the exact MySQL 8.0 source shape supported by
-// DMTX. Unsupported catalog features fail closed before any target mutation.
+// InspectMySQLTable discovers the exact version-pinned MySQL or MariaDB source
+// shape supported by DMTX. Unsupported catalog features fail closed before any
+// target mutation.
 func InspectMySQLTable(ctx context.Context, database *sql.DB, namespace, name string) (schema.Table, error) {
-	return inspectMySQL80Table(ctx, database, namespace, name)
+	flavor, err := detectMySQLServerFlavor(ctx, database)
+	if err != nil {
+		return schema.Table{}, err
+	}
+	switch flavor {
+	case mysqlServerFlavorOracle80:
+		return inspectMySQL80Table(ctx, database, namespace, name)
+	case mysqlServerFlavorMariaDB1011:
+		return inspectMariaDB1011Table(ctx, database, namespace, name)
+	default:
+		return schema.Table{}, fmt.Errorf(
+			"inspect MySQL table %s.%s: unsupported server flavor",
+			namespace,
+			name,
+		)
+	}
 }

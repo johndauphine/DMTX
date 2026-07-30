@@ -5,15 +5,16 @@ import "github.com/johndauphine/dmtx/internal/engine"
 // builtInAdapters contains the recognized source and target roles and the
 // routes whose current implementations are certified for execution.
 //
-// SQLite sources compose with the PostgreSQL target. PostgreSQL and Oracle
-// MySQL 8.0 sources compose with PostgreSQL, SQLite, and the native MySQL
-// target where explicitly certified. SQL Server sources and PostgreSQL
-// sources compose with the native SQL Server target where explicitly
-// certified; its SQLite source remains on the compatibility route until the
-// shared value contract has a live fixture. SQL Server's SQLite target route
-// remains deferred until driver values and SQLite storage classes have an
-// exact, live-tested contract. Compatibility overrides preserve the remaining
-// routes until both sides move behind the shared contracts.
+// SQLite sources compose with the PostgreSQL target. PostgreSQL and
+// version-pinned MySQL/MariaDB sources compose with PostgreSQL, SQLite, and
+// the native MySQL target where explicitly certified; unsupported
+// flavor/target combinations still fail during read-only planning. SQL Server
+// and PostgreSQL sources compose with the native SQL Server target where
+// explicitly certified; its SQLite source remains on the compatibility route
+// until the shared value contract has a live fixture. SQL Server's SQLite
+// target route remains deferred until driver values and SQLite storage classes
+// have an exact, live-tested contract. Compatibility overrides preserve the
+// remaining routes until both sides move behind the shared contracts.
 var builtInAdapters = mustBuildAdapterRegistry(
 	[]sourceRole{
 		{
