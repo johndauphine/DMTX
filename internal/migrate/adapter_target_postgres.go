@@ -16,6 +16,13 @@ type postgresTargetAdapter struct {
 	namespace   string
 }
 
+func (adapter *postgresTargetAdapter) postgresDatabaseHandle() *sql.DB {
+	if adapter == nil {
+		return nil
+	}
+	return adapter.database
+}
+
 func validatePostgresTargetEndpoint(endpoint config.Endpoint) error {
 	if endpoint.Host == "" || endpoint.Database == "" || endpoint.User == "" {
 		return fmt.Errorf("PostgreSQL host, database, and user are required")

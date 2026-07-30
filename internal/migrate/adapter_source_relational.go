@@ -30,6 +30,13 @@ type relationalSourceAdapter struct {
 	namespace string
 }
 
+func (adapter *relationalSourceAdapter) postgresDatabaseHandle() *sql.DB {
+	if adapter == nil || adapter.spec.engine != "postgres" {
+		return nil
+	}
+	return adapter.database
+}
+
 func (adapter *relationalSourceAdapter) mySQLDatabaseHandle() *sql.DB {
 	if adapter == nil || adapter.spec.engine != "mysql" {
 		return nil

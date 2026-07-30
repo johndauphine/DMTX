@@ -49,6 +49,16 @@ func (route resolvedAdapterRoute) execute(
 			target.Engine(),
 		)
 	}
+	if route.source.engine == "postgres" &&
+		route.target.engine == "postgres" {
+		if err := requireDistinctLivePostgresDatabases(
+			ctx,
+			source,
+			target,
+		); err != nil {
+			return Result{}, err
+		}
+	}
 	if route.source.engine == "mysql" && route.target.engine == "mysql" {
 		if err := requireDistinctLiveMySQLDatabases(
 			ctx,
