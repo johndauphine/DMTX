@@ -66,6 +66,82 @@ func TestUnknownTypeIsClassifiable(t *testing.T) {
 	}
 }
 
+func TestClickHouseOrderByIsIndependentFromRelationalPrimaryKey(t *testing.T) {
+	table := Table{
+		Schema:            "analytics",
+		Name:              "events",
+		ClickHouseOrderBy: []string{"tenant_id", "event_id"},
+		Columns: []Column{
+			{Name: "payload", Type: "text"},
+			{Name: "tenant_id", Type: "bigint"},
+			{Name: "event_id", Type: "bigint"},
+		},
+	}
+	statement, err := CreateTable(ClickHouse, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `CREATE TABLE "analytics"."events" (` +
+		`"payload" String, "tenant_id" Int64, "event_id" Int64) ` +
+		`ENGINE = MergeTree ORDER BY ("tenant_id", "event_id");`
+	if statement != want {
+		t.Fatalf("ClickHouse DDL:\n got: %s\nwant: %s", statement, want)
+	}
+	for _, column := range table.Columns {
+		if column.PrimaryKey || column.PrimaryKeyPosition != 0 {
+			t.Fatalf("ordering metadata became relational key: %#v", column)
+		}
+	}
+}
+
+func TestClickHouseRendererDoesNotInferOrderFromRelationalPrimaryKey(
+	t *testing.T,
+) {
+	table := Table{
+		Schema: "analytics",
+		Name:   "events",
+		Columns: []Column{{
+			Name:       "id",
+			Type:       "bigint",
+			PrimaryKey: true,
+		}},
+	}
+	statement, err := CreateTable(ClickHouse, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `CREATE TABLE "analytics"."events" ("id" Int64) ` +
+		`ENGINE = MergeTree ORDER BY tuple();`
+	if statement != want {
+		t.Fatalf("ClickHouse DDL:\n got: %s\nwant: %s", statement, want)
+	}
+}
+
+func TestClickHouseOrderByRejectsMissingOrDuplicateColumns(t *testing.T) {
+	base := Table{
+		Name:              "events",
+		ClickHouseOrderBy: []string{"id"},
+		Columns:           []Column{{Name: "id", Type: "bigint"}},
+	}
+	tests := []Table{
+		func() Table {
+			value := base
+			value.ClickHouseOrderBy = []string{"missing"}
+			return value
+		}(),
+		func() Table {
+			value := base
+			value.ClickHouseOrderBy = []string{"id", "id"}
+			return value
+		}(),
+	}
+	for _, table := range tests {
+		if _, err := CreateTable(ClickHouse, table); err == nil {
+			t.Fatalf("unsafe ClickHouse ordering accepted: %#v", table)
+		}
+	}
+}
+
 func TestSQLiteForeignKeyClauseOrderIsDeterministic(t *testing.T) {
 	table := Table{
 		Name: "children",

@@ -20,6 +20,13 @@ type clickHouseTargetAdapter struct {
 
 var _ targetAdapter = (*clickHouseTargetAdapter)(nil)
 
+func (adapter *clickHouseTargetAdapter) clickHouseDatabaseHandle() *sql.DB {
+	if adapter == nil {
+		return nil
+	}
+	return adapter.database
+}
+
 func validateClickHouseTargetEndpoint(endpoint config.Endpoint) error {
 	if endpoint.Host == "" || endpoint.Database == "" || endpoint.User == "" {
 		return fmt.Errorf(
@@ -96,7 +103,7 @@ func (adapter *clickHouseTargetAdapter) PlanTables(
 			mode,
 		)
 	}
-	if sourceEngine != "sqlite" {
+	if sourceEngine != "sqlite" && sourceEngine != "clickhouse" {
 		return nil, fmt.Errorf(
 			"ClickHouse target does not support source engine %q",
 			sourceEngine,
@@ -110,7 +117,13 @@ func (adapter *clickHouseTargetAdapter) PlanTables(
 
 	targetTables := make([]schema.Table, 0, len(sourceTables))
 	for _, sourceTable := range sourceTables {
-		targetTable, err := projectSQLiteTableForClickHouse(sourceTable)
+		var targetTable schema.Table
+		switch sourceEngine {
+		case "sqlite":
+			targetTable, err = projectSQLiteTableForClickHouse(sourceTable)
+		case "clickhouse":
+			targetTable, err = projectClickHouseTableForClickHouse(sourceTable)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -182,6 +195,13 @@ func projectSQLiteTableForClickHouse(
 	}
 
 	target := source
+	target.ClickHouseOrderBy = primaryKeyColumns(source)
+	if len(target.ClickHouseOrderBy) == 0 {
+		return schema.Table{}, clickHouseTargetPolicy(
+			"map SQLite ordering key",
+			source.Name,
+		)
+	}
 	target.Identity = nil
 	target.Indexes = nil
 	target.ForeignKeys = nil
@@ -228,7 +248,105 @@ func projectSQLiteTableForClickHouse(
 		if targetColumn.PrimaryKey {
 			targetColumn.Nullable = false
 		}
+		targetColumn.PrimaryKey = false
+		targetColumn.PrimaryKeyPosition = 0
 		target.Columns[index] = targetColumn
+	}
+	return target, nil
+}
+
+func projectClickHouseTableForClickHouse(
+	source schema.Table,
+) (schema.Table, error) {
+	if source.MySQLCollation != "" ||
+		source.Identity != nil ||
+		len(source.Indexes) != 0 ||
+		len(source.ForeignKeys) != 0 ||
+		len(source.Checks) != 0 ||
+		source.SQLiteStrict ||
+		source.SQLiteWithoutRowID {
+		return schema.Table{}, clickHouseTargetPolicy(
+			"rebuild ClickHouse source metadata",
+			source.Name,
+		)
+	}
+	if len(source.ClickHouseOrderBy) == 0 {
+		return schema.Table{}, clickHouseTargetPolicy(
+			"rebuild ClickHouse ordering key",
+			source.Name,
+		)
+	}
+	columns := make(map[string]schema.Column, len(source.Columns))
+	target := source
+	target.Columns = make([]schema.Column, len(source.Columns))
+	for index, column := range source.Columns {
+		if column.Name == "" {
+			return schema.Table{}, clickHouseTargetPolicy(
+				"rebuild ClickHouse empty column",
+				source.Name,
+			)
+		}
+		if _, duplicate := columns[column.Name]; duplicate {
+			return schema.Table{}, clickHouseTargetPolicy(
+				"rebuild ClickHouse duplicate column",
+				source.Name+"."+column.Name,
+			)
+		}
+		if column.PrimaryKey ||
+			column.PrimaryKeyPosition != 0 ||
+			column.DeclaredType != nil ||
+			column.Default != nil {
+			return schema.Table{}, clickHouseTargetPolicy(
+				"rebuild ClickHouse column metadata",
+				source.Name+"."+column.Name,
+			)
+		}
+		switch strings.ToLower(strings.TrimSpace(column.Type)) {
+		case "bigint", "double", "text":
+		default:
+			return schema.Table{}, clickHouseTargetPolicy(
+				"rebuild ClickHouse column type",
+				source.Name+"."+column.Name+" "+column.Type,
+			)
+		}
+		columns[column.Name] = column
+		target.Columns[index] = column
+	}
+	seen := make(map[string]struct{}, len(source.ClickHouseOrderBy))
+	target.ClickHouseOrderBy = append(
+		[]string(nil),
+		source.ClickHouseOrderBy...,
+	)
+	for _, name := range target.ClickHouseOrderBy {
+		column, exists := columns[name]
+		if !exists {
+			return schema.Table{}, clickHouseTargetPolicy(
+				"rebuild ClickHouse ordering column",
+				source.Name+"."+name,
+			)
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return schema.Table{}, clickHouseTargetPolicy(
+				"rebuild ClickHouse duplicate ordering column",
+				source.Name+"."+name,
+			)
+		}
+		if column.Nullable {
+			return schema.Table{}, clickHouseTargetPolicy(
+				"rebuild ClickHouse nullable ordering column",
+				source.Name+"."+name,
+			)
+		}
+		if strings.EqualFold(
+			strings.TrimSpace(column.Type),
+			"double",
+		) {
+			return schema.Table{}, clickHouseTargetPolicy(
+				"rebuild ClickHouse floating-point ordering column",
+				source.Name+"."+name,
+			)
+		}
+		seen[name] = struct{}{}
 	}
 	return target, nil
 }
@@ -255,14 +373,22 @@ func (adapter *clickHouseTargetAdapter) PreflightTables(
 	}
 	for _, table := range targetTables {
 		var engineName string
+		var dependenciesDatabase, dependenciesTable []string
 		err := adapter.database.QueryRowContext(
 			ctx,
-			`SELECT engine
+			`SELECT
+				engine,
+				dependencies_database,
+				dependencies_table
 			 FROM system.tables
 			 WHERE database = ? AND name = ?`,
 			table.Schema,
 			table.Name,
-		).Scan(&engineName)
+		).Scan(
+			&engineName,
+			&dependenciesDatabase,
+			&dependenciesTable,
+		)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
@@ -277,6 +403,13 @@ func (adapter *clickHouseTargetAdapter) PreflightTables(
 			return clickHouseTargetPolicy(
 				"replace existing target engine",
 				table.Name+" "+engineName,
+			)
+		}
+		if len(dependenciesDatabase) != 0 ||
+			len(dependenciesTable) != 0 {
+			return clickHouseTargetPolicy(
+				"replace target with dependent objects",
+				table.Name,
 			)
 		}
 	}

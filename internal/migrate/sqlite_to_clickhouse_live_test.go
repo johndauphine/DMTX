@@ -236,30 +236,41 @@ func TestSQLiteToClickHouse248ComposedRouteLive(t *testing.T) {
 
 func clickHouseLiveEndpoint(t *testing.T) config.Endpoint {
 	t.Helper()
-	dsn := os.Getenv("DMTX_TEST_CLICKHOUSE_DSN")
+	return clickHouseLiveEndpointFromEnvironment(
+		t,
+		"DMTX_TEST_CLICKHOUSE_DSN",
+	)
+}
+
+func clickHouseLiveEndpointFromEnvironment(
+	t *testing.T,
+	dsnVariable string,
+) config.Endpoint {
+	t.Helper()
+	dsn := os.Getenv(dsnVariable)
 	caPath := os.Getenv("DMTX_TEST_CLICKHOUSE_CA")
 	if dsn == "" || caPath == "" {
 		t.Skip(
-			"set DMTX_TEST_CLICKHOUSE_DSN and DMTX_TEST_CLICKHOUSE_CA " +
+			"set " + dsnVariable + " and DMTX_TEST_CLICKHOUSE_CA " +
 				"to run the ClickHouse 24.8 TLS route test",
 		)
 	}
 	parsed, err := url.Parse(dsn)
 	if err != nil {
-		t.Fatalf("parse DMTX_TEST_CLICKHOUSE_DSN: %v", err)
+		t.Fatalf("parse %s: %v", dsnVariable, err)
 	}
 	if parsed.Scheme != "clickhouse" ||
 		parsed.Hostname() == "" ||
 		strings.TrimPrefix(parsed.Path, "/") == "" ||
 		parsed.User == nil {
 		t.Fatal(
-			"DMTX_TEST_CLICKHOUSE_DSN must be a complete clickhouse URI",
+			dsnVariable + " must be a complete clickhouse URI",
 		)
 	}
 	if parsed.Query().Get("secure") != "true" ||
 		parsed.Query().Get("skip_verify") == "true" {
 		t.Fatal(
-			"DMTX_TEST_CLICKHOUSE_DSN must require verified TLS",
+			dsnVariable + " must require verified TLS",
 		)
 	}
 	port := 9440

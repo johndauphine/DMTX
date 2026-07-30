@@ -66,6 +66,16 @@ func (route resolvedAdapterRoute) execute(
 			return Result{}, err
 		}
 	}
+	if route.source.engine == "clickhouse" &&
+		route.target.engine == "clickhouse" {
+		if err := requireDistinctLiveClickHouseDatabases(
+			ctx,
+			source,
+			target,
+		); err != nil {
+			return Result{}, err
+		}
+	}
 	return migrateWithAdapters(ctx, cfg, observer, source, target)
 }
 
@@ -106,6 +116,14 @@ type adapterTablePlan struct {
 	source  schema.Table
 	target  schema.Table
 	columns []string
+}
+
+// adapterSourceRebuildRowOrderer is the narrow exception to relational
+// primary-key ordering for rebuild-only analytical sources. The returned
+// column list must be a complete permutation of the source columns. It is row
+// ordering metadata only and must not be interpreted as uniqueness.
+type adapterSourceRebuildRowOrderer interface {
+	RebuildRowOrder(schema.Table) ([]string, error)
 }
 
 // adapterSourceRowPreflighter permits a source to reject legacy values whose
@@ -361,11 +379,12 @@ func planAdapterTables(
 				sourceTable.Name,
 			)
 		}
-		if !hasPrimaryKey(sourceTable) {
-			return nil, fmt.Errorf(
-				"table %s has no primary key; deterministic transfer requires a primary key",
-				name,
-			)
+		if err := requireAdapterSourceRowOrder(
+			source,
+			sourceTable,
+			mode,
+		); err != nil {
+			return nil, err
 		}
 		sourceTables = append(sourceTables, sourceTable)
 	}
@@ -417,6 +436,75 @@ func planAdapterTables(
 		})
 	}
 	return plans, nil
+}
+
+func requireAdapterSourceRowOrder(
+	source sourceAdapter,
+	table schema.Table,
+	mode string,
+) error {
+	if hasPrimaryKey(table) {
+		return nil
+	}
+	orderer, ok := source.(adapterSourceRebuildRowOrderer)
+	if !ok || mode != "drop_recreate" {
+		return fmt.Errorf(
+			"table %s has no primary key; deterministic transfer requires a primary key",
+			table.Name,
+		)
+	}
+	order, err := orderer.RebuildRowOrder(table)
+	if err != nil {
+		return fmt.Errorf(
+			"determine rebuild row order for %s: %w",
+			table.Name,
+			err,
+		)
+	}
+	if len(order) != len(table.Columns) {
+		return fmt.Errorf(
+			"table %s rebuild row order has %d columns for a %d-column source schema",
+			table.Name,
+			len(order),
+			len(table.Columns),
+		)
+	}
+	columns := make(map[string]struct{}, len(table.Columns))
+	for _, column := range table.Columns {
+		if column.Name == "" {
+			return fmt.Errorf(
+				"table %s source schema has an empty column name",
+				table.Name,
+			)
+		}
+		if _, duplicate := columns[column.Name]; duplicate {
+			return fmt.Errorf(
+				"table %s source schema has duplicate column %s",
+				table.Name,
+				column.Name,
+			)
+		}
+		columns[column.Name] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(order))
+	for _, name := range order {
+		if _, exists := columns[name]; !exists {
+			return fmt.Errorf(
+				"table %s rebuild row order contains unknown column %s",
+				table.Name,
+				name,
+			)
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return fmt.Errorf(
+				"table %s rebuild row order contains duplicate column %s",
+				table.Name,
+				name,
+			)
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
 }
 
 func copyAdapterRows(

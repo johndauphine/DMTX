@@ -15,10 +15,9 @@ import (
 
 	clickhouse "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/johndauphine/dmtx/internal/config"
-	"github.com/johndauphine/dmtx/internal/schema"
 )
 
-const ClickHouseTargetVersionPrefix = "24.8."
+const ClickHouse248VersionPrefix = "24.8."
 
 // ClickHouseDSN creates a TLS-required ClickHouse URI without logging or
 // resolving password templates.
@@ -123,12 +122,43 @@ func VerifyClickHouse248Target(
 	database *sql.DB,
 	namespace string,
 ) error {
+	return verifyClickHouse248Endpoint(
+		ctx,
+		database,
+		namespace,
+		"target",
+	)
+}
+
+// VerifyClickHouse248Source pins source discovery to the same server and
+// Atomic-database catalog line as the independently certified target.
+func VerifyClickHouse248Source(
+	ctx context.Context,
+	database *sql.DB,
+	namespace string,
+) error {
+	return verifyClickHouse248Endpoint(
+		ctx,
+		database,
+		namespace,
+		"source",
+	)
+}
+
+func verifyClickHouse248Endpoint(
+	ctx context.Context,
+	database *sql.DB,
+	namespace string,
+	role string,
+) error {
+	operation := "verify ClickHouse 24.8 " + role
 	if database == nil {
-		return fmt.Errorf("verify ClickHouse 24.8 target: database is required")
+		return fmt.Errorf("%s: database is required", operation)
 	}
 	if namespace == "" {
 		return fmt.Errorf(
-			"verify ClickHouse 24.8 target: database name is required",
+			"%s: database name is required",
+			operation,
 		)
 	}
 	var version string
@@ -137,15 +167,13 @@ func VerifyClickHouse248Target(
 		"SELECT version()",
 	).Scan(&version); err != nil {
 		return fmt.Errorf(
-			"verify ClickHouse 24.8 target version: %w",
+			"%s version: %w",
+			operation,
 			err,
 		)
 	}
-	if !strings.HasPrefix(version, ClickHouseTargetVersionPrefix) {
-		return fmt.Errorf(
-			"verify ClickHouse 24.8 target: server version %q is unsupported",
-			version,
-		)
+	if err := validateClickHouse248Version(version, role); err != nil {
+		return err
 	}
 	var engineName string
 	err := database.QueryRowContext(
@@ -157,21 +185,56 @@ func VerifyClickHouse248Target(
 	).Scan(&engineName)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf(
-			"verify ClickHouse 24.8 target: database %q does not exist",
+			"%s: database %q does not exist",
+			operation,
 			namespace,
 		)
 	}
 	if err != nil {
 		return fmt.Errorf(
-			"verify ClickHouse 24.8 target database: %w",
+			"%s database: %w",
+			operation,
 			err,
 		)
 	}
 	if engineName != "Atomic" {
 		return fmt.Errorf(
-			"verify ClickHouse 24.8 target: database %q uses unsupported engine %q",
+			"%s: database %q uses unsupported engine %q",
+			operation,
 			namespace,
 			engineName,
+		)
+	}
+	var indexGranularity string
+	err = database.QueryRowContext(
+		ctx,
+		`SELECT value
+		   FROM system.merge_tree_settings
+		  WHERE name = 'index_granularity'`,
+	).Scan(&indexGranularity)
+	if err != nil {
+		return fmt.Errorf(
+			"%s MergeTree settings: %w",
+			operation,
+			err,
+		)
+	}
+	if indexGranularity != "8192" {
+		return fmt.Errorf(
+			"%s: unsupported default index_granularity %q",
+			operation,
+			indexGranularity,
+		)
+	}
+	return nil
+}
+
+func validateClickHouse248Version(version string, role string) error {
+	if !strings.HasPrefix(version, ClickHouse248VersionPrefix) {
+		return fmt.Errorf(
+			"verify ClickHouse 24.8 %s: server version %q is unsupported",
+			role,
+			version,
 		)
 	}
 	return nil
@@ -202,60 +265,4 @@ func ListClickHouseTables(ctx context.Context, database *sql.DB, namespace strin
 		return nil, fmt.Errorf("iterate ClickHouse tables: %w", err)
 	}
 	return tables, nil
-}
-
-// InspectClickHouseTable discovers ordered columns and primary/order-key
-// membership without falsely treating ClickHouse keys as relational uniqueness.
-func InspectClickHouseTable(ctx context.Context, database *sql.DB, namespace, name string) (schema.Table, error) {
-	rows, err := database.QueryContext(ctx, `
-		SELECT name, type, is_in_primary_key
-		FROM system.columns
-		WHERE database = ? AND table = ?
-		ORDER BY position
-	`, namespace, name)
-	if err != nil {
-		return schema.Table{}, fmt.Errorf("list ClickHouse columns: %w", err)
-	}
-	defer rows.Close()
-	var columns []schema.Column
-	for rows.Next() {
-		var column schema.Column
-		var inPrimaryKey uint8
-		if err := rows.Scan(&column.Name, &column.Type, &inPrimaryKey); err != nil {
-			return schema.Table{}, fmt.Errorf("read ClickHouse column: %w", err)
-		}
-		rawType := column.Type
-		column.Type = normalizeClickHouseType(column.Type)
-		column.Nullable = strings.HasPrefix(strings.ToLower(rawType), "nullable(")
-		// ClickHouse's primary key is an ordering key, not relational uniqueness.
-		column.PrimaryKey = false
-		columns = append(columns, column)
-	}
-	if err := rows.Err(); err != nil {
-		return schema.Table{}, fmt.Errorf("iterate ClickHouse columns: %w", err)
-	}
-	if len(columns) == 0 {
-		return schema.Table{}, fmt.Errorf("ClickHouse table %s.%s does not exist", namespace, name)
-	}
-	return schema.Table{Schema: namespace, Name: name, Columns: columns}, nil
-}
-
-func normalizeClickHouseType(value string) string {
-	value = strings.ToLower(value)
-	value = strings.TrimPrefix(value, "nullable(")
-	value = strings.TrimSuffix(value, ")")
-	switch value {
-	case "int8", "int16", "int32", "uint8", "uint16", "uint32":
-		return "integer"
-	case "int64", "uint64":
-		return "bigint"
-	case "string", "fixedstring":
-		return "text"
-	case "bool", "boolean":
-		return "boolean"
-	case "datetime", "datetime64":
-		return "timestamp"
-	default:
-		return value
-	}
 }

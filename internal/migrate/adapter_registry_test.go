@@ -209,6 +209,10 @@ func TestBuiltInAdaptersPreserveCertifiedRoutes(t *testing.T) {
 			source: openSQLServerSourceAdapter,
 			target: openSQLServerTargetAdapter,
 		},
+		{source: "clickhouse", target: "clickhouse"}: {
+			source: openClickHouseSourceAdapter,
+			target: openClickHouseTargetAdapter,
+		},
 	}
 	if got := len(builtInAdapters.certified); got != len(expected) {
 		t.Fatalf("certified route count = %d, want %d", got, len(expected))

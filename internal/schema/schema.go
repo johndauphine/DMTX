@@ -111,8 +111,11 @@ type CheckConstraint struct {
 }
 
 type Table struct {
-	Schema, Name       string
-	MySQLCollation     string
+	Schema, Name   string
+	MySQLCollation string
+	// ClickHouseOrderBy is physical ordering metadata, never a relational
+	// primary-key or uniqueness claim.
+	ClickHouseOrderBy  []string
 	Identity           *Identity
 	Columns            []Column
 	Indexes            []Index
@@ -358,8 +361,12 @@ func CreateTable(target Dialect, table Table) (string, error) {
 	}
 	if target == ClickHouse {
 		orderBy := "tuple()"
-		if len(pk) > 0 {
-			orderBy = "(" + strings.Join(pk, ", ") + ")"
+		clickHouseOrder, err := clickHouseOrderByColumns(table)
+		if err != nil {
+			return "", err
+		}
+		if len(clickHouseOrder) > 0 {
+			orderBy = "(" + strings.Join(clickHouseOrder, ", ") + ")"
 		}
 		return "CREATE TABLE " + qualified(target, table.Schema, table.Name) + " (" + strings.Join(parts, ", ") + ") ENGINE = MergeTree ORDER BY " + orderBy + ";", nil
 	}
@@ -414,6 +421,50 @@ func CreateTable(target Dialect, table Table) (string, error) {
 		}
 	}
 	return statement + ";", nil
+}
+
+func clickHouseOrderByColumns(table Table) ([]string, error) {
+	if len(table.ClickHouseOrderBy) == 0 {
+		return nil, nil
+	}
+	columns := make(map[string]struct{}, len(table.Columns))
+	for _, column := range table.Columns {
+		if column.Name == "" {
+			return nil, fmt.Errorf(
+				"ClickHouse table %s has an empty column name",
+				table.Name,
+			)
+		}
+		if _, duplicate := columns[column.Name]; duplicate {
+			return nil, fmt.Errorf(
+				"ClickHouse table %s has duplicate column %s",
+				table.Name,
+				column.Name,
+			)
+		}
+		columns[column.Name] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(table.ClickHouseOrderBy))
+	orderBy := make([]string, len(table.ClickHouseOrderBy))
+	for index, name := range table.ClickHouseOrderBy {
+		if _, exists := columns[name]; !exists {
+			return nil, fmt.Errorf(
+				"ClickHouse table %s ordering column %s is absent",
+				table.Name,
+				name,
+			)
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return nil, fmt.Errorf(
+				"ClickHouse table %s has duplicate ordering column %s",
+				table.Name,
+				name,
+			)
+		}
+		seen[name] = struct{}{}
+		orderBy[index] = quote(ClickHouse, name)
+	}
+	return orderBy, nil
 }
 
 func orderedPrimaryKeyColumns(table Table) []Column {

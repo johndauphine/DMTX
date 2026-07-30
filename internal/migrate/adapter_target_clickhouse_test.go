@@ -75,10 +75,23 @@ func TestClickHouseTargetProjectsStrictSQLiteScalarContract(t *testing.T) {
 		target.Columns[0].Nullable {
 		t.Fatalf("projected target = %+v", target)
 	}
+	if want := []string{"tenant_id", "event_id"}; !reflect.DeepEqual(
+		target.ClickHouseOrderBy,
+		want,
+	) {
+		t.Fatalf(
+			"ClickHouse order = %v, want %v",
+			target.ClickHouseOrderBy,
+			want,
+		)
+	}
 	gotTypes := make([]string, len(target.Columns))
 	for index, column := range target.Columns {
 		gotTypes[index] = column.Type
-		if column.DeclaredType != nil || column.Default != nil {
+		if column.DeclaredType != nil ||
+			column.Default != nil ||
+			column.PrimaryKey ||
+			column.PrimaryKeyPosition != 0 {
 			t.Fatalf("projected column retained SQLite metadata: %+v", column)
 		}
 	}
@@ -104,6 +117,144 @@ func TestClickHouseTargetProjectsStrictSQLiteScalarContract(t *testing.T) {
 		`ENGINE = MergeTree ORDER BY ("tenant_id", "event_id");`
 	if statement != want {
 		t.Fatalf("ClickHouse DDL:\n got: %s\nwant: %s", statement, want)
+	}
+}
+
+func TestClickHouseTargetRebuildsNativeOrderingWithoutRelationalKey(
+	t *testing.T,
+) {
+	adapter := &clickHouseTargetAdapter{namespace: "target"}
+	source := schema.Table{
+		Schema:            "source",
+		Name:              "events",
+		ClickHouseOrderBy: []string{"tenant_id", "event_id"},
+		Columns: []schema.Column{
+			{Name: "payload", Type: "text"},
+			{Name: "tenant_id", Type: "bigint"},
+			{Name: "event_id", Type: "bigint"},
+			{Name: "score", Type: "double", Nullable: true},
+			{Name: "note", Type: "text", Nullable: true},
+		},
+	}
+	target, err := planSingleTargetTable(
+		adapter,
+		"clickhouse",
+		source,
+		"drop_recreate",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.Schema != "target" ||
+		!reflect.DeepEqual(
+			target.ClickHouseOrderBy,
+			source.ClickHouseOrderBy,
+		) {
+		t.Fatalf("projected native target = %#v", target)
+	}
+	for _, column := range target.Columns {
+		if column.PrimaryKey || column.PrimaryKeyPosition != 0 {
+			t.Fatalf("native order became relational key: %#v", column)
+		}
+	}
+	statement, err := schema.CreateTable(schema.ClickHouse, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `CREATE TABLE "target"."events" (` +
+		`"payload" String, "tenant_id" Int64, "event_id" Int64, ` +
+		`"score" Nullable(Float64), "note" Nullable(String)) ` +
+		`ENGINE = MergeTree ORDER BY ("tenant_id", "event_id");`
+	if statement != want {
+		t.Fatalf("ClickHouse DDL:\n got: %s\nwant: %s", statement, want)
+	}
+}
+
+func TestClickHouseNativeProjectionFailsClosed(t *testing.T) {
+	base := schema.Table{
+		Name:              "events",
+		ClickHouseOrderBy: []string{"id"},
+		Columns: []schema.Column{
+			{Name: "id", Type: "bigint"},
+			{Name: "payload", Type: "text", Nullable: true},
+		},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*schema.Table)
+		want   string
+	}{
+		{
+			name: "missing order",
+			mutate: func(table *schema.Table) {
+				table.ClickHouseOrderBy = nil
+			},
+			want: "ordering key",
+		},
+		{
+			name: "relational key",
+			mutate: func(table *schema.Table) {
+				table.Columns[0].PrimaryKey = true
+			},
+			want: "column metadata",
+		},
+		{
+			name: "unsupported type",
+			mutate: func(table *schema.Table) {
+				table.Columns[1].Type = "decimal"
+			},
+			want: "column type",
+		},
+		{
+			name: "nullable order",
+			mutate: func(table *schema.Table) {
+				table.Columns[0].Nullable = true
+			},
+			want: "nullable ordering",
+		},
+		{
+			name: "floating order",
+			mutate: func(table *schema.Table) {
+				table.Columns[0].Type = "double"
+			},
+			want: "floating-point ordering",
+		},
+		{
+			name: "unknown order",
+			mutate: func(table *schema.Table) {
+				table.ClickHouseOrderBy = []string{"missing"}
+			},
+			want: "ordering column",
+		},
+		{
+			name: "source object",
+			mutate: func(table *schema.Table) {
+				table.Indexes = []schema.Index{{Name: "idx"}}
+			},
+			want: "source metadata",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			table := base
+			table.Columns = append([]schema.Column(nil), base.Columns...)
+			table.ClickHouseOrderBy = append(
+				[]string(nil),
+				base.ClickHouseOrderBy...,
+			)
+			test.mutate(&table)
+			_, err := projectClickHouseTableForClickHouse(table)
+			var policy *schema.PolicyError
+			if !errors.As(err, &policy) ||
+				!strings.Contains(err.Error(), test.want) {
+				t.Fatalf(
+					"error = %T %v, want policy containing %q",
+					err,
+					err,
+					test.want,
+				)
+			}
+		})
 	}
 }
 

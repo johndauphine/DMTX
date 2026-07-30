@@ -135,7 +135,8 @@ implementations:
 - Oracle MySQL 8.0 to PostgreSQL, SQLite, or Oracle MySQL 8.0;
 - MariaDB 10.11 to PostgreSQL, SQLite, or MariaDB 10.11; and
 - SQL Server 2022 to PostgreSQL, SQLite, Oracle MySQL 8.0, MariaDB 10.11,
-  or SQL Server 2022.
+  or SQL Server 2022; and
+- ClickHouse 24.8 to a distinct ClickHouse 24.8 Atomic database.
 
 These paths remain incomplete Stage 3 implementations. They do not yet share
 SQLite's full range checkpoint, replay, fencing, resume, and fault-injection
@@ -147,11 +148,13 @@ SQLite, PostgreSQL, Oracle MySQL 8.0, MariaDB 10.11, and SQL Server 2022
 sources now compose independently with the PostgreSQL target. PostgreSQL,
 each admitted MySQL-family source, and SQL Server compose with the SQLite
 target behind shared contracts. SQLite also composes with the native
-ClickHouse 24.8 target. PostgreSQL and SQL Server sources compose with either
-native MySQL-family target, while each MySQL-family source composes with its
-matching native flavor. PostgreSQL and SQL Server sources also compose with
-the native SQL Server target. Cross-flavor Oracle-MySQL/MariaDB copies remain
-fail-closed where exact collation and catalog semantics differ.
+ClickHouse 24.8 target. ClickHouse 24.8 sources compose with a distinct native
+ClickHouse target for the admitted same-engine rebuild shape. PostgreSQL and
+SQL Server sources compose with either native MySQL-family target, while each
+MySQL-family source composes with its matching native flavor. PostgreSQL and
+SQL Server sources also compose with the native SQL Server target.
+Cross-flavor Oracle-MySQL/MariaDB copies remain fail-closed where exact
+collation and catalog semantics differ.
 
 The SQL Server-to-SQLite route currently supports fresh drop/recreate only.
 It preserves the admitted integral, bit, floating-point, UTF-8 text, binary,
@@ -173,6 +176,19 @@ modifiers, defaults, identities, indexes, foreign keys, CHECK constraints,
 upsert, strict consistency, non-Atomic target databases, unpinned server
 versions, and unsafe existing target engines fail before target mutation.
 Writes use bounded native ClickHouse batches over verified TLS.
+
+The ClickHouse-to-ClickHouse route admits plain `MergeTree` tables in Atomic
+databases with a nonempty direct-column `ORDER BY`, default sparse primary key
+and engine settings, and ordered `Int64`, `Float64`, and `String` columns with
+optional `Nullable` wrappers. The source sorting key is preserved as dedicated
+ClickHouse ordering metadata; it is never labeled as a relational primary key
+or uniqueness constraint. Reads order by that key followed by every remaining
+source column, so identical duplicate rows are retained without a uniqueness
+claim. Partitioning, sampling, expression, nullable, or floating-point order
+keys, custom engine settings, defaults/generated columns, codecs, TTLs,
+comments, indexes, projections, constraints, dependencies, and other types
+fail before target mutation. Same-engine rebuild also verifies distinct live
+Atomic database UUIDs before planning or mutation.
 
 The native Oracle MySQL-to-MySQL route requires read access to
 `performance_schema.replication_connection_configuration` and

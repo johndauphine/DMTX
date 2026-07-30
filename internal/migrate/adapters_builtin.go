@@ -16,6 +16,9 @@ import "github.com/johndauphine/dmtx/internal/engine"
 // certified for its conservative drop/recreate contract; unsupported SQLite
 // storage and comparison shapes remain fail-closed. SQLite composes with the
 // pinned ClickHouse 24.8 target under its strict rebuild-only contract.
+// ClickHouse 24.8 also composes with a distinct ClickHouse Atomic database for
+// the narrow same-engine rebuild shape whose ordering metadata is explicitly
+// non-unique.
 // Compatibility overrides preserve the remaining routes until both sides move
 // behind the shared contracts.
 var builtInAdapters = mustBuildAdapterRegistry(
@@ -28,7 +31,11 @@ var builtInAdapters = mustBuildAdapterRegistry(
 		{engine: "postgres", open: openPostgresSourceAdapter},
 		{engine: "mysql", open: openMySQLSourceAdapter},
 		{engine: "mssql", open: openSQLServerSourceAdapter},
-		{engine: "clickhouse"},
+		{
+			engine:   "clickhouse",
+			validate: validateClickHouseSourceEndpoint,
+			open:     openClickHouseSourceAdapter,
+		},
 	},
 	[]targetRole{
 		builtInTargetRole(
@@ -74,6 +81,7 @@ var builtInAdapters = mustBuildAdapterRegistry(
 		{source: "mssql", target: "sqlite"},
 		{source: "mssql", target: "mysql"},
 		{source: "mssql", target: "mssql"},
+		{source: "clickhouse", target: "clickhouse"},
 	},
 	[]adapterOverride{
 		{pair: adapterPair{source: "sqlite", target: "sqlite"}, run: SQLiteToSQLiteWithObserver},
