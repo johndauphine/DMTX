@@ -14,9 +14,10 @@ import (
 )
 
 type clickHouseTargetAdapter struct {
-	database    *sql.DB
-	batchWriter clickHouseBatchWriter
-	namespace   string
+	database                *sql.DB
+	batchWriter             clickHouseBatchWriter
+	namespace               string
+	destructiveAcknowledged bool
 }
 
 var _ targetAdapter = (*clickHouseTargetAdapter)(nil)
@@ -422,61 +423,22 @@ func (adapter *clickHouseTargetAdapter) PreflightDestructive(
 	targetTables []schema.Table,
 	migration config.Migration,
 ) error {
+	// Reset first so a reused adapter can never retain acknowledgement from a
+	// prior failed run.
+	adapter.destructiveAcknowledged = false
 	mode, err := normalizeAdapterTargetMode(migration.TargetMode)
 	if err != nil {
 		return err
 	}
-	if mode != "drop_recreate" ||
-		migration.DestructiveAcknowledged {
+	if mode != "drop_recreate" {
 		return nil
 	}
-	for _, table := range targetTables {
-		var exists uint64
-		if err := adapter.database.QueryRowContext(
-			ctx,
-			`SELECT count()
-			   FROM system.tables
-			  WHERE database = ? AND name = ?`,
-			table.Schema,
-			table.Name,
-		).Scan(&exists); err != nil {
-			return fmt.Errorf(
-				"inspect ClickHouse rebuild target %s: %w",
-				table.Name,
-				err,
-			)
-		}
-		if exists == 0 {
-			continue
-		}
-		if exists != 1 {
-			return fmt.Errorf(
-				"inspect ClickHouse rebuild target %s: catalog returned %d tables",
-				table.Name,
-				exists,
-			)
-		}
-		var rows uint64
-		if err := adapter.database.QueryRowContext(
-			ctx,
-			"SELECT count() FROM "+
-				clickHouseQualified(table.Schema, table.Name),
-		).Scan(&rows); err != nil {
-			return fmt.Errorf(
-				"inspect ClickHouse rebuild target rows for %s: %w",
-				table.Name,
-				err,
-			)
-		}
-		if rows != 0 {
-			return fmt.Errorf(
-				"%w: ClickHouse target table %q contains rows; rerun with --acknowledge-destructive",
-				ErrDestructiveAcknowledgement,
-				table.Name,
-			)
-		}
+	adapter.destructiveAcknowledged =
+		migration.DestructiveAcknowledged
+	if adapter.destructiveAcknowledged {
+		return nil
 	}
-	return nil
+	return requireClickHouseTargetsAbsent(ctx, adapter.database, targetTables)
 }
 
 func (adapter *clickHouseTargetAdapter) PrepareTables(
@@ -523,20 +485,40 @@ func (adapter *clickHouseTargetAdapter) PrepareTables(
 		}
 		creates[index] = create
 	}
+	if !adapter.destructiveAcknowledged {
+		// ClickHouse exposes no admitted lock or transactional DDL boundary
+		// that can make a count-then-DROP safe. Recheck after the table-set
+		// checkpoint and issue no DROP at all on the unacknowledged path.
+		// If a name appears after this recheck, plain CREATE fails without
+		// deleting the concurrent object.
+		if err := requireClickHouseTargetsAbsent(
+			ctx,
+			adapter.database,
+			ordered,
+		); err != nil {
+			return err
+		}
+		for index, statement := range creates {
+			if _, err := adapter.database.ExecContext(
+				ctx,
+				statement,
+			); err != nil {
+				return clickHousePreparationExecutionError(
+					"create",
+					ordered[index].Name,
+					err,
+				)
+			}
+		}
+		return nil
+	}
 	for index, statement := range drops {
 		if _, err := adapter.database.ExecContext(
 			ctx,
 			statement,
 		); err != nil {
-			if index == 0 {
-				return fmt.Errorf(
-					"drop ClickHouse table %s: %w",
-					ordered[index].Name,
-					err,
-				)
-			}
-			return fmt.Errorf(
-				"drop ClickHouse table %s: %w; target preparation is partial and rerunning drop_recreate mode is the recovery path",
+			return clickHousePreparationExecutionError(
+				"drop",
 				ordered[index].Name,
 				err,
 			)
@@ -547,14 +529,76 @@ func (adapter *clickHouseTargetAdapter) PrepareTables(
 			ctx,
 			statement,
 		); err != nil {
-			return fmt.Errorf(
-				"create ClickHouse table %s: %w; selected target tables were dropped and rerunning drop_recreate mode is the recovery path",
+			return clickHousePreparationExecutionError(
+				"create",
 				ordered[index].Name,
 				err,
 			)
 		}
 	}
 	return nil
+}
+
+func requireClickHouseTargetsAbsent(
+	ctx context.Context,
+	database *sql.DB,
+	targetTables []schema.Table,
+) error {
+	ordered := append([]schema.Table(nil), targetTables...)
+	sort.Slice(ordered, func(left, right int) bool {
+		return adapterSourceTableKey(
+			ordered[left].Schema,
+			ordered[left].Name,
+		) < adapterSourceTableKey(
+			ordered[right].Schema,
+			ordered[right].Name,
+		)
+	})
+	for _, table := range ordered {
+		var exists uint64
+		if err := database.QueryRowContext(
+			ctx,
+			`SELECT count()
+			   FROM system.tables
+			  WHERE database = ? AND name = ?`,
+			table.Schema,
+			table.Name,
+		).Scan(&exists); err != nil {
+			return fmt.Errorf(
+				"inspect ClickHouse rebuild target %s: %w",
+				table.Name,
+				err,
+			)
+		}
+		if exists > 1 {
+			return fmt.Errorf(
+				"inspect ClickHouse rebuild target %s: catalog returned %d tables",
+				table.Name,
+				exists,
+			)
+		}
+		if exists == 1 {
+			return fmt.Errorf(
+				"%w: ClickHouse target table %q already exists; replacement can destroy present or concurrent rows, so rerun with --acknowledge-destructive",
+				ErrDestructiveAcknowledgement,
+				table.Name,
+			)
+		}
+	}
+	return nil
+}
+
+func clickHousePreparationExecutionError(
+	operation string,
+	table string,
+	err error,
+) error {
+	return fmt.Errorf(
+		"%s ClickHouse table %s: %w; ClickHouse DDL is non-transactional and target preparation may be partial; rerun the full migration in drop_recreate mode with --acknowledge-destructive to rebuild all selected targets",
+		operation,
+		table,
+		err,
+	)
 }
 
 func (adapter *clickHouseTargetAdapter) WriteBatch(

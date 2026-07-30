@@ -6,9 +6,11 @@ import (
 	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
+	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
@@ -22,7 +24,10 @@ func TestClickHousePrepareDropsEveryTableBeforeCreatingAny(t *testing.T) {
 			t.Errorf("close lifecycle test database: %v", err)
 		}
 	})
-	adapter := &clickHouseTargetAdapter{database: database}
+	adapter := &clickHouseTargetAdapter{
+		database:                database,
+		destructiveAcknowledged: true,
+	}
 	tables := []schema.Table{
 		clickHouseLifecycleTable("later"),
 		clickHouseLifecycleTable("first"),
@@ -72,11 +77,13 @@ func TestClickHousePrepareDropsEveryTableBeforeCreatingAny(t *testing.T) {
 	}
 }
 
-func TestClickHousePrepareFailureNamesRebuildRecoveryPath(t *testing.T) {
-	forced := errors.New("forced create failure")
+func TestClickHouseDestructivePreflightRequiresAcknowledgementForAnyExistingTarget(
+	t *testing.T,
+) {
 	connection := &clickHouseLifecycleTestConnection{
-		failAt: 3,
-		fail:   forced,
+		existing: map[string]uint64{
+			"analytics.existing": 1,
+		},
 	}
 	database := sql.OpenDB(&clickHouseLifecycleTestConnector{
 		connection: connection,
@@ -87,29 +94,190 @@ func TestClickHousePrepareFailureNamesRebuildRecoveryPath(t *testing.T) {
 		}
 	})
 	adapter := &clickHouseTargetAdapter{database: database}
+	tables := []schema.Table{clickHouseLifecycleTable("existing")}
+	err := adapter.PreflightDestructive(
+		context.Background(),
+		tables,
+		config.Migration{TargetMode: "drop_recreate"},
+	)
+	if !errors.Is(err, ErrDestructiveAcknowledgement) ||
+		!strings.Contains(err.Error(), "--acknowledge-destructive") {
+		t.Fatalf("unacknowledged existing target error = %v", err)
+	}
+	if adapter.destructiveAcknowledged {
+		t.Fatal("failed preflight retained destructive acknowledgement")
+	}
+	if len(connection.statements) != 0 {
+		t.Fatalf("destructive preflight mutated target: %#v", connection.statements)
+	}
+
+	if err := adapter.PreflightDestructive(
+		context.Background(),
+		tables,
+		config.Migration{
+			TargetMode:              "drop_recreate",
+			DestructiveAcknowledged: true,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !adapter.destructiveAcknowledged {
+		t.Fatal("successful acknowledged preflight did not arm preparation")
+	}
+}
+
+func TestClickHousePrepareRechecksUnacknowledgedNamesAfterCheckpoint(
+	t *testing.T,
+) {
+	connection := &clickHouseLifecycleTestConnection{
+		existing: make(map[string]uint64),
+	}
+	database := sql.OpenDB(&clickHouseLifecycleTestConnector{
+		connection: connection,
+	})
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close lifecycle test database: %v", err)
+		}
+	})
+	adapter := &clickHouseTargetAdapter{database: database}
+	tables := []schema.Table{
+		clickHouseLifecycleTable("later"),
+		clickHouseLifecycleTable("first"),
+	}
+	if err := adapter.PreflightDestructive(
+		context.Background(),
+		tables,
+		config.Migration{TargetMode: "drop_recreate"},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a target created and populated by the table-set checkpoint
+	// after read-only preflight.
+	connection.existing["analytics.first"] = 1
 	err := adapter.PrepareTables(
 		context.Background(),
-		[]schema.Table{
-			clickHouseLifecycleTable("later"),
-			clickHouseLifecycleTable("first"),
-		},
+		tables,
 		"drop_recreate",
 	)
-	if !errors.Is(err, forced) ||
-		!strings.Contains(
-			err.Error(),
-			"rerunning drop_recreate mode is the recovery path",
-		) {
-		t.Fatalf("partial preparation error = %v", err)
+	if !errors.Is(err, ErrDestructiveAcknowledgement) {
+		t.Fatalf("post-checkpoint existing target error = %v", err)
 	}
-	if len(connection.statements) != 3 ||
-		!strings.HasPrefix(connection.statements[0], "DROP TABLE") ||
-		!strings.HasPrefix(connection.statements[1], "DROP TABLE") ||
-		!strings.HasPrefix(connection.statements[2], "CREATE TABLE") {
-		t.Fatalf(
-			"partial preparation statements = %#v",
-			connection.statements,
-		)
+	if len(connection.statements) != 0 {
+		t.Fatalf("unacknowledged preparation executed DDL: %#v", connection.statements)
+	}
+}
+
+func TestClickHouseUnacknowledgedPrepareCreatesWithoutDrop(t *testing.T) {
+	connection := &clickHouseLifecycleTestConnection{
+		existing: make(map[string]uint64),
+	}
+	database := sql.OpenDB(&clickHouseLifecycleTestConnector{
+		connection: connection,
+	})
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close lifecycle test database: %v", err)
+		}
+	})
+	adapter := &clickHouseTargetAdapter{database: database}
+	tables := []schema.Table{
+		clickHouseLifecycleTable("later"),
+		clickHouseLifecycleTable("first"),
+	}
+	if err := adapter.PreflightDestructive(
+		context.Background(),
+		tables,
+		config.Migration{TargetMode: "drop_recreate"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.PrepareTables(
+		context.Background(),
+		tables,
+		"drop_recreate",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(connection.statements) != 2 {
+		t.Fatalf("statements = %#v", connection.statements)
+	}
+	for _, statement := range connection.statements {
+		if !strings.HasPrefix(statement, "CREATE TABLE") {
+			t.Fatalf("unacknowledged preparation executed %q", statement)
+		}
+	}
+}
+
+func TestClickHousePrepareFailureNamesRebuildRecoveryPath(t *testing.T) {
+	for failAt := 1; failAt <= 4; failAt++ {
+		t.Run(fmt.Sprintf("statement_%d", failAt), func(t *testing.T) {
+			forced := errors.New("forced DDL failure")
+			connection := &clickHouseLifecycleTestConnection{
+				failAt: failAt,
+				fail:   forced,
+			}
+			database := sql.OpenDB(&clickHouseLifecycleTestConnector{
+				connection: connection,
+			})
+			t.Cleanup(func() {
+				if err := database.Close(); err != nil {
+					t.Errorf("close lifecycle test database: %v", err)
+				}
+			})
+			adapter := &clickHouseTargetAdapter{
+				database:                database,
+				destructiveAcknowledged: true,
+			}
+			err := adapter.PrepareTables(
+				context.Background(),
+				[]schema.Table{
+					clickHouseLifecycleTable("later"),
+					clickHouseLifecycleTable("first"),
+				},
+				"drop_recreate",
+			)
+			if !errors.Is(err, forced) ||
+				!strings.Contains(
+					err.Error(),
+					"target preparation may be partial",
+				) ||
+				!strings.Contains(
+					err.Error(),
+					"rerun the full migration in drop_recreate mode",
+				) ||
+				!strings.Contains(
+					err.Error(),
+					"rebuild all selected targets",
+				) {
+				t.Fatalf("partial preparation error = %v", err)
+			}
+			if len(connection.statements) != failAt {
+				t.Fatalf(
+					"partial preparation statements = %#v",
+					connection.statements,
+				)
+			}
+			for index, statement := range connection.statements {
+				if index < 2 &&
+					!strings.HasPrefix(statement, "DROP TABLE") {
+					t.Fatalf(
+						"statement %d ran before every drop: %s",
+						index,
+						statement,
+					)
+				}
+				if index >= 2 &&
+					!strings.HasPrefix(statement, "CREATE TABLE") {
+					t.Fatalf(
+						"statement %d is not a create: %s",
+						index,
+						statement,
+					)
+				}
+			}
+		})
 	}
 }
 
@@ -125,7 +293,10 @@ func TestClickHousePreparePlansEveryStatementBeforeMutation(t *testing.T) {
 	})
 	invalid := clickHouseLifecycleTable("invalid")
 	invalid.Columns[0].Type = "unsupported"
-	adapter := &clickHouseTargetAdapter{database: database}
+	adapter := &clickHouseTargetAdapter{
+		database:                database,
+		destructiveAcknowledged: true,
+	}
 	err := adapter.PrepareTables(
 		context.Background(),
 		[]schema.Table{
@@ -181,6 +352,7 @@ func (clickHouseLifecycleTestDriver) Open(
 
 type clickHouseLifecycleTestConnection struct {
 	statements []string
+	existing   map[string]uint64
 	failAt     int
 	fail       error
 }
@@ -210,4 +382,50 @@ func (connection *clickHouseLifecycleTestConnection) ExecContext(
 		return nil, connection.fail
 	}
 	return sqldriver.RowsAffected(0), nil
+}
+
+func (connection *clickHouseLifecycleTestConnection) QueryContext(
+	_ context.Context,
+	query string,
+	arguments []sqldriver.NamedValue,
+) (sqldriver.Rows, error) {
+	if !strings.Contains(query, "FROM system.tables") ||
+		len(arguments) != 2 {
+		return nil, fmt.Errorf("unexpected lifecycle query %q", query)
+	}
+	database, databaseOK := arguments[0].Value.(string)
+	table, tableOK := arguments[1].Value.(string)
+	if !databaseOK || !tableOK {
+		return nil, fmt.Errorf(
+			"unexpected lifecycle query arguments %#v",
+			arguments,
+		)
+	}
+	return &clickHouseLifecycleTestRows{
+		value: connection.existing[database+"."+table],
+	}, nil
+}
+
+type clickHouseLifecycleTestRows struct {
+	value uint64
+	read  bool
+}
+
+func (*clickHouseLifecycleTestRows) Columns() []string {
+	return []string{"count()"}
+}
+
+func (*clickHouseLifecycleTestRows) Close() error {
+	return nil
+}
+
+func (rows *clickHouseLifecycleTestRows) Next(
+	values []sqldriver.Value,
+) error {
+	if rows.read {
+		return io.EOF
+	}
+	rows.read = true
+	values[0] = int64(rows.value)
+	return nil
 }
