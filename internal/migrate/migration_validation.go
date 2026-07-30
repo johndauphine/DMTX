@@ -21,6 +21,19 @@ func resolveMigration(
 	if err != nil {
 		return resolvedAdapterRoute{}, err
 	}
+	strictScope, err := normalizedStrictConsistencyScope(
+		cfg.Migration.StrictConsistencyScope,
+	)
+	if err != nil {
+		return resolvedAdapterRoute{}, err
+	}
+	if cfg.Migration.StrictConsistency {
+		return resolvedAdapterRoute{}, fmt.Errorf(
+			"source engine %s does not support strict consistency scope %q in this implementation",
+			source.engine,
+			strictScope,
+		)
+	}
 	if config.SameEndpoint(cfg.Source, cfg.Target) {
 		return resolvedAdapterRoute{}, fmt.Errorf(
 			"source and target resolve to the same endpoint",
@@ -29,13 +42,6 @@ func resolveMigration(
 	if cfg.Migration.TargetMode == "upsert" && !target.capability.Upsert {
 		return resolvedAdapterRoute{}, fmt.Errorf(
 			"target engine %s does not support upsert mode",
-			cfg.Target.Type,
-		)
-	}
-	if cfg.Migration.StrictConsistency &&
-		target.capability.StrictConsistency == "unsupported" {
-		return resolvedAdapterRoute{}, fmt.Errorf(
-			"target engine %s does not support strict consistency",
 			cfg.Target.Type,
 		)
 	}
@@ -54,4 +60,16 @@ func resolveMigration(
 		}
 	}
 	return route, nil
+}
+
+func normalizedStrictConsistencyScope(scope string) (string, error) {
+	if scope == "" {
+		return "table", nil
+	}
+	switch scope {
+	case "table", "migration":
+		return scope, nil
+	default:
+		return "", fmt.Errorf("invalid strict_consistency_scope %q", scope)
+	}
 }

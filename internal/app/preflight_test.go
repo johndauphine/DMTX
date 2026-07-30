@@ -37,6 +37,61 @@ func TestPreflightAcceptsDistinctSQLitePaths(t *testing.T) {
 	}
 }
 
+func TestPreflightRejectsStrictConsistencyAsUnsupportedCapability(
+	t *testing.T,
+) {
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "migration.yaml")
+	sourcePath := filepath.Join(directory, "source.db")
+	database, err := sql.Open("sqlite", sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(
+		`CREATE TABLE source_probe (id INTEGER PRIMARY KEY)`,
+	); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	contents := "source:\n" +
+		"  type: sqlite\n" +
+		"  database: " + sourcePath + "\n" +
+		"target:\n" +
+		"  type: sqlite\n" +
+		"  database: " + filepath.Join(directory, "target.db") + "\n" +
+		"migration:\n" +
+		"  strict_consistency: true\n" +
+		"  strict_consistency_scope: migration\n"
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var output, errors bytes.Buffer
+	if code := Run(
+		[]string{"preflight", "--config", configPath},
+		&output,
+		&errors,
+	); code != ConfigurationError {
+		t.Fatalf(
+			"code = %d, stdout = %s, stderr = %s",
+			code,
+			output.String(),
+			errors.String(),
+		)
+	}
+	if !bytes.Contains(
+		output.Bytes(),
+		[]byte(`"class":"unsupported_capability"`),
+	) || !bytes.Contains(
+		output.Bytes(),
+		[]byte(`source engine sqlite does not support strict consistency scope \"migration\"`),
+	) {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
 func TestPreflightRejectsMissingSourceWithoutCreatingIt(t *testing.T) {
 	directory := t.TempDir()
 	sourcePath := filepath.Join(directory, "missing-source.db")

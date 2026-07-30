@@ -7,15 +7,14 @@ type Capability struct {
 	Upsert              bool
 	SequenceReset       bool
 	PostLoadConstraints bool
-	StrictConsistency   string
 }
 
 var targetCapabilities = map[string]Capability{
-	"postgres":   {BulkPath: "COPY", Upsert: true, SequenceReset: true, PostLoadConstraints: true, StrictConsistency: "table_and_migration"},
-	"mssql":      {BulkPath: "TDS bulk copy", Upsert: true, SequenceReset: true, PostLoadConstraints: true, StrictConsistency: "table_and_migration"},
-	"mysql":      {BulkPath: "LOAD DATA LOCAL INFILE or bounded insert", Upsert: true, SequenceReset: true, PostLoadConstraints: true, StrictConsistency: "table"},
-	"sqlite":     {BulkPath: "bounded batched insert", Upsert: true, SequenceReset: true, PostLoadConstraints: false, StrictConsistency: "table"},
-	"clickhouse": {BulkPath: "native or batched columnar insert", Upsert: false, SequenceReset: false, PostLoadConstraints: false, StrictConsistency: "unsupported"},
+	"postgres":   {BulkPath: "COPY", Upsert: true, SequenceReset: true, PostLoadConstraints: true},
+	"mssql":      {BulkPath: "TDS bulk copy", Upsert: true, SequenceReset: true, PostLoadConstraints: true},
+	"mysql":      {BulkPath: "LOAD DATA LOCAL INFILE or bounded insert", Upsert: true, SequenceReset: true, PostLoadConstraints: true},
+	"sqlite":     {BulkPath: "bounded batched insert", Upsert: true, SequenceReset: true, PostLoadConstraints: false},
+	"clickhouse": {BulkPath: "native or batched columnar insert", Upsert: false, SequenceReset: false, PostLoadConstraints: false},
 }
 
 // TargetCapability returns the immutable capability declaration for one

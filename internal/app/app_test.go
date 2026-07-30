@@ -73,6 +73,51 @@ func TestRunRejectsUnsupportedCapabilityBeforeStateCreation(t *testing.T) {
 	}
 }
 
+func TestRunRejectsStrictConsistencyBeforeStateCreation(t *testing.T) {
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "migration.yaml")
+	statePath := filepath.Join(directory, "migration.state.db")
+	targetPath := filepath.Join(directory, "target.db")
+	configuration := "" +
+		"source:\n" +
+		"  type: sqlite\n" +
+		"  database: " + filepath.Join(directory, "source.db") + "\n" +
+		"target:\n" +
+		"  type: sqlite\n" +
+		"  database: " + targetPath + "\n" +
+		"migration:\n" +
+		"  strict_consistency: true\n" +
+		"  strict_consistency_scope: table\n"
+	if err := os.WriteFile(configPath, []byte(configuration), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var output, errors bytes.Buffer
+	code := Run(
+		[]string{
+			"run",
+			"--config", configPath,
+			"--state", statePath,
+		},
+		&output,
+		&errors,
+	)
+	if code != ConfigurationError {
+		t.Fatalf("exit code = %d, stderr = %s", code, errors.String())
+	}
+	if !strings.Contains(
+		errors.String(),
+		`source engine sqlite does not support strict consistency scope "table"`,
+	) {
+		t.Fatalf("stderr = %q", errors.String())
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("state path exists after strict-consistency rejection: %v", err)
+	}
+	if _, err := os.Stat(targetPath); !os.IsNotExist(err) {
+		t.Fatalf("target exists after strict-consistency rejection: %v", err)
+	}
+}
+
 func TestUnknownCommandHasConfigurationExitCode(t *testing.T) {
 	var output, errors bytes.Buffer
 	if code := Run([]string{"unknown"}, &output, &errors); code != ConfigurationError {

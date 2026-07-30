@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -13,9 +14,8 @@ import (
 )
 
 var testTargetCapability = engine.Capability{
-	BulkPath:          "test batches",
-	Upsert:            true,
-	StrictConsistency: "test",
+	BulkPath: "test batches",
+	Upsert:   true,
 }
 
 func unusedSourceFactory(
@@ -307,9 +307,8 @@ func TestCapabilityValidationPrecedesAdapterConstruction(t *testing.T) {
 		[]targetRole{{
 			engine: "clickhouse",
 			capability: engine.Capability{
-				BulkPath:          "test batches",
-				Upsert:            false,
-				StrictConsistency: "unsupported",
+				BulkPath: "test batches",
+				Upsert:   false,
 			},
 			open: func(
 				context.Context,
@@ -344,7 +343,7 @@ func TestCapabilityValidationPrecedesAdapterConstruction(t *testing.T) {
 	}
 }
 
-func TestUnsupportedStrictConsistencyPrecedesAdapterConstruction(t *testing.T) {
+func TestStrictConsistencyPrecedesAdapterConstruction(t *testing.T) {
 	sourceOpened, targetOpened := false, false
 	registry, err := newAdapterRegistry(
 		[]sourceRole{{
@@ -360,8 +359,7 @@ func TestUnsupportedStrictConsistencyPrecedesAdapterConstruction(t *testing.T) {
 		[]targetRole{{
 			engine: "clickhouse",
 			capability: engine.Capability{
-				BulkPath:          "test batches",
-				StrictConsistency: "unsupported",
+				BulkPath: "test batches",
 			},
 			open: func(
 				context.Context,
@@ -377,25 +375,114 @@ func TestUnsupportedStrictConsistencyPrecedesAdapterConstruction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newAdapterRegistry: %v", err)
 	}
-	_, err = executeWithRegistry(context.Background(), config.Config{
-		Source: config.Endpoint{Type: "sqlite"},
-		Target: config.Endpoint{Type: "clickhouse"},
-		Migration: config.Migration{
-			StrictConsistency: true,
-		},
-	}, nil, registry)
-	if err == nil || !strings.Contains(
-		err.Error(),
-		"does not support strict consistency",
-	) {
-		t.Fatalf("error = %v", err)
+	tests := []struct {
+		name    string
+		enabled bool
+		scope   string
+		want    string
+	}{
+		{name: "default table", enabled: true, want: `scope "table"`},
+		{name: "explicit table", enabled: true, scope: "table", want: `scope "table"`},
+		{name: "migration", enabled: true, scope: "migration", want: `scope "migration"`},
+		{name: "unknown enabled", enabled: true, scope: "process", want: `invalid strict_consistency_scope "process"`},
+		{name: "unknown disabled", scope: "process", want: `invalid strict_consistency_scope "process"`},
 	}
-	if sourceOpened || targetOpened {
-		t.Fatalf(
-			"adapters opened before capability rejection: source=%v target=%v",
-			sourceOpened,
-			targetOpened,
-		)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := executeWithRegistry(
+				context.Background(),
+				config.Config{
+					Source: config.Endpoint{Type: "sqlite"},
+					Target: config.Endpoint{Type: "clickhouse"},
+					Migration: config.Migration{
+						StrictConsistency:      test.enabled,
+						StrictConsistencyScope: test.scope,
+					},
+				},
+				nil,
+				registry,
+			)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want substring %q", err, test.want)
+			}
+			if sourceOpened || targetOpened {
+				t.Fatalf(
+					"adapters opened before strict-consistency rejection: source=%v target=%v",
+					sourceOpened,
+					targetOpened,
+				)
+			}
+		})
+	}
+}
+
+func TestBuiltInRoutesRejectStrictConsistencyScopes(t *testing.T) {
+	pairs := make([]adapterPair, 0, len(builtInAdapters.certified))
+	for pair := range builtInAdapters.certified {
+		pairs = append(pairs, pair)
+	}
+	sort.Slice(pairs, func(left, right int) bool {
+		if pairs[left].source == pairs[right].source {
+			return pairs[left].target < pairs[right].target
+		}
+		return pairs[left].source < pairs[right].source
+	})
+
+	for _, pair := range pairs {
+		for _, scope := range []string{"table", "migration"} {
+			t.Run(
+				pair.source+"_to_"+pair.target+"_"+scope,
+				func(t *testing.T) {
+					err := ValidateMigration(config.Config{
+						Source: strictConsistencyTestEndpoint(
+							pair.source,
+							"source",
+						),
+						Target: strictConsistencyTestEndpoint(
+							pair.target,
+							"target",
+						),
+						Migration: config.Migration{
+							StrictConsistency:      true,
+							StrictConsistencyScope: scope,
+						},
+					})
+					if err == nil ||
+						!strings.Contains(
+							err.Error(),
+							"source engine "+pair.source,
+						) ||
+						!strings.Contains(
+							err.Error(),
+							`scope "`+scope+`"`,
+						) {
+						t.Fatalf(
+							"ValidateMigration(%s-to-%s, %s) error = %v",
+							pair.source,
+							pair.target,
+							scope,
+							err,
+						)
+					}
+				},
+			)
+		}
+	}
+}
+
+func strictConsistencyTestEndpoint(
+	engineName string,
+	role string,
+) config.Endpoint {
+	database := role + "_strict_consistency"
+	if engineName == "sqlite" {
+		database += ".db"
+	}
+	return config.Endpoint{
+		Type:     engineName,
+		Host:     role + ".example.test",
+		Database: database,
+		User:     "dmtx",
 	}
 }
 
