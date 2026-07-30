@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -93,6 +94,13 @@ func newValidationSampleDescriptor(
 				)
 			}
 			continue
+		}
+		if column.Nullable {
+			return validationSampleDescriptor{}, fmt.Errorf(
+				"validation table %s primary-key column %s is nullable",
+				table.Name,
+				column.Name,
+			)
 		}
 		if column.PrimaryKeyPosition <= 0 {
 			return validationSampleDescriptor{}, fmt.Errorf(
@@ -342,6 +350,236 @@ func canonicalValidationDynamic(value any) (validationValueKind, []byte, error) 
 		return validationBytes, payload, err
 	default:
 		return "", nil, unexpectedValidationShape(validationDynamic, value)
+	}
+}
+
+// compareValidationPrimaryKeyValues compares complete primary-key values in
+// the ascending semantic order required from a source sample adapter. It does
+// not compare the canonical wire bytes: integer, decimal, and floating-point
+// payloads must be compared by mathematical value, and composite keys must be
+// compared one component at a time.
+func compareValidationPrimaryKeyValues(
+	descriptor validationSampleDescriptor,
+	left []any,
+	right []any,
+) (int, error) {
+	if len(descriptor.Columns) == 0 {
+		return 0, fmt.Errorf("validation primary-key descriptor is empty")
+	}
+	if len(left) != len(descriptor.Columns) ||
+		len(right) != len(descriptor.Columns) {
+		return 0, fmt.Errorf(
+			"validation primary-key value count does not match its descriptor",
+		)
+	}
+	for index, column := range descriptor.Columns {
+		comparison, err := compareValidationOrderValue(
+			column.Kind,
+			left[index],
+			right[index],
+		)
+		if err != nil {
+			return 0, fmt.Errorf(
+				"compare validation primary-key column %d (%s): %w",
+				index,
+				column.Name,
+				err,
+			)
+		}
+		if comparison != 0 {
+			return comparison, nil
+		}
+	}
+	return 0, nil
+}
+
+func compareValidationOrderValue(
+	declaredKind validationValueKind,
+	left any,
+	right any,
+) (int, error) {
+	leftKind, leftPayload, err := canonicalValidationValue(
+		declaredKind,
+		left,
+	)
+	if err != nil {
+		return 0, err
+	}
+	rightKind, rightPayload, err := canonicalValidationValue(
+		declaredKind,
+		right,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if leftKind == "null" || rightKind == "null" {
+		return 0, fmt.Errorf(
+			"primary-key ordering cannot admit NULL values",
+		)
+	}
+	if declaredKind == validationDynamic {
+		return compareDynamicValidationOrder(
+			leftKind,
+			leftPayload,
+			rightKind,
+			rightPayload,
+		)
+	}
+	if leftKind != declaredKind || rightKind != declaredKind {
+		return 0, fmt.Errorf(
+			"canonical primary-key kind does not match its descriptor",
+		)
+	}
+	switch declaredKind {
+	case validationInteger, validationDecimal, validationFloat:
+		return compareCanonicalValidationNumbers(
+			declaredKind,
+			leftPayload,
+			declaredKind,
+			rightPayload,
+		)
+	case validationBoolean, validationText, validationBytes,
+		validationDate, validationTime, validationTimestamp,
+		validationUUID:
+		return bytes.Compare(leftPayload, rightPayload), nil
+	default:
+		return 0, fmt.Errorf(
+			"unsupported primary-key ordering kind %q",
+			declaredKind,
+		)
+	}
+}
+
+func compareDynamicValidationOrder(
+	leftKind validationValueKind,
+	leftPayload []byte,
+	rightKind validationValueKind,
+	rightPayload []byte,
+) (int, error) {
+	leftRank, err := dynamicValidationOrderRank(leftKind)
+	if err != nil {
+		return 0, err
+	}
+	rightRank, err := dynamicValidationOrderRank(rightKind)
+	if err != nil {
+		return 0, err
+	}
+	if leftRank < rightRank {
+		return -1, nil
+	}
+	if leftRank > rightRank {
+		return 1, nil
+	}
+	if leftRank == 0 {
+		return compareCanonicalValidationNumbers(
+			leftKind,
+			leftPayload,
+			rightKind,
+			rightPayload,
+		)
+	}
+	return bytes.Compare(leftPayload, rightPayload), nil
+}
+
+func dynamicValidationOrderRank(kind validationValueKind) (int, error) {
+	switch kind {
+	case validationInteger, validationFloat:
+		return 0, nil
+	case validationText:
+		return 1, nil
+	case validationBytes:
+		return 2, nil
+	default:
+		return 0, fmt.Errorf(
+			"unsupported dynamic primary-key ordering kind %q",
+			kind,
+		)
+	}
+}
+
+type canonicalValidationNumber struct {
+	infinity int
+	value    *big.Rat
+}
+
+func compareCanonicalValidationNumbers(
+	leftKind validationValueKind,
+	leftPayload []byte,
+	rightKind validationValueKind,
+	rightPayload []byte,
+) (int, error) {
+	left, err := parseCanonicalValidationNumber(leftKind, leftPayload)
+	if err != nil {
+		return 0, err
+	}
+	right, err := parseCanonicalValidationNumber(rightKind, rightPayload)
+	if err != nil {
+		return 0, err
+	}
+	if left.infinity < right.infinity {
+		return -1, nil
+	}
+	if left.infinity > right.infinity {
+		return 1, nil
+	}
+	if left.infinity != 0 {
+		return 0, nil
+	}
+	return left.value.Cmp(right.value), nil
+}
+
+func parseCanonicalValidationNumber(
+	kind validationValueKind,
+	payload []byte,
+) (canonicalValidationNumber, error) {
+	switch kind {
+	case validationInteger:
+		integer, ok := new(big.Int).SetString(string(payload), 10)
+		if !ok {
+			return canonicalValidationNumber{}, fmt.Errorf(
+				"canonical integer has an unsupported shape",
+			)
+		}
+		return canonicalValidationNumber{
+			value: new(big.Rat).SetInt(integer),
+		}, nil
+	case validationDecimal:
+		rational, ok := new(big.Rat).SetString(string(payload))
+		if !ok {
+			return canonicalValidationNumber{}, fmt.Errorf(
+				"canonical decimal has an unsupported shape",
+			)
+		}
+		return canonicalValidationNumber{value: rational}, nil
+	case validationFloat:
+		switch string(payload) {
+		case "-inf":
+			return canonicalValidationNumber{infinity: -1}, nil
+		case "+inf":
+			return canonicalValidationNumber{infinity: 1}, nil
+		case "nan":
+			return canonicalValidationNumber{}, fmt.Errorf(
+				"NaN has no strict primary-key order",
+			)
+		}
+		floating, err := strconv.ParseFloat(string(payload), 64)
+		if err != nil {
+			return canonicalValidationNumber{}, fmt.Errorf(
+				"canonical float has an unsupported shape",
+			)
+		}
+		rational := new(big.Rat).SetFloat64(floating)
+		if rational == nil {
+			return canonicalValidationNumber{}, fmt.Errorf(
+				"canonical float has no finite mathematical value",
+			)
+		}
+		return canonicalValidationNumber{value: rational}, nil
+	default:
+		return canonicalValidationNumber{}, fmt.Errorf(
+			"unsupported numeric primary-key ordering kind %q",
+			kind,
+		)
 	}
 }
 
