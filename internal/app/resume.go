@@ -142,13 +142,17 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		return StateError
 	}
 	guard := state.NewLeaseGuard(leaseStore, lease)
-	store = state.FenceBackend(store, guard)
 	leaseReleased := false
 	defer func() {
 		if !leaseReleased {
 			_ = guard.Release()
 		}
 	}()
+	store, err = newStage4FencedStateBackend(store, guard)
+	if err != nil {
+		fmt.Fprintf(stderr, "fence Stage 4 state backend: %v\n", err)
+		return StateError
+	}
 	authoritative, found, err := latestRunForTarget(store, cfg.Target)
 	if err != nil {
 		fmt.Fprintf(stderr, "reselect migration run: %v\n", err)
@@ -206,6 +210,19 @@ func resume(args []string, stdout, stderr io.Writer) int {
 	}
 	if err := store.ReactivateRun(run.ID, "migration resume in progress"); err != nil {
 		fmt.Fprintf(stderr, "reactivate migration run: %v\n", err)
+		return StateError
+	}
+	spoolDirectory, err := stage4SpoolDirectory(statePath, run.ID)
+	if err != nil {
+		if stateErr := persistStage4SpoolPreparationFailure(
+			store,
+			run.ID,
+			err,
+		); stateErr != nil {
+			fmt.Fprintf(stderr, "record Stage 4 spool preparation failure: %v\n", stateErr)
+			return StateError
+		}
+		fmt.Fprintf(stderr, "Stage 4 spool directory: %v\n", err)
 		return StateError
 	}
 	if err := appLifecycleBoundary("resume_reactivated"); err != nil {
@@ -270,7 +287,17 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 	}
-	observer := resumeCheckpointObserver{tableCheckpointObserver: tableCheckpointObserver{store: store, runID: run.ID, guard: guard, resetTopology: true}, existing: existing}
+	observer := resumeCheckpointObserver{
+		tableCheckpointObserver: tableCheckpointObserver{
+			store:          store,
+			runID:          run.ID,
+			guard:          guard,
+			resetTopology:  true,
+			resume:         true,
+			spoolDirectory: spoolDirectory,
+		},
+		existing: existing,
+	}
 	migrationContext, heartbeat := startLeaseHeartbeat(migrationContext, guard, 30*time.Second)
 	var result migrate.Result
 	if cfg.Source.Type == "sqlite" && cfg.Target.Type == "sqlite" {

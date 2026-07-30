@@ -130,13 +130,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return StateError
 	}
 	guard := state.NewLeaseGuard(leaseStore, lease)
-	store = state.FenceBackend(store, guard)
 	leaseReleased := false
 	defer func() {
 		if !leaseReleased {
 			_ = guard.Release()
 		}
 	}()
+	store, err = newStage4FencedStateBackend(store, guard)
+	if err != nil {
+		fmt.Fprintf(stderr, "fence Stage 4 state backend: %v\n", err)
+		return StateError
+	}
 	sourceIdentity, err := endpointWorkloadIdentity(cfg.Source)
 	if err != nil {
 		fmt.Fprintf(stderr, "source workload identity: %v\n", err)
@@ -166,6 +170,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "record resume compatibility: %v\n", err)
 		return StateError
 	}
+	spoolDirectory, err := stage4SpoolDirectory(statePath, runID)
+	if err != nil {
+		if stateErr := persistStage4SpoolPreparationFailure(
+			store,
+			runID,
+			err,
+		); stateErr != nil {
+			fmt.Fprintf(stderr, "record Stage 4 spool preparation failure: %v\n", stateErr)
+			return StateError
+		}
+		fmt.Fprintf(stderr, "Stage 4 spool directory: %v\n", err)
+		return StateError
+	}
 	if err := appendAudit(configPath, runID, "run_started"); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
@@ -175,7 +192,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return StateError
 	}
 	migrationContext, heartbeat := startLeaseHeartbeat(migrationContext, guard, 30*time.Second)
-	observer := tableCheckpointObserver{store: store, runID: runID, guard: guard}
+	observer := tableCheckpointObserver{
+		store:          store,
+		runID:          runID,
+		guard:          guard,
+		resume:         false,
+		spoolDirectory: spoolDirectory,
+	}
 	result, err := migrate.Execute(migrationContext, cfg, observer)
 	if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
 		err = fmt.Errorf("%w: renew target lease: %v", state.ErrState, heartbeatErr)
