@@ -18,19 +18,69 @@ const (
 )
 
 type Run struct {
-	ID        string    `json:"id"`
-	Source    string    `json:"source"`
-	Target    string    `json:"target"`
-	Outcome   Outcome   `json:"outcome"`
-	Resumable bool      `json:"resumable"`
-	Reason    string    `json:"resumability_reason"`
-	StartedAt time.Time `json:"started_at"`
-	EndedAt   time.Time `json:"ended_at,omitempty"`
+	ID             string    `json:"id" yaml:"id"`
+	Source         string    `json:"source" yaml:"source"`
+	Target         string    `json:"target" yaml:"target"`
+	SourceEngine   string    `json:"source_engine,omitempty" yaml:"source_engine,omitempty"`
+	SourceIdentity string    `json:"source_identity,omitempty" yaml:"source_identity,omitempty"`
+	TargetIdentity string    `json:"target_identity,omitempty" yaml:"target_identity,omitempty"`
+	Outcome        Outcome   `json:"outcome" yaml:"outcome"`
+	Resumable      bool      `json:"resumable" yaml:"resumable"`
+	Reason         string    `json:"resumability_reason" yaml:"resumability_reason"`
+	StartedAt      time.Time `json:"started_at" yaml:"started_at"`
+	EndedAt        time.Time `json:"ended_at,omitempty" yaml:"ended_at,omitempty"`
+}
+
+func inheritRunWorkloadIdentity(existing, next Run) (Run, error) {
+	fields := []struct {
+		name     string
+		existing string
+		next     *string
+	}{
+		{name: "source", existing: existing.Source, next: &next.Source},
+		{name: "target", existing: existing.Target, next: &next.Target},
+		{name: "source engine", existing: existing.SourceEngine, next: &next.SourceEngine},
+		{name: "source identity", existing: existing.SourceIdentity, next: &next.SourceIdentity},
+		{name: "target identity", existing: existing.TargetIdentity, next: &next.TargetIdentity},
+	}
+	for _, field := range fields {
+		if *field.next == "" {
+			*field.next = field.existing
+			continue
+		}
+		if *field.next != field.existing {
+			return Run{}, fmt.Errorf(
+				"%w: run %q %s changed",
+				ErrImmutableEvidence,
+				next.ID,
+				field.name,
+			)
+		}
+	}
+	if err := validateRunSourceEngine(next.SourceEngine); err != nil {
+		return Run{}, err
+	}
+	return next, nil
+}
+
+func validateRunSourceEngine(engine string) error {
+	switch engine {
+	case "", "postgres", "mssql", "mysql", "sqlite", "clickhouse":
+		return nil
+	default:
+		return fmt.Errorf(
+			"run source engine %q is not a canonical supported engine",
+			engine,
+		)
+	}
 }
 
 type Store struct{ Path string }
 
 func (store Store) Append(run Run) error {
+	if err := validateRunSourceEngine(run.SourceEngine); err != nil {
+		return err
+	}
 	runs, err := store.List()
 	if err != nil {
 		return err

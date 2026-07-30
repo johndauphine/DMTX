@@ -179,14 +179,17 @@ func (store SQLiteStore) ListWork(runID string) ([]WorkTask, []RangeState, error
 		}
 		tasks = append(tasks, task)
 	}
-	if err := taskRows.Close(); err != nil {
+	if err := finishSQLiteRows(
+		taskRows,
+		"iterate work tasks",
+		"close work task query",
+	); err != nil {
 		return nil, nil, err
 	}
 	rangeRows, err := database.Query(`SELECT payload FROM work_ranges WHERE run_id = ? ORDER BY task_key, range_id`, runID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list work ranges: %w", err)
 	}
-	defer rangeRows.Close()
 	var ranges []RangeState
 	for rangeRows.Next() {
 		var payload string
@@ -199,7 +202,11 @@ func (store SQLiteStore) ListWork(runID string) ([]WorkTask, []RangeState, error
 		}
 		ranges = append(ranges, workRange)
 	}
-	if err := rangeRows.Err(); err != nil {
+	if err := finishSQLiteRows(
+		rangeRows,
+		"iterate work ranges",
+		"close work range query",
+	); err != nil {
 		return nil, nil, err
 	}
 	return tasks, ranges, nil
@@ -427,7 +434,11 @@ func (store SQLiteStore) CompleteWorkTask(runID string, task TaskKey, topologyHa
 			return fmt.Errorf("%w: task has incomplete or stale ranges", ErrRangeOrder)
 		}
 	}
-	if err := rows.Close(); err != nil {
+	if err := finishSQLiteRows(
+		rows,
+		"iterate work ranges for completion",
+		"close work completion range query",
+	); err != nil {
 		return err
 	}
 	var workTask WorkTask

@@ -22,14 +22,23 @@ func (store SQLiteStore) UpdateRecoverableOutcome(runID string, outcome Outcome,
 	}
 	defer transaction.Rollback()
 
-	var source, target string
+	var source, target, sourceEngine, sourceIdentity, targetIdentity string
 	var startedAt time.Time
 	var latest Outcome
 	var resumable bool
 	err = transaction.QueryRow(`
-		SELECT source, target, started_at, outcome, resumable
+		SELECT source, target, source_engine, source_identity, target_identity, started_at, outcome, resumable
 		FROM runs WHERE id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1
-	`, runID).Scan(&source, &target, &startedAt, &latest, &resumable)
+	`, runID).Scan(
+		&source,
+		&target,
+		&sourceEngine,
+		&sourceIdentity,
+		&targetIdentity,
+		&startedAt,
+		&latest,
+		&resumable,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("update recoverable run state: unknown run %q", runID)
 	}
@@ -49,9 +58,13 @@ func (store SQLiteStore) UpdateRecoverableOutcome(runID string, outcome Outcome,
 		return fmt.Errorf("replace recoverable run state: %w", err)
 	}
 	if _, err := transaction.Exec(`
-		INSERT INTO runs (id, source, target, outcome, resumable, reason, started_at, ended_at)
-		VALUES (?, ?, ?, ?, 1, ?, ?, ?)
-	`, runID, source, target, outcome, reason, startedAt.UTC(), endedAt.UTC()); err != nil {
+		INSERT INTO runs (
+			id, source, target, source_engine, source_identity, target_identity,
+			outcome, resumable, reason, started_at, ended_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+	`, runID, source, target, sourceEngine, sourceIdentity, targetIdentity,
+		outcome, reason, startedAt.UTC(), endedAt.UTC()); err != nil {
 		return fmt.Errorf("record recoverable run state: %w", err)
 	}
 	if err := transaction.Commit(); err != nil {

@@ -24,12 +24,15 @@ func (store SQLiteStore) ReactivateRun(runID, reason string) error {
 
 	var run Run
 	err = transaction.QueryRow(`
-		SELECT id, source, target, outcome, resumable, started_at
+		SELECT id, source, target, source_engine, source_identity, target_identity, outcome, resumable, started_at
 		FROM runs WHERE id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1
 	`, runID).Scan(
 		&run.ID,
 		&run.Source,
 		&run.Target,
+		&run.SourceEngine,
+		&run.SourceIdentity,
+		&run.TargetIdentity,
 		&run.Outcome,
 		&run.Resumable,
 		&run.StartedAt,
@@ -49,9 +52,13 @@ func (store SQLiteStore) ReactivateRun(runID, reason string) error {
 		return fmt.Errorf("replace running run state: %w", err)
 	}
 	if _, err := transaction.Exec(`
-		INSERT INTO runs (id, source, target, outcome, resumable, reason, started_at, ended_at)
-		VALUES (?, ?, ?, ?, 1, ?, ?, NULL)
-	`, run.ID, run.Source, run.Target, Running, reason, run.StartedAt.UTC()); err != nil {
+		INSERT INTO runs (
+			id, source, target, source_engine, source_identity, target_identity,
+			outcome, resumable, reason, started_at, ended_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)
+	`, run.ID, run.Source, run.Target, run.SourceEngine, run.SourceIdentity, run.TargetIdentity,
+		Running, reason, run.StartedAt.UTC()); err != nil {
 		return fmt.Errorf("record running run state: %w", err)
 	}
 	if err := transaction.Commit(); err != nil {

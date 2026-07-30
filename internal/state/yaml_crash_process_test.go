@@ -68,7 +68,9 @@ func TestYAMLReplacementIsValidAcrossMidReplacementHardKills(t *testing.T) {
 			})
 			waitForYAMLCrashBoundary(t, eventPath, wait, &reaped, &output)
 			if err := command.Process.Kill(); err != nil {
-				t.Fatalf("kill YAML writer: %v\n%s", err, output.String())
+				waitErr := <-wait
+				reaped = true
+				t.Fatalf("kill YAML writer: %v (wait: %v)\n%s", err, waitErr, output.String())
 			}
 			if err := <-wait; err == nil {
 				t.Fatalf("YAML writer exited successfully instead of being killed\n%s", output.String())
@@ -103,7 +105,9 @@ func TestYAMLReplacementCrashHelperProcess(t *testing.T) {
 		if err := os.WriteFile(eventPath, []byte("ready"), 0o600); err != nil {
 			return err
 		}
-		select {}
+		for {
+			time.Sleep(time.Hour)
+		}
 	}
 	switch mode {
 	case "before-replace":
@@ -145,7 +149,9 @@ func waitForYAMLCrashBoundary(t *testing.T, eventPath string, exited <-chan erro
 			*reaped = true
 			t.Fatalf("YAML writer exited before replacement boundary: %v\n%s", err, output.String())
 		case <-deadline.C:
-			t.Fatalf("timed out waiting for YAML replacement boundary\n%s", output.String())
+			// Cleanup kills and reaps the child before its shared output
+			// buffer can be inspected safely.
+			t.Fatal("timed out waiting for YAML replacement boundary")
 		case <-ticker.C:
 			if _, err := os.Stat(eventPath); err == nil {
 				return

@@ -65,12 +65,16 @@ func (guard *LeaseGuard) Protect(ctx context.Context, operation func() error) (e
 	}()
 
 	var ownerToken string
+	var runID string
 	var generation int64
 	queryErr := connection.QueryRowContext(ctx,
-		`SELECT owner_token, generation FROM leases WHERE target = ?`,
+		`SELECT run_id, owner_token, generation FROM leases WHERE target = ?`,
 		guard.lease.Target,
-	).Scan(&ownerToken, &generation)
-	if errors.Is(queryErr, sql.ErrNoRows) || ownerToken != guard.lease.OwnerToken || generation != guard.lease.Generation {
+	).Scan(&runID, &ownerToken, &generation)
+	if errors.Is(queryErr, sql.ErrNoRows) ||
+		runID != guard.lease.RunID ||
+		ownerToken != guard.lease.OwnerToken ||
+		generation != guard.lease.Generation {
 		return fmt.Errorf("%w: target=%q generation=%d", ErrLeaseLost, guard.lease.Target, guard.lease.Generation)
 	}
 	if queryErr != nil {
@@ -113,12 +117,19 @@ func (guard *LeaseGuard) Release() error {
 // FenceBackend returns a backend whose every mutation is protected by the
 // supplied lease generation. Reads remain available for diagnosis after loss.
 func FenceBackend(backend Backend, guard *LeaseGuard) Backend {
-	return &fencedBackend{backend: backend, ranges: backend.(RangeBackend), guard: guard}
+	stage4, _ := backend.(Stage4Backend)
+	return &fencedBackend{
+		backend: backend,
+		ranges:  backend.(RangeBackend),
+		stage4:  stage4,
+		guard:   guard,
+	}
 }
 
 type fencedBackend struct {
 	backend Backend
 	ranges  RangeBackend
+	stage4  Stage4Backend
 	guard   *LeaseGuard
 }
 
@@ -126,11 +137,18 @@ func (backend *fencedBackend) protect(operation func() error) error {
 	return backend.guard.Protect(context.Background(), operation)
 }
 
+func (backend *fencedBackend) protectRun(runID string, operation func() error) error {
+	if backend.guard == nil || runID == "" || backend.guard.Lease().RunID != runID {
+		return fmt.Errorf("%w: mutation run %q is not owned by the lease", ErrLeaseLost, runID)
+	}
+	return backend.protect(operation)
+}
+
 func (backend *fencedBackend) InitializeRun(run Run, hash string) error {
-	return backend.protect(func() error { return backend.backend.InitializeRun(run, hash) })
+	return backend.protectRun(run.ID, func() error { return backend.backend.InitializeRun(run, hash) })
 }
 func (backend *fencedBackend) Append(run Run) error {
-	return backend.protect(func() error { return backend.backend.Append(run) })
+	return backend.protectRun(run.ID, func() error { return backend.backend.Append(run) })
 }
 func (backend *fencedBackend) List() ([]Run, error) { return backend.backend.List() }
 func (backend *fencedBackend) Latest() (Run, bool, error) {
@@ -140,37 +158,46 @@ func (backend *fencedBackend) LatestResumableForTarget(target string) (Run, bool
 	return backend.backend.LatestResumableForTarget(target)
 }
 func (backend *fencedBackend) ReactivateRun(runID, reason string) error {
-	return backend.protect(func() error { return backend.backend.ReactivateRun(runID, reason) })
+	return backend.protectRun(runID, func() error { return backend.backend.ReactivateRun(runID, reason) })
 }
 func (backend *fencedBackend) UpdateFailure(runID, reason string, endedAt time.Time) error {
-	return backend.protect(func() error { return backend.backend.UpdateFailure(runID, reason, endedAt) })
+	return backend.protectRun(runID, func() error { return backend.backend.UpdateFailure(runID, reason, endedAt) })
 }
 func (backend *fencedBackend) UpdateRecoverableOutcome(runID string, outcome Outcome, reason string, endedAt time.Time) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.backend.UpdateRecoverableOutcome(runID, outcome, reason, endedAt)
 	})
 }
 func (backend *fencedBackend) AbandonRun(runID, reason string, endedAt time.Time) error {
-	return backend.protect(func() error { return backend.backend.AbandonRun(runID, reason, endedAt) })
+	return backend.protectRun(runID, func() error { return backend.backend.AbandonRun(runID, reason, endedAt) })
 }
 func (backend *fencedBackend) CreateTask(task Task) error {
-	return backend.protect(func() error { return backend.backend.CreateTask(task) })
+	return backend.protectRun(task.RunID, func() error { return backend.backend.CreateTask(task) })
 }
 func (backend *fencedBackend) CreateTasks(tasks []Task) error {
-	return backend.protect(func() error { return backend.backend.CreateTasks(tasks) })
+	if len(tasks) == 0 {
+		return nil
+	}
+	runID := tasks[0].RunID
+	for _, task := range tasks[1:] {
+		if task.RunID != runID {
+			return fmt.Errorf("%w: batch contains multiple run IDs", ErrLeaseLost)
+		}
+	}
+	return backend.protectRun(runID, func() error { return backend.backend.CreateTasks(tasks) })
 }
 func (backend *fencedBackend) AdvanceIntegerKeysetTask(runID, table string, rows int, watermark int64) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.backend.AdvanceIntegerKeysetTask(runID, table, rows, watermark)
 	})
 }
 func (backend *fencedBackend) AdvanceRowNumberTask(runID, table string, rows int, watermark int64) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.backend.AdvanceRowNumberTask(runID, table, rows, watermark)
 	})
 }
 func (backend *fencedBackend) CompleteTask(runID, table string, rows int, completedAt time.Time) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.backend.CompleteTask(runID, table, rows, completedAt)
 	})
 }
@@ -178,13 +205,13 @@ func (backend *fencedBackend) ListTasks(runID string) ([]Task, error) {
 	return backend.backend.ListTasks(runID)
 }
 func (backend *fencedBackend) SaveConfigHash(runID, hash string) error {
-	return backend.protect(func() error { return backend.backend.SaveConfigHash(runID, hash) })
+	return backend.protectRun(runID, func() error { return backend.backend.SaveConfigHash(runID, hash) })
 }
 func (backend *fencedBackend) ConfigHash(runID string) (string, bool, error) {
 	return backend.backend.ConfigHash(runID)
 }
 func (backend *fencedBackend) SaveResumeCompatibilityHash(runID, hash string) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.backend.SaveResumeCompatibilityHash(runID, hash)
 	})
 }
@@ -192,13 +219,13 @@ func (backend *fencedBackend) ResumeCompatibilityHash(runID string) (string, boo
 	return backend.backend.ResumeCompatibilityHash(runID)
 }
 func (backend *fencedBackend) AcknowledgeConfigOverride(runID, hash, compatibility string) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.backend.AcknowledgeConfigOverride(runID, hash, compatibility)
 	})
 }
 func (backend *fencedBackend) EnsureWorkPlan(task WorkTask, ranges []RangeState) (bool, error) {
 	var created bool
-	err := backend.protect(func() error {
+	err := backend.protectRun(task.RunID, func() error {
 		var err error
 		created, err = backend.ranges.EnsureWorkPlan(task, ranges)
 		return err
@@ -206,20 +233,20 @@ func (backend *fencedBackend) EnsureWorkPlan(task WorkTask, ranges []RangeState)
 	return created, err
 }
 func (backend *fencedBackend) ResetWorkPlan(task WorkTask, ranges []RangeState) error {
-	return backend.protect(func() error { return backend.ranges.ResetWorkPlan(task, ranges) })
+	return backend.protectRun(task.RunID, func() error { return backend.ranges.ResetWorkPlan(task, ranges) })
 }
 func (backend *fencedBackend) ListWork(runID string) ([]WorkTask, []RangeState, error) {
 	return backend.ranges.ListWork(runID)
 }
 func (backend *fencedBackend) BeginRangeChunk(intent RangeChunkIntent) error {
-	return backend.protect(func() error { return backend.ranges.BeginRangeChunk(intent) })
+	return backend.protectRun(intent.RunID, func() error { return backend.ranges.BeginRangeChunk(intent) })
 }
 func (backend *fencedBackend) RecordRangeAttempt(attempt RangeAttempt) error {
-	return backend.protect(func() error { return backend.ranges.RecordRangeAttempt(attempt) })
+	return backend.protectRun(attempt.RunID, func() error { return backend.ranges.RecordRangeAttempt(attempt) })
 }
 func (backend *fencedBackend) AcknowledgeRange(ack RangeAcknowledgement) (RangeState, error) {
 	var updated RangeState
-	err := backend.protect(func() error {
+	err := backend.protectRun(ack.RunID, func() error {
 		var err error
 		updated, err = backend.ranges.AcknowledgeRange(ack)
 		return err
@@ -227,17 +254,196 @@ func (backend *fencedBackend) AcknowledgeRange(ack RangeAcknowledgement) (RangeS
 	return updated, err
 }
 func (backend *fencedBackend) CompleteRange(runID string, task TaskKey, rangeID, topology string, expected uint64, completedAt time.Time) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.ranges.CompleteRange(runID, task, rangeID, topology, expected, completedAt)
 	})
 }
 func (backend *fencedBackend) CompleteWorkTask(runID string, task TaskKey, topology string, completedAt time.Time) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.ranges.CompleteWorkTask(runID, task, topology, completedAt)
 	})
 }
+func (backend *fencedBackend) stage4Backend() (Stage4Backend, error) {
+	if backend.stage4 == nil {
+		return nil, fmt.Errorf("Stage 4 state is unsupported by this backend")
+	}
+	return backend.stage4, nil
+}
+func (backend *fencedBackend) SaveSchemaSnapshot(snapshot SchemaSnapshot) error {
+	return backend.protectRun(snapshot.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.SaveSchemaSnapshot(snapshot)
+	})
+}
+func (backend *fencedBackend) LoadSchemaSnapshot(runID string, task TaskKey) (SchemaSnapshot, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return SchemaSnapshot{}, false, err
+	}
+	return stage4.LoadSchemaSnapshot(runID, task)
+}
+func (backend *fencedBackend) LoadLatestApplicableSchemaSnapshot(
+	runID string,
+	task TaskKey,
+) (SchemaSnapshot, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return SchemaSnapshot{}, false, err
+	}
+	return stage4.LoadLatestApplicableSchemaSnapshot(runID, task)
+}
+func (backend *fencedBackend) BeginIncrementalAttempt(attempt IncrementalAttempt) (IncrementalAttempt, bool, error) {
+	var stored IncrementalAttempt
+	var created bool
+	err := backend.protectRun(attempt.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		stored, created, err = stage4.BeginIncrementalAttempt(attempt)
+		return err
+	})
+	return stored, created, err
+}
+func (backend *fencedBackend) LoadIncrementalAttempt(
+	runID string,
+	task TaskKey,
+	attemptID string,
+) (IncrementalAttempt, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return IncrementalAttempt{}, false, err
+	}
+	return stage4.LoadIncrementalAttempt(runID, task, attemptID)
+}
+func (backend *fencedBackend) LoadActiveIncrementalAttempt(
+	runID string,
+	task TaskKey,
+) (IncrementalAttempt, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return IncrementalAttempt{}, false, err
+	}
+	return stage4.LoadActiveIncrementalAttempt(runID, task)
+}
+func (backend *fencedBackend) LoadLatestCommittedIncrementalAttempt(
+	runID string,
+	task TaskKey,
+) (IncrementalAttempt, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return IncrementalAttempt{}, false, err
+	}
+	return stage4.LoadLatestCommittedIncrementalAttempt(runID, task)
+}
+func (backend *fencedBackend) CommitIncrementalAttempt(commit IncrementalCommit) error {
+	return backend.protectRun(commit.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.CommitIncrementalAttempt(commit)
+	})
+}
+func (backend *fencedBackend) BeginDeleteReconciliation(
+	record DeleteReconciliation,
+) (DeleteReconciliation, bool, error) {
+	var stored DeleteReconciliation
+	var created bool
+	err := backend.protectRun(record.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		stored, created, err = stage4.BeginDeleteReconciliation(record)
+		return err
+	})
+	return stored, created, err
+}
+func (backend *fencedBackend) LoadDeleteReconciliation(
+	runID string,
+	task TaskKey,
+	attemptID string,
+) (DeleteReconciliation, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return DeleteReconciliation{}, false, err
+	}
+	return stage4.LoadDeleteReconciliation(runID, task, attemptID)
+}
+func (backend *fencedBackend) LoadLatestSuccessfulDeleteReconciliation(
+	runID string,
+	task TaskKey,
+) (DeleteReconciliation, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return DeleteReconciliation{}, false, err
+	}
+	return stage4.LoadLatestSuccessfulDeleteReconciliation(runID, task)
+}
+func (backend *fencedBackend) FinishDeleteReconciliation(result DeleteReconciliationResult) error {
+	return backend.protectRun(result.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.FinishDeleteReconciliation(result)
+	})
+}
+func (backend *fencedBackend) SaveStrictMigrationSnapshot(snapshot StrictMigrationSnapshot) error {
+	return backend.protectRun(snapshot.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.SaveStrictMigrationSnapshot(snapshot)
+	})
+}
+func (backend *fencedBackend) LoadStrictMigrationSnapshot(
+	runID string,
+	epochID string,
+) (StrictMigrationSnapshot, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return StrictMigrationSnapshot{}, false, err
+	}
+	return stage4.LoadStrictMigrationSnapshot(runID, epochID)
+}
+func (backend *fencedBackend) LoadLatestStrictMigrationSnapshot(
+	runID string,
+) (StrictMigrationSnapshot, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return StrictMigrationSnapshot{}, false, err
+	}
+	return stage4.LoadLatestStrictMigrationSnapshot(runID)
+}
+func (backend *fencedBackend) SaveStrictSnapshotEvidence(evidence StrictSnapshotEvidence) error {
+	return backend.protectRun(evidence.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.SaveStrictSnapshotEvidence(evidence)
+	})
+}
+func (backend *fencedBackend) LoadStrictSnapshotEvidence(
+	runID string,
+	task TaskKey,
+	attemptID string,
+) (StrictSnapshotEvidence, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return StrictSnapshotEvidence{}, false, err
+	}
+	return stage4.LoadStrictSnapshotEvidence(runID, task, attemptID)
+}
 
 var (
-	_ Backend      = (*fencedBackend)(nil)
-	_ RangeBackend = (*fencedBackend)(nil)
+	_ Backend       = (*fencedBackend)(nil)
+	_ RangeBackend  = (*fencedBackend)(nil)
+	_ Stage4Backend = (*fencedBackend)(nil)
 )

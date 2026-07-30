@@ -5,6 +5,9 @@ import "fmt"
 // InitializeRun atomically records a run's initial state and compatibility
 // hash in one locked replacement cycle.
 func (store YAMLStore) InitializeRun(run Run, configHash string) error {
+	if err := validateRunSourceEngine(run.SourceEngine); err != nil {
+		return err
+	}
 	return store.update(func(document *yamlStateDocument) error {
 		for _, existing := range document.Runs {
 			if existing.ID == run.ID && existing.Outcome == run.Outcome {

@@ -12,6 +12,7 @@ import (
 // Lease is an exclusive, fenced claim on a canonical migration target.
 type Lease struct {
 	Target     string
+	RunID      string
 	OwnerToken string
 	Generation int64
 }
@@ -20,6 +21,9 @@ type Lease struct {
 func (store SQLiteStore) AcquireLease(target, runID string, ttl time.Duration) (Lease, error) {
 	if ttl <= 0 {
 		return Lease{}, fmt.Errorf("lease TTL must be positive")
+	}
+	if target == "" || runID == "" {
+		return Lease{}, fmt.Errorf("lease target and run ID are required")
 	}
 	database, err := store.Open()
 	if err != nil {
@@ -75,7 +79,7 @@ func (store SQLiteStore) AcquireLease(target, runID string, ttl time.Duration) (
 	if err := tx.Commit(); err != nil {
 		return Lease{}, fmt.Errorf("commit target lease: %w", err)
 	}
-	return Lease{Target: target, OwnerToken: token, Generation: generation}, nil
+	return Lease{Target: target, RunID: runID, OwnerToken: token, Generation: generation}, nil
 }
 
 // RenewLease extends a lease only while this owner still holds its generation.
@@ -85,7 +89,10 @@ func (store SQLiteStore) RenewLease(lease Lease) error {
 		return err
 	}
 	defer database.Close()
-	result, err := database.Exec(`UPDATE leases SET heartbeat_at = ? WHERE target = ? AND owner_token = ? AND generation = ?`, time.Now().UTC(), lease.Target, lease.OwnerToken, lease.Generation)
+	result, err := database.Exec(`
+		UPDATE leases SET heartbeat_at = ?
+		WHERE target = ? AND run_id = ? AND owner_token = ? AND generation = ?
+	`, time.Now().UTC(), lease.Target, lease.RunID, lease.OwnerToken, lease.Generation)
 	if err != nil {
 		return fmt.Errorf("renew target lease: %w", err)
 	}
@@ -108,8 +115,8 @@ func (store SQLiteStore) ReleaseLease(lease Lease) error {
 	defer database.Close()
 	result, err := database.Exec(`
 		UPDATE leases SET owner_token = '', run_id = '', heartbeat_at = ?
-		WHERE target = ? AND owner_token = ? AND generation = ?
-	`, time.Unix(0, 0).UTC(), lease.Target, lease.OwnerToken, lease.Generation)
+		WHERE target = ? AND run_id = ? AND owner_token = ? AND generation = ?
+	`, time.Unix(0, 0).UTC(), lease.Target, lease.RunID, lease.OwnerToken, lease.Generation)
 	if err != nil {
 		return fmt.Errorf("release target lease: %w", err)
 	}
