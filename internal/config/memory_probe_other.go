@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && (!darwin || ios)
 
 package config
 
