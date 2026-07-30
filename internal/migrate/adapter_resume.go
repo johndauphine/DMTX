@@ -87,6 +87,14 @@ func executeResumeWithRegistry(
 			route.target.engine,
 		)
 	}
+	stage4, err := resolveStage4AdapterAdmission(
+		cfg,
+		observer,
+		true,
+	)
+	if err != nil {
+		return Result{}, err
+	}
 
 	if err := checkAdapterResumeContext(
 		ctx,
@@ -152,7 +160,7 @@ func executeResumeWithRegistry(
 		return Result{}, err
 	}
 
-	return resumeWithAdapters(
+	return resumeWithAdaptersAdmission(
 		ctx,
 		cfg,
 		completed,
@@ -160,6 +168,7 @@ func executeResumeWithRegistry(
 		taskObserver,
 		source,
 		target,
+		stage4,
 	)
 }
 
@@ -201,6 +210,51 @@ func resumeWithAdapters(
 	target targetAdapter,
 ) (Result, error) {
 	const mode = "upsert"
+
+	stage4, err := resolveStage4AdapterAdmission(
+		cfg,
+		observer,
+		true,
+	)
+	if err != nil {
+		return Result{}, err
+	}
+	return resumeWithAdaptersAdmission(
+		ctx,
+		cfg,
+		completed,
+		observer,
+		taskObserver,
+		source,
+		target,
+		stage4,
+	)
+}
+
+func resumeWithAdaptersAdmission(
+	ctx context.Context,
+	cfg config.Config,
+	completed CompletedTableCheckpoints,
+	observer TableObserver,
+	taskObserver TableSetObserver,
+	source sourceAdapter,
+	target targetAdapter,
+	stage4 stage4AdapterAdmission,
+) (Result, error) {
+	const mode = "upsert"
+
+	if stage4.enabled {
+		return resumeWithStage4Adapters(
+			ctx,
+			cfg,
+			completed,
+			observer,
+			taskObserver,
+			source,
+			target,
+			stage4.run,
+		)
+	}
 
 	if err := checkAdapterResumeContext(
 		ctx,

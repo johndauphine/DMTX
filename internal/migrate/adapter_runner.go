@@ -25,6 +25,18 @@ func (route resolvedAdapterRoute) execute(
 			route.target.engine,
 		)
 	}
+	mode, err := normalizeAdapterTargetMode(cfg.Migration.TargetMode)
+	if err != nil {
+		return Result{}, err
+	}
+	stage4, err := resolveStage4AdapterAdmission(
+		cfg,
+		observer,
+		false,
+	)
+	if err != nil {
+		return Result{}, err
+	}
 	source, err := route.source.open(ctx, cfg.Source)
 	if err != nil {
 		return Result{}, err
@@ -87,7 +99,15 @@ func (route resolvedAdapterRoute) execute(
 			return Result{}, err
 		}
 	}
-	return migrateWithAdapters(ctx, cfg, observer, source, target)
+	return migrateWithAdaptersAdmission(
+		ctx,
+		cfg,
+		observer,
+		source,
+		target,
+		mode,
+		stage4,
+	)
 }
 
 func executeBuiltInComposedRoute(
@@ -245,6 +265,45 @@ func migrateWithAdapters(
 	mode, err := normalizeAdapterTargetMode(cfg.Migration.TargetMode)
 	if err != nil {
 		return Result{}, err
+	}
+	stage4, err := resolveStage4AdapterAdmission(
+		cfg,
+		observer,
+		false,
+	)
+	if err != nil {
+		return Result{}, err
+	}
+	return migrateWithAdaptersAdmission(
+		ctx,
+		cfg,
+		observer,
+		source,
+		target,
+		mode,
+		stage4,
+	)
+}
+
+func migrateWithAdaptersAdmission(
+	ctx context.Context,
+	cfg config.Config,
+	observer TableObserver,
+	source sourceAdapter,
+	target targetAdapter,
+	mode string,
+	stage4 stage4AdapterAdmission,
+) (Result, error) {
+	if stage4.enabled {
+		return migrateWithStage4Adapters(
+			ctx,
+			cfg,
+			observer,
+			source,
+			target,
+			mode,
+			stage4.run,
+		)
 	}
 	names, err := source.ListTables(ctx)
 	if err != nil {
