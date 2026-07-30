@@ -303,7 +303,6 @@ func createSQLServerCommonFixture(
 				COLLATE Latin1_General_100_BIN2_UTF8 NULL,
 			[external_id] UNIQUEIDENTIFIER NOT NULL,
 			CONSTRAINT %s PRIMARY KEY CLUSTERED ([id] ASC),
-			CONSTRAINT %s UNIQUE NONCLUSTERED ([id] ASC),
 			CONSTRAINT %s CHECK ([balance] >= (0))
 		)
 	`,
@@ -312,11 +311,22 @@ func createSQLServerCommonFixture(
 		sqlServerIdentifier(prefix+"_balance_df"),
 		sqlServerIdentifier(prefix+"_enabled_df"),
 		sqlServerIdentifier(prefix+"_accounts_pk"),
-		sqlServerIdentifier(prefix+"_id_uq"),
 		sqlServerIdentifier(prefix+"_account_ck"),
 	)
 	if _, err := database.ExecContext(ctx, accountsDDL); err != nil {
 		t.Fatalf("create SQL Server common-fixture accounts: %v", err)
+	}
+	if _, err := database.ExecContext(
+		ctx,
+		"CREATE UNIQUE NONCLUSTERED INDEX "+
+			sqlServerIdentifier(prefix+"_id_uq")+
+			" ON "+sqlServerQualified("dbo", accountsName)+
+			" ([id] ASC)",
+	); err != nil {
+		t.Fatalf(
+			"create SQL Server common-fixture account index: %v",
+			err,
+		)
 	}
 	eventsDDL := fmt.Sprintf(`
 		CREATE TABLE %s (

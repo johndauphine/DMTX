@@ -266,10 +266,8 @@ func sqlServerSourcePrimaryKeyFromCatalog(
 		catalog.parentObjectID != catalog.tableObjectID ||
 		catalog.indexID <= 0 ||
 		catalog.indexName != catalog.name ||
-		!validSQLServerRowstoreIndexType(
-			catalog.indexType,
-			catalog.indexTypeDescription,
-		) ||
+		catalog.indexType != 1 ||
+		catalog.indexTypeDescription != "CLUSTERED" ||
 		!catalog.unique ||
 		!catalog.primary ||
 		catalog.uniqueConstraint ||
@@ -547,12 +545,10 @@ func sqlServerSourceIndexFromCatalog(
 		catalog.table != table.Name ||
 		catalog.indexID <= 0 ||
 		!validSQLServerSourceIdentifier(catalog.name) ||
-		!validSQLServerRowstoreIndexType(
-			catalog.typ,
-			catalog.typeDescription,
-		) ||
+		catalog.typ != 2 ||
+		catalog.typeDescription != "NONCLUSTERED" ||
 		catalog.primary ||
-		catalog.uniqueConstraint && !catalog.unique ||
+		catalog.uniqueConstraint ||
 		catalog.disabled ||
 		catalog.hypothetical ||
 		catalog.filtered ||

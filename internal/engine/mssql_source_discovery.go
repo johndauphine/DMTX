@@ -28,6 +28,22 @@ func VerifySQLServer2022Source(
 	return validateSQLServer2022SourceCatalog(catalog)
 }
 
+// VerifySQLServer2022Target pins native target behavior to the same SQL Server
+// 2022 database flags admitted for source discovery: compatibility level 160,
+// online/writable ordinary database state, and the explicitly inspected
+// publication/CDC flags. Availability-group, mirroring, and log-shipping
+// admission are outside this validator and require a separate contract.
+func VerifySQLServer2022Target(
+	ctx context.Context,
+	database *sql.DB,
+) error {
+	catalog, err := readSQLServer2022SourceCatalog(ctx, database)
+	if err != nil {
+		return err
+	}
+	return validateSQLServer2022SourceCatalog(catalog)
+}
+
 type sqlServer2022SourceCatalog struct {
 	productMajorVersion int
 	engineEdition       int

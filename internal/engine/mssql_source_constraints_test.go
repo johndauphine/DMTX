@@ -176,6 +176,12 @@ func TestSQLServerSourcePrimaryKeyFailsClosed(t *testing.T) {
 			value.indexType = 5
 			value.indexTypeDescription = "CLUSTERED COLUMNSTORE"
 		},
+		"nonclustered primary key": func(
+			value *sqlServerSourcePrimaryKeyCatalog,
+		) {
+			value.indexType = 2
+			value.indexTypeDescription = "NONCLUSTERED"
+		},
 		"filtered": func(value *sqlServerSourcePrimaryKeyCatalog) {
 			value.filtered = true
 			value.filterDefinition = sql.NullString{
@@ -307,6 +313,13 @@ func TestSQLServerSourceIndexFailsClosedOnNonportableShape(t *testing.T) {
 		"hash": func(value *sqlServerSourceIndexCatalog) {
 			value.typ = 7
 			value.typeDescription = "NONCLUSTERED HASH"
+		},
+		"clustered secondary": func(value *sqlServerSourceIndexCatalog) {
+			value.typ = 1
+			value.typeDescription = "CLUSTERED"
+		},
+		"unique constraint": func(value *sqlServerSourceIndexCatalog) {
+			value.uniqueConstraint = true
 		},
 		"collation": func(value *sqlServerSourceIndexCatalog) {
 			value.columns[0].collation = sql.NullString{

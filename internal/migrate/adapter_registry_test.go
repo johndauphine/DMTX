@@ -176,6 +176,10 @@ func TestBuiltInAdaptersPreserveCertifiedRoutes(t *testing.T) {
 			source: openPostgresSourceAdapter,
 			target: openMySQLTargetAdapter,
 		},
+		{source: "postgres", target: "mssql"}: {
+			source: openPostgresSourceAdapter,
+			target: openSQLServerTargetAdapter,
+		},
 		{source: "mysql", target: "postgres"}: {
 			source: openMySQLSourceAdapter,
 			target: openPostgresTargetAdapter,
@@ -191,6 +195,10 @@ func TestBuiltInAdaptersPreserveCertifiedRoutes(t *testing.T) {
 		{source: "mssql", target: "postgres"}: {
 			source: openSQLServerSourceAdapter,
 			target: openPostgresTargetAdapter,
+		},
+		{source: "mssql", target: "mssql"}: {
+			source: openSQLServerSourceAdapter,
+			target: openSQLServerTargetAdapter,
 		},
 	}
 	if got := len(builtInAdapters.certified); got != len(expected) {

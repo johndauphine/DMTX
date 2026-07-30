@@ -86,6 +86,33 @@ func OpenSQLServer2022Source(
 	return database, nil
 }
 
+// OpenSQLServer2022Target opens a TLS-verified SQL Server 2022 target pool.
+// Target admission uses the same server and inspected database catalog
+// contract as source discovery, including compatibility level 160 and the
+// rejection of Azure, snapshots, CDC/publication flags, and read-only
+// databases. Availability-group, mirroring, and log-shipping state are not
+// certified by this opener.
+func OpenSQLServer2022Target(
+	ctx context.Context,
+	endpoint config.Endpoint,
+) (*sql.DB, error) {
+	database, err := OpenSQLServer(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	if err := VerifySQLServer2022Target(ctx, database); err != nil {
+		if closeErr := database.Close(); closeErr != nil {
+			return nil, fmt.Errorf(
+				"verify SQL Server 2022 target: %w (close: %v)",
+				err,
+				closeErr,
+			)
+		}
+		return nil, fmt.Errorf("verify SQL Server 2022 target: %w", err)
+	}
+	return database, nil
+}
+
 // ListSQLServerTables returns one schema's base tables in deterministic order.
 func ListSQLServerTables(ctx context.Context, database *sql.DB, namespace string) ([]string, error) {
 	if namespace == "" {

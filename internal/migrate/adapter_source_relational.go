@@ -36,6 +36,13 @@ func (adapter *relationalSourceAdapter) mySQLDatabaseHandle() *sql.DB {
 	return adapter.database
 }
 
+func (adapter *relationalSourceAdapter) sqlServerDatabaseHandle() *sql.DB {
+	if adapter == nil || adapter.spec.engine != "mssql" {
+		return nil
+	}
+	return adapter.database
+}
+
 func openPostgresSourceAdapter(
 	ctx context.Context,
 	endpoint config.Endpoint,
@@ -91,6 +98,7 @@ func openSQLServerSourceAdapter(
 		inspectTable:   engine.InspectSQLServerTable,
 		readQuery:      sqlServerReadQuery,
 		qualifiedTable: sqlServerQualified,
+		wrapRows:       wrapSQLServerSourceRows,
 	})
 }
 

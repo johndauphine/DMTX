@@ -57,6 +57,15 @@ func (route resolvedAdapterRoute) execute(
 			return Result{}, err
 		}
 	}
+	if route.source.engine == "mssql" && route.target.engine == "mssql" {
+		if err := requireDistinctLiveSQLServerDatabases(
+			ctx,
+			source,
+			target,
+		); err != nil {
+			return Result{}, err
+		}
+	}
 	return migrateWithAdapters(ctx, cfg, observer, source, target)
 }
 
@@ -97,6 +106,19 @@ type adapterTablePlan struct {
 	source  schema.Table
 	target  schema.Table
 	columns []string
+}
+
+// adapterTargetSourceDataPreflighter permits a target to perform bounded,
+// read-only source checks required by its narrower value or lifecycle
+// contracts. It runs after all metadata and target-catalog preflight and
+// before the first target mutation or checkpoint.
+type adapterTargetSourceDataPreflighter interface {
+	PreflightSourceData(
+		context.Context,
+		sourceAdapter,
+		[]adapterTablePlan,
+		string,
+	) error
 }
 
 type adapterTargetMutationProtector interface {
@@ -193,6 +215,19 @@ func migrateWithAdapters(
 	}
 	if err := target.PreflightTables(ctx, targetTables, mode); err != nil {
 		return Result{}, fmt.Errorf("preflight target tables: %w", err)
+	}
+	if preflighter, ok := target.(adapterTargetSourceDataPreflighter); ok {
+		if err := preflighter.PreflightSourceData(
+			ctx,
+			source,
+			plans,
+			mode,
+		); err != nil {
+			return Result{}, fmt.Errorf(
+				"preflight source data for target: %w",
+				err,
+			)
+		}
 	}
 	if setObserver, ok := observer.(TableSetObserver); ok {
 		if err := setObserver.BeforeTables(
