@@ -128,8 +128,8 @@ The same inspection commands accept the default SQLite path
 The Stage 3 adapter registry currently certifies these fresh-run
 implementations:
 
-- SQLite to PostgreSQL, MySQL/MariaDB (legacy compatibility override),
-  SQL Server, and ClickHouse;
+- SQLite to PostgreSQL and ClickHouse, plus MySQL/MariaDB and SQL Server
+  compatibility routes;
 - PostgreSQL to PostgreSQL, SQLite, Oracle MySQL 8.0, MariaDB 10.11, or
   SQL Server 2022;
 - Oracle MySQL 8.0 to PostgreSQL, SQLite, or Oracle MySQL 8.0;
@@ -146,11 +146,12 @@ migrations.
 SQLite, PostgreSQL, Oracle MySQL 8.0, MariaDB 10.11, and SQL Server 2022
 sources now compose independently with the PostgreSQL target. PostgreSQL,
 each admitted MySQL-family source, and SQL Server compose with the SQLite
-target behind shared contracts. PostgreSQL and SQL Server sources compose with
-either native MySQL-family target, while each MySQL-family source composes with
-its matching native flavor. PostgreSQL and SQL Server sources also compose
-with the native SQL Server target. Cross-flavor Oracle-MySQL/MariaDB copies
-remain fail-closed where exact collation and catalog semantics differ.
+target behind shared contracts. SQLite also composes with the native
+ClickHouse 24.8 target. PostgreSQL and SQL Server sources compose with either
+native MySQL-family target, while each MySQL-family source composes with its
+matching native flavor. PostgreSQL and SQL Server sources also compose with
+the native SQL Server target. Cross-flavor Oracle-MySQL/MariaDB copies remain
+fail-closed where exact collation and catalog semantics differ.
 
 The SQL Server-to-SQLite route currently supports fresh drop/recreate only.
 It preserves the admitted integral, bit, floating-point, UTF-8 text, binary,
@@ -161,6 +162,17 @@ wider exact numerics, padding-sensitive comparison roles, unsafe nullable
 unique indexes, unsupported foreign-key or CHECK semantics, and SQLite-global
 object-name collisions fail before target preparation. Upsert remains
 fail-closed until retained SQLite shape equivalence is fully proven.
+
+The SQLite-to-ClickHouse 24.8 route is a rebuild-only analytical projection.
+It admits SQLite `STRICT` tables with deterministic primary keys and maps
+`INTEGER`, `REAL`, `TEXT`, and `BLOB` to `Int64`, `Float64`, and ClickHouse
+`String`, preserving nullability with `Nullable` wrappers. Source primary-key
+order becomes the MergeTree `ORDER BY` key and is not represented as a
+relational uniqueness guarantee. `ANY`, non-`STRICT` tables, declared type
+modifiers, defaults, identities, indexes, foreign keys, CHECK constraints,
+upsert, strict consistency, non-Atomic target databases, unpinned server
+versions, and unsafe existing target engines fail before target mutation.
+Writes use bounded native ClickHouse batches over verified TLS.
 
 The native Oracle MySQL-to-MySQL route requires read access to
 `performance_schema.replication_connection_configuration` and

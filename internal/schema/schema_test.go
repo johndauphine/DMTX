@@ -30,7 +30,10 @@ func TestMapTypeSupportsCommonPortableTypes(t *testing.T) {
 		{"jsonb", MySQL, "JSON"},
 		{"json", Postgres, "JSON"},
 		{"jsonb", Postgres, "JSONB"},
-		{"date", ClickHouse, "DATE"},
+		{"date", ClickHouse, "Date"},
+		{"text", ClickHouse, "String"},
+		{"boolean", ClickHouse, "Bool"},
+		{"timestamp", ClickHouse, "DateTime64(6)"},
 		{"timestamptz", Postgres, "TIMESTAMP WITH TIME ZONE"},
 	}
 	for _, test := range cases {

@@ -32,6 +32,13 @@ func resolveMigration(
 			cfg.Target.Type,
 		)
 	}
+	if cfg.Migration.StrictConsistency &&
+		target.capability.StrictConsistency == "unsupported" {
+		return resolvedAdapterRoute{}, fmt.Errorf(
+			"target engine %s does not support strict consistency",
+			cfg.Target.Type,
+		)
+	}
 	route, err := registry.certifiedRoute(source, target)
 	if err != nil {
 		return resolvedAdapterRoute{}, err

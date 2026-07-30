@@ -162,7 +162,8 @@ func TestBuiltInAdaptersPreserveCertifiedRoutes(t *testing.T) {
 			override: SQLiteToSQLServerWithObserver,
 		},
 		{source: "sqlite", target: "clickhouse"}: {
-			override: SQLiteToClickHouseWithObserver,
+			source: openSQLiteSourceAdapter,
+			target: openClickHouseTargetAdapter,
 		},
 		{source: "postgres", target: "postgres"}: {
 			source: openPostgresSourceAdapter,
@@ -322,6 +323,61 @@ func TestCapabilityValidationPrecedesAdapterConstruction(t *testing.T) {
 		},
 	}, nil, registry)
 	if err == nil || !strings.Contains(err.Error(), "does not support upsert") {
+		t.Fatalf("error = %v", err)
+	}
+	if sourceOpened || targetOpened {
+		t.Fatalf(
+			"adapters opened before capability rejection: source=%v target=%v",
+			sourceOpened,
+			targetOpened,
+		)
+	}
+}
+
+func TestUnsupportedStrictConsistencyPrecedesAdapterConstruction(t *testing.T) {
+	sourceOpened, targetOpened := false, false
+	registry, err := newAdapterRegistry(
+		[]sourceRole{{
+			engine: "sqlite",
+			open: func(
+				context.Context,
+				config.Endpoint,
+			) (sourceAdapter, error) {
+				sourceOpened = true
+				return nil, errors.New("source adapter should not open")
+			},
+		}},
+		[]targetRole{{
+			engine: "clickhouse",
+			capability: engine.Capability{
+				BulkPath:          "test batches",
+				StrictConsistency: "unsupported",
+			},
+			open: func(
+				context.Context,
+				config.Endpoint,
+			) (targetAdapter, error) {
+				targetOpened = true
+				return nil, errors.New("target adapter should not open")
+			},
+		}},
+		[]adapterPair{{source: "sqlite", target: "clickhouse"}},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("newAdapterRegistry: %v", err)
+	}
+	_, err = executeWithRegistry(context.Background(), config.Config{
+		Source: config.Endpoint{Type: "sqlite"},
+		Target: config.Endpoint{Type: "clickhouse"},
+		Migration: config.Migration{
+			StrictConsistency: true,
+		},
+	}, nil, registry)
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"does not support strict consistency",
+	) {
 		t.Fatalf("error = %v", err)
 	}
 	if sourceOpened || targetOpened {

@@ -179,6 +179,9 @@ func MapType(source string, target Dialect) (string, error) {
 			return "DECIMAL(38, 10)", nil
 		}
 	case "text", "varchar", "character varying":
+		if target == ClickHouse {
+			return "String", nil
+		}
 		return "TEXT", nil
 	case "uuid":
 		switch target {
@@ -237,10 +240,16 @@ func MapType(source string, target Dialect) (string, error) {
 		if target == MySQL {
 			return "BOOLEAN", nil
 		}
+		if target == ClickHouse {
+			return "Bool", nil
+		}
 		return "BOOLEAN", nil
 	case "timestamp", "datetime":
 		if target == SQLServer {
 			return "DATETIME2", nil
+		}
+		if target == ClickHouse {
+			return "DateTime64(6)", nil
 		}
 		return "TIMESTAMP", nil
 	case "timestamptz":
@@ -250,6 +259,9 @@ func MapType(source string, target Dialect) (string, error) {
 		return "", &PolicyError{
 			Operation: "map type", Type: source, Target: string(target)}
 	case "date":
+		if target == ClickHouse {
+			return "Date", nil
+		}
 		return "DATE", nil
 	default:
 		return "", &PolicyError{Operation: "map type", Type: source, Target: string(target)}
@@ -310,7 +322,12 @@ func CreateTable(target Dialect, table Table) (string, error) {
 			}
 		}
 		nullability := " NOT NULL"
-		if column.Nullable {
+		if target == ClickHouse {
+			nullability = ""
+			if column.Nullable {
+				typ = "Nullable(" + typ + ")"
+			}
+		} else if column.Nullable {
 			nullability = ""
 		}
 		identity := ""

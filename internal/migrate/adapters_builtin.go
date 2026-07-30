@@ -14,9 +14,10 @@ import "github.com/johndauphine/dmtx/internal/engine"
 // SQL Server target's SQLite source remains on the compatibility route until
 // the shared value contract has a live fixture. SQL Server's SQLite target is
 // certified for its conservative drop/recreate contract; unsupported SQLite
-// storage and comparison shapes remain fail-closed. Compatibility overrides
-// preserve the remaining routes until both sides move behind the shared
-// contracts.
+// storage and comparison shapes remain fail-closed. SQLite composes with the
+// pinned ClickHouse 24.8 target under its strict rebuild-only contract.
+// Compatibility overrides preserve the remaining routes until both sides move
+// behind the shared contracts.
 var builtInAdapters = mustBuildAdapterRegistry(
 	[]sourceRole{
 		{
@@ -50,7 +51,11 @@ var builtInAdapters = mustBuildAdapterRegistry(
 			validateSQLServerTargetEndpoint,
 			openSQLServerTargetAdapter,
 		),
-		builtInTargetRole("clickhouse", nil, nil),
+		builtInTargetRole(
+			"clickhouse",
+			validateClickHouseTargetEndpoint,
+			openClickHouseTargetAdapter,
+		),
 	},
 	[]adapterPair{
 		{source: "sqlite", target: "sqlite"},
@@ -74,7 +79,6 @@ var builtInAdapters = mustBuildAdapterRegistry(
 		{pair: adapterPair{source: "sqlite", target: "sqlite"}, run: SQLiteToSQLiteWithObserver},
 		{pair: adapterPair{source: "sqlite", target: "mysql"}, run: SQLiteToMySQLWithObserver},
 		{pair: adapterPair{source: "sqlite", target: "mssql"}, run: SQLiteToSQLServerWithObserver},
-		{pair: adapterPair{source: "sqlite", target: "clickhouse"}, run: SQLiteToClickHouseWithObserver},
 	},
 )
 
