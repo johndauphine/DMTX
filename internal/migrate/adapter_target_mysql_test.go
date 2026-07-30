@@ -268,6 +268,30 @@ func TestValidateMySQLRetainedTableShapeReportsFirstMismatch(t *testing.T) {
 	}
 }
 
+func TestValidateMySQLRetainedColumnTreatsUUIDAsPhysicalVarchar36(
+	t *testing.T,
+) {
+	planned := schema.Column{
+		Name:     "external_id",
+		Type:     "uuid",
+		Nullable: false,
+		DeclaredType: &schema.DeclaredType{
+			Base:      "varchar",
+			Arguments: []int{36},
+		},
+	}
+	actual := planned
+	actual.Type = "varchar"
+	if err := validateMySQLRetainedColumn(planned, actual); err != nil {
+		t.Fatalf("physical UUID retained column was rejected: %v", err)
+	}
+
+	actual.DeclaredType.Arguments = []int{35}
+	if err := validateMySQLRetainedColumn(planned, actual); err == nil {
+		t.Fatal("non-VARCHAR(36) retained UUID shape was accepted")
+	}
+}
+
 func TestValidateMySQLRetainedTableShapeIgnoresObjectCatalogOrder(
 	t *testing.T,
 ) {

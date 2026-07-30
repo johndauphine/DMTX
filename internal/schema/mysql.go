@@ -487,6 +487,18 @@ func renderMySQLDefault(column Column) (string, error) {
 			return expression.literal, nil
 		}
 	case expressionString:
+		if target := mysqlCatalogDefaultTargetForColumn(column); target == mysqlCatalogDefaultDate ||
+			target == mysqlCatalogDefaultTimestamp {
+			literal, ok := canonicalMySQLStaticTemporalDefault(
+				column,
+				target,
+				expression.literal,
+			)
+			if !ok {
+				return "", mysqlDefaultPolicy(column)
+			}
+			return mysqlStringLiteral(literal), nil
+		}
 		if !mysqlTextBase(base) ||
 			!utf8.ValidString(expression.literal) ||
 			strings.ContainsRune(expression.literal, '\x00') {
@@ -555,6 +567,16 @@ func NormalizeMySQLDefault(column Column) (*Expression, error) {
 	case expressionNull:
 		return nil, nil
 	case expressionString:
+		target := mysqlCatalogDefaultTargetForColumn(column)
+		if target == mysqlCatalogDefaultDate ||
+			target == mysqlCatalogDefaultTimestamp {
+			literal := column.Default.literal
+			return ParseMySQLCatalogDefault(
+				column,
+				&literal,
+				false,
+			)
+		}
 		return &Expression{
 			sql:     portableCheckStringLiteral(column.Default.literal),
 			kind:    expressionString,

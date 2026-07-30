@@ -43,8 +43,15 @@ func (adapter *mysqlTargetAdapter) PreflightSourceData(
 			"preflight source data for MySQL target: source adapter is required",
 		)
 	}
-	adapter.validateSQLServerSourceValues = source.Engine() == "mssql"
-	if !adapter.validateSQLServerSourceValues {
+	adapter.normalizeSQLiteSourceValues = false
+	adapter.validateSQLServerSourceValues = false
+	switch source.Engine() {
+	case "sqlite":
+		adapter.normalizeSQLiteSourceValues = true
+		return preflightSQLiteMySQLSourceData(ctx, source, plans)
+	case "mssql":
+		adapter.validateSQLServerSourceValues = true
+	default:
 		return nil
 	}
 	for _, plan := range plans {

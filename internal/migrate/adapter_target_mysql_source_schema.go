@@ -28,6 +28,8 @@ func projectMySQLTargetTable(
 		target, err = projectPostgresTableForMySQL(sourceTable)
 	case "mssql":
 		target, err = projectSQLServerTableForMySQL(sourceTable)
+	case "sqlite":
+		target, err = projectSQLiteTableForMySQL(sourceTable)
 	default:
 		return schema.Table{}, fmt.Errorf(
 			"MySQL target does not support source engine %q",
@@ -55,7 +57,9 @@ func normalizeMySQLTargetCollation(
 	collation := strings.ToLower(strings.TrimSpace(table.MySQLCollation))
 	switch targetFlavor {
 	case engine.MySQLServerFlavorOracle80:
-		if sourceEngine == "postgres" || sourceEngine == "mssql" {
+		if sourceEngine == "postgres" ||
+			sourceEngine == "mssql" ||
+			sourceEngine == "sqlite" {
 			table.MySQLCollation = "utf8mb4_0900_bin"
 			return nil
 		}
@@ -65,7 +69,9 @@ func normalizeMySQLTargetCollation(
 			return nil
 		}
 	case engine.MySQLServerFlavorMariaDB1011:
-		if sourceEngine == "postgres" || sourceEngine == "mssql" {
+		if sourceEngine == "postgres" ||
+			sourceEngine == "mssql" ||
+			sourceEngine == "sqlite" {
 			table.MySQLCollation = "utf8mb4_nopad_bin"
 			return nil
 		}

@@ -140,6 +140,29 @@ func TestParseMySQLCatalogDefaultReconstructsSafeScalars(t *testing.T) {
 			wantKind:         expressionCurrentTimestamp,
 		},
 		{
+			name:        "static date",
+			column:      Column{Name: "occurred_on", Type: "date"},
+			catalog:     "2026-07-29",
+			wantSQL:     "'2026-07-29'",
+			wantKind:    expressionString,
+			wantLiteral: "2026-07-29",
+		},
+		{
+			name: "static datetime exact precision",
+			column: Column{
+				Name: "created_at",
+				Type: "datetime",
+				DeclaredType: &DeclaredType{
+					Base:      "datetime",
+					Arguments: []int{6},
+				},
+			},
+			catalog:     "2026-07-29 12:34:56.123456",
+			wantSQL:     "'2026-07-29 12:34:56.123456'",
+			wantKind:    expressionString,
+			wantLiteral: "2026-07-29 12:34:56.123456",
+		},
+		{
 			name: "generated blob hexadecimal",
 			column: Column{
 				Name: "payload",
@@ -310,9 +333,18 @@ func TestParseMySQLCatalogDefaultFailsClosed(t *testing.T) {
 			catalog: mysqlCatalogTestString("2"),
 		},
 		{
-			name:    "static temporal default lacks a structural kind",
-			column:  Column{Name: "occurred_on", Type: "date"},
-			catalog: mysqlCatalogTestString("2026-07-29"),
+			name: "static temporal precision mismatch",
+			column: Column{
+				Name: "created_at",
+				Type: "datetime",
+				DeclaredType: &DeclaredType{
+					Base:      "datetime",
+					Arguments: []int{6},
+				},
+			},
+			catalog: mysqlCatalogTestString(
+				"2026-07-29 12:34:56.123",
+			),
 		},
 		{
 			name:    "unsupported type",

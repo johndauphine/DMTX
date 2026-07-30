@@ -19,8 +19,8 @@ import "github.com/johndauphine/dmtx/internal/engine"
 // ClickHouse 24.8 also composes with a distinct ClickHouse Atomic database for
 // the narrow same-engine rebuild shape whose ordering metadata is explicitly
 // non-unique.
-// Compatibility overrides preserve the remaining routes until both sides move
-// behind the shared contracts.
+// The SQLite-to-SQLite compatibility implementation remains outside the
+// network-adapter composition layer.
 var builtInAdapters = mustBuildAdapterRegistry(
 	[]sourceRole{
 		{
@@ -86,7 +86,6 @@ var builtInAdapters = mustBuildAdapterRegistry(
 	},
 	[]adapterOverride{
 		{pair: adapterPair{source: "sqlite", target: "sqlite"}, run: SQLiteToSQLiteWithObserver},
-		{pair: adapterPair{source: "sqlite", target: "mysql"}, run: SQLiteToMySQLWithObserver},
 	},
 )
 

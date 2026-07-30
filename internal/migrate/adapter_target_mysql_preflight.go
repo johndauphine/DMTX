@@ -38,11 +38,22 @@ func (adapter *mysqlTargetAdapter) PreflightTables(
 			adapter.flavor,
 		)
 	}
+	return preflightMySQLRetainedTables(
+		ctx,
+		adapter.database,
+		targetTables,
+	)
+}
 
+func preflightMySQLRetainedTables(
+	ctx context.Context,
+	database *sql.DB,
+	targetTables []schema.Table,
+) error {
 	for _, planned := range targetTables {
 		exists, err := mysqlTargetTableExists(
 			ctx,
-			adapter.database,
+			database,
 			planned,
 		)
 		if err != nil {
@@ -60,7 +71,7 @@ func (adapter *mysqlTargetAdapter) PreflightTables(
 		}
 		actual, err := engine.InspectMySQLTable(
 			ctx,
-			adapter.database,
+			database,
 			planned.Schema,
 			planned.Name,
 		)
@@ -352,7 +363,8 @@ func validateMySQLRetainedColumn(
 	actual schema.Column,
 ) error {
 	if planned.Name != actual.Name ||
-		planned.Type != actual.Type ||
+		mysqlRetainedEffectiveColumnType(planned) !=
+			mysqlRetainedEffectiveColumnType(actual) ||
 		planned.Nullable != actual.Nullable ||
 		planned.PrimaryKey != actual.PrimaryKey ||
 		planned.PrimaryKeyPosition != actual.PrimaryKeyPosition {
@@ -375,6 +387,25 @@ func validateMySQLRetainedColumn(
 		return fmt.Errorf("default differs")
 	}
 	return nil
+}
+
+func mysqlRetainedEffectiveColumnType(column schema.Column) string {
+	semantic := strings.ToLower(strings.Join(
+		strings.Fields(column.Type),
+		" ",
+	))
+	if semantic != "uuid" || column.DeclaredType == nil {
+		return semantic
+	}
+	base := strings.ToLower(strings.Join(
+		strings.Fields(column.DeclaredType.Base),
+		" ",
+	))
+	if base == "varchar" &&
+		slices.Equal(column.DeclaredType.Arguments, []int{36}) {
+		return "varchar"
+	}
+	return semantic
 }
 
 func renderMySQLRetainedColumn(column schema.Column) (string, error) {
@@ -417,7 +448,7 @@ type mysqlExternalForeignKey struct {
 
 func preflightMySQLDropRecreate(
 	ctx context.Context,
-	database *sql.DB,
+	database mysqlTargetCatalogQueryer,
 	tables []schema.Table,
 	flavor engine.MySQLServerFlavor,
 ) error {
@@ -437,6 +468,14 @@ func preflightMySQLDropRecreate(
 		return fmt.Errorf(
 			"preflight MySQL target: all tables must use one target database",
 		)
+	}
+	if err := preflightMySQLSelectedTargetTriggers(
+		ctx,
+		database,
+		tables[0].Schema,
+		selected,
+	); err != nil {
+		return err
 	}
 	if err := preflightMySQLRelationKindsAndViews(
 		ctx,
@@ -529,7 +568,7 @@ func preflightMySQLDropRecreate(
 
 func preflightMySQLRelationKindsAndViews(
 	ctx context.Context,
-	database *sql.DB,
+	database mysqlTargetCatalogQueryer,
 	namespace string,
 	selected map[string]struct{},
 	flavor engine.MySQLServerFlavor,
@@ -568,6 +607,13 @@ func preflightMySQLRelationKindsAndViews(
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("close MySQL target relation catalog: %w", err)
 	}
+	if err := preflightMySQLGlobalViewVisibility(
+		ctx,
+		database,
+		flavor,
+	); err != nil {
+		return err
+	}
 
 	switch flavor {
 	case engine.MySQLServerFlavorOracle80:
@@ -590,9 +636,65 @@ func preflightMySQLRelationKindsAndViews(
 	}
 }
 
+func preflightMySQLSelectedTargetTriggers(
+	ctx context.Context,
+	database mysqlTargetCatalogQueryer,
+	namespace string,
+	selected map[string]struct{},
+) error {
+	rows, err := database.QueryContext(
+		ctx,
+		`SELECT
+			EVENT_OBJECT_SCHEMA,
+			EVENT_OBJECT_TABLE,
+			TRIGGER_NAME
+		FROM information_schema.TRIGGERS
+		WHERE TRIGGER_SCHEMA = ?
+		ORDER BY EVENT_OBJECT_TABLE, TRIGGER_NAME`,
+		namespace,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"inspect MySQL target triggers: %w",
+			err,
+		)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var schemaName, tableName, triggerName string
+		if err := rows.Scan(
+			&schemaName,
+			&tableName,
+			&triggerName,
+		); err != nil {
+			return fmt.Errorf(
+				"read MySQL target trigger: %w",
+				err,
+			)
+		}
+		if _, planned := selected[adapterSourceTableKey(
+			schemaName,
+			tableName,
+		)]; planned {
+			return fmt.Errorf(
+				"preflight MySQL table %s: target trigger %s prevents safe replacement",
+				tableName,
+				triggerName,
+			)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf(
+			"iterate MySQL target triggers: %w",
+			err,
+		)
+	}
+	return nil
+}
+
 func preflightOracleMySQLViewDependencies(
 	ctx context.Context,
-	database *sql.DB,
+	database mysqlTargetCatalogQueryer,
 	namespace string,
 	selected map[string]struct{},
 ) error {
@@ -648,28 +750,9 @@ func preflightOracleMySQLViewDependencies(
 
 func preflightMariaDBViewDependencies(
 	ctx context.Context,
-	database *sql.DB,
+	database mysqlTargetCatalogQueryer,
 	selected map[string]struct{},
 ) error {
-	var hasGlobalShowView bool
-	if err := database.QueryRowContext(
-		ctx,
-		`SELECT COUNT(*) > 0
-		FROM information_schema.USER_PRIVILEGES
-		WHERE REPLACE(GRANTEE, '''', '') = CURRENT_USER()
-			AND PRIVILEGE_TYPE = 'SHOW VIEW'`,
-	).Scan(&hasGlobalShowView); err != nil {
-		return fmt.Errorf(
-			"inspect MariaDB target view visibility: %w",
-			err,
-		)
-	}
-	if err := validateMariaDBGlobalViewVisibility(
-		hasGlobalShowView,
-	); err != nil {
-		return err
-	}
-
 	type selectedRelation struct {
 		table  string
 		needle string
@@ -752,6 +835,76 @@ func preflightMariaDBViewDependencies(
 	return nil
 }
 
+func preflightMySQLGlobalViewVisibility(
+	ctx context.Context,
+	database mysqlTargetCatalogQueryer,
+	flavor engine.MySQLServerFlavor,
+) error {
+	var hasGlobalShowView bool
+	switch flavor {
+	case engine.MySQLServerFlavorOracle80:
+		var partialRevokes int
+		if err := database.QueryRowContext(
+			ctx,
+			`SELECT
+				COUNT(*) > 0,
+				@@global.partial_revokes
+			FROM information_schema.USER_PRIVILEGES
+			WHERE REPLACE(GRANTEE, '''', '') = CURRENT_USER()
+			  AND PRIVILEGE_TYPE = 'SHOW VIEW'`,
+		).Scan(
+			&hasGlobalShowView,
+			&partialRevokes,
+		); err != nil {
+			return fmt.Errorf(
+				"inspect MySQL target view visibility: %w",
+				err,
+			)
+		}
+		return validateOracleMySQLGlobalViewVisibility(
+			hasGlobalShowView,
+			partialRevokes,
+		)
+	case engine.MySQLServerFlavorMariaDB1011:
+		if err := database.QueryRowContext(
+			ctx,
+			`SELECT COUNT(*) > 0
+			FROM information_schema.USER_PRIVILEGES
+			WHERE REPLACE(GRANTEE, '''', '') = CURRENT_USER()
+			  AND PRIVILEGE_TYPE = 'SHOW VIEW'`,
+		).Scan(&hasGlobalShowView); err != nil {
+			return fmt.Errorf(
+				"inspect MariaDB target view visibility: %w",
+				err,
+			)
+		}
+		return validateMariaDBGlobalViewVisibility(
+			hasGlobalShowView,
+		)
+	default:
+		return fmt.Errorf(
+			"inspect MySQL target view visibility: unsupported server flavor",
+		)
+	}
+}
+
+func validateOracleMySQLGlobalViewVisibility(
+	hasGlobalShowView bool,
+	partialRevokes int,
+) error {
+	if !hasGlobalShowView {
+		return fmt.Errorf(
+			"inspect MySQL target view visibility: global SHOW VIEW privilege is required",
+		)
+	}
+	if partialRevokes != 0 {
+		return fmt.Errorf(
+			"inspect MySQL target view visibility: partial_revokes must be disabled",
+		)
+	}
+	return nil
+}
+
 func validateMariaDBGlobalViewVisibility(hasGlobalShowView bool) error {
 	if !hasGlobalShowView {
 		return fmt.Errorf(
@@ -794,7 +947,7 @@ func isMariaDBBuiltInSystemView(schemaName, definer string) bool {
 
 func preflightMySQLConstraintNames(
 	ctx context.Context,
-	database *sql.DB,
+	database mysqlTargetCatalogQueryer,
 	tables []schema.Table,
 	selected map[string]struct{},
 ) error {

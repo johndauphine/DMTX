@@ -16,6 +16,8 @@ type mysqlTargetAdapter struct {
 	batchWriter                   mysqlBatchWriter
 	flavor                        engine.MySQLServerFlavor
 	namespace                     string
+	destructiveAcknowledged       bool
+	normalizeSQLiteSourceValues   bool
 	validateSQLServerSourceValues bool
 }
 
@@ -109,14 +111,42 @@ func (adapter *mysqlTargetAdapter) PlanTables(
 			return nil, err
 		}
 		targetTable.Schema = adapter.namespace
-		targetTable, err = schema.AddMySQLForeignKeyIndexes(targetTable)
+		targetTables = append(targetTables, targetTable)
+	}
+	if sourceEngine == "sqlite" {
+		targetTables, err = validateSQLiteMySQLTables(
+			sourceTables,
+			targetTables,
+		)
 		if err != nil {
+			return nil, err
+		}
+	}
+	for index := range targetTables {
+		targetTable, addErr := schema.AddMySQLForeignKeyIndexes(
+			targetTables[index],
+		)
+		if addErr != nil {
 			return nil, fmt.Errorf(
 				"plan MySQL table %s foreign-key indexes: %w",
-				targetTable.Name,
+				targetTables[index].Name,
+				addErr,
+			)
+		}
+		targetTables[index] = targetTable
+	}
+	if sourceEngine == "sqlite" {
+		targetTables, err = schema.MaterializeMySQLObjectNames(
+			targetTables,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"materialize SQLite to MySQL relational objects: %w",
 				err,
 			)
 		}
+	}
+	for _, targetTable := range targetTables {
 		if _, err := schema.DropTable(schema.MySQL, targetTable); err != nil {
 			return nil, fmt.Errorf(
 				"plan MySQL table %s drop: %w",
@@ -154,7 +184,6 @@ func (adapter *mysqlTargetAdapter) PlanTables(
 				)
 			}
 		}
-		targetTables = append(targetTables, targetTable)
 	}
 	if _, err := schema.PlanMySQLDropRecreateObjects(
 		targetTables,
@@ -174,9 +203,19 @@ func (adapter *mysqlTargetAdapter) PrepareTables(
 		return err
 	}
 	if mode == "upsert" {
-		return nil
+		return preflightMySQLRetainedTables(
+			ctx,
+			adapter.database,
+			targetTables,
+		)
 	}
-	return prepareMySQLTargets(ctx, adapter.database, targetTables)
+	return prepareMySQLTargets(
+		ctx,
+		adapter.database,
+		targetTables,
+		adapter.flavor,
+		adapter.destructiveAcknowledged,
+	)
 }
 
 func (adapter *mysqlTargetAdapter) WriteBatch(
@@ -191,6 +230,20 @@ func (adapter *mysqlTargetAdapter) WriteBatch(
 			Certainty:     CommitNotCommitted,
 			AttemptedRows: int64(len(rows)),
 		}, fmt.Errorf("MySQL native batch writer is not configured")
+	}
+	if adapter.normalizeSQLiteSourceValues {
+		normalized, err := normalizeSQLiteMySQLBatch(
+			table,
+			columns,
+			rows,
+		)
+		if err != nil {
+			return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: int64(len(rows)),
+			}, err
+		}
+		rows = normalized
 	}
 	if adapter.validateSQLServerSourceValues {
 		if err := validateMySQLTargetSQLServerBatchValues(

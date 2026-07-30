@@ -184,8 +184,9 @@ func testSQLServerToMySQLFamilyCommonFixtureLive(
 		Source: sourceEndpoint,
 		Target: targetEndpoint,
 		Migration: config.Migration{
-			TargetMode:    "drop_recreate",
-			IncludeTables: []string{accountsName, eventsName},
+			TargetMode:              "drop_recreate",
+			IncludeTables:           []string{accountsName, eventsName},
+			DestructiveAcknowledged: true,
 		},
 	}
 	result, err := SQLServerToMySQLWithObserver(

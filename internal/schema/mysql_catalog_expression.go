@@ -3,6 +3,7 @@ package schema
 import (
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -161,6 +162,17 @@ func ParseMySQLCatalogDefault(
 	case mysqlCatalogDefaultTime,
 		mysqlCatalogDefaultDate,
 		mysqlCatalogDefaultTimestamp:
+		if literal, ok := canonicalMySQLStaticTemporalDefault(
+			column,
+			target,
+			value,
+		); ok {
+			return &Expression{
+				sql:     portableCheckStringLiteral(literal),
+				kind:    expressionString,
+				literal: literal,
+			}, nil
+		}
 		return parseMySQLCatalogCurrentDefault(column, target, value)
 	}
 	return nil, mysqlCatalogDefaultPolicy(column)
@@ -292,6 +304,27 @@ func ParseMariaDBCatalogDefault(
 	case mysqlCatalogDefaultTime,
 		mysqlCatalogDefaultDate,
 		mysqlCatalogDefaultTimestamp:
+		if len(value) >= 2 && value[0] == '\'' {
+			literal, next, err := parsePlainMySQLCatalogCheckString(
+				value,
+				1,
+			)
+			if err == nil && next == len(value) {
+				if canonical, ok := canonicalMySQLStaticTemporalDefault(
+					column,
+					target,
+					literal,
+				); ok {
+					return &Expression{
+						sql: portableCheckStringLiteral(
+							canonical,
+						),
+						kind:    expressionString,
+						literal: canonical,
+					}, nil
+				}
+			}
+		}
 		expression, err := parseMySQLCatalogCurrentDefault(
 			column,
 			target,
@@ -303,6 +336,81 @@ func ParseMariaDBCatalogDefault(
 	}
 
 	return nil, mariaDBCatalogDefaultPolicy(column)
+}
+
+// canonicalMySQLStaticTemporalDefault validates the literal payload that
+// Oracle MySQL and MariaDB expose for static temporal defaults. It accepts
+// only exact, zero-date-free catalog spellings whose fractional width matches
+// the declared column precision. TIME literals remain unsupported because the
+// MySQL family admits signed durations that do not share one portable scalar
+// domain.
+func canonicalMySQLStaticTemporalDefault(
+	column Column,
+	target mysqlCatalogDefaultTarget,
+	value string,
+) (string, bool) {
+	switch target {
+	case mysqlCatalogDefaultDate:
+		if len(value) != len("2006-01-02") {
+			return "", false
+		}
+		parsed, err := time.Parse("2006-01-02", value)
+		if err != nil ||
+			parsed.Year() < 1000 ||
+			parsed.Year() > 9999 ||
+			parsed.Format("2006-01-02") != value {
+			return "", false
+		}
+		return value, true
+	case mysqlCatalogDefaultTimestamp:
+		base := mysqlColumnBase(column)
+		if base != "datetime" && base != "timestamp" {
+			return "", false
+		}
+		precision := mysqlCatalogTemporalPrecision(column)
+		layout := "2006-01-02 15:04:05"
+		if precision > 0 {
+			layout += "." + strings.Repeat("0", precision)
+		}
+		if len(value) != len(layout) {
+			return "", false
+		}
+		parsed, err := time.ParseInLocation(layout, value, time.UTC)
+		if err != nil ||
+			parsed.Year() < 1000 ||
+			parsed.Year() > 9999 ||
+			parsed.Format(layout) != value {
+			return "", false
+		}
+		if base == "timestamp" {
+			first := time.Date(
+				1970,
+				time.January,
+				1,
+				0,
+				0,
+				1,
+				0,
+				time.UTC,
+			)
+			last := time.Date(
+				2038,
+				time.January,
+				19,
+				3,
+				14,
+				7,
+				999_999_000,
+				time.UTC,
+			)
+			if parsed.Before(first) || parsed.After(last) {
+				return "", false
+			}
+		}
+		return value, true
+	default:
+		return "", false
+	}
 }
 
 func parseMySQLCatalogCurrentDefault(

@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net"
 	"os"
 	"reflect"
@@ -164,6 +165,49 @@ func testMySQLFamilyNativeCommonFixtureLive(
 			IncludeTables: []string{accountsName, eventsName},
 		},
 	}
+	observer := &mysqlNativePreflightObserver{}
+	unacknowledged, err := MySQLToMySQLWithObserver(
+		ctx,
+		migrationConfig,
+		observer,
+	)
+	if !errors.Is(err, ErrDestructiveAcknowledgement) {
+		t.Fatalf(
+			"%s populated native rebuild result = %+v, error = %v, want destructive acknowledgement",
+			fixture.name,
+			unacknowledged,
+			err,
+		)
+	}
+	assertMySQLNativePreflightDidNotMutate(
+		t,
+		unacknowledged,
+		observer,
+	)
+	for _, name := range []string{accountsName, eventsName} {
+		var retained int
+		if err := targetDatabase.QueryRowContext(
+			ctx,
+			"SELECT COUNT(*) FROM "+mySQLIdentifier(name)+
+				" WHERE stale_id = 99 AND stale_marker = 'must disappear'",
+		).Scan(&retained); err != nil {
+			t.Fatalf(
+				"read %s destructive-ack sentinel %s: %v",
+				fixture.name,
+				name,
+				err,
+			)
+		}
+		if retained != 1 {
+			t.Fatalf(
+				"%s destructive-ack sentinel %s rows = %d",
+				fixture.name,
+				name,
+				retained,
+			)
+		}
+	}
+	migrationConfig.Migration.DestructiveAcknowledged = true
 	result, err := MySQLToMySQLWithObserver(
 		ctx,
 		migrationConfig,

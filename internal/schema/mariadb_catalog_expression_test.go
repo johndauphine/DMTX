@@ -118,6 +118,29 @@ func TestParseMariaDBCatalogDefaultReconstructsSafeScalars(t *testing.T) {
 			wantSQL:  "CURRENT_TIMESTAMP",
 			wantKind: expressionCurrentTimestamp,
 		},
+		{
+			name:        "quoted static date",
+			column:      Column{Name: "occurred_on", Type: "date"},
+			catalog:     "'2026-07-29'",
+			wantSQL:     "'2026-07-29'",
+			wantKind:    expressionString,
+			wantLiteral: "2026-07-29",
+		},
+		{
+			name: "quoted static datetime exact precision",
+			column: Column{
+				Name: "created_at",
+				Type: "datetime",
+				DeclaredType: &DeclaredType{
+					Base:      "datetime",
+					Arguments: []int{3},
+				},
+			},
+			catalog:     "'2026-07-29 12:34:56.123'",
+			wantSQL:     "'2026-07-29 12:34:56.123'",
+			wantKind:    expressionString,
+			wantLiteral: "2026-07-29 12:34:56.123",
+		},
 	}
 
 	for _, test := range tests {

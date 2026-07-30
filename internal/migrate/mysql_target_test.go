@@ -1,26 +1,24 @@
 package migrate
 
 import (
+	"context"
 	"strings"
 	"testing"
 
-	"github.com/johndauphine/dmtx/internal/schema"
+	"github.com/johndauphine/dmtx/internal/config"
 )
 
-func TestMySQLWriteStatementUsesMySQLUpsert(t *testing.T) {
-	table := schema.Table{Name: "events", Columns: []schema.Column{{Name: "id", PrimaryKey: true}, {Name: "note"}}}
-	statement := mySQLWriteStatement(table, []string{"id", "note"}, "upsert")
-	for _, expected := range []string{"INSERT INTO `events`", "VALUES (?, ?)", "ON DUPLICATE KEY UPDATE", "`note` = VALUES(`note`)"} {
-		if !strings.Contains(statement, expected) {
-			t.Fatalf("statement %q does not contain %q", statement, expected)
-		}
-	}
-}
-
-func TestMySQLWriteStatementWithOnlyPrimaryKeyIsNoOpUpdate(t *testing.T) {
-	table := schema.Table{Name: "events", Columns: []schema.Column{{Name: "id", PrimaryKey: true}}}
-	statement := mySQLWriteStatement(table, []string{"id"}, "upsert")
-	if !strings.HasSuffix(statement, "`id` = `id`") {
-		t.Fatalf("unexpected statement: %q", statement)
+func TestSQLiteToMySQLWithObserverRejectsOtherPairs(t *testing.T) {
+	_, err := SQLiteToMySQLWithObserver(
+		context.Background(),
+		config.Config{
+			Source: config.Endpoint{Type: "postgres"},
+			Target: config.Endpoint{Type: "mysql"},
+		},
+		nil,
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "requires source.type sqlite") {
+		t.Fatalf("route error = %v", err)
 	}
 }
