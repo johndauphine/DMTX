@@ -95,6 +95,8 @@ func renderColumnType(column Column, target Dialect) (string, error) {
 		return renderSQLiteDeclaredType(*column.DeclaredType)
 	case Postgres:
 		return renderPostgresDeclaredType(*column.DeclaredType)
+	case MySQL:
+		return renderMySQLDeclaredType(*column.DeclaredType)
 	}
 	if len(column.DeclaredType.Arguments) > 0 {
 		return "", &PolicyError{Operation: "map declared type modifiers", Type: column.Type, Target: string(target)}
@@ -210,6 +212,13 @@ func rejectSQLiteOnlySchema(target Dialect, table Table) error {
 		_, err := postgresIdentityColumn(table)
 		return err
 	}
+	if target == MySQL {
+		if table.SQLiteStrict || table.SQLiteWithoutRowID {
+			return &PolicyError{Operation: "map SQLite schema objects", Type: table.Name, Target: string(target)}
+		}
+		_, err := mysqlIdentityColumn(table)
+		return err
+	}
 	if table.Identity != nil || table.SQLiteStrict || table.SQLiteWithoutRowID ||
 		len(table.Indexes) > 0 || len(table.ForeignKeys) > 0 ||
 		len(table.Checks) > 0 {
@@ -236,6 +245,8 @@ func renderDefault(target Dialect, column Column) (string, error) {
 		return column.Default.sql, nil
 	case Postgres:
 		return renderPostgresDefault(column)
+	case MySQL:
+		return renderMySQLDefault(column)
 	default:
 		return "", &PolicyError{
 			Operation: "render default",

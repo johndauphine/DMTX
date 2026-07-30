@@ -86,6 +86,21 @@ func TestParseMySQLCatalogDefaultReconstructsSafeScalars(t *testing.T) {
 			wantLiteral: "O'Brien\\draft'); DROP TABLE audit; --",
 		},
 		{
+			name: "generated longtext literal",
+			column: Column{
+				Name: "note",
+				Type: "text",
+				DeclaredType: &DeclaredType{
+					Base: "longtext",
+				},
+			},
+			catalog:          `_utf8mb4\'O\\\'Brien\'`,
+			defaultGenerated: true,
+			wantSQL:          "'O''Brien'",
+			wantKind:         expressionString,
+			wantLiteral:      "O'Brien",
+		},
+		{
 			name:             "current time",
 			column:           Column{Name: "occurred_at", Type: "time"},
 			catalog:          "curtime()",
@@ -108,6 +123,36 @@ func TestParseMySQLCatalogDefaultReconstructsSafeScalars(t *testing.T) {
 			defaultGenerated: true,
 			wantSQL:          "CURRENT_TIMESTAMP",
 			wantKind:         expressionCurrentTimestamp,
+		},
+		{
+			name: "current timestamp exact precision",
+			column: Column{
+				Name: "created_at",
+				Type: "datetime",
+				DeclaredType: &DeclaredType{
+					Base:      "datetime",
+					Arguments: []int{3},
+				},
+			},
+			catalog:          "CURRENT_TIMESTAMP(3)",
+			defaultGenerated: true,
+			wantSQL:          "CURRENT_TIMESTAMP",
+			wantKind:         expressionCurrentTimestamp,
+		},
+		{
+			name: "generated blob hexadecimal",
+			column: Column{
+				Name: "payload",
+				Type: "blob",
+				DeclaredType: &DeclaredType{
+					Base: "longblob",
+				},
+			},
+			catalog:          "0x00FF",
+			defaultGenerated: true,
+			wantSQL:          "X'00ff'",
+			wantKind:         expressionBlob,
+			wantLiteral:      "00ff",
 		},
 	}
 
@@ -205,6 +250,42 @@ func TestParseMySQLCatalogDefaultFailsClosed(t *testing.T) {
 			name:             "current timestamp precision cannot be retained",
 			column:           Column{Name: "created_at", Type: "timestamp"},
 			catalog:          mysqlCatalogTestString("CURRENT_TIMESTAMP(6)"),
+			defaultGenerated: true,
+		},
+		{
+			name: "current timestamp precision mismatch",
+			column: Column{
+				Name: "created_at",
+				Type: "datetime",
+				DeclaredType: &DeclaredType{
+					Base:      "datetime",
+					Arguments: []int{3},
+				},
+			},
+			catalog:          mysqlCatalogTestString("CURRENT_TIMESTAMP(6)"),
+			defaultGenerated: true,
+		},
+		{
+			name: "blob default must be generated",
+			column: Column{
+				Name: "payload",
+				Type: "blob",
+				DeclaredType: &DeclaredType{
+					Base: "longblob",
+				},
+			},
+			catalog: mysqlCatalogTestString("0x00ff"),
+		},
+		{
+			name: "blob default must be even hexadecimal",
+			column: Column{
+				Name: "payload",
+				Type: "blob",
+				DeclaredType: &DeclaredType{
+					Base: "longblob",
+				},
+			},
+			catalog:          mysqlCatalogTestString("0x0fg"),
 			defaultGenerated: true,
 		},
 		{

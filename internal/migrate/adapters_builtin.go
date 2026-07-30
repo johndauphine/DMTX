@@ -5,11 +5,11 @@ import "github.com/johndauphine/dmtx/internal/engine"
 // builtInAdapters contains the recognized source and target roles and the
 // routes whose current implementations are certified for execution.
 //
-// SQLite sources compose with the PostgreSQL target. PostgreSQL and
-// MySQL/MariaDB sources compose with the PostgreSQL and SQLite targets, while
-// SQL Server sources compose with the SQLite target. Compatibility overrides
-// preserve the remaining routes until both sides move behind the shared
-// contracts.
+// SQLite sources compose with the PostgreSQL target. PostgreSQL and Oracle
+// MySQL 8.0 sources compose with PostgreSQL, SQLite, and the native MySQL
+// target where explicitly certified, while SQL Server sources compose with
+// SQLite. Compatibility overrides preserve the remaining routes until both
+// sides move behind the shared contracts.
 var builtInAdapters = mustBuildAdapterRegistry(
 	[]sourceRole{
 		{
@@ -33,7 +33,11 @@ var builtInAdapters = mustBuildAdapterRegistry(
 			validatePostgresTargetEndpoint,
 			openPostgresTargetAdapter,
 		),
-		builtInTargetRole("mysql", nil, nil),
+		builtInTargetRole(
+			"mysql",
+			validateMySQLTargetEndpoint,
+			openMySQLTargetAdapter,
+		),
 		builtInTargetRole("mssql", nil, nil),
 		builtInTargetRole("clickhouse", nil, nil),
 	},
@@ -45,8 +49,10 @@ var builtInAdapters = mustBuildAdapterRegistry(
 		{source: "sqlite", target: "clickhouse"},
 		{source: "postgres", target: "postgres"},
 		{source: "postgres", target: "sqlite"},
+		{source: "postgres", target: "mysql"},
 		{source: "mysql", target: "postgres"},
 		{source: "mysql", target: "sqlite"},
+		{source: "mysql", target: "mysql"},
 		{source: "mssql", target: "sqlite"},
 	},
 	[]adapterOverride{

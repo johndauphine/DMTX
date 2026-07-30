@@ -19,6 +19,9 @@ func validMySQL80ServerCatalog() mysql80SourceServerCatalog {
 		autoIncrementOffset:       1,
 		lowerCaseTableNames:       0,
 		explicitTimestampDefaults: 1,
+		foreignKeyChecks:          1,
+		uniqueChecks:              1,
+		innodbPageSize:            16_384,
 	}
 }
 
@@ -74,6 +77,54 @@ func TestValidateMySQL80SourceServerCatalog(t *testing.T) {
 	}
 }
 
+func TestValidateMySQL80TargetServerCatalogRequiresRowAliasUpsert(
+	t *testing.T,
+) {
+	value := validMySQL80ServerCatalog()
+	value.version = "8.0.30"
+	value.sqlMode += ",NO_AUTO_VALUE_ON_ZERO"
+	if err := validateMySQL80TargetServerCatalog(value); err != nil {
+		t.Fatalf("minimum native target version: %v", err)
+	}
+	value.version = "8.0.29"
+	if err := validateMySQL80TargetServerCatalog(value); err == nil ||
+		!strings.Contains(err.Error(), "native target session contract") {
+		t.Fatalf(
+			"old native target version error = %v, want upsert policy error",
+			err,
+		)
+	}
+
+	for name, mutate := range map[string]func(*mysql80SourceServerCatalog){
+		"zero identity mode": func(value *mysql80SourceServerCatalog) {
+			value.sqlMode = strings.ReplaceAll(
+				value.sqlMode,
+				",NO_AUTO_VALUE_ON_ZERO",
+				"",
+			)
+		},
+		"foreign key enforcement": func(value *mysql80SourceServerCatalog) {
+			value.foreignKeyChecks = 0
+		},
+		"unique enforcement": func(value *mysql80SourceServerCatalog) {
+			value.uniqueChecks = 0
+		},
+		"InnoDB page size": func(value *mysql80SourceServerCatalog) {
+			value.innodbPageSize = 8_192
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := validMySQL80ServerCatalog()
+			value.version = "8.0.30"
+			value.sqlMode += ",NO_AUTO_VALUE_ON_ZERO"
+			mutate(&value)
+			if err := validateMySQL80TargetServerCatalog(value); err == nil {
+				t.Fatal("unsafe target session was accepted")
+			}
+		})
+	}
+}
+
 func validMySQL80TableCatalog() mysql80SourceTableCatalog {
 	return mysql80SourceTableCatalog{
 		tableType:      "BASE TABLE",
@@ -103,6 +154,11 @@ func TestValidateMySQL80SourceTableCatalogFailsClosed(t *testing.T) {
 		},
 		"nonbinary collation": func(value *mysql80SourceTableCatalog) {
 			value.tableCollation.String = "utf8mb4_0900_ai_ci"
+		},
+		"different binary collation semantics": func(
+			value *mysql80SourceTableCatalog,
+		) {
+			value.tableCollation.String = "utf8mb4_unmodeled_bin"
 		},
 		"table options": func(value *mysql80SourceTableCatalog) {
 			value.createOptions = "stats_persistent=1"

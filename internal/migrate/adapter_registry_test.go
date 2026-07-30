@@ -172,6 +172,10 @@ func TestBuiltInAdaptersPreserveCertifiedRoutes(t *testing.T) {
 			source: openPostgresSourceAdapter,
 			target: openSQLiteTargetAdapter,
 		},
+		{source: "postgres", target: "mysql"}: {
+			source: openPostgresSourceAdapter,
+			target: openMySQLTargetAdapter,
+		},
 		{source: "mysql", target: "postgres"}: {
 			source: openMySQLSourceAdapter,
 			target: openPostgresTargetAdapter,
@@ -179,6 +183,10 @@ func TestBuiltInAdaptersPreserveCertifiedRoutes(t *testing.T) {
 		{source: "mysql", target: "sqlite"}: {
 			source: openMySQLSourceAdapter,
 			target: openSQLiteTargetAdapter,
+		},
+		{source: "mysql", target: "mysql"}: {
+			source: openMySQLSourceAdapter,
+			target: openMySQLTargetAdapter,
 		},
 		{source: "mssql", target: "sqlite"}: {
 			source: openSQLServerSourceAdapter,

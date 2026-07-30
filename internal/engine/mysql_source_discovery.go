@@ -12,7 +12,10 @@ import (
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
-const mysql80MinimumPatch = 16
+const (
+	mysql80MinimumPatch       = 16
+	mysql80TargetMinimumPatch = 30
+)
 
 // VerifyMySQL80Source pins discovery to the Oracle MySQL 8.0 catalog shape
 // covered by DMTX's live conformance tests. MariaDB and later MySQL catalog
@@ -21,6 +24,113 @@ func VerifyMySQL80Source(
 	ctx context.Context,
 	database *sql.DB,
 ) error {
+	catalog, err := readMySQL80ServerCatalog(ctx, database)
+	if err != nil {
+		return err
+	}
+	return validateMySQL80SourceServerCatalog(catalog)
+}
+
+// VerifyMySQL80Target adds the minimum patch-level and session contracts
+// required by the native target's row-alias upserts and primary-key behavior.
+func VerifyMySQL80Target(
+	ctx context.Context,
+	database *sql.DB,
+) error {
+	catalog, err := readMySQL80ServerCatalog(ctx, database)
+	if err != nil {
+		return err
+	}
+	if err := validateMySQL80SourceServerCatalog(catalog); err != nil {
+		return err
+	}
+	if err := validateMySQL80TargetServerCatalog(catalog); err != nil {
+		return err
+	}
+	var generateInvisiblePrimaryKey, requirePrimaryKey int
+	if err := database.QueryRowContext(
+		ctx,
+		`SELECT
+			@@session.sql_generate_invisible_primary_key,
+			@@session.sql_require_primary_key`,
+	).Scan(
+		&generateInvisiblePrimaryKey,
+		&requirePrimaryKey,
+	); err != nil {
+		return fmt.Errorf(
+			"read MySQL target primary-key generation contract: %w",
+			err,
+		)
+	}
+	if generateInvisiblePrimaryKey != 0 || requirePrimaryKey != 0 {
+		return mysqlSourcePolicy(
+			"target primary-key generation",
+			fmt.Sprintf(
+				"sql_generate_invisible_primary_key=%d sql_require_primary_key=%d; both must be disabled",
+				generateInvisiblePrimaryKey,
+				requirePrimaryKey,
+			),
+		)
+	}
+	return nil
+}
+
+func validateMySQL80TargetServerCatalog(
+	catalog mysql80SourceServerCatalog,
+) error {
+	if err := validateMySQL80TargetVersion(catalog); err != nil {
+		return err
+	}
+	modes := mysqlSQLModes(catalog.sqlMode)
+	if !modes["NO_AUTO_VALUE_ON_ZERO"] {
+		return mysqlSourcePolicy(
+			"target SQL mode",
+			"required mode NO_AUTO_VALUE_ON_ZERO is absent",
+		)
+	}
+	if catalog.foreignKeyChecks != 1 || catalog.uniqueChecks != 1 {
+		return mysqlSourcePolicy(
+			"target constraint enforcement",
+			fmt.Sprintf(
+				"foreign_key_checks=%d unique_checks=%d; both must be enabled",
+				catalog.foreignKeyChecks,
+				catalog.uniqueChecks,
+			),
+		)
+	}
+	if catalog.innodbPageSize != 16_384 {
+		return mysqlSourcePolicy(
+			"target InnoDB page size",
+			fmt.Sprintf(
+				"innodb_page_size=%d; 16384 is required",
+				catalog.innodbPageSize,
+			),
+		)
+	}
+	return nil
+}
+
+func validateMySQL80TargetVersion(
+	catalog mysql80SourceServerCatalog,
+) error {
+	_, _, patch, _ := parseMySQLVersion(catalog.version)
+	if patch < mysql80TargetMinimumPatch {
+		return mysqlSourcePolicy(
+			"target catalog version",
+			fmt.Sprintf(
+				"version=%q; Oracle MySQL 8.0.%d or later is required for the native target session contract",
+				catalog.version,
+				mysql80TargetMinimumPatch,
+			),
+		)
+	}
+	return nil
+}
+
+func readMySQL80ServerCatalog(
+	ctx context.Context,
+	database *sql.DB,
+) (mysql80SourceServerCatalog, error) {
 	var catalog mysql80SourceServerCatalog
 	err := database.QueryRowContext(ctx, mysql80SourceServerCatalogQuery).Scan(
 		&catalog.version,
@@ -32,11 +142,17 @@ func VerifyMySQL80Source(
 		&catalog.autoIncrementOffset,
 		&catalog.lowerCaseTableNames,
 		&catalog.explicitTimestampDefaults,
+		&catalog.foreignKeyChecks,
+		&catalog.uniqueChecks,
+		&catalog.innodbPageSize,
 	)
 	if err != nil {
-		return fmt.Errorf("read MySQL source version and session contract: %w", err)
+		return mysql80SourceServerCatalog{}, fmt.Errorf(
+			"read MySQL source version and session contract: %w",
+			err,
+		)
 	}
-	return validateMySQL80SourceServerCatalog(catalog)
+	return catalog, nil
 }
 
 type mysql80SourceServerCatalog struct {
@@ -49,6 +165,9 @@ type mysql80SourceServerCatalog struct {
 	autoIncrementOffset       int64
 	lowerCaseTableNames       int
 	explicitTimestampDefaults int
+	foreignKeyChecks          int
+	uniqueChecks              int
+	innodbPageSize            int64
 }
 
 const mysql80SourceServerCatalogQuery = `
@@ -61,7 +180,10 @@ const mysql80SourceServerCatalogQuery = `
 		@@session.auto_increment_increment,
 		@@session.auto_increment_offset,
 		@@lower_case_table_names,
-		@@explicit_defaults_for_timestamp
+		@@explicit_defaults_for_timestamp,
+		@@session.foreign_key_checks,
+		@@session.unique_checks,
+		@@innodb_page_size
 `
 
 func validateMySQL80SourceServerCatalog(
@@ -86,13 +208,7 @@ func validateMySQL80SourceServerCatalog(
 		)
 	}
 
-	modes := make(map[string]bool)
-	for _, mode := range strings.Split(value.sqlMode, ",") {
-		mode = strings.ToUpper(strings.TrimSpace(mode))
-		if mode != "" {
-			modes[mode] = true
-		}
-	}
+	modes := mysqlSQLModes(value.sqlMode)
 	requiredModes := []string{
 		"STRICT_TRANS_TABLES",
 		"NO_ZERO_IN_DATE",
@@ -155,6 +271,17 @@ func validateMySQL80SourceServerCatalog(
 		)
 	}
 	return nil
+}
+
+func mysqlSQLModes(value string) map[string]bool {
+	modes := make(map[string]bool)
+	for _, mode := range strings.Split(value, ",") {
+		mode = strings.ToUpper(strings.TrimSpace(mode))
+		if mode != "" {
+			modes[mode] = true
+		}
+	}
+	return modes
 }
 
 func parseMySQLVersion(value string) (int, int, int, bool) {
@@ -470,6 +597,17 @@ func readMySQL80SourceColumns(
 				name,
 				catalog.name,
 				err,
+			)
+		}
+		if catalog.characterSet.Valid &&
+			(!catalog.collation.Valid ||
+				!strings.EqualFold(
+					catalog.collation.String,
+					table.tableCollation.String,
+				)) {
+			return nil, nil, mysqlSourcePolicy(
+				"column collation override",
+				namespace+"."+name+"."+catalog.name,
 			)
 		}
 		if catalog.defaultValue.Valid || metadata.defaultGenerated {
@@ -895,9 +1033,10 @@ func inspectMySQL80Table(
 		return schema.Table{}, err
 	}
 	table := schema.Table{
-		Schema:  namespace,
-		Name:    name,
-		Columns: columns,
+		Schema:         namespace,
+		Name:           name,
+		MySQLCollation: tableCatalog.tableCollation.String,
+		Columns:        columns,
 	}
 	if err := discoverMySQL80SourcePrimaryKey(
 		ctx,
@@ -1002,13 +1141,17 @@ func mysqlSourcePolicy(operation, value string) error {
 func validMySQLSourceIdentifier(value string) bool {
 	return value != "" &&
 		utf8.ValidString(value) &&
-		!strings.ContainsRune(value, '\x00')
+		!strings.ContainsRune(value, '\x00') &&
+		!strings.HasSuffix(value, " ")
 }
 
 func mySQLBinaryUTF8Collation(value string) bool {
-	lower := strings.ToLower(strings.TrimSpace(value))
-	return strings.HasPrefix(lower, "utf8mb4_") &&
-		strings.HasSuffix(lower, "_bin")
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "utf8mb4_bin", "utf8mb4_0900_bin":
+		return true
+	default:
+		return false
+	}
 }
 
 func quotedNullString(value sql.NullString) string {

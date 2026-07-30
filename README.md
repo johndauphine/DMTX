@@ -128,9 +128,10 @@ The same inspection commands accept the default SQLite path
 The Stage 3 adapter registry currently certifies these fresh-run
 implementations:
 
-- SQLite to PostgreSQL, MySQL/MariaDB, SQL Server, and ClickHouse;
-- PostgreSQL to PostgreSQL or SQLite;
-- MySQL/MariaDB to PostgreSQL or SQLite; and
+- SQLite to PostgreSQL, MySQL/MariaDB (legacy compatibility override),
+  SQL Server, and ClickHouse;
+- PostgreSQL to PostgreSQL, SQLite, or Oracle MySQL 8.0;
+- Oracle MySQL 8.0 to PostgreSQL, SQLite, or Oracle MySQL 8.0; and
 - SQL Server to SQLite.
 
 These paths remain incomplete Stage 3 implementations. They do not yet share
@@ -139,11 +140,21 @@ matrix, and they have not passed the Stage 3 native-bulk and live-engine
 conformance suite. Treat them as experimental, not as Stage 2-certified
 migrations.
 
-SQLite, PostgreSQL, and MySQL/MariaDB sources now compose independently with
-the PostgreSQL target. PostgreSQL, MySQL/MariaDB, and SQL Server sources
-compose independently with the SQLite target behind shared source and target
-contracts. The remaining Stage 3 work will migrate the other routes and prove
-each combination with common and live-engine fixtures.
+SQLite, PostgreSQL, and Oracle MySQL 8.0 sources now compose independently
+with the PostgreSQL target. PostgreSQL, Oracle MySQL 8.0, and SQL Server
+sources compose independently with the SQLite target behind shared contracts.
+PostgreSQL and Oracle MySQL 8.0 sources also compose with the native Oracle
+MySQL 8.0 target. The remaining Stage 3 work will migrate the other routes and
+prove each combination with common and live-engine fixtures.
+
+The native MySQL-to-MySQL route requires read access to
+`performance_schema.replication_connection_configuration` and
+`performance_schema.replication_group_members`. It fails closed when that
+topology cannot be inspected and currently rejects replicated endpoints, so a
+target change cannot flow back into the live source through replication. The
+native MySQL target requires Oracle MySQL 8.0.30 or later and verifies its
+session, InnoDB page-size, constraint-enforcement, and primary-key-generation
+contracts before planning a migration.
 
 ## Scope and roadmap
 

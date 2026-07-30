@@ -48,6 +48,15 @@ func (route resolvedAdapterRoute) execute(
 			target.Engine(),
 		)
 	}
+	if route.source.engine == "mysql" && route.target.engine == "mysql" {
+		if err := requireDistinctLiveMySQLDatabases(
+			ctx,
+			source,
+			target,
+		); err != nil {
+			return Result{}, err
+		}
+	}
 	return migrateWithAdapters(ctx, cfg, observer, source, target)
 }
 

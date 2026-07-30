@@ -29,6 +29,13 @@ type relationalSourceAdapter struct {
 	namespace string
 }
 
+func (adapter *relationalSourceAdapter) mySQLDatabaseHandle() *sql.DB {
+	if adapter == nil || adapter.spec.engine != "mysql" {
+		return nil
+	}
+	return adapter.database
+}
+
 func openPostgresSourceAdapter(
 	ctx context.Context,
 	endpoint config.Endpoint,
@@ -58,7 +65,7 @@ func openMySQLSourceAdapter(
 		defaultNamespace: func(endpoint config.Endpoint) string {
 			return endpoint.Database
 		},
-		open:           engine.OpenMySQL,
+		open:           engine.OpenMySQL80,
 		verify:         engine.VerifyMySQL80Source,
 		listTables:     engine.ListMySQLTables,
 		inspectTable:   engine.InspectMySQLTable,

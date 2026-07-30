@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -17,13 +18,15 @@ const (
 	mysqlCatalogDefaultTime
 	mysqlCatalogDefaultDate
 	mysqlCatalogDefaultTimestamp
+	mysqlCatalogDefaultBlob
 )
 
 // ParseMySQLCatalogDefault converts one MySQL 8 COLUMN_DEFAULT value into
 // DMTX's structured expression contract. defaultGenerated must reflect the
 // DEFAULT_GENERATED token in information_schema.columns.EXTRA. Generated
 // defaults fail closed except for the supported type-appropriate CURRENT_*
-// forms.
+// forms and the structurally parsed expression forms MySQL emits for
+// supported large-object literals.
 //
 // MySQL reports string defaults as unquoted values. This function quotes those
 // values from their literal payload and reconstructs every other accepted
@@ -49,15 +52,51 @@ func ParseMySQLCatalogDefault(
 	}
 
 	if target == mysqlCatalogDefaultString {
-		if defaultGenerated ||
-			!utf8.ValidString(*columnDefault) ||
-			strings.ContainsRune(*columnDefault, '\x00') {
+		literal := *columnDefault
+		if defaultGenerated {
+			base := mysqlColumnBase(column)
+			decoded, next, matched, err := parseMySQLCatalogCheckString(
+				literal,
+				0,
+			)
+			if err != nil ||
+				!matched ||
+				next != len(literal) ||
+				!strings.HasPrefix(
+					strings.ToLower(literal),
+					"_utf8mb4",
+				) ||
+				!mysqlLargeObjectBase(base) {
+				return nil, mysqlCatalogDefaultPolicy(column)
+			}
+			literal = decoded
+		}
+		if !utf8.ValidString(literal) ||
+			strings.ContainsRune(literal, '\x00') {
 			return nil, mysqlCatalogDefaultPolicy(column)
 		}
 		return &Expression{
-			sql:     portableCheckStringLiteral(*columnDefault),
+			sql:     portableCheckStringLiteral(literal),
 			kind:    expressionString,
-			literal: *columnDefault,
+			literal: literal,
+		}, nil
+	}
+	if target == mysqlCatalogDefaultBlob {
+		if !defaultGenerated {
+			return nil, mysqlCatalogDefaultPolicy(column)
+		}
+		value := strings.TrimSpace(*columnDefault)
+		if len(value) < 2 ||
+			!strings.EqualFold(value[:2], "0x") ||
+			len(value[2:])%2 != 0 ||
+			!isLowerHex(strings.ToLower(value[2:])) {
+			return nil, mysqlCatalogDefaultPolicy(column)
+		}
+		hexadecimal := strings.ToLower(value[2:])
+		return &Expression{
+			sql:     "X'" + hexadecimal + "'",
+			kind:    expressionBlob,
+			literal: hexadecimal,
 		}, nil
 	}
 
@@ -132,25 +171,34 @@ func parseMySQLCatalogCurrentDefault(
 	target mysqlCatalogDefaultTarget,
 	value string,
 ) (*Expression, error) {
-	keyword, ok := canonicalMySQLCurrentKeyword(value)
+	keyword, precision, ok := canonicalMySQLCurrentKeyword(value)
 	if !ok {
 		return nil, mysqlCatalogDefaultPolicy(column)
 	}
+	expectedPrecision := mysqlCatalogTemporalPrecision(column)
 
 	expression := &Expression{sql: keyword}
 	switch keyword {
 	case "CURRENT_TIME":
-		if target != mysqlCatalogDefaultTime {
+		if target != mysqlCatalogDefaultTime ||
+			!mysqlCatalogPrecisionMatches(
+				expectedPrecision,
+				precision,
+			) {
 			return nil, mysqlCatalogDefaultPolicy(column)
 		}
 		expression.kind = expressionCurrentTime
 	case "CURRENT_DATE":
-		if target != mysqlCatalogDefaultDate {
+		if target != mysqlCatalogDefaultDate || precision != nil {
 			return nil, mysqlCatalogDefaultPolicy(column)
 		}
 		expression.kind = expressionCurrentDate
 	case "CURRENT_TIMESTAMP":
-		if target != mysqlCatalogDefaultTimestamp {
+		if target != mysqlCatalogDefaultTimestamp ||
+			!mysqlCatalogPrecisionMatches(
+				expectedPrecision,
+				precision,
+			) {
 			return nil, mysqlCatalogDefaultPolicy(column)
 		}
 		expression.kind = expressionCurrentTimestamp
@@ -160,25 +208,61 @@ func parseMySQLCatalogCurrentDefault(
 	return expression, nil
 }
 
-func canonicalMySQLCurrentKeyword(value string) (string, bool) {
+func canonicalMySQLCurrentKeyword(
+	value string,
+) (string, *int, bool) {
 	value = strings.TrimSpace(value)
 	for hasSingleOuterParentheses(value) {
 		value = strings.TrimSpace(value[1 : len(value)-1])
 	}
-	if strings.HasSuffix(value, "()") {
-		value = strings.TrimSpace(value[:len(value)-2])
+	var precision *int
+	if open := strings.LastIndexByte(value, '('); open >= 0 {
+		if value[len(value)-1] != ')' {
+			return "", nil, false
+		}
+		raw := strings.TrimSpace(value[open+1 : len(value)-1])
+		value = strings.TrimSpace(value[:open])
+		if raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 0 || parsed > 6 {
+				return "", nil, false
+			}
+			precision = &parsed
+		}
 	}
 	keyword := strings.ToUpper(value)
 	switch keyword {
 	case "CURTIME":
-		return "CURRENT_TIME", true
+		return "CURRENT_TIME", precision, true
 	case "CURDATE":
-		return "CURRENT_DATE", true
+		return "CURRENT_DATE", precision, true
 	case "CURRENT_TIME", "CURRENT_DATE", "CURRENT_TIMESTAMP":
-		return keyword, true
+		return keyword, precision, true
 	default:
-		return "", false
+		return "", nil, false
 	}
+}
+
+func mysqlCatalogTemporalPrecision(column Column) int {
+	if column.DeclaredType == nil ||
+		len(column.DeclaredType.Arguments) != 1 {
+		return 0
+	}
+	switch strings.ToLower(strings.TrimSpace(column.DeclaredType.Base)) {
+	case "time", "datetime", "timestamp":
+		precision := column.DeclaredType.Arguments[0]
+		if precision >= 0 && precision <= 6 {
+			return precision
+		}
+	}
+	return 0
+}
+
+func mysqlCatalogPrecisionMatches(expected int, actual *int) bool {
+	if actual == nil {
+		return expected == 0
+	}
+	return *actual == expected
 }
 
 func mysqlCatalogDefaultTargetForColumn(
@@ -214,6 +298,9 @@ func mysqlCatalogDefaultTargetForColumn(
 		return mysqlCatalogDefaultDate
 	case "datetime", "timestamp":
 		return mysqlCatalogDefaultTimestamp
+	case "binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob",
+		"bytea":
+		return mysqlCatalogDefaultBlob
 	default:
 		return mysqlCatalogDefaultUnknown
 	}
