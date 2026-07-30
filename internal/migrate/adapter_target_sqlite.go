@@ -11,8 +11,10 @@ import (
 )
 
 type sqliteTargetAdapter struct {
-	database       *sql.DB
-	sqlServerRoute bool
+	database                *sql.DB
+	sourceEngine            string
+	sqlServerRoute          bool
+	destructiveAcknowledged bool
 }
 
 func validateSQLiteTargetEndpoint(endpoint config.Endpoint) error {
@@ -23,15 +25,15 @@ func validateSQLiteTargetEndpoint(endpoint config.Endpoint) error {
 }
 
 func openSQLiteTargetAdapter(
-	_ context.Context,
+	ctx context.Context,
 	endpoint config.Endpoint,
 ) (targetAdapter, error) {
 	if err := validateSQLiteTargetEndpoint(endpoint); err != nil {
 		return nil, err
 	}
-	database, err := sql.Open("sqlite", endpoint.Database)
+	database, err := openSQLiteTargetDatabase(ctx, endpoint.Database)
 	if err != nil {
-		return nil, fmt.Errorf("open SQLite target: %w", err)
+		return nil, err
 	}
 	return &sqliteTargetAdapter{database: database}, nil
 }
@@ -48,9 +50,10 @@ func (adapter *sqliteTargetAdapter) PlanTables(
 	if _, err := normalizeAdapterTargetMode(mode); err != nil {
 		return nil, err
 	}
+	adapter.sourceEngine = ""
+	adapter.sqlServerRoute = false
 	switch sourceEngine {
 	case "postgres", "mysql", "sqlite":
-		adapter.sqlServerRoute = false
 	case "mssql":
 		if mode != "drop_recreate" {
 			return nil, sqliteSQLServerProjectionPolicy(
@@ -65,16 +68,24 @@ func (adapter *sqliteTargetAdapter) PlanTables(
 			sourceEngine,
 		)
 	}
+	adapter.sourceEngine = sourceEngine
 	targetTables := make([]schema.Table, 0, len(sourceTables))
 	for _, sourceTable := range sourceTables {
 		targetTable := sourceTable
-		if sourceEngine == "mssql" {
+		switch sourceEngine {
+		case "postgres":
+			var err error
+			targetTable, err = projectPostgresTableForSQLite(sourceTable)
+			if err != nil {
+				return nil, err
+			}
+		case "mssql":
 			var err error
 			targetTable, err = projectSQLServerTableForSQLite(sourceTable)
 			if err != nil {
 				return nil, err
 			}
-		} else {
+		default:
 			targetTable.Schema = ""
 			targetTable.Identity = cloneSchemaIdentity(sourceTable.Identity)
 		}
@@ -108,6 +119,14 @@ func (adapter *sqliteTargetAdapter) PlanTables(
 		}
 		targetTables = append(targetTables, targetTable)
 	}
+	if sourceEngine == "postgres" {
+		if err := validatePostgresSQLiteTables(
+			sourceTables,
+			targetTables,
+		); err != nil {
+			return nil, err
+		}
+	}
 	if sourceEngine == "mssql" {
 		if err := validateSQLServerSQLiteTables(
 			sourceTables,
@@ -137,6 +156,14 @@ func (adapter *sqliteTargetAdapter) PreflightTables(
 			return err
 		}
 	}
+	if err := preflightSQLiteTargetCatalog(
+		ctx,
+		adapter.database,
+		targetTables,
+		mode,
+	); err != nil {
+		return err
+	}
 	for _, targetTable := range targetTables {
 		exists, err := tableExists(ctx, adapter.database, targetTable.Name)
 		if err != nil {
@@ -153,6 +180,17 @@ func (adapter *sqliteTargetAdapter) PreflightTables(
 			)
 		}
 		if mode == "upsert" {
+			if err := rejectSQLiteTableTriggers(
+				ctx,
+				adapter.database,
+				targetTable.Name,
+			); err != nil {
+				return fmt.Errorf(
+					"preflight SQLite table %s: %w",
+					targetTable.Name,
+					err,
+				)
+			}
 			discovered, _, err := inspectSQLiteSchema(
 				ctx,
 				adapter.database,
@@ -165,14 +203,22 @@ func (adapter *sqliteTargetAdapter) PreflightTables(
 					err,
 				)
 			}
-			if !sameSQLiteIdentityShape(
-				targetTable.Identity,
-				discovered.Identity,
-			) {
+			if err := validateSQLiteRetainedTable(
+				targetTable,
+				discovered,
+			); err != nil {
 				return fmt.Errorf(
-					"preflight SQLite table %s: target identity does not match the planned identity",
+					"preflight SQLite table %s retained schema: %w",
 					targetTable.Name,
+					err,
 				)
+			}
+			if err := preflightSQLiteForeignKeyIntegrity(
+				ctx,
+				adapter.database,
+				targetTable.Name,
+			); err != nil {
+				return err
 			}
 		}
 	}
@@ -191,12 +237,7 @@ func (adapter *sqliteTargetAdapter) PrepareTables(
 	if mode == "upsert" {
 		return nil
 	}
-	for _, targetTable := range targetTables {
-		if err := prepareTarget(ctx, adapter.database, targetTable, mode); err != nil {
-			return err
-		}
-	}
-	return nil
+	return adapter.prepareDropRecreate(ctx, targetTables)
 }
 
 func (adapter *sqliteTargetAdapter) WriteBatch(
@@ -206,6 +247,20 @@ func (adapter *sqliteTargetAdapter) WriteBatch(
 	mode string,
 	rows [][]any,
 ) (WriteReceipt, error) {
+	if adapter.sourceEngine == "postgres" {
+		normalized, err := normalizePostgresSQLiteBatch(
+			table,
+			columns,
+			rows,
+		)
+		if err != nil {
+			return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: int64(len(rows)),
+			}, err
+		}
+		rows = normalized
+	}
 	if adapter.sqlServerRoute {
 		normalized, err := normalizeSQLServerSQLiteBatch(
 			table,

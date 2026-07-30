@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/schema"
@@ -132,6 +133,18 @@ type adapterSourceRebuildRowOrderer interface {
 // mutation.
 type adapterSourceRowPreflighter interface {
 	PreflightRows(context.Context, []schema.Table) error
+}
+
+// adapterTargetSourceTableOrderer permits a target with constraints active
+// during row loading to request a deterministic source-table execution order.
+// The runner verifies that the returned slice is an exact metadata-preserving
+// permutation before any target planning or mutation.
+type adapterTargetSourceTableOrderer interface {
+	OrderSourceTables(
+		string,
+		[]schema.Table,
+		string,
+	) ([]schema.Table, error)
 }
 
 // adapterTargetSourceDataPreflighter permits a target to perform bounded,
@@ -419,6 +432,31 @@ func planAdapterTables(
 	if err != nil {
 		return nil, err
 	}
+	if orderer, ok := target.(adapterTargetSourceTableOrderer); ok {
+		requested, orderErr := orderer.OrderSourceTables(
+			sourceEngine,
+			append([]schema.Table(nil), sourceTables...),
+			mode,
+		)
+		if orderErr != nil {
+			return nil, fmt.Errorf(
+				"order source tables for target %s: %w",
+				target.Engine(),
+				orderErr,
+			)
+		}
+		sourceTables, err = validateAdapterTargetSourceTableOrder(
+			sourceTables,
+			requested,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"order source tables for target %s: %w",
+				target.Engine(),
+				err,
+			)
+		}
+	}
 	if preflighter, ok := source.(adapterSourceRowPreflighter); ok {
 		if err := preflighter.PreflightRows(
 			ctx,
@@ -460,6 +498,57 @@ func planAdapterTables(
 		})
 	}
 	return plans, nil
+}
+
+func validateAdapterTargetSourceTableOrder(
+	original []schema.Table,
+	requested []schema.Table,
+) ([]schema.Table, error) {
+	if len(requested) != len(original) {
+		return nil, fmt.Errorf(
+			"target returned %d source tables for a %d-table selection",
+			len(requested),
+			len(original),
+		)
+	}
+	available := make(map[string]schema.Table, len(original))
+	for _, table := range original {
+		key := adapterSourceTableKey(table.Schema, table.Name)
+		if _, duplicate := available[key]; duplicate {
+			return nil, fmt.Errorf(
+				"source table %s is duplicated before target ordering",
+				table.Name,
+			)
+		}
+		available[key] = table
+	}
+	ordered := make([]schema.Table, len(requested))
+	seen := make(map[string]struct{}, len(requested))
+	for index, table := range requested {
+		key := adapterSourceTableKey(table.Schema, table.Name)
+		canonical, exists := available[key]
+		if !exists {
+			return nil, fmt.Errorf(
+				"target ordering returned unknown source table %s",
+				table.Name,
+			)
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return nil, fmt.Errorf(
+				"target ordering duplicated source table %s",
+				table.Name,
+			)
+		}
+		if !reflect.DeepEqual(table, canonical) {
+			return nil, fmt.Errorf(
+				"target ordering changed source table metadata for %s",
+				table.Name,
+			)
+		}
+		seen[key] = struct{}{}
+		ordered[index] = canonical
+	}
+	return ordered, nil
 }
 
 func requireAdapterSourceRowOrder(

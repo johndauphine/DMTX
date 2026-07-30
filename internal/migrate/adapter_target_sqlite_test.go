@@ -16,14 +16,17 @@ func TestSQLiteTargetPlanTableIsPureAndClearsNamespace(t *testing.T) {
 		Schema: "public",
 		Name:   "events",
 		Columns: []schema.Column{
-			{Name: "id", Type: "bigint", PrimaryKey: true},
-			{Name: "note", Type: "text", Nullable: true},
+			{
+				Name: "id", Type: "bigint", PrimaryKey: true,
+				PrimaryKeyPosition: 1,
+			},
+			{Name: "note", Type: "text"},
 		},
 		Indexes: []schema.Index{
 			{
 				Name: "events_note",
 				Columns: []schema.IndexColumn{
-					{Name: "note"},
+					{Name: "note", Collation: "BINARY"},
 				},
 			},
 		},
@@ -55,7 +58,10 @@ func TestSQLiteTargetPlanTableValidatesSourceAndRenderShape(t *testing.T) {
 		Schema: "public",
 		Name:   "events",
 		Columns: []schema.Column{
-			{Name: "id", Type: "bigint", PrimaryKey: true},
+			{
+				Name: "id", Type: "bigint", PrimaryKey: true,
+				PrimaryKeyPosition: 1,
+			},
 		},
 	}
 	if _, err := planSingleTargetTable(adapter,
@@ -71,7 +77,7 @@ func TestSQLiteTargetPlanTableValidatesSourceAndRenderShape(t *testing.T) {
 		"postgres",
 		table,
 		"drop_recreate",
-	); err == nil || !strings.Contains(err.Error(), "plan SQLite table") {
+	); err == nil || !strings.Contains(err.Error(), "map PostgreSQL") {
 		t.Fatalf("invalid render shape error = %v", err)
 	}
 
@@ -90,14 +96,20 @@ func TestSQLiteTargetPlanTablesIsPureAndPreservesOrder(t *testing.T) {
 			Schema: "public",
 			Name:   "parents",
 			Columns: []schema.Column{
-				{Name: "id", Type: "bigint", PrimaryKey: true},
+				{
+					Name: "id", Type: "bigint", PrimaryKey: true,
+					PrimaryKeyPosition: 1,
+				},
 			},
 		},
 		{
 			Schema: "audit",
 			Name:   "children",
 			Columns: []schema.Column{
-				{Name: "id", Type: "bigint", PrimaryKey: true},
+				{
+					Name: "id", Type: "bigint", PrimaryKey: true,
+					PrimaryKeyPosition: 1,
+				},
 				{Name: "parent_id", Type: "bigint"},
 			},
 		},
@@ -137,7 +149,7 @@ func TestSQLiteTargetPreflightIsReadOnlyAndRequiresUpsertTable(
 ) {
 	database, err := sql.Open(
 		"sqlite",
-		filepath.Join(t.TempDir(), "target.db"),
+		sqliteTargetURI(filepath.Join(t.TempDir(), "target.db")),
 	)
 	if err != nil {
 		t.Fatalf("open SQLite target: %v", err)

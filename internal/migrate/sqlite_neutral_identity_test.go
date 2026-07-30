@@ -14,7 +14,7 @@ func openNeutralIdentitySQLite(t *testing.T) *sql.DB {
 	t.Helper()
 	database, err := sql.Open(
 		"sqlite",
-		filepath.Join(t.TempDir(), "identity.db"),
+		sqliteTargetURI(filepath.Join(t.TempDir(), "identity.db")),
 	)
 	if err != nil {
 		t.Fatal(err)

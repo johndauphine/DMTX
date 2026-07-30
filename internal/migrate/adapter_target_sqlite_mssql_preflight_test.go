@@ -15,7 +15,7 @@ func TestSQLServerSQLitePreflightRejectsObjectCollisionWithoutMutation(
 ) {
 	database, err := sql.Open(
 		"sqlite",
-		filepath.Join(t.TempDir(), "target.db"),
+		sqliteTargetURI(filepath.Join(t.TempDir(), "target.db")),
 	)
 	if err != nil {
 		t.Fatalf("open SQLite target: %v", err)

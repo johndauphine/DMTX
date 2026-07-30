@@ -18,7 +18,11 @@ func (adapter *sqliteTargetAdapter) PreflightSourceData(
 	plans []adapterTablePlan,
 	_ string,
 ) error {
-	if source.Engine() != "mssql" {
+	switch source.Engine() {
+	case "postgres":
+		return preflightPostgresSQLiteSourceData(ctx, source, plans)
+	case "mssql":
+	default:
 		return nil
 	}
 	for _, plan := range plans {
