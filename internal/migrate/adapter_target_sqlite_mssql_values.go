@@ -21,6 +21,8 @@ func (adapter *sqliteTargetAdapter) PreflightSourceData(
 	switch source.Engine() {
 	case "postgres":
 		return preflightPostgresSQLiteSourceData(ctx, source, plans)
+	case "mysql":
+		return preflightMySQLSQLiteSourceData(ctx, source, plans)
 	case "mssql":
 	default:
 		return nil

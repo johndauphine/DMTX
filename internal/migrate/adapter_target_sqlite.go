@@ -79,6 +79,12 @@ func (adapter *sqliteTargetAdapter) PlanTables(
 			if err != nil {
 				return nil, err
 			}
+		case "mysql":
+			var err error
+			targetTable, err = projectMySQLTableForSQLite(sourceTable)
+			if err != nil {
+				return nil, err
+			}
 		case "mssql":
 			var err error
 			targetTable, err = projectSQLServerTableForSQLite(sourceTable)
@@ -121,6 +127,14 @@ func (adapter *sqliteTargetAdapter) PlanTables(
 	}
 	if sourceEngine == "postgres" {
 		if err := validatePostgresSQLiteTables(
+			sourceTables,
+			targetTables,
+		); err != nil {
+			return nil, err
+		}
+	}
+	if sourceEngine == "mysql" {
+		if err := validateMySQLSQLiteTables(
 			sourceTables,
 			targetTables,
 		); err != nil {
@@ -249,6 +263,20 @@ func (adapter *sqliteTargetAdapter) WriteBatch(
 ) (WriteReceipt, error) {
 	if adapter.sourceEngine == "postgres" {
 		normalized, err := normalizePostgresSQLiteBatch(
+			table,
+			columns,
+			rows,
+		)
+		if err != nil {
+			return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: int64(len(rows)),
+			}, err
+		}
+		rows = normalized
+	}
+	if adapter.sourceEngine == "mysql" {
+		normalized, err := normalizeMySQLSQLiteBatch(
 			table,
 			columns,
 			rows,
