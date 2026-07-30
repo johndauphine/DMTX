@@ -15,6 +15,7 @@ type relationalSourceSpec struct {
 	displayName      string
 	defaultNamespace func(config.Endpoint) string
 	open             func(context.Context, config.Endpoint) (*sql.DB, error)
+	verify           func(context.Context, *sql.DB) error
 	listTables       func(context.Context, *sql.DB, string) ([]string, error)
 	inspectTable     func(context.Context, *sql.DB, string, string) (schema.Table, error)
 	readQuery        func(string, schema.Table, []string) string
@@ -39,6 +40,7 @@ func openPostgresSourceAdapter(
 			return "public"
 		},
 		open:           engine.OpenPostgres,
+		verify:         engine.VerifyPostgres16Source,
 		listTables:     engine.ListPostgresTables,
 		inspectTable:   engine.InspectPostgresTable,
 		readQuery:      postgresReadQuery,
@@ -95,6 +97,23 @@ func openRelationalSourceAdapter(
 	database, err := spec.open(ctx, resolved)
 	if err != nil {
 		return nil, err
+	}
+	if spec.verify != nil {
+		if err := spec.verify(ctx, database); err != nil {
+			if closeErr := database.Close(); closeErr != nil {
+				return nil, fmt.Errorf(
+					"verify %s source: %w (close: %v)",
+					spec.displayName,
+					err,
+					closeErr,
+				)
+			}
+			return nil, fmt.Errorf(
+				"verify %s source: %w",
+				spec.displayName,
+				err,
+			)
+		}
 	}
 	namespace := resolved.Schema
 	if namespace == "" {

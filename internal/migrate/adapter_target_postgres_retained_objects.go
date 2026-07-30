@@ -812,7 +812,8 @@ func postgresRetainedIndexSortKey(index schema.Index) string {
 func postgresRetainedForeignKeySortKey(
 	foreignKey schema.ForeignKey,
 ) string {
-	parts := append([]string(nil), foreignKey.Columns...)
+	parts := []string{foreignKey.Name}
+	parts = append(parts, foreignKey.Columns...)
 	parts = append(parts, foreignKey.ReferencedTable)
 	parts = append(parts, foreignKey.ReferencedColumns...)
 	parts = append(

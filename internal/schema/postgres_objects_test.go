@@ -250,6 +250,62 @@ func TestPlanPostgresObjectsInfersReferencedPrimaryKeyOrder(
 	}
 }
 
+func TestPlanPostgresObjectsPreservesForeignKeyConstraintName(
+	t *testing.T,
+) {
+	tables := []Table{
+		{
+			Schema: "archive",
+			Name:   "parents",
+			Columns: []Column{{
+				Name:               "id",
+				Type:               "bigint",
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 1,
+			}},
+		},
+		{
+			Schema: "archive",
+			Name:   "children",
+			Columns: []Column{
+				{
+					Name:               "id",
+					Type:               "bigint",
+					PrimaryKey:         true,
+					PrimaryKeyPosition: 1,
+				},
+				{Name: "parent_id", Type: "bigint"},
+			},
+			ForeignKeys: []ForeignKey{{
+				Name:              "children_parent_contract",
+				Columns:           []string{"parent_id"},
+				ReferencedTable:   "parents",
+				ReferencedColumns: []string{"id"},
+			}},
+		},
+	}
+	statements, err := PlanPostgresDropRecreateObjects(
+		tables,
+		PostgresObjectPlanOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, statement := range statements {
+		if statement.Kind != PostgresForeignKeyObject {
+			continue
+		}
+		found = true
+		if statement.Name != "children_parent_contract" {
+			t.Fatalf("foreign-key name = %q", statement.Name)
+		}
+	}
+	if !found {
+		t.Fatal("foreign-key statement was not planned")
+	}
+}
+
 func TestPlanPostgresObjectsAcceptsKnownUniqueReferencedIndex(
 	t *testing.T,
 ) {

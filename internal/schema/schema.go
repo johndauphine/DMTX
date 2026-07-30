@@ -96,6 +96,7 @@ type Index struct {
 }
 
 type ForeignKey struct {
+	Name              string
 	Columns           []string
 	ReferencedTable   string
 	ReferencedColumns []string

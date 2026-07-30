@@ -429,6 +429,15 @@ func validatePostgresForeignKey(
 			"incomplete foreign key for table "+table.source.Name,
 		)
 	}
+	if foreignKey.Name != "" {
+		if err := validateSourceObjectIdentifier(
+			"foreign-key constraint",
+			foreignKey.Name,
+			false,
+		); err != nil {
+			return nil, err
+		}
+	}
 	if err := validatePostgresObjectIdentifier(
 		"referenced table",
 		foreignKey.ReferencedTable,
@@ -843,8 +852,11 @@ func planPostgresForeignKey(
 			referencedColumns = append(referencedColumns, column.Name)
 		}
 	}
-	preferredName := "dmtx_" + spec.table.source.Name + "_" +
-		strings.Join(foreignKey.Columns, "_") + "_fkey"
+	preferredName := foreignKey.Name
+	if preferredName == "" {
+		preferredName = "dmtx_" + spec.table.source.Name + "_" +
+			strings.Join(foreignKey.Columns, "_") + "_fkey"
+	}
 	name := names.allocate(
 		postgresTargetTableKey(
 			spec.table.targetSchema,
@@ -957,7 +969,8 @@ func postgresCheckSortKey(check CheckConstraint) string {
 }
 
 func postgresForeignKeySortKey(foreignKey ForeignKey) string {
-	parts := append([]string(nil), foreignKey.Columns...)
+	parts := []string{foreignKey.Name}
+	parts = append(parts, foreignKey.Columns...)
 	parts = append(parts, foreignKey.ReferencedTable)
 	parts = append(parts, foreignKey.ReferencedColumns...)
 	parts = append(
