@@ -9,12 +9,26 @@ import (
 	"github.com/johndauphine/dmtx/internal/config"
 )
 
-type mysqlServerFlavor uint8
+// MySQLServerFlavor identifies one version-pinned server implementation behind
+// the canonical mysql engine. Configuration aliases are not flavor evidence:
+// callers must use the live server identity returned by this package.
+type MySQLServerFlavor uint8
 
 const (
-	mysqlServerFlavorUnknown mysqlServerFlavor = iota
-	mysqlServerFlavorOracle80
-	mysqlServerFlavorMariaDB1011
+	MySQLServerFlavorUnknown MySQLServerFlavor = iota
+	MySQLServerFlavorOracle80
+	MySQLServerFlavorMariaDB1011
+)
+
+// Preserve the package-private names used by the existing source discovery
+// implementation and its tests while exposing the same closed flavor type to
+// target adapters.
+type mysqlServerFlavor = MySQLServerFlavor
+
+const (
+	mysqlServerFlavorUnknown     = MySQLServerFlavorUnknown
+	mysqlServerFlavorOracle80    = MySQLServerFlavorOracle80
+	mysqlServerFlavorMariaDB1011 = MySQLServerFlavorMariaDB1011
 )
 
 type mysqlServerFlavorCatalog struct {
@@ -58,6 +72,47 @@ func OpenMySQLSource(
 	}
 }
 
+// OpenMySQLTarget opens and verifies the version-pinned native target selected
+// from the live server identity. The returned flavor is the only supported
+// basis for choosing flavor-specific planning and write syntax.
+func OpenMySQLTarget(
+	ctx context.Context,
+	endpoint config.Endpoint,
+) (*sql.DB, MySQLServerFlavor, error) {
+	probe, err := OpenMySQL(ctx, endpoint)
+	if err != nil {
+		return nil, MySQLServerFlavorUnknown, err
+	}
+	flavor, err := DetectMySQLServerFlavor(ctx, probe)
+	if err != nil {
+		_ = probe.Close()
+		return nil, MySQLServerFlavorUnknown, fmt.Errorf(
+			"detect MySQL target flavor: %w",
+			err,
+		)
+	}
+	if err := probe.Close(); err != nil {
+		return nil, MySQLServerFlavorUnknown, fmt.Errorf(
+			"close MySQL target flavor probe: %w",
+			err,
+		)
+	}
+
+	var database *sql.DB
+	switch flavor {
+	case MySQLServerFlavorOracle80:
+		database, err = OpenMySQL80Target(ctx, endpoint)
+	case MySQLServerFlavorMariaDB1011:
+		database, err = OpenMariaDB1011Target(ctx, endpoint)
+	default:
+		err = fmt.Errorf("unsupported MySQL target flavor")
+	}
+	if err != nil {
+		return nil, MySQLServerFlavorUnknown, err
+	}
+	return database, flavor, nil
+}
+
 // OpenMariaDB1011 verifies and pins a MariaDB 10.11 source connection. Unlike
 // Oracle MySQL, MariaDB must not receive information_schema_stats_expiry.
 func OpenMariaDB1011(
@@ -95,6 +150,39 @@ func VerifyMySQLSource(
 	default:
 		return fmt.Errorf("unsupported MySQL source flavor")
 	}
+}
+
+// VerifyMySQLTarget dispatches target verification using the live server
+// flavor, then returns that flavor for target planning and writer selection.
+func VerifyMySQLTarget(
+	ctx context.Context,
+	database *sql.DB,
+) (MySQLServerFlavor, error) {
+	flavor, err := DetectMySQLServerFlavor(ctx, database)
+	if err != nil {
+		return MySQLServerFlavorUnknown, err
+	}
+	switch flavor {
+	case MySQLServerFlavorOracle80:
+		err = VerifyMySQL80Target(ctx, database)
+	case MySQLServerFlavorMariaDB1011:
+		err = VerifyMariaDB1011Target(ctx, database)
+	default:
+		err = fmt.Errorf("unsupported MySQL target flavor")
+	}
+	if err != nil {
+		return MySQLServerFlavorUnknown, err
+	}
+	return flavor, nil
+}
+
+// DetectMySQLServerFlavor reads the live server identity and rejects ambiguous
+// or inconsistent MySQL-compatible distributions.
+func DetectMySQLServerFlavor(
+	ctx context.Context,
+	database *sql.DB,
+) (MySQLServerFlavor, error) {
+	return detectMySQLServerFlavor(ctx, database)
 }
 
 func detectMySQLServerFlavor(

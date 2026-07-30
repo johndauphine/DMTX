@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/engine"
@@ -13,6 +14,7 @@ import (
 type mysqlTargetAdapter struct {
 	database    *sql.DB
 	batchWriter mysqlBatchWriter
+	flavor      engine.MySQLServerFlavor
 	namespace   string
 }
 
@@ -26,6 +28,13 @@ func (adapter *mysqlTargetAdapter) mySQLDatabaseHandle() *sql.DB {
 func validateMySQLTargetEndpoint(endpoint config.Endpoint) error {
 	if endpoint.Host == "" || endpoint.Database == "" || endpoint.User == "" {
 		return fmt.Errorf("MySQL host, database, and user are required")
+	}
+	switch strings.ToLower(endpoint.Database) {
+	case "information_schema", "mysql", "performance_schema", "sys":
+		return fmt.Errorf(
+			"MySQL target database %q is a reserved system database",
+			endpoint.Database,
+		)
 	}
 	if endpoint.Schema != "" && endpoint.Schema != endpoint.Database {
 		return fmt.Errorf(
@@ -46,23 +55,31 @@ func openMySQLTargetAdapter(
 	if err != nil {
 		return nil, fmt.Errorf("resolve target: %w", err)
 	}
-	database, err := engine.OpenMySQL80Target(ctx, resolved)
+	database, flavor, err := engine.OpenMySQLTarget(ctx, resolved)
 	if err != nil {
 		return nil, err
 	}
-	if err := engine.VerifyMySQL80Target(ctx, database); err != nil {
+	verifiedFlavor, err := engine.VerifyMySQLTarget(ctx, database)
+	if err != nil {
 		if closeErr := database.Close(); closeErr != nil {
 			return nil, fmt.Errorf(
-				"verify MySQL 8.0 target: %w (close: %v)",
+				"verify MySQL-family target: %w (close: %v)",
 				err,
 				closeErr,
 			)
 		}
-		return nil, fmt.Errorf("verify MySQL 8.0 target: %w", err)
+		return nil, fmt.Errorf("verify MySQL-family target: %w", err)
+	}
+	if verifiedFlavor != flavor {
+		_ = database.Close()
+		return nil, fmt.Errorf(
+			"verify MySQL-family target: server flavor changed during connection setup",
+		)
 	}
 	return &mysqlTargetAdapter{
 		database:    database,
-		batchWriter: newMySQLNativeWriter(database),
+		batchWriter: newMySQLNativeWriterForFlavor(database, flavor),
+		flavor:      flavor,
 		namespace:   resolved.Database,
 	}, nil
 }
@@ -85,6 +102,7 @@ func (adapter *mysqlTargetAdapter) PlanTables(
 		targetTable, err := projectMySQLTargetTable(
 			sourceEngine,
 			sourceTable,
+			adapter.flavor,
 		)
 		if err != nil {
 			return nil, err

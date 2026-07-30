@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/engine"
 )
 
 type mysqlDatabaseHandleProvider interface {
@@ -14,14 +15,14 @@ type mysqlDatabaseHandleProvider interface {
 }
 
 type mysqlDatabaseIdentity struct {
-	serverUUID          string
-	database            string
-	replicationChannels int
-	groupMembers        int
+	flavor         engine.MySQLServerFlavor
+	serverIdentity string
+	database       string
 }
 
-// MySQLToMySQLWithObserver migrates a MySQL 8 schema to a distinct MySQL 8
-// database through the shared source/target adapter runner.
+// MySQLToMySQLWithObserver migrates a version-pinned MySQL-family schema to a
+// distinct, compatible MySQL-family database through the shared adapter
+// runner. Cross-flavor metadata must pass the target's exact planning policy.
 func MySQLToMySQLWithObserver(
 	ctx context.Context,
 	cfg config.Config,
@@ -106,6 +107,26 @@ func readMySQLDatabaseIdentity(
 	ctx context.Context,
 	database *sql.DB,
 ) (mysqlDatabaseIdentity, error) {
+	flavor, err := engine.DetectMySQLServerFlavor(ctx, database)
+	if err != nil {
+		return mysqlDatabaseIdentity{}, err
+	}
+	switch flavor {
+	case engine.MySQLServerFlavorOracle80:
+		return readOracleMySQLDatabaseIdentity(ctx, database)
+	case engine.MySQLServerFlavorMariaDB1011:
+		return readMariaDBDatabaseIdentity(ctx, database)
+	default:
+		return mysqlDatabaseIdentity{}, fmt.Errorf(
+			"unsupported MySQL server flavor for database identity",
+		)
+	}
+}
+
+func readOracleMySQLDatabaseIdentity(
+	ctx context.Context,
+	database *sql.DB,
+) (mysqlDatabaseIdentity, error) {
 	var serverUUID, selectedDatabase sql.NullString
 	var replicationChannels, groupMembers int
 	if err := database.QueryRowContext(
@@ -126,18 +147,17 @@ func readMySQLDatabaseIdentity(
 		return mysqlDatabaseIdentity{}, err
 	}
 	identity := mysqlDatabaseIdentity{
-		serverUUID:          strings.TrimSpace(serverUUID.String),
-		database:            selectedDatabase.String,
-		replicationChannels: replicationChannels,
-		groupMembers:        groupMembers,
+		flavor:         engine.MySQLServerFlavorOracle80,
+		serverIdentity: strings.TrimSpace(serverUUID.String),
+		database:       selectedDatabase.String,
 	}
-	if !serverUUID.Valid || identity.serverUUID == "" ||
+	if !serverUUID.Valid || identity.serverIdentity == "" ||
 		!selectedDatabase.Valid || identity.database == "" {
 		return mysqlDatabaseIdentity{}, fmt.Errorf(
 			"MySQL server UUID and selected database are required",
 		)
 	}
-	if identity.replicationChannels != 0 || identity.groupMembers != 0 {
+	if replicationChannels != 0 || groupMembers != 0 {
 		return mysqlDatabaseIdentity{}, fmt.Errorf(
 			"replicated MySQL endpoints are unsupported for native MySQL-to-MySQL migration",
 		)
@@ -145,16 +165,170 @@ func readMySQLDatabaseIdentity(
 	return identity, nil
 }
 
+func readMariaDBDatabaseIdentity(
+	ctx context.Context,
+	database *sql.DB,
+) (mysqlDatabaseIdentity, error) {
+	var serverUID, selectedDatabase sql.NullString
+	var wsrepOn int
+	if err := database.QueryRowContext(
+		ctx,
+		`SELECT
+			@@global.server_uid,
+			DATABASE(),
+			@@global.wsrep_on`,
+	).Scan(
+		&serverUID,
+		&selectedDatabase,
+		&wsrepOn,
+	); err != nil {
+		return mysqlDatabaseIdentity{}, err
+	}
+	replicationChannels, err := countMariaDBReplicationChannels(
+		ctx,
+		database,
+	)
+	if err != nil {
+		return mysqlDatabaseIdentity{}, err
+	}
+	return mariaDBDatabaseIdentityFromCatalog(
+		serverUID,
+		selectedDatabase,
+		wsrepOn,
+		replicationChannels,
+	)
+}
+
+func mariaDBDatabaseIdentityFromCatalog(
+	serverUID sql.NullString,
+	selectedDatabase sql.NullString,
+	wsrepOn int,
+	replicationChannels int,
+) (mysqlDatabaseIdentity, error) {
+	identity := mysqlDatabaseIdentity{
+		flavor:         engine.MySQLServerFlavorMariaDB1011,
+		serverIdentity: strings.TrimSpace(serverUID.String),
+		database:       selectedDatabase.String,
+	}
+	if !serverUID.Valid || identity.serverIdentity == "" ||
+		!selectedDatabase.Valid || identity.database == "" {
+		return mysqlDatabaseIdentity{}, fmt.Errorf(
+			"MariaDB server UID and selected database are required",
+		)
+	}
+	if wsrepOn != 0 || replicationChannels != 0 {
+		return mysqlDatabaseIdentity{}, fmt.Errorf(
+			"replicated MariaDB endpoints are unsupported for native MySQL-to-MySQL migration",
+		)
+	}
+	return identity, nil
+}
+
+func countMariaDBReplicationChannels(
+	ctx context.Context,
+	database *sql.DB,
+) (count int, result error) {
+	rows, err := database.QueryContext(ctx, "SHOW ALL SLAVES STATUS")
+	if err != nil {
+		return 0, fmt.Errorf("inspect MariaDB replication channels: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil && result == nil {
+			result = fmt.Errorf(
+				"close MariaDB replication channel catalog: %w",
+				closeErr,
+			)
+		}
+	}()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return 0, fmt.Errorf(
+			"inspect MariaDB replication channel shape: %w",
+			err,
+		)
+	}
+	if err := validateMariaDBReplicationStatusColumns(columns); err != nil {
+		return 0, err
+	}
+	values := make([]sql.RawBytes, len(columns))
+	destinations := make([]any, len(columns))
+	for index := range values {
+		destinations[index] = &values[index]
+	}
+	for rows.Next() {
+		if err := rows.Scan(destinations...); err != nil {
+			return 0, fmt.Errorf(
+				"read MariaDB replication channel: %w",
+				err,
+			)
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf(
+			"iterate MariaDB replication channels: %w",
+			err,
+		)
+	}
+	return count, nil
+}
+
+func validateMariaDBReplicationStatusColumns(columns []string) error {
+	seen := make(map[string]struct{}, len(columns))
+	for _, column := range columns {
+		key := strings.ToLower(strings.TrimSpace(column))
+		if key == "" {
+			return fmt.Errorf(
+				"unexpected MariaDB replication channel catalog shape",
+			)
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf(
+				"unexpected MariaDB replication channel catalog shape",
+			)
+		}
+		seen[key] = struct{}{}
+	}
+	for _, required := range []string{
+		"connection_name",
+		"master_host",
+		"slave_io_running",
+		"slave_sql_running",
+	} {
+		if _, present := seen[required]; !present {
+			return fmt.Errorf(
+				"unexpected MariaDB replication channel catalog shape",
+			)
+		}
+	}
+	return nil
+}
+
 func sameMySQLDatabaseIdentity(
 	source mysqlDatabaseIdentity,
 	target mysqlDatabaseIdentity,
 ) bool {
-	return strings.EqualFold(source.serverUUID, target.serverUUID) &&
-		source.database == target.database
+	if source.flavor != target.flavor ||
+		source.database != target.database {
+		return false
+	}
+	switch source.flavor {
+	case engine.MySQLServerFlavorOracle80:
+		return strings.EqualFold(
+			source.serverIdentity,
+			target.serverIdentity,
+		)
+	case engine.MySQLServerFlavorMariaDB1011:
+		return source.serverIdentity == target.serverIdentity
+	default:
+		return false
+	}
 }
 
 // PostgresToMySQLWithObserver migrates deterministic PostgreSQL 16 metadata
-// and rows through the shared source/target adapter runner.
+// and rows to an admitted Oracle MySQL or MariaDB target through the shared
+// source/target adapter runner.
 func PostgresToMySQLWithObserver(
 	ctx context.Context,
 	cfg config.Config,

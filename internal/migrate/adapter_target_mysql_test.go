@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/engine"
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
@@ -37,11 +38,111 @@ func TestMySQLTargetEndpointValidationDoesNotResolveSecrets(t *testing.T) {
 	}
 }
 
+func TestMySQLTargetEndpointRejectsSystemDatabases(t *testing.T) {
+	for _, database := range []string{
+		"information_schema",
+		"MYSQL",
+		"Performance_Schema",
+		"sys",
+	} {
+		t.Run(database, func(t *testing.T) {
+			err := validateMySQLTargetEndpoint(config.Endpoint{
+				Host:     "database.example",
+				Database: database,
+				User:     "migrator",
+			})
+			if err == nil ||
+				!strings.Contains(err.Error(), "reserved system database") {
+				t.Fatalf("system database error = %v", err)
+			}
+		})
+	}
+}
+
+func TestMariaDBBuiltInSystemViewRecognition(t *testing.T) {
+	for _, testCase := range []struct {
+		schema  string
+		definer string
+		want    bool
+	}{
+		{schema: "mysql", definer: "mariadb.sys@localhost", want: true},
+		{schema: "sys", definer: "mariadb.sys@localhost", want: true},
+		{schema: "application", definer: "mariadb.sys@localhost"},
+		{schema: "sys", definer: "root@localhost"},
+	} {
+		if got := isMariaDBBuiltInSystemView(
+			testCase.schema,
+			testCase.definer,
+		); got != testCase.want {
+			t.Fatalf(
+				"isMariaDBBuiltInSystemView(%q, %q) = %t, want %t",
+				testCase.schema,
+				testCase.definer,
+				got,
+				testCase.want,
+			)
+		}
+	}
+}
+
+func TestMariaDBViewVisibilityFailsClosed(t *testing.T) {
+	if err := validateMariaDBGlobalViewVisibility(false); err == nil ||
+		!strings.Contains(err.Error(), "global SHOW VIEW") {
+		t.Fatalf("missing SHOW VIEW error = %v", err)
+	}
+	if err := validateMariaDBGlobalViewVisibility(true); err != nil {
+		t.Fatalf("global SHOW VIEW was rejected: %v", err)
+	}
+
+	visible, err := validateMariaDBViewDefinition(
+		"application",
+		"hidden_view",
+		"",
+		"dmtx@%",
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "has no visible definition") ||
+		visible {
+		t.Fatalf(
+			"hidden application view result = %t, error = %v",
+			visible,
+			err,
+		)
+	}
+	visible, err = validateMariaDBViewDefinition(
+		"sys",
+		"host_summary",
+		"",
+		"mariadb.sys@localhost",
+	)
+	if err != nil || visible {
+		t.Fatalf(
+			"hidden built-in view result = %t, error = %v",
+			visible,
+			err,
+		)
+	}
+	visible, err = validateMariaDBViewDefinition(
+		"application",
+		"visible_view",
+		"select 1 AS `one`",
+		"dmtx@%",
+	)
+	if err != nil || !visible {
+		t.Fatalf(
+			"visible application view result = %t, error = %v",
+			visible,
+			err,
+		)
+	}
+}
+
 func TestMySQLTargetPlansWithoutMutatingMySQLSource(t *testing.T) {
 	frontier := int64(41)
 	source := schema.Table{
-		Schema: "source_db",
-		Name:   "events",
+		Schema:         "source_db",
+		Name:           "events",
+		MySQLCollation: "utf8mb4_0900_bin",
 		Identity: &schema.Identity{
 			Column:     "id",
 			Generation: schema.IdentityByDefault,
@@ -58,6 +159,7 @@ func TestMySQLTargetPlansWithoutMutatingMySQLSource(t *testing.T) {
 	}
 	before := cloneMySQLTargetTable(source)
 	adapter := &mysqlTargetAdapter{namespace: "target_db"}
+	adapter.flavor = engine.MySQLServerFlavorOracle80
 	planned, err := adapter.PlanTables(
 		"mysql",
 		[]schema.Table{source},

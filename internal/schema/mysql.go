@@ -22,7 +22,7 @@ func mysqlTableCollation(table Table) (string, error) {
 		return "utf8mb4_bin", nil
 	}
 	switch value {
-	case "utf8mb4_bin", "utf8mb4_0900_bin":
+	case "utf8mb4_bin", "utf8mb4_0900_bin", "utf8mb4_nopad_bin":
 		return value, nil
 	default:
 		return "", &PolicyError{

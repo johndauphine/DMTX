@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/johndauphine/dmtx/internal/engine"
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
@@ -18,6 +19,14 @@ func TestMySQLNativeWriteStatementUsesQualifiedAliasUpsert(
 		[]string{"id", "payload"},
 		"upsert",
 	)
+	const want = "INSERT INTO `target_db`.`events` (`id`, `payload`) " +
+		"VALUES (?, ?) AS `dmtx_new` ON DUPLICATE KEY UPDATE " +
+		"`id` = IF(`events`.`id` <=> `dmtx_new`.`id`, " +
+		"`events`.`id`, JSON_EXTRACT('dmtx-invalid-json', '$')), " +
+		"`payload` = `dmtx_new`.`payload`"
+	if statement != want {
+		t.Fatalf("Oracle MySQL statement = %q, want %q", statement, want)
+	}
 	for _, expected := range []string{
 		"INSERT INTO `target_db`.`events`",
 		"VALUES (?, ?)",
@@ -76,6 +85,123 @@ func TestMySQLNativeWriteStatementAvoidsTableAliasCollision(t *testing.T) {
 		"AS `dmtx_incoming` ON DUPLICATE KEY UPDATE",
 	) || strings.Contains(statement, "AS `dmtx_new`") {
 		t.Fatalf("unsafe row alias: %q", statement)
+	}
+}
+
+func TestMySQLNativeWriteStatementForMariaDBUsesGuardedValuesUpsert(
+	t *testing.T,
+) {
+	table := mysqlNativeTestTable()
+	statement, err := mySQLNativeWriteStatementForFlavor(
+		table,
+		[]string{"id", "payload"},
+		"upsert",
+		engine.MySQLServerFlavorMariaDB1011,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "INSERT INTO `target_db`.`events` (`id`, `payload`) " +
+		"VALUES (?, ?) ON DUPLICATE KEY UPDATE " +
+		"`id` = IF(`events`.`id` <=> VALUES(`id`), " +
+		"`events`.`id`, JSON_EXTRACT('dmtx-invalid-json', '$')), " +
+		"`payload` = VALUES(`payload`)"
+	if statement != want {
+		t.Fatalf("MariaDB statement = %q, want %q", statement, want)
+	}
+	if strings.Contains(statement, " AS `dmtx_new`") {
+		t.Fatalf("MariaDB statement uses unsupported row alias: %q", statement)
+	}
+}
+
+func TestMySQLNativeWriteStatementForMariaDBGuardsCompletePrimaryKey(
+	t *testing.T,
+) {
+	table := mysqlNativeTestTable()
+	table.Columns = append(
+		[]schema.Column{{
+			Name:               "tenant_id",
+			Type:               "integer",
+			PrimaryKey:         true,
+			PrimaryKeyPosition: 1,
+		}},
+		table.Columns...,
+	)
+	table.Columns[1].PrimaryKeyPosition = 2
+	statement, err := mySQLNativeWriteStatementForFlavor(
+		table,
+		[]string{"tenant_id", "id", "payload"},
+		"upsert",
+		engine.MySQLServerFlavorMariaDB1011,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const guard = "`events`.`tenant_id` <=> VALUES(`tenant_id`) AND " +
+		"`events`.`id` <=> VALUES(`id`)"
+	if !strings.Contains(statement, guard) {
+		t.Fatalf(
+			"MariaDB composite-key statement %q does not contain %q",
+			statement,
+			guard,
+		)
+	}
+}
+
+func TestMySQLNativeWriterUsesConfiguredMariaDBFlavor(t *testing.T) {
+	writer, transaction := newMySQLNativeTestWriterForFlavor(
+		engine.MySQLServerFlavorMariaDB1011,
+	)
+	transaction.statement.affected = []int64{2}
+	transaction.warnings = []int64{0}
+
+	receipt, err := writer.WriteBatch(
+		context.Background(),
+		mysqlNativeTestTable(),
+		[]string{"id", "payload"},
+		"upsert",
+		[][]any{{int64(1), "updated"}},
+	)
+	if err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	assertMySQLNativeReceipt(t, receipt, CommitDurable, 1, 1)
+	if !strings.Contains(
+		transaction.statement.query,
+		"`payload` = VALUES(`payload`)",
+	) || strings.Contains(
+		transaction.statement.query,
+		" AS `dmtx_new`",
+	) {
+		t.Fatalf(
+			"writer prepared wrong MariaDB statement: %q",
+			transaction.statement.query,
+		)
+	}
+}
+
+func TestMySQLNativeWriterRejectsUnknownFlavorBeforeTransaction(
+	t *testing.T,
+) {
+	writer, transaction := newMySQLNativeTestWriterForFlavor(
+		engine.MySQLServerFlavorUnknown,
+	)
+	receipt, err := writer.WriteBatch(
+		context.Background(),
+		mysqlNativeTestTable(),
+		[]string{"id", "payload"},
+		"drop_recreate",
+		[][]any{{int64(1), "value"}},
+	)
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"unsupported target server flavor",
+	) {
+		t.Fatalf("error = %v", err)
+	}
+	assertMySQLNativeReceipt(t, receipt, CommitNotCommitted, 1, 0)
+	if transaction.begins != 0 {
+		t.Fatal("transaction began for an unsupported target flavor")
 	}
 }
 
@@ -362,6 +488,17 @@ func newMySQLNativeTestWriter() (
 	*mysqlNativeWriter,
 	*mysqlNativeTestTransaction,
 ) {
+	return newMySQLNativeTestWriterForFlavor(
+		engine.MySQLServerFlavorOracle80,
+	)
+}
+
+func newMySQLNativeTestWriterForFlavor(
+	flavor engine.MySQLServerFlavor,
+) (
+	*mysqlNativeWriter,
+	*mysqlNativeTestTransaction,
+) {
 	transaction := &mysqlNativeTestTransaction{
 		statement: &mysqlNativeTestStatement{},
 	}
@@ -369,5 +506,6 @@ func newMySQLNativeTestWriter() (
 		transactions: &mysqlNativeTestProvider{
 			transaction: transaction,
 		},
+		flavor: flavor,
 	}, transaction
 }

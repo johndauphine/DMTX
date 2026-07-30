@@ -219,6 +219,32 @@ func ParseMariaDBCatalogDefault(
 			literal: literal,
 		}, nil
 	}
+	if target == mysqlCatalogDefaultBlob {
+		// MariaDB 10.11 preserves BLOB-family defaults as exact X'...' hex
+		// literals. BINARY and VARBINARY defaults instead pass through the
+		// connection character set in COLUMN_DEFAULT and can replace
+		// arbitrary bytes, so those catalog shapes remain unsupported.
+		switch mysqlColumnBase(column) {
+		case "tinyblob", "blob", "mediumblob", "longblob":
+		default:
+			return nil, mariaDBCatalogDefaultPolicy(column)
+		}
+		if len(value) < 3 ||
+			(value[0] != 'X' && value[0] != 'x') ||
+			value[1] != '\'' ||
+			value[len(value)-1] != '\'' {
+			return nil, mariaDBCatalogDefaultPolicy(column)
+		}
+		hexadecimal := strings.ToLower(value[2 : len(value)-1])
+		if len(hexadecimal)%2 != 0 || !isLowerHex(hexadecimal) {
+			return nil, mariaDBCatalogDefaultPolicy(column)
+		}
+		return &Expression{
+			sql:     "X'" + hexadecimal + "'",
+			kind:    expressionBlob,
+			literal: hexadecimal,
+		}, nil
+	}
 
 	switch target {
 	case mysqlCatalogDefaultBoolean:

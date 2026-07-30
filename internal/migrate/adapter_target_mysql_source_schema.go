@@ -6,28 +6,74 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/johndauphine/dmtx/internal/engine"
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
-// projectMySQLTargetTable converts one already-discovered source table into
-// the exact, conservative shape accepted by the native MySQL 8 target. The
-// result contains no executable catalog text: defaults and CHECKs remain
-// structured schema expressions.
+// projectMySQLTargetTable converts one already-discovered source table into the
+// exact, conservative shape accepted by the selected native MySQL-family
+// target. The result contains no executable catalog text: defaults and CHECKs
+// remain structured schema expressions.
 func projectMySQLTargetTable(
 	sourceEngine string,
 	sourceTable schema.Table,
+	targetFlavor engine.MySQLServerFlavor,
 ) (schema.Table, error) {
+	var target schema.Table
+	var err error
 	switch sourceEngine {
 	case "mysql":
-		return cloneMySQLTargetTable(sourceTable), nil
+		target = cloneMySQLTargetTable(sourceTable)
 	case "postgres":
-		return projectPostgresTableForMySQL(sourceTable)
+		target, err = projectPostgresTableForMySQL(sourceTable)
 	default:
 		return schema.Table{}, fmt.Errorf(
 			"MySQL target does not support source engine %q",
 			sourceEngine,
 		)
 	}
+	if err != nil {
+		return schema.Table{}, err
+	}
+	if err := normalizeMySQLTargetCollation(
+		sourceEngine,
+		&target,
+		targetFlavor,
+	); err != nil {
+		return schema.Table{}, err
+	}
+	return target, nil
+}
+
+func normalizeMySQLTargetCollation(
+	sourceEngine string,
+	table *schema.Table,
+	targetFlavor engine.MySQLServerFlavor,
+) error {
+	collation := strings.ToLower(strings.TrimSpace(table.MySQLCollation))
+	switch targetFlavor {
+	case engine.MySQLServerFlavorOracle80:
+		switch collation {
+		case "utf8mb4_bin", "utf8mb4_0900_bin":
+			table.MySQLCollation = collation
+			return nil
+		}
+	case engine.MySQLServerFlavorMariaDB1011:
+		if sourceEngine == "postgres" {
+			table.MySQLCollation = "utf8mb4_nopad_bin"
+			return nil
+		}
+		if collation == "utf8mb4_nopad_bin" {
+			table.MySQLCollation = collation
+			return nil
+		}
+	default:
+		return fmt.Errorf("unsupported MySQL target flavor")
+	}
+	return mysqlProjectionPolicy(
+		"map MySQL-family table collation",
+		table.Name+"."+table.MySQLCollation,
+	)
 }
 
 func cloneMySQLTargetTable(source schema.Table) schema.Table {

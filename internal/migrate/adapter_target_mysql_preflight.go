@@ -35,6 +35,7 @@ func (adapter *mysqlTargetAdapter) PreflightTables(
 			ctx,
 			adapter.database,
 			targetTables,
+			adapter.flavor,
 		)
 	}
 
@@ -418,6 +419,7 @@ func preflightMySQLDropRecreate(
 	ctx context.Context,
 	database *sql.DB,
 	tables []schema.Table,
+	flavor engine.MySQLServerFlavor,
 ) error {
 	if len(tables) == 0 {
 		return nil
@@ -441,6 +443,7 @@ func preflightMySQLDropRecreate(
 		database,
 		tables[0].Schema,
 		selected,
+		flavor,
 	); err != nil {
 		return err
 	}
@@ -529,6 +532,7 @@ func preflightMySQLRelationKindsAndViews(
 	database *sql.DB,
 	namespace string,
 	selected map[string]struct{},
+	flavor engine.MySQLServerFlavor,
 ) error {
 	rows, err := database.QueryContext(
 		ctx,
@@ -565,6 +569,33 @@ func preflightMySQLRelationKindsAndViews(
 		return fmt.Errorf("close MySQL target relation catalog: %w", err)
 	}
 
+	switch flavor {
+	case engine.MySQLServerFlavorOracle80:
+		return preflightOracleMySQLViewDependencies(
+			ctx,
+			database,
+			namespace,
+			selected,
+		)
+	case engine.MySQLServerFlavorMariaDB1011:
+		return preflightMariaDBViewDependencies(
+			ctx,
+			database,
+			selected,
+		)
+	default:
+		return fmt.Errorf(
+			"inspect MySQL target view dependencies: unsupported server flavor",
+		)
+	}
+}
+
+func preflightOracleMySQLViewDependencies(
+	ctx context.Context,
+	database *sql.DB,
+	namespace string,
+	selected map[string]struct{},
+) error {
 	viewRows, err := database.QueryContext(
 		ctx,
 		`SELECT
@@ -613,6 +644,152 @@ func preflightMySQLRelationKindsAndViews(
 		)
 	}
 	return nil
+}
+
+func preflightMariaDBViewDependencies(
+	ctx context.Context,
+	database *sql.DB,
+	selected map[string]struct{},
+) error {
+	var hasGlobalShowView bool
+	if err := database.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) > 0
+		FROM information_schema.USER_PRIVILEGES
+		WHERE REPLACE(GRANTEE, '''', '') = CURRENT_USER()
+			AND PRIVILEGE_TYPE = 'SHOW VIEW'`,
+	).Scan(&hasGlobalShowView); err != nil {
+		return fmt.Errorf(
+			"inspect MariaDB target view visibility: %w",
+			err,
+		)
+	}
+	if err := validateMariaDBGlobalViewVisibility(
+		hasGlobalShowView,
+	); err != nil {
+		return err
+	}
+
+	type selectedRelation struct {
+		table  string
+		needle string
+	}
+	relations := make([]selectedRelation, 0, len(selected))
+	for key := range selected {
+		parts := strings.SplitN(key, "\x00", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return fmt.Errorf(
+				"inspect MariaDB target view dependencies: invalid selected relation",
+			)
+		}
+		relations = append(relations, selectedRelation{
+			table: parts[1],
+			needle: mySQLIdentifier(parts[0]) + "." +
+				mySQLIdentifier(parts[1]),
+		})
+	}
+
+	rows, err := database.QueryContext(
+		ctx,
+		`SELECT TABLE_SCHEMA, TABLE_NAME, VIEW_DEFINITION, DEFINER
+		FROM information_schema.VIEWS
+		ORDER BY TABLE_SCHEMA, TABLE_NAME`,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"inspect MariaDB target view dependencies: %w",
+			err,
+		)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var viewSchema, viewName, definition, definer string
+		if err := rows.Scan(
+			&viewSchema,
+			&viewName,
+			&definition,
+			&definer,
+		); err != nil {
+			return fmt.Errorf(
+				"read MariaDB target view dependency: %w",
+				err,
+			)
+		}
+		visible, err := validateMariaDBViewDefinition(
+			viewSchema,
+			viewName,
+			definition,
+			definer,
+		)
+		if err != nil {
+			return err
+		}
+		if !visible {
+			continue
+		}
+		for _, relation := range relations {
+			// MariaDB 10.11 exposes canonical VIEW_DEFINITION text with
+			// every table reference schema-qualified and backtick-quoted.
+			// Matching that exact identifier pair may conservatively reject
+			// a definition containing the same text in a literal, but it
+			// cannot miss a visible direct dependency.
+			if strings.Contains(definition, relation.needle) {
+				return fmt.Errorf(
+					"preflight MySQL table %s: view %s.%s depends on the selected target",
+					relation.table,
+					viewSchema,
+					viewName,
+				)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf(
+			"iterate MariaDB target view dependencies: %w",
+			err,
+		)
+	}
+	return nil
+}
+
+func validateMariaDBGlobalViewVisibility(hasGlobalShowView bool) error {
+	if !hasGlobalShowView {
+		return fmt.Errorf(
+			"inspect MariaDB target view visibility: global SHOW VIEW privilege is required",
+		)
+	}
+	return nil
+}
+
+func validateMariaDBViewDefinition(
+	schemaName string,
+	viewName string,
+	definition string,
+	definer string,
+) (bool, error) {
+	if strings.TrimSpace(definition) != "" {
+		return true, nil
+	}
+	if isMariaDBBuiltInSystemView(schemaName, definer) {
+		return false, nil
+	}
+	return false, fmt.Errorf(
+		"read MariaDB target view dependency: view %s.%s has no visible definition",
+		schemaName,
+		viewName,
+	)
+}
+
+func isMariaDBBuiltInSystemView(schemaName, definer string) bool {
+	if definer != "mariadb.sys@localhost" {
+		return false
+	}
+	switch schemaName {
+	case "mysql", "sys":
+		return true
+	default:
+		return false
+	}
 }
 
 func preflightMySQLConstraintNames(

@@ -164,6 +164,25 @@ func TestCreateMySQLTableUsesValidatedExplicitCollation(t *testing.T) {
 	}
 }
 
+func TestCreateMySQLTableSupportsMariaDBNoPadBinaryCollation(t *testing.T) {
+	table := Table{
+		Schema:         "app",
+		Name:           "events",
+		MySQLCollation: "utf8mb4_nopad_bin",
+		Columns: []Column{{
+			Name: "id",
+			Type: "bigint",
+		}},
+	}
+	statement, err := CreateTable(MySQL, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(statement, "COLLATE=utf8mb4_nopad_bin") {
+		t.Fatalf("statement = %q", statement)
+	}
+}
+
 func TestCreateMySQLTableRejectsInvalidTypesDefaultsAndIdentity(t *testing.T) {
 	frontier := int64(4)
 	base := Table{

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/johndauphine/dmtx/internal/engine"
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
@@ -73,11 +74,23 @@ func newMySQLSafeOperationError(
 
 type mysqlNativeWriter struct {
 	transactions mysqlTransactionProvider
+	flavor       engine.MySQLServerFlavor
 }
 
 func newMySQLNativeWriter(database *sql.DB) *mysqlNativeWriter {
+	return newMySQLNativeWriterForFlavor(
+		database,
+		engine.MySQLServerFlavorOracle80,
+	)
+}
+
+func newMySQLNativeWriterForFlavor(
+	database *sql.DB,
+	flavor engine.MySQLServerFlavor,
+) *mysqlNativeWriter {
 	return &mysqlNativeWriter{
 		transactions: mysqlSQLTransactionProvider{database: database},
+		flavor:       flavor,
 	}
 }
 
@@ -116,6 +129,15 @@ func (writer *mysqlNativeWriter) WriteBatch(
 			table.Name,
 		)
 	}
+	writeStatement, err := mySQLNativeWriteStatementForFlavor(
+		table,
+		columns,
+		mode,
+		writer.flavor,
+	)
+	if err != nil {
+		return notCommitted, err
+	}
 
 	transaction, err := writer.transactions.Begin(ctx)
 	if err != nil {
@@ -134,7 +156,7 @@ func (writer *mysqlNativeWriter) WriteBatch(
 
 	statement, err := transaction.Prepare(
 		ctx,
-		mySQLNativeWriteStatement(table, columns, mode),
+		writeStatement,
 	)
 	if err != nil {
 		return notCommitted, newMySQLSafeOperationError(
@@ -364,6 +386,76 @@ func mySQLNativeWriteStatement(
 	}
 	return statement + " AS " + mySQLIdentifier(incoming) +
 		" ON DUPLICATE KEY UPDATE " +
+		strings.Join(updates, ", ")
+}
+
+func mySQLNativeWriteStatementForFlavor(
+	table schema.Table,
+	columns []string,
+	mode string,
+	flavor engine.MySQLServerFlavor,
+) (string, error) {
+	switch flavor {
+	case engine.MySQLServerFlavorOracle80:
+		return mySQLNativeWriteStatement(table, columns, mode), nil
+	case engine.MySQLServerFlavorMariaDB1011:
+		return mySQLNativeMariaDBWriteStatement(
+			table,
+			columns,
+			mode,
+		), nil
+	default:
+		return "", fmt.Errorf(
+			"write MySQL table %s: unsupported target server flavor",
+			table.Name,
+		)
+	}
+}
+
+func mySQLNativeMariaDBWriteStatement(
+	table schema.Table,
+	columns []string,
+	mode string,
+) string {
+	statement := "INSERT INTO " +
+		mySQLQualified(table.Schema, table.Name) +
+		" (" + mySQLQuotedColumns(columns) + ") VALUES (" +
+		placeholders(len(columns)) + ")"
+	if mode != "upsert" {
+		return statement
+	}
+
+	keys := primaryKeyColumns(table)
+	keyMatches := make([]string, len(keys))
+	for index, key := range keys {
+		keyMatches[index] = mySQLIdentifier(table.Name) + "." +
+			mySQLIdentifier(key) + " <=> VALUES(" +
+			mySQLIdentifier(key) + ")"
+	}
+	// MariaDB 10.11 does not accept Oracle MySQL's row-alias syntax after
+	// VALUES. Its VALUES(column) form still lets the first assignment prove
+	// that the duplicate row matched the complete primary key. A collision
+	// through another UNIQUE key evaluates the invalid JSON branch; assigning
+	// its NULL result to the NOT NULL primary key fails or warns, and the
+	// writer rolls the whole transaction back in either case.
+	guardKey := keys[0]
+	updates := []string{
+		mySQLIdentifier(guardKey) + " = IF(" +
+			strings.Join(keyMatches, " AND ") + ", " +
+			mySQLIdentifier(table.Name) + "." +
+			mySQLIdentifier(guardKey) + ", " +
+			"JSON_EXTRACT('dmtx-invalid-json', '$'))",
+	}
+	for _, column := range columns {
+		if !contains(keys, column) {
+			updates = append(
+				updates,
+				mySQLIdentifier(column)+" = VALUES("+
+					mySQLIdentifier(column)+")",
+			)
+		}
+	}
+	return statement + " ON DUPLICATE KEY UPDATE " +
 		strings.Join(updates, ", ")
 }
 

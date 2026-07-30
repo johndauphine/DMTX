@@ -79,6 +79,18 @@ func TestParseMariaDBCatalogDefaultReconstructsSafeScalars(t *testing.T) {
 			wantLiteral: "0",
 		},
 		{
+			name: "BLOB hex literal",
+			column: Column{
+				Name:         "payload",
+				Type:         "blob",
+				DeclaredType: &DeclaredType{Base: "longblob"},
+			},
+			catalog:     "X'00fF'",
+			wantSQL:     "X'00ff'",
+			wantKind:    expressionBlob,
+			wantLiteral: "00ff",
+		},
+		{
 			name:     "current date function",
 			column:   Column{Name: "occurred_on", Type: "date"},
 			catalog:  "curdate()",
@@ -225,6 +237,27 @@ func TestParseMariaDBCatalogDefaultFailsClosed(t *testing.T) {
 			name:    "arbitrary function",
 			column:  Column{Name: "created_at", Type: "timestamp"},
 			catalog: "now()",
+		},
+		{
+			name: "lossy VARBINARY catalog literal",
+			column: Column{
+				Name: "payload",
+				Type: "blob",
+				DeclaredType: &DeclaredType{
+					Base:      "varbinary",
+					Arguments: []int{16},
+				},
+			},
+			catalog: `'\\0?'`,
+		},
+		{
+			name: "malformed BLOB hex literal",
+			column: Column{
+				Name:         "payload",
+				Type:         "blob",
+				DeclaredType: &DeclaredType{Base: "longblob"},
+			},
+			catalog: "X'0xz1'",
 		},
 		{
 			name:    "unsupported type",

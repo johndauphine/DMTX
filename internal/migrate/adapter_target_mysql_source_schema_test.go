@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/johndauphine/dmtx/internal/engine"
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
@@ -79,7 +80,11 @@ func TestProjectPostgresTableForMySQLPreservesCommonShape(t *testing.T) {
 		}},
 	}
 
-	got, err := projectMySQLTargetTable("postgres", source)
+	got, err := projectMySQLTargetTable(
+		"postgres",
+		source,
+		engine.MySQLServerFlavorOracle80,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +159,11 @@ func TestProjectPostgresTableForMySQLNormalizesForeignKeyMatch(t *testing.T) {
 			Match:             "SIMPLE",
 		}},
 	}
-	got, err := projectMySQLTargetTable("postgres", source)
+	got, err := projectMySQLTargetTable(
+		"postgres",
+		source,
+		engine.MySQLServerFlavorOracle80,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,10 +230,14 @@ func TestProjectPostgresTableForMySQLFailsClosed(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := projectMySQLTargetTable("postgres", schema.Table{
-				Name:    "items",
-				Columns: []schema.Column{test.column},
-			})
+			_, err := projectMySQLTargetTable(
+				"postgres",
+				schema.Table{
+					Name:    "items",
+					Columns: []schema.Column{test.column},
+				},
+				engine.MySQLServerFlavorOracle80,
+			)
 			var policy *schema.PolicyError
 			if !errors.As(err, &policy) ||
 				policy.Target != string(schema.MySQL) {
@@ -253,7 +266,12 @@ func TestProjectMySQLTargetTableClonesSourceMetadata(t *testing.T) {
 			Columns: []schema.IndexColumn{{Name: "id"}},
 		}},
 	}
-	got, err := projectMySQLTargetTable("mysql", source)
+	source.MySQLCollation = "utf8mb4_0900_bin"
+	got, err := projectMySQLTargetTable(
+		"mysql",
+		source,
+		engine.MySQLServerFlavorOracle80,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,5 +282,82 @@ func TestProjectMySQLTargetTableClonesSourceMetadata(t *testing.T) {
 		source.Indexes[0].Columns[0].Name != "id" ||
 		*source.Identity.Frontier != 9 {
 		t.Fatalf("projection mutated source metadata: %#v", source)
+	}
+}
+
+func TestProjectMySQLTargetTablePinsFlavorCollation(t *testing.T) {
+	mysqlSource := schema.Table{
+		Name:           "items",
+		MySQLCollation: "utf8mb4_nopad_bin",
+		Columns:        []schema.Column{{Name: "id", Type: "bigint"}},
+	}
+	maria, err := projectMySQLTargetTable(
+		"mysql",
+		mysqlSource,
+		engine.MySQLServerFlavorMariaDB1011,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if maria.MySQLCollation != "utf8mb4_nopad_bin" {
+		t.Fatalf("MariaDB collation = %q", maria.MySQLCollation)
+	}
+
+	postgresSource := schema.Table{
+		Name:    "items",
+		Columns: []schema.Column{{Name: "id", Type: "bigint"}},
+	}
+	maria, err = projectMySQLTargetTable(
+		"postgres",
+		postgresSource,
+		engine.MySQLServerFlavorMariaDB1011,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if maria.MySQLCollation != "utf8mb4_nopad_bin" {
+		t.Fatalf(
+			"PostgreSQL-to-MariaDB collation = %q",
+			maria.MySQLCollation,
+		)
+	}
+}
+
+func TestProjectMySQLTargetTableRejectsCrossFlavorCollation(t *testing.T) {
+	tests := []struct {
+		name      string
+		collation string
+		target    engine.MySQLServerFlavor
+	}{
+		{
+			name:      "MariaDB source into Oracle target",
+			collation: "utf8mb4_nopad_bin",
+			target:    engine.MySQLServerFlavorOracle80,
+		},
+		{
+			name:      "Oracle source into MariaDB target",
+			collation: "utf8mb4_0900_bin",
+			target:    engine.MySQLServerFlavorMariaDB1011,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := projectMySQLTargetTable(
+				"mysql",
+				schema.Table{
+					Name:           "items",
+					MySQLCollation: test.collation,
+					Columns: []schema.Column{{
+						Name: "id",
+						Type: "bigint",
+					}},
+				},
+				test.target,
+			)
+			var policy *schema.PolicyError
+			if !errors.As(err, &policy) {
+				t.Fatalf("error = %v, want policy error", err)
+			}
+		})
 	}
 }

@@ -18,38 +18,97 @@ import (
 )
 
 func TestMySQLToMySQLCommonFixtureLive(t *testing.T) {
-	sourceDSN := os.Getenv("DMTX_TEST_MYSQL_DSN")
-	targetDSN := os.Getenv("DMTX_TEST_MYSQL_TARGET_DSN")
-	caPath := os.Getenv("DMTX_TEST_MYSQL_CA")
+	testMySQLFamilyNativeCommonFixtureLive(t, mysqlNativeLiveFixture{
+		name:        "MySQL",
+		sourceEnv:   "DMTX_TEST_MYSQL_DSN",
+		targetEnv:   "DMTX_TEST_MYSQL_TARGET_DSN",
+		caEnv:       "DMTX_TEST_MYSQL_CA",
+		tlsConfig:   "dmtx_test",
+		namePrefix:  "dmtx_mm_",
+		collation:   "utf8mb4_0900_bin",
+		refreshInfo: true,
+	})
+}
+
+func TestMariaDBToMariaDBCommonFixtureLive(t *testing.T) {
+	testMySQLFamilyNativeCommonFixtureLive(t, mysqlNativeLiveFixture{
+		name:       "MariaDB",
+		sourceEnv:  "DMTX_TEST_MARIADB_DSN",
+		targetEnv:  "DMTX_TEST_MARIADB_TARGET_DSN",
+		caEnv:      "DMTX_TEST_MARIADB_CA",
+		tlsConfig:  "dmtx_mariadb_test",
+		namePrefix: "dmtx_maria_mm_",
+		collation:  "utf8mb4_nopad_bin",
+	})
+}
+
+type mysqlNativeLiveFixture struct {
+	name        string
+	sourceEnv   string
+	targetEnv   string
+	caEnv       string
+	tlsConfig   string
+	namePrefix  string
+	collation   string
+	refreshInfo bool
+}
+
+func testMySQLFamilyNativeCommonFixtureLive(
+	t *testing.T,
+	fixture mysqlNativeLiveFixture,
+) {
+	t.Helper()
+	sourceDSN := os.Getenv(fixture.sourceEnv)
+	targetDSN := os.Getenv(fixture.targetEnv)
+	caPath := os.Getenv(fixture.caEnv)
 	if sourceDSN == "" || targetDSN == "" || caPath == "" {
 		t.Skip(
-			"set DMTX_TEST_MYSQL_DSN, DMTX_TEST_MYSQL_TARGET_DSN, and DMTX_TEST_MYSQL_CA to run the MySQL-to-MySQL common fixture",
+			"set " + fixture.sourceEnv + ", " + fixture.targetEnv +
+				", and " + fixture.caEnv + " to run the " +
+				fixture.name + "-to-" + fixture.name +
+				" common fixture",
 		)
 	}
-	registerMySQLCommonFixtureTLS(t, caPath)
-	sourceConfig := parseMySQLNativeTargetDSN(t, "source", sourceDSN)
-	targetConfig := parseMySQLNativeTargetDSN(t, "target", targetDSN)
+	registerMySQLCommonFixtureTLSNamed(t, caPath, fixture.tlsConfig)
+	sourceConfig := parseMySQLNativeTargetDSNForTLS(
+		t,
+		"source",
+		sourceDSN,
+		fixture.tlsConfig,
+	)
+	targetConfig := parseMySQLNativeTargetDSNForTLS(
+		t,
+		"target",
+		targetDSN,
+		fixture.tlsConfig,
+	)
 	if sourceConfig.DBName == targetConfig.DBName &&
 		sourceConfig.Addr == targetConfig.Addr {
-		t.Fatal("MySQL common fixture requires distinct source and target databases")
+		t.Fatalf(
+			"%s common fixture requires distinct source and target databases",
+			fixture.name,
+		)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	sourceDatabase := openMySQLNativeLiveDatabase(
+	sourceDatabase := openMySQLNativeLiveDatabaseForFlavor(
 		t,
 		ctx,
 		"source",
 		sourceDSN,
+		fixture.refreshInfo,
 	)
-	targetDatabase := openMySQLNativeLiveDatabase(
+	targetDatabase := openMySQLNativeLiveDatabaseForFlavor(
 		t,
 		ctx,
 		"target",
 		targetDSN,
+		fixture.refreshInfo,
 	)
 
-	prefix := "dmtx_mm_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	prefix := fixture.namePrefix +
+		strconv.FormatInt(time.Now().UnixNano(), 36)
 	accountsName := prefix + "_accounts"
 	eventsName := prefix + "_events"
 	cleanupMySQLNativeTables(
@@ -71,13 +130,14 @@ func TestMySQLToMySQLCommonFixtureLive(t *testing.T) {
 		accountsName,
 		eventsName,
 	)
-	createMySQLCommonFixture(
+	createMySQLCommonFixtureWithCollation(
 		t,
 		ctx,
 		sourceDatabase,
 		prefix,
 		accountsName,
 		eventsName,
+		fixture.collation,
 	)
 	insertMySQLCommonFixtureRows(
 		t,
@@ -110,11 +170,18 @@ func TestMySQLToMySQLCommonFixtureLive(t *testing.T) {
 		nil,
 	)
 	if err != nil {
-		t.Fatalf("migrate MySQL common fixture into MySQL: %v", err)
+		t.Fatalf(
+			"migrate %s common fixture into %s: %v",
+			fixture.name,
+			fixture.name,
+			err,
+		)
 	}
 	if result.Tables != 2 || result.Rows != 4 || !result.Validated {
 		t.Fatalf(
-			"MySQL-to-MySQL common-fixture result = %+v, want 2 tables, 4 rows, validated",
+			"%s-to-%s common-fixture result = %+v, want 2 tables, 4 rows, validated",
+			fixture.name,
+			fixture.name,
 			result,
 		)
 	}
@@ -158,13 +225,20 @@ func TestMySQLToMySQLCommonFixtureLive(t *testing.T) {
 		nil,
 	)
 	if err != nil {
-		t.Fatalf("upsert MySQL common fixture into MySQL: %v", err)
+		t.Fatalf(
+			"upsert %s common fixture into %s: %v",
+			fixture.name,
+			fixture.name,
+			err,
+		)
 	}
 	if upsertResult.Tables != 2 ||
 		upsertResult.Rows != 6 ||
 		!upsertResult.Validated {
 		t.Fatalf(
-			"MySQL-to-MySQL upsert result = %+v, want 2 tables, 6 rows, validated",
+			"%s-to-%s upsert result = %+v, want 2 tables, 6 rows, validated",
+			fixture.name,
+			fixture.name,
 			upsertResult,
 		)
 	}
@@ -601,12 +675,40 @@ func assertMySQLNativeMismatchPreflight(
 }
 
 func TestPostgresToMySQLCommonFixtureLive(t *testing.T) {
+	testPostgresToMySQLFamilyCommonFixtureLive(t, mysqlNativeLiveFixture{
+		name:        "MySQL",
+		targetEnv:   "DMTX_TEST_MYSQL_TARGET_DSN",
+		caEnv:       "DMTX_TEST_MYSQL_CA",
+		tlsConfig:   "dmtx_test",
+		collation:   "utf8mb4_0900_bin",
+		refreshInfo: true,
+	})
+}
+
+func TestPostgresToMariaDBCommonFixtureLive(t *testing.T) {
+	testPostgresToMySQLFamilyCommonFixtureLive(t, mysqlNativeLiveFixture{
+		name:      "MariaDB",
+		targetEnv: "DMTX_TEST_MARIADB_TARGET_DSN",
+		caEnv:     "DMTX_TEST_MARIADB_CA",
+		tlsConfig: "dmtx_mariadb_test",
+		collation: "utf8mb4_nopad_bin",
+	})
+}
+
+func testPostgresToMySQLFamilyCommonFixtureLive(
+	t *testing.T,
+	targetFixture mysqlNativeLiveFixture,
+) {
+	t.Helper()
 	postgresDSN := os.Getenv("DMTX_TEST_POSTGRES_DSN")
-	targetDSN := os.Getenv("DMTX_TEST_MYSQL_TARGET_DSN")
-	caPath := os.Getenv("DMTX_TEST_MYSQL_CA")
+	targetDSN := os.Getenv(targetFixture.targetEnv)
+	caPath := os.Getenv(targetFixture.caEnv)
 	if postgresDSN == "" || targetDSN == "" || caPath == "" {
 		t.Skip(
-			"set DMTX_TEST_POSTGRES_DSN, DMTX_TEST_MYSQL_TARGET_DSN, and DMTX_TEST_MYSQL_CA to run the PostgreSQL-to-MySQL common fixture",
+			"set DMTX_TEST_POSTGRES_DSN, " +
+				targetFixture.targetEnv + ", and " +
+				targetFixture.caEnv + " to run the PostgreSQL-to-" +
+				targetFixture.name + " common fixture",
 		)
 	}
 	postgresConfig, err := pgx.ParseConfig(postgresDSN)
@@ -616,8 +718,17 @@ func TestPostgresToMySQLCommonFixtureLive(t *testing.T) {
 	if !postgresRouteLiveRequiresTLS(postgresConfig) {
 		t.Fatal("DMTX_TEST_POSTGRES_DSN must require TLS")
 	}
-	registerMySQLCommonFixtureTLS(t, caPath)
-	targetConfig := parseMySQLNativeTargetDSN(t, "target", targetDSN)
+	registerMySQLCommonFixtureTLSNamed(
+		t,
+		caPath,
+		targetFixture.tlsConfig,
+	)
+	targetConfig := parseMySQLNativeTargetDSNForTLS(
+		t,
+		"target",
+		targetDSN,
+		targetFixture.tlsConfig,
+	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -633,11 +744,12 @@ func TestPostgresToMySQLCommonFixtureLive(t *testing.T) {
 	if err := sourceDatabase.PingContext(ctx); err != nil {
 		t.Fatalf("verify PostgreSQL common-fixture source: %T", err)
 	}
-	targetDatabase := openMySQLNativeLiveDatabase(
+	targetDatabase := openMySQLNativeLiveDatabaseForFlavor(
 		t,
 		ctx,
 		"target",
 		targetDSN,
+		targetFixture.refreshInfo,
 	)
 	cleanupMySQLNativeTables(
 		t,
@@ -762,6 +874,17 @@ func TestPostgresToMySQLCommonFixtureLive(t *testing.T) {
 		"accounts",
 		"account_events",
 	)
+	for name, table := range targetMetadata {
+		if table.MySQLCollation != targetFixture.collation {
+			t.Fatalf(
+				"%s target table %s collation = %q, want %q",
+				targetFixture.name,
+				name,
+				table.MySQLCollation,
+				targetFixture.collation,
+			)
+		}
+	}
 	assertPostgresToMySQLCommonMetadata(t, targetMetadata)
 	assertMySQLNativeCommonRows(
 		t,
@@ -821,41 +944,78 @@ func TestPostgresToMySQLCommonFixtureLive(t *testing.T) {
 }
 
 func TestMySQLToMySQLRejectsLiveSameDatabaseAlias(t *testing.T) {
-	sourceDSN := os.Getenv("DMTX_TEST_MYSQL_DSN")
-	caPath := os.Getenv("DMTX_TEST_MYSQL_CA")
+	testMySQLFamilyRejectsLiveSameDatabaseAlias(t, mysqlNativeLiveFixture{
+		name:        "MySQL",
+		sourceEnv:   "DMTX_TEST_MYSQL_DSN",
+		caEnv:       "DMTX_TEST_MYSQL_CA",
+		tlsConfig:   "dmtx_test",
+		namePrefix:  "dmtx_alias_",
+		collation:   "utf8mb4_bin",
+		refreshInfo: true,
+	})
+}
+
+func TestMariaDBToMariaDBRejectsLiveSameDatabaseAlias(t *testing.T) {
+	testMySQLFamilyRejectsLiveSameDatabaseAlias(t, mysqlNativeLiveFixture{
+		name:       "MariaDB",
+		sourceEnv:  "DMTX_TEST_MARIADB_DSN",
+		caEnv:      "DMTX_TEST_MARIADB_CA",
+		tlsConfig:  "dmtx_mariadb_test",
+		namePrefix: "dmtx_maria_alias_",
+		collation:  "utf8mb4_nopad_bin",
+	})
+}
+
+func testMySQLFamilyRejectsLiveSameDatabaseAlias(
+	t *testing.T,
+	fixture mysqlNativeLiveFixture,
+) {
+	t.Helper()
+	sourceDSN := os.Getenv(fixture.sourceEnv)
+	caPath := os.Getenv(fixture.caEnv)
 	if sourceDSN == "" || caPath == "" {
 		t.Skip(
-			"set DMTX_TEST_MYSQL_DSN and DMTX_TEST_MYSQL_CA to run the MySQL same-database alias guard",
+			"set " + fixture.sourceEnv + " and " + fixture.caEnv +
+				" to run the " + fixture.name +
+				" same-database alias guard",
 		)
 	}
-	registerMySQLCommonFixtureTLS(t, caPath)
-	sourceConfig := parseMySQLNativeTargetDSN(t, "source", sourceDSN)
+	registerMySQLCommonFixtureTLSNamed(t, caPath, fixture.tlsConfig)
+	sourceConfig := parseMySQLNativeTargetDSNForTLS(
+		t,
+		"source",
+		sourceDSN,
+		fixture.tlsConfig,
+	)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	database := openMySQLNativeLiveDatabase(
+	database := openMySQLNativeLiveDatabaseForFlavor(
 		t,
 		ctx,
 		"source",
 		sourceDSN,
+		fixture.refreshInfo,
 	)
-	tableName := "dmtx_alias_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	tableName := fixture.namePrefix +
+		strconv.FormatInt(time.Now().UnixNano(), 36)
 	cleanupMySQLNativeTables(t, database, tableName)
 	if _, err := database.ExecContext(
 		ctx,
 		"CREATE TABLE "+mySQLIdentifier(tableName)+
 			" (id BIGINT NOT NULL, payload VARCHAR(24) NOT NULL, "+
 			"PRIMARY KEY (id)) ENGINE=InnoDB "+
-			"DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_bin "+
+			"DEFAULT CHARACTER SET=utf8mb4 COLLATE="+
+			fixture.collation+" "+
 			"ROW_FORMAT=DYNAMIC",
 	); err != nil {
-		t.Fatalf("create MySQL alias-guard source: %v", err)
+		t.Fatalf("create %s alias-guard source: %v", fixture.name, err)
 	}
 	if _, err := database.ExecContext(
 		ctx,
 		"INSERT INTO "+mySQLIdentifier(tableName)+
 			" (id, payload) VALUES (1, 'must remain')",
 	); err != nil {
-		t.Fatalf("insert MySQL alias-guard sentinel: %v", err)
+		t.Fatalf("insert %s alias-guard sentinel: %v", fixture.name, err)
 	}
 
 	sourceEndpoint := mysqlNativeTargetEndpoint(t, sourceConfig, caPath)
@@ -881,7 +1041,8 @@ func TestMySQLToMySQLRejectsLiveSameDatabaseAlias(t *testing.T) {
 	if err == nil ||
 		!strings.Contains(err.Error(), "distinct live source and target") {
 		t.Fatalf(
-			"MySQL same-database alias result = %+v, error = %v",
+			"%s same-database alias result = %+v, error = %v",
+			fixture.name,
 			result,
 			err,
 		)
@@ -892,46 +1053,90 @@ func TestMySQLToMySQLRejectsLiveSameDatabaseAlias(t *testing.T) {
 		ctx,
 		"SELECT payload FROM "+mySQLIdentifier(tableName)+" WHERE id = 1",
 	).Scan(&payload); err != nil {
-		t.Fatalf("read MySQL alias-guard sentinel: %v", err)
+		t.Fatalf("read %s alias-guard sentinel: %v", fixture.name, err)
 	}
 	if payload != "must remain" {
-		t.Fatalf("MySQL alias-guard sentinel = %q", payload)
+		t.Fatalf("%s alias-guard sentinel = %q", fixture.name, payload)
 	}
 }
 
 func TestMySQLTargetDropPreflightLive(t *testing.T) {
-	sourceDSN := os.Getenv("DMTX_TEST_MYSQL_DSN")
-	targetDSN := os.Getenv("DMTX_TEST_MYSQL_TARGET_DSN")
-	caPath := os.Getenv("DMTX_TEST_MYSQL_CA")
+	testMySQLFamilyTargetDropPreflightLive(t, mysqlNativeLiveFixture{
+		name:        "MySQL",
+		sourceEnv:   "DMTX_TEST_MYSQL_DSN",
+		targetEnv:   "DMTX_TEST_MYSQL_TARGET_DSN",
+		caEnv:       "DMTX_TEST_MYSQL_CA",
+		tlsConfig:   "dmtx_test",
+		namePrefix:  "dmtx_mp_",
+		collation:   "utf8mb4_bin",
+		refreshInfo: true,
+	})
+}
+
+func TestMariaDBTargetDropPreflightLive(t *testing.T) {
+	testMySQLFamilyTargetDropPreflightLive(t, mysqlNativeLiveFixture{
+		name:       "MariaDB",
+		sourceEnv:  "DMTX_TEST_MARIADB_DSN",
+		targetEnv:  "DMTX_TEST_MARIADB_TARGET_DSN",
+		caEnv:      "DMTX_TEST_MARIADB_CA",
+		tlsConfig:  "dmtx_mariadb_test",
+		namePrefix: "dmtx_maria_mp_",
+		collation:  "utf8mb4_nopad_bin",
+	})
+}
+
+func testMySQLFamilyTargetDropPreflightLive(
+	t *testing.T,
+	fixture mysqlNativeLiveFixture,
+) {
+	t.Helper()
+	sourceDSN := os.Getenv(fixture.sourceEnv)
+	targetDSN := os.Getenv(fixture.targetEnv)
+	caPath := os.Getenv(fixture.caEnv)
 	if sourceDSN == "" || targetDSN == "" || caPath == "" {
 		t.Skip(
-			"set DMTX_TEST_MYSQL_DSN, DMTX_TEST_MYSQL_TARGET_DSN, and DMTX_TEST_MYSQL_CA to run MySQL target drop preflight tests",
+			"set " + fixture.sourceEnv + ", " + fixture.targetEnv +
+				", and " + fixture.caEnv + " to run " +
+				fixture.name + " target drop preflight tests",
 		)
 	}
-	registerMySQLCommonFixtureTLS(t, caPath)
-	sourceConfig := parseMySQLNativeTargetDSN(t, "source", sourceDSN)
-	targetConfig := parseMySQLNativeTargetDSN(t, "target", targetDSN)
+	registerMySQLCommonFixtureTLSNamed(t, caPath, fixture.tlsConfig)
+	sourceConfig := parseMySQLNativeTargetDSNForTLS(
+		t,
+		"source",
+		sourceDSN,
+		fixture.tlsConfig,
+	)
+	targetConfig := parseMySQLNativeTargetDSNForTLS(
+		t,
+		"target",
+		targetDSN,
+		fixture.tlsConfig,
+	)
 	if sourceConfig.DBName == targetConfig.DBName &&
 		sourceConfig.Addr == targetConfig.Addr {
 		t.Fatal("MySQL target preflight requires distinct source and target databases")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	sourceDatabase := openMySQLNativeLiveDatabase(
+	sourceDatabase := openMySQLNativeLiveDatabaseForFlavor(
 		t,
 		ctx,
 		"source",
 		sourceDSN,
+		fixture.refreshInfo,
 	)
-	targetDatabase := openMySQLNativeLiveDatabase(
+	targetDatabase := openMySQLNativeLiveDatabaseForFlavor(
 		t,
 		ctx,
 		"target",
 		targetDSN,
+		fixture.refreshInfo,
 	)
 	sourceEndpoint := mysqlNativeTargetEndpoint(t, sourceConfig, caPath)
 	targetEndpoint := mysqlNativeTargetEndpoint(t, targetConfig, caPath)
-	prefix := "dmtx_mp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	prefix := fixture.namePrefix +
+		strconv.FormatInt(time.Now().UnixNano(), 36)
 
 	t.Run("selected target name occupied by view", func(t *testing.T) {
 		tableName := prefix + "_view_target"
@@ -944,6 +1149,7 @@ func TestMySQLTargetDropPreflightLive(t *testing.T) {
 			sourceDatabase,
 			tableName,
 			checkName,
+			fixture.collation,
 		)
 		if _, err := targetDatabase.ExecContext(
 			ctx,
@@ -990,6 +1196,181 @@ func TestMySQLTargetDropPreflightLive(t *testing.T) {
 		}
 	})
 
+	t.Run("external view depends on selected target", func(t *testing.T) {
+		tableName := prefix + "_view_base"
+		viewName := prefix + "_dependent_view"
+		checkName := prefix + "_view_base_check"
+		cleanupMySQLNativeTables(t, sourceDatabase, tableName)
+		cleanupMySQLNativeRelations(
+			t,
+			targetDatabase,
+			viewName,
+			tableName,
+		)
+		createMySQLNativePreflightSource(
+			t,
+			ctx,
+			sourceDatabase,
+			tableName,
+			checkName,
+			fixture.collation,
+		)
+		if _, err := targetDatabase.ExecContext(
+			ctx,
+			"CREATE TABLE "+mySQLIdentifier(tableName)+
+				" (id BIGINT NOT NULL, balance DECIMAL(12,2) NOT NULL, "+
+				"PRIMARY KEY (id)) ENGINE=InnoDB "+
+				"DEFAULT CHARACTER SET=utf8mb4 COLLATE="+
+				fixture.collation+" ROW_FORMAT=DYNAMIC",
+		); err != nil {
+			t.Fatalf("create target table behind dependent view: %v", err)
+		}
+		if _, err := targetDatabase.ExecContext(
+			ctx,
+			"INSERT INTO "+mySQLIdentifier(tableName)+
+				" (id, balance) VALUES (71, 1.00)",
+		); err != nil {
+			t.Fatalf("insert dependent-view target sentinel: %v", err)
+		}
+		if _, err := targetDatabase.ExecContext(
+			ctx,
+			"CREATE VIEW "+mySQLIdentifier(viewName)+" AS SELECT id "+
+				"FROM "+mySQLIdentifier(tableName),
+		); err != nil {
+			t.Fatalf("create dependent target view: %v", err)
+		}
+
+		observer := &mysqlNativePreflightObserver{}
+		result, err := MySQLToMySQLWithObserver(
+			ctx,
+			config.Config{
+				Source: sourceEndpoint,
+				Target: targetEndpoint,
+				Migration: config.Migration{
+					TargetMode:    "drop_recreate",
+					IncludeTables: []string{tableName},
+				},
+			},
+			observer,
+		)
+		if err == nil ||
+			!strings.Contains(
+				err.Error(),
+				"depends on the selected target",
+			) {
+			t.Fatalf(
+				"MySQL dependent-view preflight result = %+v, error = %v",
+				result,
+				err,
+			)
+		}
+		assertMySQLNativePreflightDidNotMutate(t, result, observer)
+		var sentinel int
+		if err := targetDatabase.QueryRowContext(
+			ctx,
+			"SELECT id FROM "+mySQLIdentifier(viewName),
+		).Scan(&sentinel); err != nil {
+			t.Fatalf("read retained dependent target view: %v", err)
+		}
+		if sentinel != 71 {
+			t.Fatalf("retained dependent target view value = %d", sentinel)
+		}
+	})
+
+	t.Run("cross-database view depends on selected target", func(t *testing.T) {
+		tableName := prefix + "_cross_db_view_base"
+		viewName := prefix + "_cross_db_dependent_view"
+		checkName := prefix + "_cross_db_view_check"
+		cleanupMySQLNativeRelations(
+			t,
+			sourceDatabase,
+			viewName,
+			tableName,
+		)
+		cleanupMySQLNativeRelations(t, targetDatabase, tableName)
+		createMySQLNativePreflightSource(
+			t,
+			ctx,
+			sourceDatabase,
+			tableName,
+			checkName,
+			fixture.collation,
+		)
+		if _, err := targetDatabase.ExecContext(
+			ctx,
+			"CREATE TABLE "+mySQLIdentifier(tableName)+
+				" (id BIGINT NOT NULL, balance DECIMAL(12,2) NOT NULL, "+
+				"PRIMARY KEY (id)) ENGINE=InnoDB "+
+				"DEFAULT CHARACTER SET=utf8mb4 COLLATE="+
+				fixture.collation+" ROW_FORMAT=DYNAMIC",
+		); err != nil {
+			t.Fatalf(
+				"create target table behind cross-database view: %v",
+				err,
+			)
+		}
+		if _, err := targetDatabase.ExecContext(
+			ctx,
+			"INSERT INTO "+mySQLIdentifier(tableName)+
+				" (id, balance) VALUES (72, 1.00)",
+		); err != nil {
+			t.Fatalf(
+				"insert cross-database-view target sentinel: %v",
+				err,
+			)
+		}
+		if _, err := sourceDatabase.ExecContext(
+			ctx,
+			"CREATE VIEW "+mySQLIdentifier(viewName)+" AS SELECT id FROM "+
+				mySQLIdentifier(targetConfig.DBName)+"."+
+				mySQLIdentifier(tableName),
+		); err != nil {
+			t.Fatalf("create cross-database dependent view: %v", err)
+		}
+
+		observer := &mysqlNativePreflightObserver{}
+		result, err := MySQLToMySQLWithObserver(
+			ctx,
+			config.Config{
+				Source: sourceEndpoint,
+				Target: targetEndpoint,
+				Migration: config.Migration{
+					TargetMode:    "drop_recreate",
+					IncludeTables: []string{tableName},
+				},
+			},
+			observer,
+		)
+		if err == nil ||
+			!strings.Contains(
+				err.Error(),
+				"depends on the selected target",
+			) {
+			t.Fatalf(
+				"MySQL cross-database dependent-view preflight result = %+v, error = %v",
+				result,
+				err,
+			)
+		}
+		assertMySQLNativePreflightDidNotMutate(t, result, observer)
+		var sentinel int
+		if err := sourceDatabase.QueryRowContext(
+			ctx,
+			"SELECT id FROM "+mySQLIdentifier(viewName),
+		).Scan(&sentinel); err != nil {
+			t.Fatalf(
+				"read retained cross-database dependent view: %v",
+				err,
+			)
+		}
+		if sentinel != 72 {
+			t.Fatalf(
+				"retained cross-database dependent view value = %d",
+				sentinel,
+			)
+		}
+	})
+
 	t.Run("case variant constraint collision", func(t *testing.T) {
 		tableName := prefix + "_collision_target"
 		guardName := prefix + "_collision_guard"
@@ -1007,6 +1388,7 @@ func TestMySQLTargetDropPreflightLive(t *testing.T) {
 			sourceDatabase,
 			tableName,
 			checkName,
+			fixture.collation,
 		)
 		if _, err := targetDatabase.ExecContext(
 			ctx,
@@ -1015,7 +1397,8 @@ func TestMySQLTargetDropPreflightLive(t *testing.T) {
 				"PRIMARY KEY (id), CONSTRAINT "+
 				mySQLIdentifier(strings.ToUpper(checkName))+
 				" CHECK (balance >= 0)) ENGINE=InnoDB "+
-				"DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_bin "+
+				"DEFAULT CHARACTER SET=utf8mb4 COLLATE="+
+				fixture.collation+" "+
 				"ROW_FORMAT=DYNAMIC",
 		); err != nil {
 			t.Fatalf("create MySQL constraint collision guard: %v", err)
@@ -1075,6 +1458,7 @@ func createMySQLNativePreflightSource(
 	database *sql.DB,
 	tableName string,
 	checkName string,
+	collation string,
 ) {
 	t.Helper()
 	if _, err := database.ExecContext(
@@ -1083,7 +1467,7 @@ func createMySQLNativePreflightSource(
 			" (id BIGINT NOT NULL, balance DECIMAL(12,2) NOT NULL DEFAULT 0.00, "+
 			"PRIMARY KEY (id), CONSTRAINT "+mySQLIdentifier(checkName)+
 			" CHECK (balance >= 0)) ENGINE=InnoDB "+
-			"DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_bin "+
+			"DEFAULT CHARACTER SET=utf8mb4 COLLATE="+collation+" "+
 			"ROW_FORMAT=DYNAMIC",
 	); err != nil {
 		t.Fatalf("create MySQL preflight source table: %v", err)
@@ -1170,6 +1554,20 @@ func parseMySQLNativeTargetDSN(
 	role string,
 	dsn string,
 ) *mysqlDriver.Config {
+	return parseMySQLNativeTargetDSNForTLS(
+		t,
+		role,
+		dsn,
+		"dmtx_test",
+	)
+}
+
+func parseMySQLNativeTargetDSNForTLS(
+	t *testing.T,
+	role string,
+	dsn string,
+	tlsConfig string,
+) *mysqlDriver.Config {
 	t.Helper()
 	parsed, err := mysqlDriver.ParseDSN(dsn)
 	if err != nil {
@@ -1178,7 +1576,7 @@ func parseMySQLNativeTargetDSN(
 	if parsed.Net != "tcp" || parsed.Addr == "" || parsed.DBName == "" {
 		t.Fatalf("MySQL %s DSN must select one TCP database", role)
 	}
-	if parsed.TLSConfig != "dmtx_test" && parsed.TLSConfig != "true" {
+	if parsed.TLSConfig != tlsConfig && parsed.TLSConfig != "true" {
 		t.Fatalf("MySQL %s DSN must require verified TLS", role)
 	}
 	return parsed
@@ -1217,6 +1615,22 @@ func openMySQLNativeLiveDatabase(
 	role string,
 	dsn string,
 ) *sql.DB {
+	return openMySQLNativeLiveDatabaseForFlavor(
+		t,
+		ctx,
+		role,
+		dsn,
+		true,
+	)
+}
+
+func openMySQLNativeLiveDatabaseForFlavor(
+	t *testing.T,
+	ctx context.Context,
+	role string,
+	dsn string,
+	refreshInformationSchemaStatistics bool,
+) *sql.DB {
 	t.Helper()
 	database, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -1232,15 +1646,17 @@ func openMySQLNativeLiveDatabase(
 	if err := database.PingContext(ctx); err != nil {
 		t.Fatalf("verify MySQL %s database: %T", role, err)
 	}
-	if _, err := database.ExecContext(
-		ctx,
-		"SET SESSION information_schema_stats_expiry = 0",
-	); err != nil {
-		t.Fatalf(
-			"configure fresh MySQL %s catalog statistics: %v",
-			role,
-			err,
-		)
+	if refreshInformationSchemaStatistics {
+		if _, err := database.ExecContext(
+			ctx,
+			"SET SESSION information_schema_stats_expiry = 0",
+		); err != nil {
+			t.Fatalf(
+				"configure fresh MySQL %s catalog statistics: %v",
+				role,
+				err,
+			)
+		}
 	}
 	return database
 }
@@ -1301,6 +1717,14 @@ func assertMySQLNativeExactMetadata(
 				"MySQL table names differ: source=%q target=%q",
 				sourceTable.Name,
 				targetTable.Name,
+			)
+		}
+		if sourceTable.MySQLCollation != targetTable.MySQLCollation {
+			t.Fatalf(
+				"MySQL table %s collations differ: source=%q target=%q",
+				name,
+				sourceTable.MySQLCollation,
+				targetTable.MySQLCollation,
 			)
 		}
 		if !reflect.DeepEqual(sourceTable.Identity, targetTable.Identity) {
