@@ -22,6 +22,11 @@ func TestMySQLReadQueryProjectsTemporalColumnsAsRawText(t *testing.T) {
 		Columns: []schema.Column{
 			{Name: "id", Type: "bigint", PrimaryKey: true},
 			{Name: "event`date", Type: "date"},
+			{
+				Name:         "local_time",
+				Type:         "time",
+				DeclaredType: &schema.DeclaredType{Base: "time", Arguments: []int{6}},
+			},
 			{Name: "occurred_at", Type: "datetime"},
 			{Name: "updated_at", Type: "timestamp"},
 			{Name: "payload", Type: "text"},
@@ -33,6 +38,7 @@ func TestMySQLReadQueryProjectsTemporalColumnsAsRawText(t *testing.T) {
 		[]string{
 			"id",
 			"event`date",
+			"local_time",
 			"occurred_at",
 			"updated_at",
 			"payload",
@@ -40,6 +46,7 @@ func TestMySQLReadQueryProjectsTemporalColumnsAsRawText(t *testing.T) {
 	)
 	want := "SELECT `id`, " +
 		"CAST(`event``date` AS CHAR) AS `event``date`, " +
+		"CAST(`local_time` AS CHAR) AS `local_time`, " +
 		"CAST(`occurred_at` AS CHAR) AS `occurred_at`, " +
 		"CAST(`updated_at` AS CHAR) AS `updated_at`, `payload` " +
 		"FROM `crm`.`event``data` ORDER BY `id`"

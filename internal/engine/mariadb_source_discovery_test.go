@@ -292,6 +292,46 @@ func TestMariaDB1011SourceColumnAcceptsExactIntegerDisplayWidths(
 	}
 }
 
+func TestMariaDB1011SourceColumnPreservesExactTimePrecision(
+	t *testing.T,
+) {
+	tests := []struct {
+		columnType string
+		precision  int64
+	}{
+		{columnType: "time", precision: 0},
+		{columnType: "time(6)", precision: 6},
+	}
+	for _, test := range tests {
+		t.Run(test.columnType, func(t *testing.T) {
+			catalog := baseMariaDB1011ColumnCatalog(
+				"local_time",
+				"time",
+				test.columnType,
+			)
+			catalog.datetimePrecision = sql.NullInt64{
+				Int64: test.precision,
+				Valid: true,
+			}
+			column, _, err := mariaDB1011SourceColumnFromCatalog(
+				catalog,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if column.Type != "time" ||
+				column.DeclaredType == nil ||
+				column.DeclaredType.Base != "time" ||
+				!equalInts(
+					column.DeclaredType.Arguments,
+					[]int{int(test.precision)},
+				) {
+				t.Fatalf("TIME column = %#v", column)
+			}
+		})
+	}
+}
+
 func TestMariaDB1011SourceColumnFailsClosedOnFlavorShapes(
 	t *testing.T,
 ) {

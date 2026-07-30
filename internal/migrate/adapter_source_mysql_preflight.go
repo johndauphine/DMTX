@@ -96,6 +96,18 @@ func planMySQLSourceValueChecks(
 						identifier + "))" +
 						"))",
 				})
+			case "time":
+				checks = append(checks, mySQLSourceValueCheck{
+					table:  table.Name,
+					column: column.Name,
+					kind:   "TIME clock",
+					query: "SELECT EXISTS (" +
+						"SELECT 1 FROM " + qualified +
+						" WHERE " + identifier + " IS NOT NULL" +
+						" AND (TIME_TO_SEC(" + identifier + ") < 0" +
+						" OR TIME_TO_SEC(" + identifier +
+						") >= 86400))",
+				})
 			case "json":
 				checks = append(checks, mySQLSourceValueCheck{
 					table:  table.Name,

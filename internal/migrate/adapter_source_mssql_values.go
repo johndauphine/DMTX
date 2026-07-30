@@ -4,15 +4,20 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
-// sqlServerSourceRows converts the two raw byte representations exposed by
-// go-mssqldb that are not safe to pass through database/sql unchanged.
+// sqlServerSourceRows converts the raw representations exposed by go-mssqldb
+// that are not safe to pass through database/sql unchanged.
 // DECIMAL/NUMERIC bytes would otherwise be bound as VARBINARY by a target
 // driver, and UNIQUEIDENTIFIER bytes need an explicit canonical UUID
-// representation. Every conversion is validated against discovered metadata.
+// representation. SQL Server TIME is decoded as a year-one time.Time, which
+// network target drivers can misinterpret as a datetime, so it is emitted as
+// exact clock text. DATE and DATETIME values retain time.Time after their
+// driver shape and declared precision are validated. Every conversion is
+// validated against discovered metadata.
 type sqlServerSourceRows struct {
 	adapterRows
 	columns []sqlServerSourceValueColumn
@@ -24,15 +29,19 @@ const (
 	sqlServerSourceValueInvalid sqlServerSourceValueKind = iota
 	sqlServerSourceValueNumeric
 	sqlServerSourceValueUUID
+	sqlServerSourceValueDate
+	sqlServerSourceValueTime
+	sqlServerSourceValueDateTime
 )
 
 type sqlServerSourceValueColumn struct {
-	index     int
-	name      string
-	kind      sqlServerSourceValueKind
-	precision int
-	scale     int
-	reason    string
+	index        int
+	name         string
+	kind         sqlServerSourceValueKind
+	precision    int
+	scale        int
+	declaredBase string
+	reason       string
 }
 
 func wrapSQLServerSourceRows(
@@ -62,6 +71,15 @@ func wrapSQLServerSourceRows(
 			converted = append(converted, value)
 		case "uuid":
 			value := sqlServerUUIDSourceColumn(index, column)
+			converted = append(converted, value)
+		case "date":
+			value := sqlServerDateSourceColumn(index, column)
+			converted = append(converted, value)
+		case "time":
+			value := sqlServerTimeSourceColumn(index, column)
+			converted = append(converted, value)
+		case "datetime":
+			value := sqlServerDateTimeSourceColumn(index, column)
 			converted = append(converted, value)
 		}
 	}
@@ -123,6 +141,86 @@ func sqlServerUUIDSourceColumn(
 	return value
 }
 
+func sqlServerDateSourceColumn(
+	index int,
+	column schema.Column,
+) sqlServerSourceValueColumn {
+	value := sqlServerSourceValueColumn{
+		index: index,
+		name:  column.Name,
+		kind:  sqlServerSourceValueInvalid,
+	}
+	if column.DeclaredType == nil ||
+		strings.ToLower(strings.TrimSpace(column.DeclaredType.Base)) != "date" ||
+		len(column.DeclaredType.Arguments) != 0 {
+		value.reason = "date declaration is invalid"
+		return value
+	}
+	value.kind = sqlServerSourceValueDate
+	return value
+}
+
+func sqlServerTimeSourceColumn(
+	index int,
+	column schema.Column,
+) sqlServerSourceValueColumn {
+	value := sqlServerSourceValueColumn{
+		index: index,
+		name:  column.Name,
+		kind:  sqlServerSourceValueInvalid,
+	}
+	if column.DeclaredType == nil ||
+		strings.ToLower(strings.TrimSpace(column.DeclaredType.Base)) != "time" ||
+		len(column.DeclaredType.Arguments) != 1 ||
+		column.DeclaredType.Arguments[0] < 0 ||
+		column.DeclaredType.Arguments[0] > 6 {
+		value.reason = "time declaration is invalid"
+		return value
+	}
+	value.kind = sqlServerSourceValueTime
+	value.scale = column.DeclaredType.Arguments[0]
+	return value
+}
+
+func sqlServerDateTimeSourceColumn(
+	index int,
+	column schema.Column,
+) sqlServerSourceValueColumn {
+	value := sqlServerSourceValueColumn{
+		index: index,
+		name:  column.Name,
+		kind:  sqlServerSourceValueInvalid,
+	}
+	if column.DeclaredType == nil {
+		value.reason = "datetime declaration is missing"
+		return value
+	}
+	base := strings.ToLower(strings.TrimSpace(column.DeclaredType.Base))
+	arguments := column.DeclaredType.Arguments
+	switch base {
+	case "timestamp":
+		if len(arguments) != 1 ||
+			arguments[0] < 0 ||
+			arguments[0] > 6 {
+			value.reason = "datetime declaration is invalid"
+			return value
+		}
+		value.scale = arguments[0]
+	case "smalldatetime":
+		if len(arguments) != 0 {
+			value.reason = "datetime declaration is invalid"
+			return value
+		}
+		value.scale = 0
+	default:
+		value.reason = "datetime declaration is invalid"
+		return value
+	}
+	value.kind = sqlServerSourceValueDateTime
+	value.declaredBase = base
+	return value
+}
+
 func (rows *sqlServerSourceRows) Scan(destinations ...any) error {
 	if err := rows.adapterRows.Scan(destinations...); err != nil {
 		return err
@@ -160,15 +258,15 @@ func normalizeSQLServerSourceValue(
 	if value == nil {
 		return nil, nil
 	}
-	raw, ok := value.([]byte)
-	if !ok {
-		return nil, sqlServerSourceValueError(
-			column,
-			"driver returned an unexpected value shape",
-		)
-	}
 	switch column.kind {
 	case sqlServerSourceValueNumeric:
+		raw, ok := value.([]byte)
+		if !ok {
+			return nil, sqlServerSourceValueError(
+				column,
+				"driver returned an unexpected value shape",
+			)
+		}
 		text := string(raw)
 		if !validSQLServerSourceNumeric(
 			text,
@@ -182,6 +280,13 @@ func normalizeSQLServerSourceValue(
 		}
 		return text, nil
 	case sqlServerSourceValueUUID:
+		raw, ok := value.([]byte)
+		if !ok {
+			return nil, sqlServerSourceValueError(
+				column,
+				"driver returned an unexpected value shape",
+			)
+		}
 		if len(raw) != 16 {
 			return nil, sqlServerSourceValueError(
 				column,
@@ -189,12 +294,120 @@ func normalizeSQLServerSourceValue(
 			)
 		}
 		return canonicalSQLServerSourceUUID(raw), nil
+	case sqlServerSourceValueDate:
+		temporal, ok := sqlServerSourceTemporal(value)
+		if !ok ||
+			temporal.Hour() != 0 ||
+			temporal.Minute() != 0 ||
+			temporal.Second() != 0 ||
+			temporal.Nanosecond() != 0 {
+			return nil, sqlServerSourceValueError(
+				column,
+				"driver returned an invalid date",
+			)
+		}
+		return canonicalSQLServerSourceTemporal(temporal), nil
+	case sqlServerSourceValueTime:
+		temporal, ok := sqlServerSourceTemporal(value)
+		if !ok ||
+			temporal.Year() != 1 ||
+			temporal.Month() != time.January ||
+			temporal.Day() != 1 ||
+			!validSQLServerSourceTemporalPrecision(
+				temporal.Nanosecond(),
+				column.scale,
+			) {
+			return nil, sqlServerSourceValueError(
+				column,
+				"driver returned an invalid time",
+			)
+		}
+		return canonicalSQLServerSourceTime(temporal, column.scale), nil
+	case sqlServerSourceValueDateTime:
+		temporal, ok := sqlServerSourceTemporal(value)
+		if !ok ||
+			!validSQLServerSourceTemporalPrecision(
+				temporal.Nanosecond(),
+				column.scale,
+			) ||
+			column.declaredBase == "smalldatetime" &&
+				(temporal.Second() != 0 || temporal.Nanosecond() != 0) {
+			return nil, sqlServerSourceValueError(
+				column,
+				"driver returned an invalid datetime",
+			)
+		}
+		return canonicalSQLServerSourceTemporal(temporal), nil
 	default:
 		return nil, sqlServerSourceValueError(
 			column,
 			"unsupported value conversion",
 		)
 	}
+}
+
+func sqlServerSourceTemporal(value any) (time.Time, bool) {
+	temporal, ok := value.(time.Time)
+	if !ok || temporal.Year() < 1 || temporal.Year() > 9999 {
+		return time.Time{}, false
+	}
+	_, offset := temporal.Zone()
+	if offset != 0 {
+		return time.Time{}, false
+	}
+	return temporal, true
+}
+
+func canonicalSQLServerSourceTemporal(value time.Time) time.Time {
+	return time.Date(
+		value.Year(),
+		value.Month(),
+		value.Day(),
+		value.Hour(),
+		value.Minute(),
+		value.Second(),
+		value.Nanosecond(),
+		time.UTC,
+	)
+}
+
+func validSQLServerSourceTemporalPrecision(
+	nanosecond int,
+	scale int,
+) bool {
+	if nanosecond < 0 || nanosecond >= int(time.Second) ||
+		scale < 0 || scale > 6 {
+		return false
+	}
+	unit := 1
+	for digits := scale; digits < 9; digits++ {
+		unit *= 10
+	}
+	return nanosecond%unit == 0
+}
+
+func canonicalSQLServerSourceTime(
+	value time.Time,
+	scale int,
+) string {
+	result := fmt.Sprintf(
+		"%02d:%02d:%02d",
+		value.Hour(),
+		value.Minute(),
+		value.Second(),
+	)
+	if scale == 0 {
+		return result
+	}
+	unit := 1
+	for digits := scale; digits < 9; digits++ {
+		unit *= 10
+	}
+	return result + fmt.Sprintf(
+		".%0*d",
+		scale,
+		value.Nanosecond()/unit,
+	)
 }
 
 func validSQLServerSourceNumeric(

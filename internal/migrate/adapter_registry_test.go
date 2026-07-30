@@ -196,6 +196,10 @@ func TestBuiltInAdaptersPreserveCertifiedRoutes(t *testing.T) {
 			source: openSQLServerSourceAdapter,
 			target: openPostgresTargetAdapter,
 		},
+		{source: "mssql", target: "mysql"}: {
+			source: openSQLServerSourceAdapter,
+			target: openMySQLTargetAdapter,
+		},
 		{source: "mssql", target: "mssql"}: {
 			source: openSQLServerSourceAdapter,
 			target: openSQLServerTargetAdapter,

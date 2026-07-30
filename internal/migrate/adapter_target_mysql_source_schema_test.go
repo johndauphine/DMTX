@@ -247,6 +247,542 @@ func TestProjectPostgresTableForMySQLFailsClosed(t *testing.T) {
 	}
 }
 
+func TestProjectSQLServerTableForMySQLPreservesAdmittedShape(
+	t *testing.T,
+) {
+	defaultValue := func(value string) *schema.Expression {
+		t.Helper()
+		expression, err := schema.ParseSQLiteDefault(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return expression
+	}
+	check, err := schema.ParseSQLiteCheckExpression(`amount >= 0`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontier := int64(41)
+	source := schema.Table{
+		Schema: "dbo",
+		Name:   "events",
+		Identity: &schema.Identity{
+			Column:     "id",
+			Generation: schema.IdentityByDefault,
+			Frontier:   &frontier,
+		},
+		Columns: []schema.Column{
+			{
+				Name:               "id",
+				Type:               "bigint",
+				DeclaredType:       &schema.DeclaredType{Base: "bigint"},
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 1,
+			},
+			{
+				Name:         "priority",
+				Type:         "integer",
+				DeclaredType: &schema.DeclaredType{Base: "tinyint"},
+				Default:      defaultValue("255"),
+			},
+			{
+				Name:         "attempts",
+				Type:         "integer",
+				DeclaredType: &schema.DeclaredType{Base: "int"},
+			},
+			{
+				Name:         "enabled",
+				Type:         "boolean",
+				DeclaredType: &schema.DeclaredType{Base: "bool"},
+				Default:      defaultValue("TRUE"),
+			},
+			{
+				Name: "amount",
+				Type: "numeric",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "decimal",
+					Arguments: []int{12, 3},
+				},
+				Default: defaultValue("0.000"),
+			},
+			{
+				Name:         "ratio",
+				Type:         "real",
+				DeclaredType: &schema.DeclaredType{Base: "real"},
+			},
+			{
+				Name: "code",
+				Type: "text",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "varchar",
+					Arguments: []int{24},
+				},
+				Default: defaultValue("'guest'"),
+			},
+			{
+				Name:         "description",
+				Type:         "text",
+				DeclaredType: &schema.DeclaredType{Base: "text"},
+				Nullable:     true,
+			},
+			{
+				Name: "digest",
+				Type: "blob",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "varbinary",
+					Arguments: []int{16},
+				},
+				Default: defaultValue("X'00FF'"),
+			},
+			{
+				Name:         "payload",
+				Type:         "blob",
+				DeclaredType: &schema.DeclaredType{Base: "blob"},
+				Nullable:     true,
+			},
+			{
+				Name:         "observed_on",
+				Type:         "date",
+				DeclaredType: &schema.DeclaredType{Base: "date"},
+			},
+			{
+				Name: "local_time",
+				Type: "time",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "time",
+					Arguments: []int{6},
+				},
+			},
+			{
+				Name: "occurred_at",
+				Type: "datetime",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "timestamp",
+					Arguments: []int{6},
+				},
+			},
+			{
+				Name:         "rounded_at",
+				Type:         "datetime",
+				DeclaredType: &schema.DeclaredType{Base: "smalldatetime"},
+			},
+			{
+				Name:         "external_id",
+				Type:         "uuid",
+				DeclaredType: &schema.DeclaredType{Base: "uuid"},
+			},
+			{
+				Name:         "account_id",
+				Type:         "bigint",
+				DeclaredType: &schema.DeclaredType{Base: "bigint"},
+			},
+		},
+		Indexes: []schema.Index{{
+			Name: "events_occurred_idx",
+			Columns: []schema.IndexColumn{{
+				Name:       "occurred_at",
+				Descending: true,
+			}},
+		}},
+		ForeignKeys: []schema.ForeignKey{{
+			Name:              "events_account_fk",
+			Columns:           []string{"account_id"},
+			ReferencedTable:   "accounts",
+			ReferencedColumns: []string{"id"},
+			OnUpdate:          "CASCADE",
+			OnDelete:          "NO ACTION",
+			Match:             "SIMPLE",
+		}},
+		Checks: []schema.CheckConstraint{{
+			Name:       "events_amount_ck",
+			Expression: check,
+		}},
+	}
+
+	for _, fixture := range []struct {
+		name      string
+		flavor    engine.MySQLServerFlavor
+		collation string
+	}{
+		{
+			name:      "Oracle MySQL",
+			flavor:    engine.MySQLServerFlavorOracle80,
+			collation: "utf8mb4_0900_bin",
+		},
+		{
+			name:      "MariaDB",
+			flavor:    engine.MySQLServerFlavorMariaDB1011,
+			collation: "utf8mb4_nopad_bin",
+		},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			got, err := projectMySQLTargetTable(
+				"mssql",
+				source,
+				fixture.flavor,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.MySQLCollation != fixture.collation {
+				t.Fatalf(
+					"target collation = %q, want %q",
+					got.MySQLCollation,
+					fixture.collation,
+				)
+			}
+			if got.Identity == nil ||
+				got.Identity.Frontier == source.Identity.Frontier ||
+				*got.Identity.Frontier != 41 {
+				t.Fatalf("projected identity = %#v", got.Identity)
+			}
+			expected := []struct {
+				column    int
+				typ       string
+				base      string
+				arguments []int
+			}{
+				{0, "bigint", "bigint", nil},
+				{1, "integer", "smallint", nil},
+				{2, "integer", "int", nil},
+				{3, "integer", "tinyint", []int{1}},
+				{4, "numeric", "decimal", []int{12, 3}},
+				{5, "double precision", "double", nil},
+				{6, "varchar", "varchar", []int{24}},
+				{7, "text", "longtext", nil},
+				{8, "varbinary", "varbinary", []int{16}},
+				{9, "blob", "longblob", nil},
+				{10, "date", "date", nil},
+				{11, "time", "time", []int{6}},
+				{12, "datetime", "datetime", []int{6}},
+				{13, "datetime", "datetime", []int{0}},
+				{14, "char", "char", []int{36}},
+				{15, "bigint", "bigint", nil},
+			}
+			for _, want := range expected {
+				column := got.Columns[want.column]
+				if column.Type != want.typ ||
+					column.DeclaredType == nil ||
+					column.DeclaredType.Base != want.base ||
+					!reflect.DeepEqual(
+						column.DeclaredType.Arguments,
+						want.arguments,
+					) {
+					t.Fatalf(
+						"projected column %s = %#v",
+						column.Name,
+						column,
+					)
+				}
+			}
+			if got.Columns[1].Default == nil ||
+				got.Columns[1].Default.CanonicalSQL() != "255" ||
+				got.Columns[3].Default == nil ||
+				got.Columns[3].Default.CanonicalSQL() != "1" ||
+				got.Columns[8].Default == nil ||
+				got.Columns[8].Default.CanonicalSQL() != "X'00ff'" {
+				t.Fatalf("projected defaults = %#v", got.Columns)
+			}
+			if got.ForeignKeys[0].Match != "NONE" {
+				t.Fatalf(
+					"foreign-key match = %q",
+					got.ForeignKeys[0].Match,
+				)
+			}
+			if len(got.Checks) != 2 ||
+				!strings.Contains(
+					got.Checks[1].Expression.CanonicalSQL(),
+					"IN",
+				) {
+				t.Fatalf("projected checks = %#v", got.Checks)
+			}
+			if _, err := schema.CreateTable(schema.MySQL, got); err != nil {
+				t.Fatalf("render projected table: %v", err)
+			}
+		})
+	}
+
+	if source.MySQLCollation != "" ||
+		source.Columns[1].DeclaredType.Base != "tinyint" ||
+		source.ForeignKeys[0].Match != "SIMPLE" ||
+		*source.Identity.Frontier != 41 {
+		t.Fatalf("projection mutated source metadata: %#v", source)
+	}
+}
+
+func TestProjectSQLServerTableForMySQLFailsClosedOnColumnShapes(
+	t *testing.T,
+) {
+	defaultValue, err := schema.ParseSQLiteDefault("0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		column schema.Column
+	}{
+		{
+			name:   "missing declaration",
+			column: schema.Column{Name: "value", Type: "bigint"},
+		},
+		{
+			name: "tinyint neutral type mismatch",
+			column: schema.Column{
+				Name:         "value",
+				Type:         "bigint",
+				DeclaredType: &schema.DeclaredType{Base: "tinyint"},
+			},
+		},
+		{
+			name: "numeric precision",
+			column: schema.Column{
+				Name: "value",
+				Type: "numeric",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "decimal",
+					Arguments: []int{39, 2},
+				},
+			},
+		},
+		{
+			name: "numeric scale",
+			column: schema.Column{
+				Name: "value",
+				Type: "numeric",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "decimal",
+					Arguments: []int{38, 31},
+				},
+			},
+		},
+		{
+			name: "varchar length",
+			column: schema.Column{
+				Name: "value",
+				Type: "text",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "varchar",
+					Arguments: []int{8_001},
+				},
+			},
+		},
+		{
+			name: "temporal precision",
+			column: schema.Column{
+				Name: "value",
+				Type: "time",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "time",
+					Arguments: []int{7},
+				},
+			},
+		},
+		{
+			name: "REAL default would be re-rounded as DOUBLE",
+			column: schema.Column{
+				Name:         "value",
+				Type:         "real",
+				DeclaredType: &schema.DeclaredType{Base: "real"},
+				Default:      defaultValue,
+			},
+		},
+		{
+			name: "unsupported declaration",
+			column: schema.Column{
+				Name:         "value",
+				Type:         "money",
+				DeclaredType: &schema.DeclaredType{Base: "money"},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := projectMySQLTargetTable(
+				"mssql",
+				schema.Table{
+					Name:    "items",
+					Columns: []schema.Column{test.column},
+				},
+				engine.MySQLServerFlavorOracle80,
+			)
+			var policy *schema.PolicyError
+			if !errors.As(err, &policy) ||
+				policy.Target != string(schema.MySQL) {
+				t.Fatalf(
+					"error = %v, want MySQL policy error",
+					err,
+				)
+			}
+		})
+	}
+}
+
+func TestProjectSQLServerTableForMySQLRejectsNonportableObjects(
+	t *testing.T,
+) {
+	textCheck, err := schema.ParseSQLiteCheckExpression(`code <> ''`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseColumns := func() []schema.Column {
+		return []schema.Column{
+			{
+				Name:         "id",
+				Type:         "bigint",
+				DeclaredType: &schema.DeclaredType{Base: "bigint"},
+			},
+			{
+				Name: "code",
+				Type: "text",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "varchar",
+					Arguments: []int{24},
+				},
+				Nullable: true,
+			},
+			{
+				Name:         "token",
+				Type:         "uuid",
+				DeclaredType: &schema.DeclaredType{Base: "uuid"},
+			},
+			{
+				Name: "payload",
+				Type: "blob",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "varbinary",
+					Arguments: []int{16},
+				},
+			},
+		}
+	}
+	tests := []struct {
+		name  string
+		table func() schema.Table
+	}{
+		{
+			name: "text primary key",
+			table: func() schema.Table {
+				columns := baseColumns()
+				columns[1].PrimaryKey = true
+				columns[1].PrimaryKeyPosition = 1
+				return schema.Table{Name: "items", Columns: columns}
+			},
+		},
+		{
+			name: "UUID index",
+			table: func() schema.Table {
+				return schema.Table{
+					Name:    "items",
+					Columns: baseColumns(),
+					Indexes: []schema.Index{{
+						Name: "items_token_idx",
+						Columns: []schema.IndexColumn{{
+							Name: "token",
+						}},
+					}},
+				}
+			},
+		},
+		{
+			name: "nullable unique index",
+			table: func() schema.Table {
+				columns := baseColumns()
+				columns[0].Nullable = true
+				return schema.Table{
+					Name:    "items",
+					Columns: columns,
+					Indexes: []schema.Index{{
+						Name:   "items_id_uq",
+						Unique: true,
+						Columns: []schema.IndexColumn{{
+							Name: "id",
+						}},
+					}},
+				}
+			},
+		},
+		{
+			name: "binary foreign key",
+			table: func() schema.Table {
+				return schema.Table{
+					Name:    "items",
+					Columns: baseColumns(),
+					ForeignKeys: []schema.ForeignKey{{
+						Name:              "items_payload_fk",
+						Columns:           []string{"payload"},
+						ReferencedTable:   "parents",
+						ReferencedColumns: []string{"payload"},
+						Match:             "SIMPLE",
+					}},
+				}
+			},
+		},
+		{
+			name: "SET DEFAULT foreign key",
+			table: func() schema.Table {
+				return schema.Table{
+					Name:    "items",
+					Columns: baseColumns(),
+					ForeignKeys: []schema.ForeignKey{{
+						Name:              "items_id_fk",
+						Columns:           []string{"id"},
+						ReferencedTable:   "parents",
+						ReferencedColumns: []string{"id"},
+						OnDelete:          "SET DEFAULT",
+						Match:             "SIMPLE",
+					}},
+				}
+			},
+		},
+		{
+			name: "text CHECK",
+			table: func() schema.Table {
+				return schema.Table{
+					Name:    "items",
+					Columns: baseColumns(),
+					Checks: []schema.CheckConstraint{{
+						Name:       "items_code_ck",
+						Expression: textCheck,
+					}},
+				}
+			},
+		},
+		{
+			name: "foreign-key match",
+			table: func() schema.Table {
+				return schema.Table{
+					Name:    "items",
+					Columns: baseColumns(),
+					ForeignKeys: []schema.ForeignKey{{
+						Name:              "items_id_fk",
+						Columns:           []string{"id"},
+						ReferencedTable:   "parents",
+						ReferencedColumns: []string{"id"},
+						Match:             "FULL",
+					}},
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := projectMySQLTargetTable(
+				"mssql",
+				test.table(),
+				engine.MySQLServerFlavorOracle80,
+			)
+			var policy *schema.PolicyError
+			if !errors.As(err, &policy) ||
+				policy.Target != string(schema.MySQL) {
+				t.Fatalf(
+					"error = %v, want MySQL policy error",
+					err,
+				)
+			}
+		})
+	}
+}
+
 func TestProjectMySQLTargetTableClonesSourceMetadata(t *testing.T) {
 	frontier := int64(9)
 	source := schema.Table{

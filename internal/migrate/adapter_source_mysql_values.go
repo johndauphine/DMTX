@@ -19,9 +19,10 @@ type mysqlTemporalRows struct {
 }
 
 type mysqlTemporalColumn struct {
-	index int
-	name  string
-	typ   string
+	index     int
+	name      string
+	typ       string
+	precision int
 }
 
 func wrapMySQLSourceRows(
@@ -39,10 +40,15 @@ func wrapMySQLSourceRows(
 		if !ok || !isMySQLTemporalType(column.Type) {
 			continue
 		}
+		precision := 0
+		if column.Type == "time" {
+			precision = mysqlSourceTimePrecision(column)
+		}
 		temporals = append(temporals, mysqlTemporalColumn{
-			index: index,
-			name:  name,
-			typ:   column.Type,
+			index:     index,
+			name:      name,
+			typ:       column.Type,
+			precision: precision,
 		})
 	}
 	if len(temporals) == 0 {
@@ -74,6 +80,7 @@ func (rows *mysqlTemporalRows) Scan(destinations ...any) error {
 		}
 		normalized, ok := normalizeMySQLTemporal(
 			column.typ,
+			column.precision,
 			*destination,
 		)
 		if !ok {
@@ -86,10 +93,14 @@ func (rows *mysqlTemporalRows) Scan(destinations ...any) error {
 
 func normalizeMySQLTemporal(
 	columnType string,
+	precision int,
 	value any,
 ) (any, bool) {
 	if value == nil {
 		return nil, true
+	}
+	if columnType == "time" {
+		return normalizeMySQLTime(precision, value)
 	}
 	if temporal, ok := value.(time.Time); ok {
 		if temporal.IsZero() {
@@ -114,6 +125,76 @@ func normalizeMySQLTemporal(
 		return nil, false
 	}
 	return parseMySQLTemporal(columnType, text)
+}
+
+func normalizeMySQLTime(
+	precision int,
+	value any,
+) (any, bool) {
+	var text string
+	switch temporal := value.(type) {
+	case string:
+		if !utf8.ValidString(temporal) {
+			return nil, false
+		}
+		text = temporal
+	case []byte:
+		if !utf8.Valid(temporal) {
+			return nil, false
+		}
+		text = string(temporal)
+	default:
+		return nil, false
+	}
+	if !validMySQLClockTime(text, precision) {
+		return nil, false
+	}
+	return text, true
+}
+
+func validMySQLClockTime(value string, precision int) bool {
+	if precision < 0 || precision > 6 {
+		return false
+	}
+	clock := value
+	if precision == 0 {
+		if len(value) != len("00:00:00") {
+			return false
+		}
+	} else {
+		fractionOffset := len("00:00:00")
+		if len(value) != fractionOffset+1+precision ||
+			value[fractionOffset] != '.' ||
+			!isMySQLDigits(value[fractionOffset+1:]) {
+			return false
+		}
+		clock = value[:fractionOffset]
+	}
+	if clock[2] != ':' || clock[5] != ':' {
+		return false
+	}
+	for _, index := range []int{0, 1, 3, 4, 6, 7} {
+		if clock[index] < '0' || clock[index] > '9' {
+			return false
+		}
+	}
+	hour := int(clock[0]-'0')*10 + int(clock[1]-'0')
+	minute := int(clock[3]-'0')*10 + int(clock[4]-'0')
+	second := int(clock[6]-'0')*10 + int(clock[7]-'0')
+	return hour <= 23 && minute <= 59 && second <= 59
+}
+
+func mysqlSourceTimePrecision(column schema.Column) int {
+	if column.DeclaredType == nil ||
+		column.DeclaredType.Base != "time" ||
+		len(column.DeclaredType.Arguments) != 1 {
+		return -1
+	}
+	precision := column.DeclaredType.Arguments[0]
+	if precision < 0 || precision > 6 {
+		return -1
+	}
+	return precision
 }
 
 func parseMySQLTemporal(
@@ -202,7 +283,7 @@ func invalidMySQLTemporal(column mysqlTemporalColumn) error {
 
 func isMySQLTemporalType(columnType string) bool {
 	switch columnType {
-	case "date", "datetime", "timestamp":
+	case "date", "time", "datetime", "timestamp":
 		return true
 	default:
 		return false

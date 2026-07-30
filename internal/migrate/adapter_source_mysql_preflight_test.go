@@ -23,6 +23,7 @@ func TestPlanMySQLSourceValueChecksCoversTemporalAndJSONColumns(
 				{Name: "id", Type: "bigint"},
 				{Name: "occurred_at", Type: "datetime"},
 				{Name: "observed_on", Type: "date"},
+				{Name: "local_time", Type: "time"},
 				{Name: "document", Type: "json"},
 			},
 		}},
@@ -30,7 +31,7 @@ func TestPlanMySQLSourceValueChecksCoversTemporalAndJSONColumns(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(checks) != 3 {
+	if len(checks) != 4 {
 		t.Fatalf("checks = %#v", checks)
 	}
 	for _, expected := range []struct {
@@ -53,6 +54,15 @@ func TestPlanMySQLSourceValueChecksCoversTemporalAndJSONColumns(
 			parts: []string{
 				"`app`.`events`",
 				"DAYOFMONTH(`observed_on`) = 0",
+			},
+		},
+		{
+			column: "local_time",
+			kind:   "TIME clock",
+			parts: []string{
+				"`app`.`events`",
+				"TIME_TO_SEC(`local_time`) < 0",
+				"TIME_TO_SEC(`local_time`) >= 86400",
 			},
 		},
 		{

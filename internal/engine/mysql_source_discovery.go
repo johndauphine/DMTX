@@ -919,6 +919,30 @@ func mySQL80SourceColumnFromCatalog(
 		}
 		column.Type = "date"
 		column.DeclaredType = &schema.DeclaredType{Base: "date"}
+	case "time":
+		if !catalog.datetimePrecision.Valid ||
+			catalog.datetimePrecision.Int64 < 0 ||
+			catalog.datetimePrecision.Int64 > 6 ||
+			catalog.numericPrecision.Valid ||
+			catalog.numericScale.Valid ||
+			!mySQLNonCharacterColumn(catalog) {
+			return schema.Column{}, metadata, unsupportedMySQLSourceType(catalog)
+		}
+		expected := "time"
+		if catalog.datetimePrecision.Int64 > 0 {
+			expected = fmt.Sprintf(
+				"time(%d)",
+				catalog.datetimePrecision.Int64,
+			)
+		}
+		if catalog.columnType != expected {
+			return schema.Column{}, metadata, unsupportedMySQLSourceType(catalog)
+		}
+		column.Type = "time"
+		column.DeclaredType = &schema.DeclaredType{
+			Base:      "time",
+			Arguments: []int{int(catalog.datetimePrecision.Int64)},
+		}
 	case "datetime", "timestamp":
 		if !catalog.datetimePrecision.Valid ||
 			catalog.datetimePrecision.Int64 < 0 ||

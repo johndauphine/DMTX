@@ -12,10 +12,11 @@ import (
 )
 
 type mysqlTargetAdapter struct {
-	database    *sql.DB
-	batchWriter mysqlBatchWriter
-	flavor      engine.MySQLServerFlavor
-	namespace   string
+	database                      *sql.DB
+	batchWriter                   mysqlBatchWriter
+	flavor                        engine.MySQLServerFlavor
+	namespace                     string
+	validateSQLServerSourceValues bool
 }
 
 func (adapter *mysqlTargetAdapter) mySQLDatabaseHandle() *sql.DB {
@@ -190,6 +191,18 @@ func (adapter *mysqlTargetAdapter) WriteBatch(
 			Certainty:     CommitNotCommitted,
 			AttemptedRows: int64(len(rows)),
 		}, fmt.Errorf("MySQL native batch writer is not configured")
+	}
+	if adapter.validateSQLServerSourceValues {
+		if err := validateMySQLTargetSQLServerBatchValues(
+			table,
+			columns,
+			rows,
+		); err != nil {
+			return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: int64(len(rows)),
+			}, err
+		}
 	}
 	return adapter.batchWriter.WriteBatch(
 		ctx,

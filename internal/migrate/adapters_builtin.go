@@ -9,11 +9,12 @@ import "github.com/johndauphine/dmtx/internal/engine"
 // version-pinned MySQL/MariaDB sources compose with PostgreSQL, SQLite, and
 // the native MySQL target where explicitly certified; unsupported
 // flavor/target combinations still fail during read-only planning. SQL Server
-// and PostgreSQL sources compose with the native SQL Server target where
-// explicitly certified; its SQLite source remains on the compatibility route
-// until the shared value contract has a live fixture. SQL Server's SQLite
-// target route remains deferred until driver values and SQLite storage classes
-// have an exact, live-tested contract. Compatibility overrides preserve the
+// and PostgreSQL sources compose with both the native SQL Server target and
+// the admitted native MySQL-family targets where explicitly certified; the
+// SQL Server target's SQLite source remains on the compatibility route until
+// the shared value contract has a live fixture. SQL Server's SQLite target
+// route remains deferred until driver values and SQLite storage classes have
+// an exact, live-tested contract. Compatibility overrides preserve the
 // remaining routes until both sides move behind the shared contracts.
 var builtInAdapters = mustBuildAdapterRegistry(
 	[]sourceRole{
@@ -64,6 +65,7 @@ var builtInAdapters = mustBuildAdapterRegistry(
 		{source: "mysql", target: "sqlite"},
 		{source: "mysql", target: "mysql"},
 		{source: "mssql", target: "postgres"},
+		{source: "mssql", target: "mysql"},
 		{source: "mssql", target: "mssql"},
 	},
 	[]adapterOverride{

@@ -130,10 +130,12 @@ implementations:
 
 - SQLite to PostgreSQL, MySQL/MariaDB (legacy compatibility override),
   SQL Server, and ClickHouse;
-- PostgreSQL to PostgreSQL, SQLite, Oracle MySQL 8.0, or MariaDB 10.11;
+- PostgreSQL to PostgreSQL, SQLite, Oracle MySQL 8.0, MariaDB 10.11, or
+  SQL Server 2022;
 - Oracle MySQL 8.0 to PostgreSQL, SQLite, or Oracle MySQL 8.0;
 - MariaDB 10.11 to PostgreSQL, SQLite, or MariaDB 10.11; and
-- SQL Server to SQLite.
+- SQL Server 2022 to PostgreSQL, Oracle MySQL 8.0, MariaDB 10.11, or
+  SQL Server 2022.
 
 These paths remain incomplete Stage 3 implementations. They do not yet share
 SQLite's full range checkpoint, replay, fencing, resume, and fault-injection
@@ -141,13 +143,14 @@ matrix, and they have not passed the Stage 3 native-bulk and live-engine
 conformance suite. Treat them as experimental, not as Stage 2-certified
 migrations.
 
-SQLite, PostgreSQL, Oracle MySQL 8.0, and MariaDB 10.11 sources now compose
-independently with the PostgreSQL target. PostgreSQL, Oracle MySQL 8.0,
-MariaDB 10.11, and SQL Server sources compose independently with the SQLite
-target behind shared contracts. PostgreSQL and each admitted MySQL-family
-source also compose with its native Oracle MySQL 8.0 or MariaDB 10.11 target.
-Cross-flavor Oracle-MySQL/MariaDB copies remain fail-closed where exact
-collation and catalog semantics differ.
+SQLite, PostgreSQL, Oracle MySQL 8.0, MariaDB 10.11, and SQL Server 2022
+sources now compose independently with the PostgreSQL target. PostgreSQL and
+each admitted MySQL-family source compose with the SQLite target behind shared
+contracts. PostgreSQL and SQL Server sources compose with either native
+MySQL-family target, while each MySQL-family source composes with its matching
+native flavor. PostgreSQL and SQL Server sources also compose with the native
+SQL Server target. Cross-flavor Oracle-MySQL/MariaDB copies remain fail-closed
+where exact collation and catalog semantics differ.
 
 The native Oracle MySQL-to-MySQL route requires read access to
 `performance_schema.replication_connection_configuration` and

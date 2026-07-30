@@ -124,6 +124,130 @@ func TestMySQLTemporalRowsParseValidTextAndPreserveNull(t *testing.T) {
 	}
 }
 
+func TestMySQLTemporalRowsPreserveExactClockTime(t *testing.T) {
+	tests := []struct {
+		name      string
+		precision int
+		value     any
+		want      any
+	}{
+		{
+			name:      "precision zero text",
+			precision: 0,
+			value:     "00:00:00",
+			want:      "00:00:00",
+		},
+		{
+			name:      "fractional bytes",
+			precision: 6,
+			value:     []byte("23:59:59.123456"),
+			want:      "23:59:59.123456",
+		},
+		{
+			name:      "null",
+			precision: 3,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := scanMySQLTimeFixture(
+				test.precision,
+				test.value,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("TIME value = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestMySQLTemporalRowsRejectNoncanonicalOrDurationTime(t *testing.T) {
+	tests := []struct {
+		name      string
+		precision int
+		value     any
+	}{
+		{"missing fraction", 3, "12:34:56"},
+		{"short fraction", 3, "12:34:56.12"},
+		{"excess fraction", 3, "12:34:56.1234"},
+		{"fraction at precision zero", 0, "12:34:56.0"},
+		{"single-digit hour", 0, "1:02:03"},
+		{"end of day", 0, "24:00:00"},
+		{"duration hour", 3, "100:02:03.123"},
+		{"negative duration", 3, "-01:02:03.123"},
+		{"positive sign", 3, "+01:02:03.123"},
+		{"invalid minute", 3, "12:60:00.123"},
+		{"invalid second", 3, "12:00:60.123"},
+		{"unexpected time value", 0, time.Date(
+			2026, time.July, 30, 12, 34, 56, 0, time.UTC,
+		)},
+		{"invalid UTF-8", 0, []byte{0xff, 0xfe}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := scanMySQLTimeFixture(
+				test.precision,
+				test.value,
+			)
+			const want = "MySQL source column local_time contains an invalid time value"
+			if err == nil || err.Error() != want {
+				t.Fatalf("error = %v, want %q", err, want)
+			}
+			raw := mysqlTemporalFixtureText(test.value)
+			if raw != "" && strings.Contains(err.Error(), raw) {
+				t.Fatalf("error leaked source value: %v", err)
+			}
+		})
+	}
+}
+
+func TestMySQLTemporalRowsRejectTimeWithoutExactDeclaredPrecision(
+	t *testing.T,
+) {
+	tests := []struct {
+		name     string
+		declared *schema.DeclaredType
+	}{
+		{name: "missing declaration"},
+		{
+			name:     "missing precision",
+			declared: &schema.DeclaredType{Base: "time"},
+		},
+		{
+			name: "wrong base",
+			declared: &schema.DeclaredType{
+				Base:      "datetime",
+				Arguments: []int{0},
+			},
+		},
+		{
+			name: "excess precision",
+			declared: &schema.DeclaredType{
+				Base:      "time",
+				Arguments: []int{7},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := scanMySQLTemporalColumnFixture(
+				schema.Column{
+					Name:         "local_time",
+					Type:         "time",
+					DeclaredType: test.declared,
+				},
+				"12:34:56",
+			)
+			if err == nil {
+				t.Fatal("expected TIME declaration to fail closed")
+			}
+		})
+	}
+}
+
 func TestMySQLTemporalRowsWrapOnlyTemporalColumns(t *testing.T) {
 	source := &mysqlTemporalFixtureRows{value: time.Time{}}
 	rows := wrapMySQLSourceRows(
@@ -150,14 +274,41 @@ func scanMySQLTemporalFixture(
 	columnType string,
 	value any,
 ) (any, error) {
+	return scanMySQLTemporalColumnFixture(
+		schema.Column{
+			Name: "occurred_at",
+			Type: columnType,
+		},
+		value,
+	)
+}
+
+func scanMySQLTimeFixture(
+	precision int,
+	value any,
+) (any, error) {
+	return scanMySQLTemporalColumnFixture(
+		schema.Column{
+			Name: "local_time",
+			Type: "time",
+			DeclaredType: &schema.DeclaredType{
+				Base:      "time",
+				Arguments: []int{precision},
+			},
+		},
+		value,
+	)
+}
+
+func scanMySQLTemporalColumnFixture(
+	column schema.Column,
+	value any,
+) (any, error) {
 	source := &mysqlTemporalFixtureRows{value: value}
 	rows := wrapMySQLSourceRows(
 		source,
-		schema.Table{Columns: []schema.Column{{
-			Name: "occurred_at",
-			Type: columnType,
-		}}},
-		[]string{"occurred_at"},
+		schema.Table{Columns: []schema.Column{column}},
+		[]string{column.Name},
 	)
 	var got any
 	err := rows.Scan(&got)

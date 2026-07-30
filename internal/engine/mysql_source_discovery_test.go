@@ -321,6 +321,41 @@ func TestMySQL80SourceColumnFromCatalogPreservesModifiers(t *testing.T) {
 			base:       "datetime",
 			arguments:  []int{0},
 		},
+		{
+			name: "time precision zero",
+			catalog: func() mysql80SourceColumnCatalog {
+				value := baseMySQL80ColumnCatalog(
+					"local_time",
+					"time",
+					"time",
+				)
+				value.datetimePrecision = sql.NullInt64{
+					Valid: true,
+				}
+				return value
+			}(),
+			columnType: "time",
+			base:       "time",
+			arguments:  []int{0},
+		},
+		{
+			name: "time fractional precision",
+			catalog: func() mysql80SourceColumnCatalog {
+				value := baseMySQL80ColumnCatalog(
+					"local_time",
+					"time",
+					"time(6)",
+				)
+				value.datetimePrecision = sql.NullInt64{
+					Int64: 6,
+					Valid: true,
+				}
+				return value
+			}(),
+			columnType: "time",
+			base:       "time",
+			arguments:  []int{6},
+		},
 	}
 
 	for _, test := range tests {
@@ -373,6 +408,80 @@ func TestMySQL80SourceColumnFromCatalogFailsClosed(t *testing.T) {
 	catalog.generation = "(`id` * 2)"
 	if _, _, err := mySQL80SourceColumnFromCatalog(catalog); err == nil {
 		t.Fatal("expected generated column to be rejected")
+	}
+}
+
+func TestMySQL80SourceTimeColumnFailsClosedOnUnexpectedCatalogShapes(
+	t *testing.T,
+) {
+	valid := baseMySQL80ColumnCatalog(
+		"local_time",
+		"time",
+		"time(3)",
+	)
+	valid.datetimePrecision = sql.NullInt64{Int64: 3, Valid: true}
+
+	tests := map[string]func(*mysql80SourceColumnCatalog){
+		"missing precision": func(value *mysql80SourceColumnCatalog) {
+			value.datetimePrecision = sql.NullInt64{}
+		},
+		"negative precision": func(value *mysql80SourceColumnCatalog) {
+			value.datetimePrecision.Int64 = -1
+		},
+		"excess precision": func(value *mysql80SourceColumnCatalog) {
+			value.datetimePrecision.Int64 = 7
+		},
+		"precision omitted from column type": func(
+			value *mysql80SourceColumnCatalog,
+		) {
+			value.columnType = "time"
+		},
+		"explicit zero column type": func(
+			value *mysql80SourceColumnCatalog,
+		) {
+			value.datetimePrecision.Int64 = 0
+			value.columnType = "time(0)"
+		},
+		"numeric precision metadata": func(
+			value *mysql80SourceColumnCatalog,
+		) {
+			value.numericPrecision = sql.NullInt64{
+				Int64: 8,
+				Valid: true,
+			}
+		},
+		"numeric scale metadata": func(
+			value *mysql80SourceColumnCatalog,
+		) {
+			value.numericScale = sql.NullInt64{Valid: true}
+		},
+		"character length metadata": func(
+			value *mysql80SourceColumnCatalog,
+		) {
+			value.characterLength = sql.NullInt64{
+				Int64: 12,
+				Valid: true,
+			}
+		},
+		"character set metadata": func(
+			value *mysql80SourceColumnCatalog,
+		) {
+			value.characterSet = sql.NullString{
+				String: "utf8mb4",
+				Valid:  true,
+			}
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			value := valid
+			mutate(&value)
+			if _, _, err := mySQL80SourceColumnFromCatalog(
+				value,
+			); err == nil {
+				t.Fatal("expected TIME catalog shape to fail closed")
+			}
+		})
 	}
 }
 

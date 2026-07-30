@@ -26,6 +26,8 @@ func projectMySQLTargetTable(
 		target = cloneMySQLTargetTable(sourceTable)
 	case "postgres":
 		target, err = projectPostgresTableForMySQL(sourceTable)
+	case "mssql":
+		target, err = projectSQLServerTableForMySQL(sourceTable)
 	default:
 		return schema.Table{}, fmt.Errorf(
 			"MySQL target does not support source engine %q",
@@ -53,13 +55,17 @@ func normalizeMySQLTargetCollation(
 	collation := strings.ToLower(strings.TrimSpace(table.MySQLCollation))
 	switch targetFlavor {
 	case engine.MySQLServerFlavorOracle80:
+		if sourceEngine == "postgres" || sourceEngine == "mssql" {
+			table.MySQLCollation = "utf8mb4_0900_bin"
+			return nil
+		}
 		switch collation {
 		case "utf8mb4_bin", "utf8mb4_0900_bin":
 			table.MySQLCollation = collation
 			return nil
 		}
 	case engine.MySQLServerFlavorMariaDB1011:
-		if sourceEngine == "postgres" {
+		if sourceEngine == "postgres" || sourceEngine == "mssql" {
 			table.MySQLCollation = "utf8mb4_nopad_bin"
 			return nil
 		}
@@ -99,6 +105,404 @@ func cloneMySQLTargetTable(source schema.Table) schema.Table {
 	)
 	cloned.Checks = append([]schema.CheckConstraint(nil), source.Checks...)
 	return cloned
+}
+
+// projectSQLServerTableForMySQL maps only the SQL Server 2022 source shape
+// whose stored values and relational objects have an exact MySQL-family
+// representation. Scalar text is safe because both admitted targets use a
+// deterministic binary/no-pad collation, but text, binary, and UUID
+// comparison roles remain fail-closed because their engine equality and
+// padding contracts differ.
+func projectSQLServerTableForMySQL(
+	source schema.Table,
+) (schema.Table, error) {
+	if source.SQLiteStrict || source.SQLiteWithoutRowID ||
+		strings.TrimSpace(source.MySQLCollation) != "" {
+		return schema.Table{}, mysqlProjectionPolicy(
+			"map SQL Server table metadata",
+			source.Name,
+		)
+	}
+	projected := cloneMySQLTargetTable(source)
+	for index, column := range source.Columns {
+		target, err := projectSQLServerColumnForMySQL(column)
+		if err != nil {
+			return schema.Table{}, fmt.Errorf(
+				"map SQL Server column %s.%s to MySQL: %w",
+				source.Name,
+				column.Name,
+				err,
+			)
+		}
+		projected.Columns[index] = target
+	}
+
+	sourceColumns := make(
+		map[string]schema.Column,
+		len(source.Columns),
+	)
+	for _, column := range source.Columns {
+		if column.Name == "" {
+			return schema.Table{}, mysqlProjectionPolicy(
+				"map SQL Server column",
+				source.Name,
+			)
+		}
+		if _, exists := sourceColumns[column.Name]; exists {
+			return schema.Table{}, mysqlProjectionPolicy(
+				"map SQL Server columns",
+				source.Name+"."+column.Name,
+			)
+		}
+		sourceColumns[column.Name] = column
+		if (column.PrimaryKey ||
+			column.PrimaryKeyPosition > 0) &&
+			sqlServerMySQLNonportableComparison(column) {
+			return schema.Table{}, mysqlProjectionPolicy(
+				"map SQL Server primary-key comparison",
+				source.Name+"."+column.Name,
+			)
+		}
+	}
+
+	for _, index := range source.Indexes {
+		if index.Inline {
+			return schema.Table{}, mysqlProjectionPolicy(
+				"map SQL Server index shape",
+				source.Name+"."+index.Name,
+			)
+		}
+		for _, indexed := range index.Columns {
+			column, exists := sourceColumns[indexed.Name]
+			if !exists ||
+				strings.TrimSpace(indexed.Collation) != "" ||
+				sqlServerMySQLNonportableComparison(column) {
+				return schema.Table{}, mysqlProjectionPolicy(
+					"map SQL Server index comparison",
+					source.Name+"."+index.Name+"."+indexed.Name,
+				)
+			}
+			if index.Unique && column.Nullable {
+				return schema.Table{}, mysqlProjectionPolicy(
+					"map SQL Server nullable unique index",
+					source.Name+"."+index.Name,
+				)
+			}
+		}
+	}
+
+	for index := range projected.ForeignKeys {
+		foreignKey := &projected.ForeignKeys[index]
+		switch strings.ToUpper(strings.TrimSpace(foreignKey.Match)) {
+		case "", "NONE", "SIMPLE":
+			foreignKey.Match = "NONE"
+		default:
+			return schema.Table{}, mysqlProjectionPolicy(
+				"map SQL Server foreign-key match",
+				source.Name+"."+foreignKey.Name,
+			)
+		}
+		for _, action := range []string{
+			foreignKey.OnUpdate,
+			foreignKey.OnDelete,
+		} {
+			if strings.EqualFold(
+				strings.TrimSpace(action),
+				"SET DEFAULT",
+			) {
+				return schema.Table{}, mysqlProjectionPolicy(
+					"map SQL Server foreign-key action",
+					source.Name+"."+foreignKey.Name,
+				)
+			}
+		}
+		for _, name := range foreignKey.Columns {
+			column, exists := sourceColumns[name]
+			if !exists ||
+				sqlServerMySQLNonportableComparison(column) {
+				return schema.Table{}, mysqlProjectionPolicy(
+					"map SQL Server foreign-key comparison",
+					source.Name+"."+foreignKey.Name+"."+name,
+				)
+			}
+		}
+	}
+
+	for _, check := range source.Checks {
+		referenced, err := schema.ReferencedCheckColumns(
+			check.Expression,
+			source.Columns,
+		)
+		if err != nil {
+			return schema.Table{}, fmt.Errorf(
+				"map SQL Server CHECK %s.%s to MySQL: %w",
+				source.Name,
+				check.Name,
+				err,
+			)
+		}
+		for _, name := range referenced {
+			column, exists := sourceColumns[name]
+			if !exists ||
+				sqlServerMySQLNonportableComparison(column) ||
+				sqlServerMySQLRealColumn(column) {
+				return schema.Table{}, mysqlProjectionPolicy(
+					"map SQL Server CHECK comparison",
+					source.Name+"."+check.Name+"."+name,
+				)
+			}
+		}
+	}
+
+	for _, column := range projected.Columns {
+		if !mySQLProjectedBoolean(column) {
+			continue
+		}
+		expression, err := schema.ParseMySQLCatalogCheck(
+			mySQLIdentifier(column.Name)+" IN (0, 1)",
+			projected.Columns,
+		)
+		if err != nil {
+			return schema.Table{}, fmt.Errorf(
+				"plan MySQL boolean domain for %s.%s: %w",
+				source.Name,
+				column.Name,
+				err,
+			)
+		}
+		projected.Checks = append(
+			projected.Checks,
+			schema.CheckConstraint{
+				Name: mySQLBooleanCheckName(
+					source,
+					column.Name,
+				),
+				Expression: expression,
+			},
+		)
+	}
+	return projected, nil
+}
+
+func projectSQLServerColumnForMySQL(
+	source schema.Column,
+) (schema.Column, error) {
+	if source.DeclaredType == nil {
+		return schema.Column{}, mysqlProjectionPolicy(
+			"map SQL Server declared type",
+			source.Name,
+		)
+	}
+	target := source
+	target.Default = cloneSchemaExpression(source.Default)
+	base := strings.ToLower(strings.Join(
+		strings.Fields(source.DeclaredType.Base),
+		" ",
+	))
+	arguments := append(
+		[]int(nil),
+		source.DeclaredType.Arguments...,
+	)
+	sourceType := strings.ToLower(strings.Join(
+		strings.Fields(source.Type),
+		" ",
+	))
+	mapped := false
+	declaration := func(name string, values ...int) {
+		target.DeclaredType = &schema.DeclaredType{
+			Base:      name,
+			Arguments: append([]int(nil), values...),
+		}
+		mapped = true
+	}
+	noArguments := func() bool {
+		return len(arguments) == 0
+	}
+
+	switch base {
+	case "tinyint":
+		// SQL Server TINYINT is unsigned (0..255); MySQL TINYINT is signed.
+		if sourceType != "integer" || !noArguments() {
+			break
+		}
+		target.Type = "integer"
+		declaration("smallint")
+	case "smallint":
+		if sourceType != "integer" || !noArguments() {
+			break
+		}
+		target.Type = "integer"
+		declaration("smallint")
+	case "int", "integer":
+		if sourceType != "integer" || !noArguments() {
+			break
+		}
+		target.Type = "integer"
+		declaration("int")
+	case "bigint":
+		if sourceType != "bigint" || !noArguments() {
+			break
+		}
+		target.Type = "bigint"
+		declaration("bigint")
+	case "bool", "boolean":
+		if sourceType != "boolean" || !noArguments() {
+			break
+		}
+		target.Type = "integer"
+		declaration("tinyint", 1)
+	case "decimal", "numeric":
+		if sourceType != "numeric" ||
+			len(arguments) != 2 ||
+			arguments[0] < 1 ||
+			arguments[0] > 38 ||
+			arguments[1] < 0 ||
+			arguments[1] > 30 ||
+			arguments[1] > arguments[0] {
+			break
+		}
+		target.Type = "numeric"
+		declaration("decimal", arguments...)
+	case "real":
+		// Every IEEE-754 binary32 value is represented exactly by DOUBLE.
+		// A source REAL default is rejected because re-evaluating its decimal
+		// token as DOUBLE would not reproduce SQL Server's binary32 rounding.
+		if sourceType != "real" ||
+			!noArguments() ||
+			source.Default != nil {
+			break
+		}
+		target.Type = "double precision"
+		declaration("double")
+	case "double precision":
+		if sourceType != "double precision" || !noArguments() {
+			break
+		}
+		target.Type = "double precision"
+		declaration("double")
+	case "char", "varchar":
+		// SQL Server's modifier is a UTF-8 byte limit while MySQL's is a
+		// character limit. VARCHAR is a safe widening that also retains the
+		// padding already present in admitted SQL Server CHAR rows/defaults.
+		if sourceType != "text" ||
+			len(arguments) != 1 ||
+			arguments[0] < 1 ||
+			arguments[0] > 8_000 {
+			break
+		}
+		target.Type = "varchar"
+		declaration("varchar", arguments[0])
+	case "text":
+		if sourceType != "text" || !noArguments() {
+			break
+		}
+		target.Type = "text"
+		declaration("longtext")
+	case "binary", "varbinary":
+		if sourceType != "blob" ||
+			len(arguments) != 1 ||
+			arguments[0] < 1 ||
+			arguments[0] > 8_000 {
+			break
+		}
+		target.Type = base
+		declaration(base, arguments[0])
+	case "blob":
+		if sourceType != "blob" || !noArguments() {
+			break
+		}
+		target.Type = "blob"
+		declaration("longblob")
+	case "date":
+		if sourceType != "date" || !noArguments() {
+			break
+		}
+		target.Type = "date"
+		declaration("date")
+	case "time":
+		if sourceType != "time" ||
+			len(arguments) != 1 ||
+			arguments[0] < 0 ||
+			arguments[0] > 6 {
+			break
+		}
+		target.Type = "time"
+		declaration("time", arguments[0])
+	case "timestamp":
+		if sourceType != "datetime" ||
+			len(arguments) != 1 ||
+			arguments[0] < 0 ||
+			arguments[0] > 6 {
+			break
+		}
+		target.Type = "datetime"
+		declaration("datetime", arguments[0])
+	case "smalldatetime":
+		if sourceType != "datetime" || !noArguments() {
+			break
+		}
+		target.Type = "datetime"
+		declaration("datetime", 0)
+	case "uuid":
+		if sourceType != "uuid" || !noArguments() {
+			break
+		}
+		target.Type = "char"
+		declaration("char", 36)
+	default:
+		return schema.Column{}, mysqlProjectionPolicy(
+			"map SQL Server type",
+			base,
+		)
+	}
+	if !mapped {
+		return schema.Column{}, mysqlProjectionPolicy(
+			"map SQL Server type",
+			source.Name+"."+base,
+		)
+	}
+	if target.Default != nil {
+		normalized, err := schema.NormalizeMySQLDefault(target)
+		if err != nil {
+			return schema.Column{}, fmt.Errorf(
+				"normalize MySQL default for %s: %w",
+				source.Name,
+				err,
+			)
+		}
+		target.Default = normalized
+	}
+	return target, nil
+}
+
+func sqlServerMySQLNonportableComparison(
+	column schema.Column,
+) bool {
+	base := strings.ToLower(strings.TrimSpace(column.Type))
+	if column.DeclaredType != nil {
+		base = strings.ToLower(strings.Join(
+			strings.Fields(column.DeclaredType.Base),
+			" ",
+		))
+	}
+	switch base {
+	case "char", "varchar", "text",
+		"binary", "varbinary", "blob",
+		"uuid", "uniqueidentifier":
+		return true
+	default:
+		return false
+	}
+}
+
+func sqlServerMySQLRealColumn(column schema.Column) bool {
+	if column.DeclaredType == nil {
+		return false
+	}
+	return strings.EqualFold(
+		strings.TrimSpace(column.DeclaredType.Base),
+		"real",
+	)
 }
 
 func projectPostgresTableForMySQL(
