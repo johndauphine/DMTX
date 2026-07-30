@@ -178,6 +178,98 @@ func TestNormalizePostgresTimestamptzRequiresMicrosecondPrecision(
 	}
 }
 
+func TestNormalizePostgresTimePreservesTimeOfDayAndPrecision(
+	t *testing.T,
+) {
+	column := schema.Column{
+		Name: "local_time",
+		Type: "time",
+		DeclaredType: &schema.DeclaredType{
+			Base:      "time",
+			Arguments: []int{6},
+		},
+	}
+	const want = int64(
+		12*time.Hour/time.Microsecond +
+			34*time.Minute/time.Microsecond +
+			56*time.Second/time.Microsecond +
+			123456,
+	)
+	for _, source := range []any{
+		"12:34:56.123456",
+		[]byte("12:34:56.123456"),
+		time.Date(
+			1,
+			time.January,
+			1,
+			12,
+			34,
+			56,
+			123456000,
+			time.UTC,
+		),
+		pgtype.Time{Microseconds: want, Valid: true},
+	} {
+		value, err := normalizePostgresColumnValue(column, source)
+		if err != nil {
+			t.Fatalf("normalize time %T: %v", source, err)
+		}
+		got := value.(pgtype.Time)
+		if !got.Valid || got.Microseconds != want {
+			t.Fatalf("normalized time %T = %#v, want %d", source, got, want)
+		}
+	}
+
+	for _, source := range []any{
+		"12:34:56.123456789",
+		"2026-07-29 12:34:56",
+		"12:34:56Z",
+		time.Date(
+			2026,
+			time.July,
+			29,
+			12,
+			34,
+			56,
+			0,
+			time.UTC,
+		),
+		time.Date(
+			1,
+			time.January,
+			1,
+			12,
+			34,
+			56,
+			0,
+			time.FixedZone("unsafe", 60*60),
+		),
+		pgtype.Time{Microseconds: -1, Valid: true},
+		pgtype.Time{Microseconds: 0, Valid: false},
+	} {
+		if _, err := normalizePostgresColumnValue(
+			column,
+			source,
+		); err == nil {
+			t.Fatalf("unsafe time %T unexpectedly succeeded", source)
+		}
+	}
+
+	column.DeclaredType.Arguments = []int{3}
+	if _, err := normalizePostgresColumnValue(
+		column,
+		"12:34:56.123",
+	); err != nil {
+		t.Fatalf("millisecond time: %v", err)
+	}
+	if _, err := normalizePostgresColumnValue(
+		column,
+		"12:34:56.1234",
+	); err == nil {
+		t.Fatal("over-precise time unexpectedly fit time(3)")
+	}
+}
+
 func TestNormalizePostgresTimestampHonorsDeclaredPrecision(t *testing.T) {
 	column := schema.Column{
 		Name: "occurred_at",

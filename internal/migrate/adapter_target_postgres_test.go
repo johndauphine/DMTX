@@ -160,6 +160,24 @@ func TestPostgresPairWrappersRejectWrongTypes(t *testing.T) {
 			},
 			want: "MySQL-to-PostgreSQL requires source.type mysql and target.type postgres",
 		},
+		{
+			name: "sql server source",
+			run:  SQLServerToPostgresWithObserver,
+			cfg: config.Config{
+				Source: config.Endpoint{Type: "postgres"},
+				Target: config.Endpoint{Type: "postgres"},
+			},
+			want: "SQL Server-to-PostgreSQL requires source.type mssql and target.type postgres",
+		},
+		{
+			name: "sql server target",
+			run:  SQLServerToPostgresWithObserver,
+			cfg: config.Config{
+				Source: config.Endpoint{Type: "mssql"},
+				Target: config.Endpoint{Type: "sqlite"},
+			},
+			want: "SQL Server-to-PostgreSQL requires source.type mssql and target.type postgres",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -168,6 +186,26 @@ func TestPostgresPairWrappersRejectWrongTypes(t *testing.T) {
 				t.Fatalf("error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestSQLServerToPostgresRouteIsCertified(t *testing.T) {
+	err := ValidateMigration(config.Config{
+		Source: config.Endpoint{
+			Type:     "mssql",
+			Host:     "source.example.test",
+			Database: "source",
+			User:     "reader",
+		},
+		Target: config.Endpoint{
+			Type:     "postgres",
+			Host:     "target.example.test",
+			Database: "target",
+			User:     "writer",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ValidateMigration(SQL Server-to-PostgreSQL): %v", err)
 	}
 }
 

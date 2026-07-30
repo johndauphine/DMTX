@@ -479,6 +479,27 @@ func TestNormalizePostgresFloatPreservesSpecialValues(t *testing.T) {
 	}
 }
 
+func TestNormalizePostgresRealRequiresExactFloat32(t *testing.T) {
+	want := float32(0.1)
+	for _, source := range []any{want, float64(want)} {
+		value, err := normalizePostgresValue("real", source)
+		if err != nil {
+			t.Fatalf("normalize REAL %T: %v", source, err)
+		}
+		if got := value.(float32); got != want {
+			t.Fatalf("REAL = %v, want %v", got, want)
+		}
+	}
+	for _, source := range []any{float64(0.1), "0.1"} {
+		if _, err := normalizePostgresValue(
+			"real",
+			source,
+		); err == nil {
+			t.Fatalf("inexact REAL %T was accepted", source)
+		}
+	}
+}
+
 func TestNormalizePostgresTemporalValuesAcceptValidGoZeroTime(t *testing.T) {
 	timestamp := time.Date(
 		2026,

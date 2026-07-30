@@ -275,13 +275,21 @@ func TestCreatePostgresTableRendersExactTemporalPrecision(t *testing.T) {
 					Arguments: []int{0},
 				},
 			},
+			{
+				Name: "local_time",
+				Type: "time",
+				DeclaredType: &DeclaredType{
+					Base:      "time",
+					Arguments: []int{6},
+				},
+			},
 		},
 	}
 	got, err := CreateTable(Postgres, table)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `CREATE TABLE "archive"."events" ("occurred_at" TIMESTAMP(3) NOT NULL, "received_at" TIMESTAMP(0) WITH TIME ZONE NOT NULL);`
+	const want = `CREATE TABLE "archive"."events" ("occurred_at" TIMESTAMP(3) NOT NULL, "received_at" TIMESTAMP(0) WITH TIME ZONE NOT NULL, "local_time" TIME(6) NOT NULL);`
 	if got != want {
 		t.Fatalf("temporal DDL:\n got: %s\nwant: %s", got, want)
 	}

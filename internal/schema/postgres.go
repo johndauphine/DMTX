@@ -33,6 +33,18 @@ func renderPostgresDeclaredType(value DeclaredType) (string, error) {
 			return "", postgresDeclaredTypePolicy(value)
 		}
 		return fmt.Sprintf("NUMERIC(%d,%d)", precision, scale), nil
+	case "real":
+		if len(value.Arguments) != 0 {
+			return "", postgresDeclaredTypePolicy(value)
+		}
+		return "REAL", nil
+	case "time":
+		if len(value.Arguments) != 1 ||
+			value.Arguments[0] < 0 ||
+			value.Arguments[0] > 6 {
+			return "", postgresDeclaredTypePolicy(value)
+		}
+		return fmt.Sprintf("TIME(%d)", value.Arguments[0]), nil
 	case "timestamp", "datetime":
 		if len(value.Arguments) != 1 ||
 			value.Arguments[0] < 0 ||

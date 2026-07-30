@@ -7,9 +7,11 @@ import "github.com/johndauphine/dmtx/internal/engine"
 //
 // SQLite sources compose with the PostgreSQL target. PostgreSQL and Oracle
 // MySQL 8.0 sources compose with PostgreSQL, SQLite, and the native MySQL
-// target where explicitly certified, while SQL Server sources compose with
-// SQLite. Compatibility overrides preserve the remaining routes until both
-// sides move behind the shared contracts.
+// target where explicitly certified. SQL Server currently composes only with
+// PostgreSQL; its SQLite route remains deferred until driver values and
+// SQLite storage classes have an exact, live-tested contract. Compatibility
+// overrides preserve the remaining routes until both sides move behind the
+// shared contracts.
 var builtInAdapters = mustBuildAdapterRegistry(
 	[]sourceRole{
 		{
@@ -53,7 +55,7 @@ var builtInAdapters = mustBuildAdapterRegistry(
 		{source: "mysql", target: "postgres"},
 		{source: "mysql", target: "sqlite"},
 		{source: "mysql", target: "mysql"},
-		{source: "mssql", target: "sqlite"},
+		{source: "mssql", target: "postgres"},
 	},
 	[]adapterOverride{
 		{pair: adapterPair{source: "sqlite", target: "sqlite"}, run: SQLiteToSQLiteWithObserver},

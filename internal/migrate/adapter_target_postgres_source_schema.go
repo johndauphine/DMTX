@@ -12,10 +12,12 @@ func projectPostgresSourceTable(
 	sourceTable schema.Table,
 ) (schema.Table, error) {
 	switch sourceEngine {
-	case "postgres", "mssql":
+	case "postgres":
 		projected := sourceTable
 		projected.Identity = cloneSchemaIdentity(sourceTable.Identity)
 		return projected, nil
+	case "mssql":
+		return projectSQLServerTableForPostgres(sourceTable)
 	case "mysql":
 		return projectMySQLTableForPostgres(sourceTable)
 	case "sqlite":

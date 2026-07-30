@@ -457,6 +457,12 @@ func postgresSourceColumnFromCatalog(
 			return schema.Column{}, unsupportedPostgresSourceType(catalog)
 		}
 		column.Type = "double precision"
+	case "float4":
+		if catalog.typeModifier != -1 {
+			return schema.Column{}, unsupportedPostgresSourceType(catalog)
+		}
+		column.Type = "real"
+		column.DeclaredType = &schema.DeclaredType{Base: "real"}
 	case "text", "uuid", "bytea", "json", "jsonb", "bool", "date":
 		if catalog.typeModifier != -1 {
 			return schema.Column{}, unsupportedPostgresSourceType(catalog)
@@ -485,7 +491,7 @@ func postgresSourceColumnFromCatalog(
 			Base:      "numeric",
 			Arguments: []int{precision, scale},
 		}
-	case "timestamp", "timestamptz":
+	case "time", "timestamp", "timestamptz":
 		column.Type = catalog.typeName
 		switch {
 		case catalog.typeModifier == -1:

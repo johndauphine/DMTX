@@ -48,7 +48,7 @@ func (adapter *sqliteTargetAdapter) PlanTables(
 		return nil, err
 	}
 	switch sourceEngine {
-	case "postgres", "mysql", "mssql", "sqlite":
+	case "postgres", "mysql", "sqlite":
 	default:
 		return nil, fmt.Errorf(
 			"SQLite target does not support source engine %q",

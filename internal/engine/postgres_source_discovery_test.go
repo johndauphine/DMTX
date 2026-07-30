@@ -62,6 +62,17 @@ func TestPostgresSourceColumnFromCatalogPreservesExactModifiers(
 			},
 		},
 		{
+			name:    "single precision",
+			catalog: validPostgresSourceColumnCatalog("score", "float4", -1),
+			expected: schema.Column{
+				Name: "score",
+				Type: "real",
+				DeclaredType: &schema.DeclaredType{
+					Base: "real",
+				},
+			},
+		},
+		{
 			name:    "varchar length",
 			catalog: validPostgresSourceColumnCatalog("code", "varchar", 16),
 			expected: schema.Column{
@@ -115,6 +126,22 @@ func TestPostgresSourceColumnFromCatalogPreservesExactModifiers(
 			expected: schema.Column{
 				Name: "observed_at",
 				Type: "timestamptz",
+			},
+		},
+		{
+			name: "explicit time precision",
+			catalog: validPostgresSourceColumnCatalog(
+				"local_time",
+				"time",
+				6,
+			),
+			expected: schema.Column{
+				Name: "local_time",
+				Type: "time",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "time",
+					Arguments: []int{6},
+				},
 			},
 		},
 		{
@@ -174,9 +201,10 @@ func TestPostgresSourceColumnFromCatalogFailsClosed(t *testing.T) {
 			},
 		},
 		{
-			name: "real would widen",
+			name: "unsupported time precision",
 			mutate: func(value *postgresSourceColumnCatalog) {
-				value.typeName = "float4"
+				value.typeName = "time"
+				value.typeModifier = 7
 			},
 		},
 		{

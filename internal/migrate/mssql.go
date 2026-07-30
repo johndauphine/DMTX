@@ -9,8 +9,9 @@ import (
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
-// SQLServerToSQLiteWithObserver migrates SQL Server base tables through the
-// shared source/target adapter runner.
+// SQLServerToSQLiteWithObserver retains the typed pair entrypoint while the
+// route remains fail-closed pending an exact SQL Server-driver-to-SQLite value
+// contract and live fixture.
 func SQLServerToSQLiteWithObserver(
 	ctx context.Context,
 	cfg config.Config,

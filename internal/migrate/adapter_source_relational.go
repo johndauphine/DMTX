@@ -85,7 +85,8 @@ func openSQLServerSourceAdapter(
 		defaultNamespace: func(config.Endpoint) string {
 			return "dbo"
 		},
-		open:           engine.OpenSQLServer,
+		open:           engine.OpenSQLServer2022Source,
+		verify:         engine.VerifySQLServer2022Source,
 		listTables:     engine.ListSQLServerTables,
 		inspectTable:   engine.InspectSQLServerTable,
 		readQuery:      sqlServerReadQuery,

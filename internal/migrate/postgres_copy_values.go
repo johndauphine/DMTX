@@ -107,7 +107,9 @@ func normalizePostgresColumnValue(column schema.Column, value any) (any, error) 
 			return nil, fmt.Errorf("expected a signed 64-bit integer")
 		}
 		return integer.Int64(), nil
-	case "real", "float", "float4", "double", "double precision", "float8":
+	case "real", "float4":
+		return normalizePostgresReal(value)
+	case "float", "double", "double precision", "float8":
 		return normalizePostgresFloat(value)
 	case "decimal", "numeric":
 		precision, scale, err := postgresNumericColumnModifiers(column)
@@ -169,6 +171,18 @@ func normalizePostgresColumnValue(column schema.Column, value any) (any, error) 
 		if err := validatePostgresTemporalPrecision(
 			column,
 			normalized.Time,
+		); err != nil {
+			return nil, err
+		}
+		return normalized, nil
+	case "time":
+		normalized, err := normalizePostgresTime(value)
+		if err != nil {
+			return nil, err
+		}
+		if err := validatePostgresTimePrecision(
+			column,
+			normalized.Microseconds,
 		); err != nil {
 			return nil, err
 		}
@@ -284,6 +298,50 @@ func validatePostgresTemporalPrecision(
 	if value.Nanosecond()%unit != 0 {
 		return fmt.Errorf(
 			"timestamp exceeds PostgreSQL fractional-second precision %d",
+			precision,
+		)
+	}
+	return nil
+}
+
+func postgresTimeColumnPrecision(
+	column schema.Column,
+) (int, bool, error) {
+	if column.DeclaredType == nil {
+		return postgresDefaultTimestampPrecision, false, nil
+	}
+	if strings.ToLower(strings.TrimSpace(
+		column.DeclaredType.Base,
+	)) != "time" ||
+		len(column.DeclaredType.Arguments) != 1 {
+		return 0, false, fmt.Errorf(
+			"invalid PostgreSQL time declaration",
+		)
+	}
+	precision := column.DeclaredType.Arguments[0]
+	if precision < 0 || precision > 6 {
+		return 0, false, fmt.Errorf(
+			"invalid PostgreSQL time precision",
+		)
+	}
+	return precision, true, nil
+}
+
+func validatePostgresTimePrecision(
+	column schema.Column,
+	microseconds int64,
+) error {
+	precision, constrained, err := postgresTimeColumnPrecision(column)
+	if err != nil || !constrained {
+		return err
+	}
+	unit := int64(1)
+	for digits := precision; digits < 6; digits++ {
+		unit *= 10
+	}
+	if microseconds%unit != 0 {
+		return fmt.Errorf(
+			"time exceeds PostgreSQL fractional-second precision %d",
 			precision,
 		)
 	}
@@ -673,6 +731,28 @@ func normalizePostgresFloat(value any) (float64, error) {
 	return number, nil
 }
 
+func normalizePostgresReal(value any) (float32, error) {
+	number, err := normalizePostgresFloat(value)
+	if err != nil {
+		return 0, err
+	}
+	result := float32(number)
+	switch {
+	case math.IsNaN(number):
+		return result, nil
+	case math.IsInf(number, 0):
+		if math.IsInf(float64(result), 0) {
+			return result, nil
+		}
+	case !math.IsInf(float64(result), 0) &&
+		float64(result) == number:
+		return result, nil
+	}
+	return 0, fmt.Errorf(
+		"floating-point value is not exactly representable as PostgreSQL REAL",
+	)
+}
+
 func normalizePostgresTimestamp(value any) (pgtype.Timestamp, error) {
 	switch timestamp := value.(type) {
 	case pgtype.Timestamp:
@@ -783,6 +863,67 @@ func normalizePostgresTimestamptz(value any) (pgtype.Timestamptz, error) {
 	return pgtype.Timestamptz{}, fmt.Errorf(
 		"expected a valid timestamptz",
 	)
+}
+
+func normalizePostgresTime(value any) (pgtype.Time, error) {
+	const microsecondsPerDay = int64(24 * time.Hour / time.Microsecond)
+	switch clock := value.(type) {
+	case pgtype.Time:
+		if !clock.Valid ||
+			clock.Microseconds < 0 ||
+			clock.Microseconds > microsecondsPerDay {
+			return pgtype.Time{}, fmt.Errorf(
+				"expected a valid PostgreSQL time",
+			)
+		}
+		return clock, nil
+	case time.Time:
+		_, offset := clock.Zone()
+		if clock.Year() != 1 ||
+			clock.Month() != time.January ||
+			clock.Day() != 1 ||
+			offset != 0 ||
+			clock.Nanosecond()%int(time.Microsecond) != 0 {
+			return pgtype.Time{}, fmt.Errorf(
+				"expected a zone-less time of day",
+			)
+		}
+		microseconds := int64(clock.Hour())*int64(time.Hour/time.Microsecond) +
+			int64(clock.Minute())*int64(time.Minute/time.Microsecond) +
+			int64(clock.Second())*int64(time.Second/time.Microsecond) +
+			int64(clock.Nanosecond()/int(time.Microsecond))
+		return pgtype.Time{
+			Microseconds: microseconds,
+			Valid:        true,
+		}, nil
+	}
+	text, err := postgresTemporalText(value)
+	if err != nil {
+		return pgtype.Time{}, fmt.Errorf("expected a time")
+	}
+	for _, layout := range []string{
+		"15:04:05.999999999",
+		"15:04:05",
+	} {
+		clock, parseErr := time.Parse(layout, text)
+		if parseErr != nil {
+			continue
+		}
+		if clock.Nanosecond()%int(time.Microsecond) != 0 {
+			return pgtype.Time{}, fmt.Errorf(
+				"time precision exceeds PostgreSQL microseconds",
+			)
+		}
+		microseconds := int64(clock.Hour())*int64(time.Hour/time.Microsecond) +
+			int64(clock.Minute())*int64(time.Minute/time.Microsecond) +
+			int64(clock.Second())*int64(time.Second/time.Microsecond) +
+			int64(clock.Nanosecond()/int(time.Microsecond))
+		return pgtype.Time{
+			Microseconds: microseconds,
+			Valid:        true,
+		}, nil
+	}
+	return pgtype.Time{}, fmt.Errorf("expected a valid time")
 }
 
 func requirePostgresMicrosecondPrecision(value time.Time) error {

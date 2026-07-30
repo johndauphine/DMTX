@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
-	"strings"
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/schema"
@@ -31,6 +30,11 @@ func SQLServerDSN(endpoint config.Endpoint) (string, error) {
 	query := url.Values{}
 	query.Set("database", endpoint.Database)
 	query.Set("encrypt", "true")
+	query.Set("guid conversion", "true")
+	query.Set("tlsmin", "1.2")
+	if endpoint.TLSCAFile != "" {
+		query.Set("certificate", endpoint.TLSCAFile)
+	}
 	connection.RawQuery = query.Encode()
 	return connection.String(), nil
 }
@@ -49,6 +53,35 @@ func OpenSQLServer(ctx context.Context, endpoint config.Endpoint) (*sql.DB, erro
 	if err := database.PingContext(ctx); err != nil {
 		database.Close()
 		return nil, fmt.Errorf("verify SQL Server connection: %w", err)
+	}
+	return database, nil
+}
+
+// OpenSQLServer2022Source opens a verified SQL Server 2022 source pool with a
+// single connection slot. Discovery independently checks stable object
+// identities and catalog equality rather than assuming database/sql can never
+// replace a failed physical connection. This opener does not provide the
+// run-scoped snapshot needed for concurrent source DDL, writes, or listener
+// failover; that is the separate strict-consistency contract.
+func OpenSQLServer2022Source(
+	ctx context.Context,
+	endpoint config.Endpoint,
+) (*sql.DB, error) {
+	database, err := OpenSQLServer(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	database.SetMaxOpenConns(1)
+	database.SetMaxIdleConns(1)
+	if err := VerifySQLServer2022Source(ctx, database); err != nil {
+		if closeErr := database.Close(); closeErr != nil {
+			return nil, fmt.Errorf(
+				"verify SQL Server 2022 source: %w (close: %v)",
+				err,
+				closeErr,
+			)
+		}
+		return nil, fmt.Errorf("verify SQL Server 2022 source: %w", err)
 	}
 	return database, nil
 }
@@ -88,94 +121,5 @@ func InspectSQLServerTable(ctx context.Context, database *sql.DB, namespace, nam
 	if namespace == "" {
 		namespace = "dbo"
 	}
-	rows, err := database.QueryContext(ctx, `
-		SELECT column_name, data_type, is_nullable
-		FROM information_schema.columns
-		WHERE table_schema = @p1 AND table_name = @p2
-		ORDER BY ordinal_position
-	`, namespace, name)
-	if err != nil {
-		return schema.Table{}, fmt.Errorf("list SQL Server columns: %w", err)
-	}
-	defer rows.Close()
-	var columns []schema.Column
-	for rows.Next() {
-		var column schema.Column
-		var nullable string
-		if err := rows.Scan(&column.Name, &column.Type, &nullable); err != nil {
-			return schema.Table{}, fmt.Errorf("read SQL Server column: %w", err)
-		}
-		column.Type = normalizeSQLServerType(column.Type)
-		column.Nullable = nullable == "YES"
-		columns = append(columns, column)
-	}
-	if err := rows.Err(); err != nil {
-		return schema.Table{}, fmt.Errorf("iterate SQL Server columns: %w", err)
-	}
-	if len(columns) == 0 {
-		return schema.Table{}, fmt.Errorf("SQL Server table %s.%s does not exist", namespace, name)
-	}
-	keys, err := sqlServerPrimaryKeys(ctx, database, namespace, name)
-	if err != nil {
-		return schema.Table{}, err
-	}
-	return buildSQLServerTable(namespace, name, columns, keys), nil
-}
-
-func sqlServerPrimaryKeys(ctx context.Context, database *sql.DB, namespace, name string) ([]string, error) {
-	rows, err := database.QueryContext(ctx, `
-		SELECT key_column_usage.column_name
-		FROM information_schema.table_constraints
-		JOIN information_schema.key_column_usage
-		  ON table_constraints.constraint_name = key_column_usage.constraint_name
-		 AND table_constraints.table_schema = key_column_usage.table_schema
-		WHERE table_constraints.table_schema = @p1
-		  AND table_constraints.table_name = @p2
-		  AND table_constraints.constraint_type = 'PRIMARY KEY'
-		ORDER BY key_column_usage.ordinal_position
-	`, namespace, name)
-	if err != nil {
-		return nil, fmt.Errorf("list SQL Server primary key: %w", err)
-	}
-	defer rows.Close()
-	var keys []string
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			return nil, fmt.Errorf("read SQL Server primary key: %w", err)
-		}
-		keys = append(keys, key)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate SQL Server primary key: %w", err)
-	}
-	return keys, nil
-}
-
-func buildSQLServerTable(namespace, name string, columns []schema.Column, primaryKeys []string) schema.Table {
-	keys := make(map[string]bool, len(primaryKeys))
-	for _, key := range primaryKeys {
-		keys[key] = true
-	}
-	for index := range columns {
-		columns[index].PrimaryKey = keys[columns[index].Name]
-	}
-	return schema.Table{Schema: namespace, Name: name, Columns: columns}
-}
-
-func normalizeSQLServerType(value string) string {
-	switch strings.ToLower(value) {
-	case "int", "smallint", "tinyint":
-		return "integer"
-	case "bigint":
-		return "bigint"
-	case "nvarchar", "varchar", "nchar", "char":
-		return "text"
-	case "bit":
-		return "boolean"
-	case "datetime", "datetime2", "datetimeoffset":
-		return "datetime"
-	default:
-		return strings.ToLower(value)
-	}
+	return inspectSQLServer2022Table(ctx, database, namespace, name)
 }
