@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/state"
 	_ "modernc.org/sqlite"
 )
@@ -31,6 +32,18 @@ func TestRunStoresCompletedTableCheckpoint(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(configuration), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	wantSourceIdentity, err := endpointWorkloadIdentity(
+		config.Endpoint{Type: "sqlite", Database: sourcePath},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTargetIdentity, err := endpointWorkloadIdentity(
+		config.Endpoint{Type: "sqlite", Database: targetPath},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var output, errors bytes.Buffer
 	if code := Run([]string{"run", "--config", configPath}, &output, &errors); code != Success {
@@ -39,6 +52,41 @@ func TestRunStoresCompletedTableCheckpoint(t *testing.T) {
 	latest, found, err := (state.SQLiteStore{Path: configPath + ".state.db"}).Latest()
 	if err != nil || !found {
 		t.Fatalf("latest = %#v, found = %v, error = %v", latest, found, err)
+	}
+	if latest.SourceIdentity != wantSourceIdentity ||
+		latest.TargetIdentity != wantTargetIdentity {
+		t.Fatalf(
+			"run workload identities = (%q, %q), want (%q, %q)",
+			latest.SourceIdentity,
+			latest.TargetIdentity,
+			wantSourceIdentity,
+			wantTargetIdentity,
+		)
+	}
+	if latest.SourceEngine != "sqlite" {
+		t.Fatalf("source engine = %q, want sqlite", latest.SourceEngine)
+	}
+	boundLease, err := latest.BoundLease()
+	if err != nil {
+		t.Fatalf("bound run lease: %v", err)
+	}
+	if boundLease.RunID != latest.ID ||
+		boundLease.Target == "" ||
+		boundLease.OwnerToken == "" ||
+		boundLease.Generation < 1 {
+		t.Fatalf("bound run lease = %#v", boundLease)
+	}
+	var status bytes.Buffer
+	if code := showState(
+		[]string{"--state", configPath + ".state.db"},
+		&status,
+		true,
+	); code != Success {
+		t.Fatalf("status exit code = %d", code)
+	}
+	if strings.Contains(status.String(), boundLease.OwnerToken) ||
+		strings.Contains(status.String(), "lease_owner_token") {
+		t.Fatalf("public status leaked lease owner token: %s", status.String())
 	}
 	tasks, err := (state.SQLiteStore{Path: configPath + ".state.db"}).ListTasks(latest.ID)
 	if err != nil {

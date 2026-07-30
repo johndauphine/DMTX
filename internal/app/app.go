@@ -137,7 +137,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 			_ = guard.Release()
 		}
 	}()
-	if err := store.InitializeRun(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Running, Resumable: true, Reason: "migration in progress", StartedAt: started}, configHash); err != nil {
+	sourceIdentity, err := endpointWorkloadIdentity(cfg.Source)
+	if err != nil {
+		fmt.Fprintf(stderr, "source workload identity: %v\n", err)
+		return StateError
+	}
+	targetIdentity, err := endpointWorkloadIdentity(cfg.Target)
+	if err != nil {
+		fmt.Fprintf(stderr, "target workload identity: %v\n", err)
+		return StateError
+	}
+	if err := store.InitializeRun(state.Run{
+		ID:             runID,
+		Source:         cfg.Source.Database,
+		Target:         cfg.Target.Database,
+		SourceEngine:   cfg.Source.Type,
+		SourceIdentity: sourceIdentity,
+		TargetIdentity: targetIdentity,
+		Outcome:        state.Running,
+		Resumable:      true,
+		Reason:         "migration in progress",
+		StartedAt:      started,
+	}, configHash); err != nil {
 		fmt.Fprintf(stderr, "record migration state: %v\n", err)
 		return StateError
 	}
@@ -199,7 +220,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
-	if err := store.Append(state.Run{ID: runID, Source: cfg.Source.Database, Target: cfg.Target.Database, Outcome: state.Success, Resumable: false, Reason: runSuccessReason, StartedAt: started, EndedAt: time.Now().UTC()}); err != nil {
+	if err := store.Append(state.Run{
+		ID:             runID,
+		Source:         cfg.Source.Database,
+		Target:         cfg.Target.Database,
+		SourceEngine:   cfg.Source.Type,
+		SourceIdentity: sourceIdentity,
+		TargetIdentity: targetIdentity,
+		Outcome:        state.Success,
+		Resumable:      false,
+		Reason:         runSuccessReason,
+		StartedAt:      started,
+		EndedAt:        time.Now().UTC(),
+	}); err != nil {
 		fmt.Fprintf(stderr, "record completed migration state: %v\n", err)
 		return StateError
 	}
@@ -295,7 +328,7 @@ func showState(args []string, stdout io.Writer, latest bool) int {
 			fmt.Fprintln(stdout, "no runs recorded")
 			return Success
 		}
-		if err := json.NewEncoder(stdout).Encode(run); err != nil {
+		if err := json.NewEncoder(stdout).Encode(publicRun(run)); err != nil {
 			fmt.Fprintln(stdout, err)
 			return FileError
 		}
@@ -306,11 +339,20 @@ func showState(args []string, stdout io.Writer, latest bool) int {
 		fmt.Fprintln(stdout, err)
 		return StateError
 	}
-	if err := json.NewEncoder(stdout).Encode(runs); err != nil {
+	publicRuns := make([]state.Run, len(runs))
+	for index, run := range runs {
+		publicRuns[index] = publicRun(run)
+	}
+	if err := json.NewEncoder(stdout).Encode(publicRuns); err != nil {
 		fmt.Fprintln(stdout, err)
 		return FileError
 	}
 	return Success
+}
+
+func publicRun(run state.Run) state.Run {
+	run.LeaseOwnerToken = ""
+	return run
 }
 
 func printHelp(output io.Writer) {

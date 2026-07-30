@@ -172,6 +172,10 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			return ConfigurationError
 		}
 	}
+	if err := store.BindRunLease(run.ID, lease); err != nil {
+		fmt.Fprintf(stderr, "bind resumed run to target lease: %v\n", err)
+		return StateError
+	}
 	if err := store.ReactivateRun(run.ID, "migration resume in progress"); err != nil {
 		fmt.Fprintf(stderr, "reactivate migration run: %v\n", err)
 		return StateError
@@ -428,6 +432,10 @@ func abandonResumeRun(configPath string, cfg config.Config, run state.Run, store
 		return StateError
 	}
 	run = authoritative
+	if err := store.BindRunLease(run.ID, lease); err != nil {
+		fmt.Fprintf(stderr, "bind abandoned run to target lease: %v\n", err)
+		return StateError
+	}
 	if err := store.AbandonRun(run.ID, reason, time.Now().UTC()); err != nil {
 		fmt.Fprintf(stderr, "abandon run: %v\n", err)
 		return StateError
@@ -570,6 +578,10 @@ func finalizePersistedSuccess(
 		result.Rows += task.RowsDone
 	}
 
+	if err := store.BindRunLease(run.ID, lease); err != nil {
+		fmt.Fprintf(stderr, "bind terminal repair to target lease: %v\n", err)
+		return StateError
+	}
 	if err := appendAudit(configPath, run.ID, "resume_finalization_started"); err != nil {
 		_ = heartbeat.Stop()
 		heartbeatStopped = true

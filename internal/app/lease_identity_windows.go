@@ -12,7 +12,7 @@ import (
 func sqliteLeaseFileIdentity(path string) (identity string, multipleLinks bool, err error) {
 	file, err := os.Open(path)
 	if os.IsNotExist(err) {
-		return "path:" + strings.ToLower(path), false, nil
+		return "path:" + path, false, nil
 	}
 	if err != nil {
 		return "", false, err
@@ -23,4 +23,8 @@ func sqliteLeaseFileIdentity(path string) (identity string, multipleLinks bool, 
 		return "", false, err
 	}
 	return fmt.Sprintf("file:%08x:%08x%08x", info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow), info.NumberOfLinks > 1, nil
+}
+
+func sqliteLeaseFoldedPath(path string) string {
+	return strings.ToLower(path)
 }
