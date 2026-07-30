@@ -65,8 +65,7 @@ func (observer *stage2WriteBeforeRangeAckObserver) BeforeSQLiteChunkAcknowledge(
 	if err := os.WriteFile(observer.eventPath, []byte("target-committed"), 0o600); err != nil {
 		return err
 	}
-	<-ctx.Done()
-	return ctx.Err()
+	return waitForParentHardKill(ctx)
 }
 
 func stage2RangeAckHelperCommand(
