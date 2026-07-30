@@ -444,6 +444,53 @@ func TestSQLServerTargetPreflightsPostgresValuesBeforeMutation(
 	}
 }
 
+func TestSQLServerTargetPreflightsMySQLValuesBeforeMutation(
+	t *testing.T,
+) {
+	sourceTable := schema.Table{
+		Schema: "dmtx",
+		Name:   "clocks",
+		Columns: []schema.Column{{
+			Name: "clock",
+			Type: "time",
+			DeclaredType: &schema.DeclaredType{
+				Base:      "time",
+				Arguments: []int{6},
+			},
+		}},
+	}
+	targetTable := sourceTable
+	targetTable.Schema = "dbo"
+	sourceFixture := &sqlServerTargetValueFixtureSource{
+		table: sourceTable,
+		rows:  [][]any{{"24:00:00.000000"}},
+	}
+	source := &mySQLServerTargetValueFixtureSource{
+		sqlServerTargetValueFixtureSource: sourceFixture,
+	}
+
+	err := (&sqlServerTargetAdapter{}).PreflightSourceData(
+		context.Background(),
+		source,
+		[]adapterTablePlan{{
+			source:  sourceTable,
+			target:  targetTable,
+			columns: []string{"clock"},
+		}},
+		"drop_recreate",
+	)
+	if err == nil || !strings.Contains(err.Error(), "TIME") {
+		t.Fatalf("preflight error = %v, want TIME rejection", err)
+	}
+	if sourceFixture.opens != 1 || sourceFixture.closes != 1 {
+		t.Fatalf(
+			"source stream opens=%d closes=%d, want 1/1",
+			sourceFixture.opens,
+			sourceFixture.closes,
+		)
+	}
+}
+
 func TestSQLServerTargetPreflightsEmptyIdentityPrimerBeforeMutation(
 	t *testing.T,
 ) {
@@ -872,6 +919,18 @@ func (*sqlServerTargetValueFixtureSource) Engine() string {
 
 func (*sqlServerTargetValueFixtureSource) DisplayName() string {
 	return "PostgreSQL"
+}
+
+type mySQLServerTargetValueFixtureSource struct {
+	*sqlServerTargetValueFixtureSource
+}
+
+func (*mySQLServerTargetValueFixtureSource) Engine() string {
+	return "mysql"
+}
+
+func (*mySQLServerTargetValueFixtureSource) DisplayName() string {
+	return "MySQL"
 }
 
 func (source *sqlServerTargetValueFixtureSource) ListTables(

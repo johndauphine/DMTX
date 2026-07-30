@@ -7,15 +7,16 @@ import "github.com/johndauphine/dmtx/internal/engine"
 //
 // SQLite sources compose with the PostgreSQL target. PostgreSQL and
 // version-pinned MySQL/MariaDB sources compose with PostgreSQL, SQLite, and
-// the native MySQL target where explicitly certified; unsupported
-// flavor/target combinations still fail during read-only planning. SQL Server
-// and PostgreSQL sources compose with both the native SQL Server target and
-// the admitted native MySQL-family targets where explicitly certified; the
-// SQL Server target's SQLite source remains on the compatibility route until
-// the shared value contract has a live fixture. SQL Server's SQLite target is
-// certified for its conservative drop/recreate contract; unsupported SQLite
-// storage and comparison shapes remain fail-closed. SQLite composes with the
-// pinned ClickHouse 24.8 target under its strict rebuild-only contract.
+// the native MySQL and SQL Server targets where explicitly certified;
+// unsupported flavor/target combinations still fail during read-only
+// planning. SQL Server and PostgreSQL sources compose with both the native
+// SQL Server target and the admitted native MySQL-family targets where
+// explicitly certified. The SQL Server target's SQLite source remains on the
+// compatibility route until the shared value contract has a live fixture. SQL
+// Server's SQLite target is certified for its conservative drop/recreate
+// contract; unsupported SQLite storage and comparison shapes remain
+// fail-closed. SQLite composes with the pinned ClickHouse 24.8 target under its
+// strict rebuild-only contract.
 // ClickHouse 24.8 also composes with a distinct ClickHouse Atomic database for
 // the narrow same-engine rebuild shape whose ordering metadata is explicitly
 // non-unique.
@@ -77,6 +78,7 @@ var builtInAdapters = mustBuildAdapterRegistry(
 		{source: "mysql", target: "postgres"},
 		{source: "mysql", target: "sqlite"},
 		{source: "mysql", target: "mysql"},
+		{source: "mysql", target: "mssql"},
 		{source: "mssql", target: "postgres"},
 		{source: "mssql", target: "sqlite"},
 		{source: "mssql", target: "mysql"},

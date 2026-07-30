@@ -32,7 +32,7 @@ type sqlServerTargetValueColumn struct {
 }
 
 // PreflightSourceData admits any empty-table identity lifecycle before target
-// mutation, then reads PostgreSQL values whose domains are wider than their
+// mutation, then reads cross-engine values whose domains are wider than their
 // admitted SQL Server projections. Same-engine values are already constrained
 // by SQL Server itself and are checked again at the write boundary.
 func (adapter *sqlServerTargetAdapter) PreflightSourceData(
@@ -50,11 +50,13 @@ func (adapter *sqlServerTargetAdapter) PreflightSourceData(
 	); err != nil {
 		return err
 	}
-	if source.Engine() != "postgres" {
+	switch source.Engine() {
+	case "postgres", "mysql":
+	default:
 		return nil
 	}
 	for _, plan := range plans {
-		if err := preflightPostgresTableValuesForSQLServer(
+		if err := preflightSourceTableValuesForSQLServer(
 			ctx,
 			source,
 			plan,
@@ -196,11 +198,12 @@ func preflightSQLServerEmptyUpsertIdentity(
 	return nil
 }
 
-func preflightPostgresTableValuesForSQLServer(
+func preflightSourceTableValuesForSQLServer(
 	ctx context.Context,
 	source sourceAdapter,
 	plan adapterTablePlan,
 ) (result error) {
+	sourceName := source.DisplayName()
 	checked, err := sqlServerTargetValueColumns(
 		plan.target,
 		plan.columns,
@@ -214,7 +217,8 @@ func preflightPostgresTableValuesForSQLServer(
 	rows, err := source.OpenRows(ctx, plan.source, plan.columns)
 	if err != nil {
 		return fmt.Errorf(
-			"open PostgreSQL table %s for SQL Server value preflight: %w",
+			"open %s table %s for SQL Server value preflight: %w",
+			sourceName,
 			plan.source.Name,
 			err,
 		)
@@ -222,7 +226,8 @@ func preflightPostgresTableValuesForSQLServer(
 	defer func() {
 		if closeErr := rows.Close(); closeErr != nil {
 			closeErr = fmt.Errorf(
-				"close PostgreSQL table %s SQL Server value preflight: %w",
+				"close %s table %s SQL Server value preflight: %w",
+				sourceName,
 				plan.source.Name,
 				closeErr,
 			)
@@ -242,7 +247,8 @@ func preflightPostgresTableValuesForSQLServer(
 	for rows.Next() {
 		if err := rows.Scan(destinations...); err != nil {
 			return fmt.Errorf(
-				"read PostgreSQL table %s during SQL Server value preflight: %w",
+				"read %s table %s during SQL Server value preflight: %w",
+				sourceName,
 				plan.source.Name,
 				err,
 			)
@@ -257,7 +263,8 @@ func preflightPostgresTableValuesForSQLServer(
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf(
-			"iterate PostgreSQL table %s during SQL Server value preflight: %w",
+			"iterate %s table %s during SQL Server value preflight: %w",
+			sourceName,
 			plan.source.Name,
 			err,
 		)

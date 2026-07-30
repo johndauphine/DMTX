@@ -11,9 +11,10 @@ import (
 )
 
 type sqlServerTargetAdapter struct {
-	database    *sql.DB
-	batchWriter sqlServerBatchWriter
-	namespace   string
+	database                *sql.DB
+	batchWriter             sqlServerBatchWriter
+	namespace               string
+	destructiveAcknowledged bool
 }
 
 func (adapter *sqlServerTargetAdapter) sqlServerDatabaseHandle() *sql.DB {
@@ -132,7 +133,12 @@ func (adapter *sqlServerTargetAdapter) PrepareTables(
 	if mode == "upsert" {
 		return nil
 	}
-	return prepareSQLServerTargets(ctx, adapter.database, targetTables)
+	return prepareSQLServerTargets(
+		ctx,
+		adapter.database,
+		targetTables,
+		adapter.destructiveAcknowledged,
+	)
 }
 
 func (adapter *sqlServerTargetAdapter) WriteBatch(

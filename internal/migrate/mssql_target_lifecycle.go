@@ -19,6 +19,7 @@ func prepareSQLServerTargets(
 	ctx context.Context,
 	database *sql.DB,
 	tables []schema.Table,
+	destructiveAcknowledged bool,
 ) (result error) {
 	ordered := orderedSQLServerTargetTables(tables)
 	drops := make([]string, len(ordered))
@@ -89,6 +90,20 @@ func prepareSQLServerTargets(
 			err,
 		)
 	}
+	var lockedExisting map[string]struct{}
+	if !destructiveAcknowledged {
+		lockedExisting, err = preflightSQLServerDestructiveRows(
+			ctx,
+			transaction,
+			ordered,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"recheck SQL Server destructive acknowledgement: %w",
+				err,
+			)
+		}
+	}
 	constraints, err := readSQLServerSelectedForeignKeyDrops(
 		ctx,
 		transaction,
@@ -107,6 +122,18 @@ func prepareSQLServerTargets(
 		}
 	}
 	for index, statement := range drops {
+		if !destructiveAcknowledged {
+			if _, exists := lockedExisting[sqlServerFoldedName(
+				ordered[index].Name,
+			)]; !exists {
+				// The name was absent while the serializable preparation
+				// transaction inspected the catalog. Do not issue DROP IF
+				// EXISTS: if another session creates that name now, CREATE
+				// below must collide and roll the transaction back rather
+				// than destroy an unacknowledged table.
+				continue
+			}
+		}
 		if _, err := transaction.ExecContext(ctx, statement); err != nil {
 			return newSQLServerSafeOperationError(
 				"drop SQL Server table",
@@ -137,6 +164,60 @@ func prepareSQLServerTargets(
 	}
 	committed = true
 	return nil
+}
+
+// preflightSQLServerDestructiveRows both rechecks and locks every existing
+// selected table. TABLOCKX plus HOLDLOCK keeps an empty table empty until the
+// surrounding serializable preparation transaction either rolls back or
+// drops it, closing the acknowledgement race between the runner's read-only
+// preflight and destructive DDL.
+func preflightSQLServerDestructiveRows(
+	ctx context.Context,
+	queryer sqlServerCatalogQueryer,
+	tables []schema.Table,
+) (map[string]struct{}, error) {
+	lockedExisting := make(map[string]struct{}, len(tables))
+	for _, table := range tables {
+		exists, err := sqlServerTargetBaseTableExists(
+			ctx,
+			queryer,
+			table,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"inspect SQL Server rebuild target %s: %w",
+				table.Name,
+				err,
+			)
+		}
+		if !exists {
+			continue
+		}
+		lockedExisting[sqlServerFoldedName(table.Name)] = struct{}{}
+		var marker int
+		err = queryer.QueryRowContext(
+			ctx,
+			"SELECT TOP (1) 1 FROM "+
+				sqlServerQualified(table.Schema, table.Name)+
+				" WITH (TABLOCKX, HOLDLOCK)",
+		).Scan(&marker)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, newSQLServerSafeOperationError(
+				"inspect SQL Server rebuild target rows for",
+				table.Name,
+				err,
+			)
+		}
+		return nil, fmt.Errorf(
+			"%w: SQL Server target table %q contains rows; rerun with --acknowledge-destructive",
+			ErrDestructiveAcknowledgement,
+			table.Name,
+		)
+	}
+	return lockedExisting, nil
 }
 
 func readSQLServerSelectedForeignKeyDrops(

@@ -326,6 +326,114 @@ func TestSQLServerNativeWriterTypesBinaryNullWithoutMutatingInput(
 	}
 }
 
+func TestSQLServerNativeWriterNormalizesMySQLTextAndDecimalBytes(
+	t *testing.T,
+) {
+	writer, _, _, transaction := newSQLServerNativeTestWriter()
+	transaction.bulk.execAffected = []int64{0}
+	transaction.bulk.doneAffected = 1
+	table := sqlServerNativeMySQLBindingTestTable()
+	columns := []string{"id", "amount", "note", "payload"}
+	rows := [][]any{{
+		int64(7),
+		[]byte("12.340"),
+		[]byte("Zażółć — 東京"),
+		[]byte{0x00, 0xff},
+	}}
+
+	receipt, err := writer.WriteBatch(
+		context.Background(),
+		table,
+		columns,
+		"drop_recreate",
+		rows,
+	)
+	if err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	assertSQLServerNativeReceipt(t, receipt, CommitDurable, 1, 1)
+	if _, ok := rows[0][1].([]byte); !ok {
+		t.Fatalf("input decimal was mutated to %T", rows[0][1])
+	}
+	if _, ok := rows[0][2].([]byte); !ok {
+		t.Fatalf("input text was mutated to %T", rows[0][2])
+	}
+	want := [][]any{{
+		int64(7),
+		"12.340",
+		"Zażółć — 東京",
+		[]byte{0x00, 0xff},
+	}}
+	if got := transaction.bulk.rows; !reflect.DeepEqual(got, want) {
+		t.Fatalf("bulk rows = %#v, want %#v", got, want)
+	}
+}
+
+func TestSQLServerNativeWriterNormalizesMySQLBytesForUpsert(
+	t *testing.T,
+) {
+	writer, _, _, transaction := newSQLServerNativeTestWriter()
+	transaction.match.execAffected = []int64{1}
+	table := sqlServerNativeMySQLBindingTestTable()
+	columns := []string{"id", "amount", "note", "payload"}
+	binary := []byte{0xde, 0xad, 0xbe, 0xef}
+
+	receipt, err := writer.WriteBatch(
+		context.Background(),
+		table,
+		columns,
+		"upsert",
+		[][]any{{
+			int64(7),
+			[]byte("98.765"),
+			[]byte("emoji 😀"),
+			binary,
+		}},
+	)
+	if err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	assertSQLServerNativeReceipt(t, receipt, CommitDurable, 1, 1)
+	want := [][]any{{
+		"98.765",
+		"emoji 😀",
+		binary,
+		int64(7),
+	}}
+	if got := transaction.match.rows; !reflect.DeepEqual(got, want) {
+		t.Fatalf("upsert rows = %#v, want %#v", got, want)
+	}
+}
+
+func TestSQLServerNativeWriterRejectsInvalidMySQLTextBeforeConnection(
+	t *testing.T,
+) {
+	writer, provider, connection, _ := newSQLServerNativeTestWriter()
+	receipt, err := writer.WriteBatch(
+		context.Background(),
+		sqlServerNativeMySQLBindingTestTable(),
+		[]string{"id", "amount", "note", "payload"},
+		"drop_recreate",
+		[][]any{{
+			int64(7),
+			[]byte("12.340"),
+			[]byte{0xff, 0xfe},
+			[]byte{0xff, 0xfe},
+		}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+		t.Fatalf("error = %v, want invalid UTF-8 rejection", err)
+	}
+	assertSQLServerNativeReceipt(t, receipt, CommitNotCommitted, 1, 0)
+	if provider.calls != 0 || connection.beginCalls != 0 {
+		t.Fatalf(
+			"provider calls=%d begin calls=%d before byte validation",
+			provider.calls,
+			connection.beginCalls,
+		)
+	}
+}
+
 func TestSQLServerNativeWriterRejectsShortBulkCompletion(
 	t *testing.T,
 ) {
@@ -1035,6 +1143,46 @@ func sqlServerNativeIdentityTestTable() schema.Table {
 				PrimaryKeyPosition: 1,
 			},
 			{Name: "payload", Type: "text"},
+		},
+	}
+}
+
+func sqlServerNativeMySQLBindingTestTable() schema.Table {
+	return schema.Table{
+		Schema: "dbo",
+		Name:   "mysql_values",
+		Columns: []schema.Column{
+			{
+				Name:               "id",
+				Type:               "bigint",
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 1,
+				DeclaredType:       &schema.DeclaredType{Base: "bigint"},
+			},
+			{
+				Name: "amount",
+				Type: "numeric",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "decimal",
+					Arguments: []int{12, 3},
+				},
+			},
+			{
+				Name: "note",
+				Type: "text",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "varchar",
+					Arguments: []int{320},
+				},
+			},
+			{
+				Name: "payload",
+				Type: "blob",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "varbinary",
+					Arguments: []int{16},
+				},
+			},
 		},
 	}
 }

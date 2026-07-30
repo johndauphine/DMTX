@@ -386,6 +386,85 @@ func TestSQLServerTargetLifecycleRollbackFailureDiscardsAndMarksState(
 	}
 }
 
+func TestSQLServerTargetLifecycleRechecksDestructiveRowsWithTableLock(
+	t *testing.T,
+) {
+	table := sqlServerTargetLifecyclePlainIndexedTable()
+
+	t.Run("populated target rejects", func(t *testing.T) {
+		state := &sqlServerLifecycleDriverState{
+			targetExists:    true,
+			targetPopulated: true,
+		}
+		database := openSQLServerLifecycleTestDatabase(t, state)
+		_, err := preflightSQLServerDestructiveRows(
+			context.Background(),
+			database,
+			[]schema.Table{table},
+		)
+		if !errors.Is(err, ErrDestructiveAcknowledgement) {
+			t.Fatalf(
+				"destructive row recheck error = %v, want %v",
+				err,
+				ErrDestructiveAcknowledgement,
+			)
+		}
+		lockPosition := sqlServerLifecycleEventPosition(
+			state.events,
+			"query SELECT TOP (1) 1 FROM [dbo].[plain_target] "+
+				"WITH (TABLOCKX, HOLDLOCK)",
+		)
+		if lockPosition < 0 {
+			t.Fatalf("destructive row recheck lacked table lock: %#v", state.events)
+		}
+	})
+
+	t.Run("empty target remains locked and admitted", func(t *testing.T) {
+		state := &sqlServerLifecycleDriverState{targetExists: true}
+		database := openSQLServerLifecycleTestDatabase(t, state)
+		locked, err := preflightSQLServerDestructiveRows(
+			context.Background(),
+			database,
+			[]schema.Table{table},
+		)
+		if err != nil {
+			t.Fatalf("empty destructive row recheck: %v", err)
+		}
+		if _, exists := locked[sqlServerFoldedName(table.Name)]; !exists {
+			t.Fatalf("existing target was not recorded as locked: %#v", locked)
+		}
+		if sqlServerLifecycleEventPosition(
+			state.events,
+			"query SELECT TOP (1) 1 FROM [dbo].[plain_target] "+
+				"WITH (TABLOCKX, HOLDLOCK)",
+		) < 0 {
+			t.Fatalf("empty target was not locked: %#v", state.events)
+		}
+	})
+
+	t.Run("absent target is never eligible for drop", func(t *testing.T) {
+		state := &sqlServerLifecycleDriverState{}
+		database := openSQLServerLifecycleTestDatabase(t, state)
+		locked, err := preflightSQLServerDestructiveRows(
+			context.Background(),
+			database,
+			[]schema.Table{table},
+		)
+		if err != nil {
+			t.Fatalf("absent destructive row recheck: %v", err)
+		}
+		if len(locked) != 0 {
+			t.Fatalf("absent target was marked safe to drop: %#v", locked)
+		}
+		if sqlServerLifecycleEventPosition(
+			state.events,
+			"query SELECT TOP (1) 1 FROM ",
+		) >= 0 {
+			t.Fatalf("absent target row query ran: %#v", state.events)
+		}
+	})
+}
+
 func TestSQLServerTargetLifecycleSuppressesStructuredXACTAbortRollback(
 	t *testing.T,
 ) {
@@ -504,13 +583,15 @@ func openSQLServerLifecycleTestDatabase(
 }
 
 type sqlServerLifecycleDriverState struct {
-	events       []string
-	execErr      error
-	commitErr    error
-	rollbackErr  error
-	closed       bool
-	maximumValue sqldriver.Value
-	currentValue sqldriver.Value
+	events          []string
+	execErr         error
+	commitErr       error
+	rollbackErr     error
+	closed          bool
+	maximumValue    sqldriver.Value
+	currentValue    sqldriver.Value
+	targetExists    bool
+	targetPopulated bool
 }
 
 type sqlServerLifecycleTestDriver struct {
@@ -590,6 +671,23 @@ func (connection *sqlServerLifecycleTestConnection) QueryContext(
 	case strings.Contains(statement, "FROM sys.identity_columns"):
 		return &sqlServerLifecycleTestRows{
 			values: [][]sqldriver.Value{{connection.state.currentValue}},
+		}, nil
+	case strings.Contains(statement, "FROM sys.objects AS target_object"):
+		if !connection.state.targetExists {
+			return &sqlServerLifecycleTestRows{}, nil
+		}
+		return &sqlServerLifecycleTestRows{
+			values: [][]sqldriver.Value{{"U"}},
+		}, nil
+	case strings.HasPrefix(
+		statement,
+		"SELECT TOP (1) 1 FROM ",
+	):
+		if !connection.state.targetPopulated {
+			return &sqlServerLifecycleTestRows{}, nil
+		}
+		return &sqlServerLifecycleTestRows{
+			values: [][]sqldriver.Value{{int64(1)}},
 		}, nil
 	default:
 		return nil, fmt.Errorf("unexpected test query")

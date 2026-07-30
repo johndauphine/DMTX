@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -117,6 +118,42 @@ func TestSQLServerToSQLServerCommonFixtureLive(t *testing.T) {
 		},
 	}
 	result, err := SQLServerToSQLServerWithObserver(
+		ctx,
+		migrationConfig,
+		nil,
+	)
+	if !errors.Is(err, ErrDestructiveAcknowledgement) {
+		t.Fatalf(
+			"unacknowledged SQL Server rebuild result = %+v, error = %v",
+			result,
+			err,
+		)
+	}
+	for _, name := range []string{accountsName, eventsName} {
+		var retained int
+		if err := targetDatabase.QueryRowContext(
+			ctx,
+			"SELECT COUNT(*) FROM "+
+				sqlServerQualified("dbo", name)+
+				" WHERE [stale_id] = 99 AND "+
+				"[stale_marker] = 'must disappear'",
+		).Scan(&retained); err != nil {
+			t.Fatalf(
+				"inspect unacknowledged SQL Server target %s: %v",
+				name,
+				err,
+			)
+		}
+		if retained != 1 {
+			t.Fatalf(
+				"unacknowledged SQL Server rebuild mutated %s: stale rows = %d",
+				name,
+				retained,
+			)
+		}
+	}
+	migrationConfig.Migration.DestructiveAcknowledged = true
+	result, err = SQLServerToSQLServerWithObserver(
 		ctx,
 		migrationConfig,
 		nil,
@@ -777,8 +814,9 @@ func TestPostgresToSQLServerRejectsEndOfDayTimeBeforeMutationLive(
 			},
 			Target: targetEndpoint,
 			Migration: config.Migration{
-				TargetMode:    "drop_recreate",
-				IncludeTables: []string{tableName},
+				TargetMode:              "drop_recreate",
+				IncludeTables:           []string{tableName},
+				DestructiveAcknowledged: true,
 			},
 		},
 		observer,

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	mssql "github.com/microsoft/go-mssqldb"
 
@@ -189,13 +190,20 @@ func (writer *sqlServerNativeWriter) WriteBatch(
 // go-mssqldb encodes an untyped nil parameter as NVARCHAR NULL. SQL Server
 // deliberately has no implicit NVARCHAR-to-VARBINARY conversion, even for a
 // NULL value. Preserve source NULL semantics while pinning the parameter type
-// with a nil []byte for binary target columns. Other values remain untouched.
+// with a nil []byte for binary target columns.
+//
+// MySQL-family drivers return exact DECIMAL and character values as []byte.
+// Preserve binary values verbatim, but bind textual and decimal bytes as
+// strings so both SQL Server bulk copy and prepared upserts use the planned
+// character/numeric target type instead of VARBINARY. Invalid UTF-8 is rejected
+// before a target connection or transaction is acquired.
 func normalizeSQLServerWriteRows(
 	table schema.Table,
 	columns []string,
 	rows [][]any,
 ) ([][]any, error) {
 	binary := make([]bool, len(columns))
+	stringBytes := make([]bool, len(columns))
 	for index, name := range columns {
 		column, exists := sqlServerTableColumn(table, name)
 		if !exists {
@@ -208,6 +216,8 @@ func normalizeSQLServerWriteRows(
 		switch strings.ToLower(strings.TrimSpace(column.Type)) {
 		case "blob", "binary", "varbinary":
 			binary[index] = true
+		case "text", "char", "varchar", "numeric", "decimal":
+			stringBytes[index] = true
 		}
 	}
 
@@ -218,7 +228,24 @@ func normalizeSQLServerWriteRows(
 			if binary[columnIndex] &&
 				normalized[rowIndex][columnIndex] == nil {
 				normalized[rowIndex][columnIndex] = []byte(nil)
+				continue
 			}
+			if !stringBytes[columnIndex] {
+				continue
+			}
+			value, ok := normalized[rowIndex][columnIndex].([]byte)
+			if !ok {
+				continue
+			}
+			if !utf8.Valid(value) {
+				return nil, fmt.Errorf(
+					"write SQL Server table %s: row %d column %s contains invalid UTF-8",
+					table.Name,
+					rowIndex,
+					columns[columnIndex],
+				)
+			}
+			normalized[rowIndex][columnIndex] = string(value)
 		}
 	}
 	return normalized, nil
