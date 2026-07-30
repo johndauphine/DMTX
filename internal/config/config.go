@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -26,33 +27,53 @@ type Endpoint struct {
 }
 
 type Migration struct {
-	TargetMode              string   `yaml:"target_mode"`
-	IncludeTables           []string `yaml:"include_tables"`
-	ExcludeTables           []string `yaml:"exclude_tables"`
-	ConnectionLimit         int      `yaml:"connection_limit"`
-	Workers                 int      `yaml:"workers"`
-	ChunkSize               int      `yaml:"chunk_size"`
-	Partitions              int      `yaml:"partitions"`
-	LargeTableThreshold     int64    `yaml:"large_table_threshold"`
-	ReaderParallelism       int      `yaml:"reader_parallelism"`
-	WriterParallelism       int      `yaml:"writer_parallelism"`
-	ReadAhead               int      `yaml:"read_ahead"`
-	UpsertMergeSize         int      `yaml:"upsert_merge_size"`
-	MemoryCeilingBytes      int64    `yaml:"memory_ceiling_bytes"`
-	CheckpointFrequency     int      `yaml:"checkpoint_frequency"`
-	MaxRetries              int      `yaml:"max_retries"`
-	StrictConsistency       bool     `yaml:"strict_consistency"`
-	StrictConsistencyScope  string   `yaml:"strict_consistency_scope"`
-	AllowPartial            bool     `yaml:"allow_partial"`
-	DestructiveAcknowledged bool     `yaml:"-" json:"-"`
+	TargetMode             string                 `yaml:"target_mode"`
+	IncludeTables          []string               `yaml:"include_tables"`
+	ExcludeTables          []string               `yaml:"exclude_tables"`
+	DateUpdatedColumns     []string               `yaml:"date_updated_columns"`
+	ConnectionLimit        int                    `yaml:"connection_limit"`
+	Workers                int                    `yaml:"workers"`
+	ChunkSize              int                    `yaml:"chunk_size"`
+	Partitions             int                    `yaml:"partitions"`
+	LargeTableThreshold    int64                  `yaml:"large_table_threshold"`
+	ReaderParallelism      int                    `yaml:"reader_parallelism"`
+	WriterParallelism      int                    `yaml:"writer_parallelism"`
+	ReadAhead              int                    `yaml:"read_ahead"`
+	UpsertMergeSize        int                    `yaml:"upsert_merge_size"`
+	MemoryCeilingBytes     int64                  `yaml:"memory_ceiling_bytes"`
+	CheckpointFrequency    int                    `yaml:"checkpoint_frequency"`
+	MaxRetries             int                    `yaml:"max_retries"`
+	StrictConsistency      bool                   `yaml:"strict_consistency"`
+	StrictConsistencyScope StrictConsistencyScope `yaml:"strict_consistency_scope"`
+	FailOnSchemaDrift      bool                   `yaml:"fail_on_schema_drift"`
+	SchemaContract         *SchemaContract        `yaml:"schema_contract,omitempty"`
+	// SchemaEvolution is the deprecated spelling of SchemaContract. Parse
+	// canonicalizes and clears it so serialized config and hash wire shape use
+	// only the preferred name.
+	SchemaEvolution       *SchemaContract  `yaml:"schema_evolution,omitempty" json:"-"`
+	Validation            ValidationPolicy `yaml:"validation"`
+	Deletes               DeletePolicy     `yaml:"deletes"`
+	HistoryRetentionDays  int              `yaml:"history_retention_days"`
+	Tuning                TuningMode       `yaml:"tuning"`
+	RuntimeTuning         bool             `yaml:"runtime_tuning"`
+	RuntimeTuningInterval time.Duration    `yaml:"runtime_tuning_interval"`
+	// LegacyAIAdjust and LegacyAIAdjustInterval retain the documented
+	// compatibility aliases. The preferred fields take precedence.
+	LegacyAIAdjust          *bool          `yaml:"ai_adjust,omitempty" json:"-"`
+	LegacyAIAdjustInterval  *time.Duration `yaml:"ai_adjust_interval,omitempty" json:"-"`
+	AllowPartial            bool           `yaml:"allow_partial"`
+	DestructiveAcknowledged bool           `yaml:"-" json:"-"`
 
-	maxRetriesSet          bool
-	checkpointFrequencySet bool
+	parsed         bool
+	explicitFields map[string]struct{}
+	parsedBaseline *Migration
 }
 type Config struct {
 	Source    Endpoint  `yaml:"source"`
 	Target    Endpoint  `yaml:"target"`
 	Migration Migration `yaml:"migration"`
+
+	diagnostics []ConfigDiagnostic
 }
 
 // SameEndpoint reports whether source and target resolve to the same physical
@@ -133,28 +154,78 @@ func effectivePort(endpoint Endpoint) int {
 }
 
 func Parse(data []byte) (Config, error) {
+	migrationFields, explicitFields, err := inspectMigrationYAML(data)
+	if err != nil {
+		return Config{}, fmt.Errorf("parse configuration: %w", err)
+	}
 	var value Config
 	if err := yaml.Unmarshal(data, &value); err != nil {
 		return Config{}, fmt.Errorf("parse configuration: %w", err)
 	}
-	var presence struct {
-		Migration struct {
-			MaxRetries          *int `yaml:"max_retries"`
-			CheckpointFrequency *int `yaml:"checkpoint_frequency"`
-		} `yaml:"migration"`
+	value.Migration.parsed = true
+	value.Migration.explicitFields = explicitFields
+	schemaContractNode, schemaContractSet := migrationFields["schema_contract"]
+	schemaEvolutionNode, schemaEvolutionSet := migrationFields["schema_evolution"]
+	if schemaContractSet &&
+		(schemaContractNode.Tag == "!!null" || value.Migration.SchemaContract == nil) {
+		return Config{}, fmt.Errorf("migration.schema_contract must be a mode or mapping")
 	}
-	if err := yaml.Unmarshal(data, &presence); err != nil {
-		return Config{}, fmt.Errorf("parse configuration presence: %w", err)
+	if schemaEvolutionSet &&
+		(schemaEvolutionNode.Tag == "!!null" || value.Migration.SchemaEvolution == nil) {
+		return Config{}, fmt.Errorf("migration.schema_evolution must be a mode or mapping")
 	}
-	value.Migration.maxRetriesSet = presence.Migration.MaxRetries != nil
-	value.Migration.checkpointFrequencySet = presence.Migration.CheckpointFrequency != nil
+	if schemaContractSet && schemaEvolutionSet {
+		return Config{}, fmt.Errorf(
+			"migration.schema_contract cannot be combined with deprecated migration.schema_evolution",
+		)
+	}
+	if schemaEvolutionSet {
+		value.diagnostics = append(value.diagnostics, deprecatedFieldDiagnostic(
+			"migration.schema_evolution",
+			"migration.schema_contract",
+			"6",
+		))
+	}
+	if _, legacySet := migrationFields["ai_adjust"]; legacySet {
+		value.diagnostics = append(value.diagnostics, deprecatedFieldDiagnostic(
+			"migration.ai_adjust",
+			"migration.runtime_tuning",
+			"6",
+		))
+	}
+	if _, legacySet := migrationFields["ai_adjust_interval"]; legacySet {
+		value.diagnostics = append(value.diagnostics, deprecatedFieldDiagnostic(
+			"migration.ai_adjust_interval",
+			"migration.runtime_tuning_interval",
+			"6",
+		))
+	}
+	if !value.Migration.fieldWasSet("runtime_tuning") &&
+		value.Migration.LegacyAIAdjust != nil {
+		value.Migration.RuntimeTuning = *value.Migration.LegacyAIAdjust
+		value.Migration.markFieldSet("runtime_tuning")
+	}
+	if !value.Migration.fieldWasSet("runtime_tuning_interval") &&
+		value.Migration.LegacyAIAdjustInterval != nil {
+		value.Migration.RuntimeTuningInterval =
+			*value.Migration.LegacyAIAdjustInterval
+		value.Migration.markFieldSet("runtime_tuning_interval")
+	}
+	if value.Migration.SchemaContract == nil &&
+		value.Migration.SchemaEvolution != nil {
+		legacy := *value.Migration.SchemaEvolution
+		value.Migration.SchemaContract = &legacy
+		value.Migration.markFieldSet("schema_contract")
+	}
+	value.Migration.SchemaEvolution = nil
+	value.Migration.LegacyAIAdjust = nil
+	value.Migration.LegacyAIAdjustInterval = nil
 	if value.Source.Type == "" {
 		value.Source.Type = "mssql"
 	}
 	if value.Target.Type == "" {
 		value.Target.Type = "postgres"
 	}
-	var err error
 	value.Source.Type, err = CanonicalEngine(value.Source.Type)
 	if err != nil {
 		return Config{}, fmt.Errorf("source.type: %w", err)
@@ -175,14 +246,18 @@ func Parse(data []byte) (Config, error) {
 			return Config{}, fmt.Errorf("target.database: %w", err)
 		}
 	}
-	if value.Migration.TargetMode == "" {
+	if !value.Migration.fieldWasSet("target_mode") {
 		value.Migration.TargetMode = "drop_recreate"
 	}
 	if value.Migration.TargetMode != "drop_recreate" && value.Migration.TargetMode != "upsert" {
 		return Config{}, fmt.Errorf("invalid target_mode %q", value.Migration.TargetMode)
 	}
 	applyTransferDefaults(&value.Migration)
+	applyProductionSemanticsDefaults(&value.Migration)
 	if err := validateTransferSettings(value.Migration); err != nil {
+		return Config{}, err
+	}
+	if err := validateProductionSemantics(value.Migration); err != nil {
 		return Config{}, err
 	}
 	if err := validatePatterns("include_tables", value.Migration.IncludeTables); err != nil {
@@ -191,6 +266,7 @@ func Parse(data []byte) (Config, error) {
 	if err := validatePatterns("exclude_tables", value.Migration.ExcludeTables); err != nil {
 		return Config{}, err
 	}
+	value.Migration.captureParsedBaseline()
 	return value, nil
 }
 
@@ -210,44 +286,103 @@ const (
 )
 
 func applyTransferDefaults(migration *Migration) {
-	if migration.ConnectionLimit == 0 {
+	if !migration.fieldWasSet("connection_limit") {
 		migration.ConnectionLimit = DefaultConnectionLimit
 	}
-	if migration.Workers == 0 {
+	if !migration.fieldWasSet("workers") {
 		migration.Workers = DefaultWorkers
 	}
-	if migration.ChunkSize == 0 {
+	if !migration.fieldWasSet("chunk_size") {
 		migration.ChunkSize = DefaultChunkSize
 	}
-	if migration.Partitions == 0 {
+	if !migration.fieldWasSet("partitions") {
 		migration.Partitions = DefaultPartitions
 	}
-	if migration.LargeTableThreshold == 0 {
+	if !migration.fieldWasSet("large_table_threshold") {
 		migration.LargeTableThreshold = DefaultLargeTableThreshold
 	}
-	if migration.ReaderParallelism == 0 {
+	if !migration.fieldWasSet("reader_parallelism") {
 		migration.ReaderParallelism = DefaultReaderParallelism
 	}
-	if migration.WriterParallelism == 0 {
+	if !migration.fieldWasSet("writer_parallelism") {
 		migration.WriterParallelism = DefaultWriterParallelism
 	}
-	if migration.ReadAhead == 0 {
+	if !migration.fieldWasSet("read_ahead") {
 		migration.ReadAhead = DefaultReadAhead
 	}
-	if migration.UpsertMergeSize == 0 {
+	if !migration.fieldWasSet("upsert_merge_size") {
 		migration.UpsertMergeSize = DefaultUpsertMergeSize
 	}
-	if migration.MemoryCeilingBytes == 0 {
+	if !migration.fieldWasSet("memory_ceiling_bytes") {
 		migration.MemoryCeilingBytes = DefaultMemoryCeilingBytes
 	}
-	if !migration.checkpointFrequencySet {
+	if !migration.fieldWasSet("checkpoint_frequency") {
 		migration.CheckpointFrequency = DefaultCheckpointFrequency
 	}
-	if !migration.maxRetriesSet {
+	if !migration.fieldWasSet("max_retries") {
 		migration.MaxRetries = DefaultMaxRetries
 	}
-	if migration.StrictConsistencyScope == "" {
-		migration.StrictConsistencyScope = "table"
+	if !migration.fieldWasSet("strict_consistency_scope") {
+		migration.StrictConsistencyScope = StrictConsistencyTable
+	}
+	adaptDerivedConcurrency(migration)
+}
+
+func adaptDerivedConcurrency(migration *Migration) {
+	limit := migration.ConnectionLimit
+	if limit < 2 {
+		return
+	}
+
+	workersRequested := migration.fieldWasSet("workers")
+	readersRequested := migration.fieldWasSet("reader_parallelism")
+	writersRequested := migration.fieldWasSet("writer_parallelism")
+	if !workersRequested && migration.Workers > limit {
+		migration.Workers = limit
+	}
+
+	concurrencyLimit := limit
+	if workersRequested && migration.Workers < concurrencyLimit {
+		concurrencyLimit = migration.Workers
+	}
+	if concurrencyLimit < 2 ||
+		migration.ReaderParallelism+migration.WriterParallelism <= concurrencyLimit {
+		return
+	}
+
+	switch {
+	case readersRequested && writersRequested:
+		return
+	case readersRequested:
+		available := concurrencyLimit - migration.ReaderParallelism
+		if available >= 1 {
+			migration.WriterParallelism = available
+		}
+	case writersRequested:
+		available := concurrencyLimit - migration.WriterParallelism
+		if available >= 1 {
+			migration.ReaderParallelism = available
+		}
+	default:
+		for migration.ReaderParallelism+migration.WriterParallelism >
+			concurrencyLimit {
+			if migration.ReaderParallelism >= migration.WriterParallelism &&
+				migration.ReaderParallelism > 1 {
+				migration.ReaderParallelism--
+				continue
+			}
+			if migration.WriterParallelism > 1 {
+				migration.WriterParallelism--
+				continue
+			}
+			break
+		}
+	}
+
+	if !workersRequested &&
+		migration.Workers < migration.ReaderParallelism+migration.WriterParallelism {
+		migration.Workers =
+			migration.ReaderParallelism + migration.WriterParallelism
 	}
 }
 
@@ -278,7 +413,8 @@ func validateTransferSettings(migration Migration) error {
 	if migration.MaxRetries < 0 {
 		return fmt.Errorf("migration.max_retries must not be negative")
 	}
-	if migration.StrictConsistencyScope != "table" && migration.StrictConsistencyScope != "migration" {
+	if migration.StrictConsistencyScope != StrictConsistencyTable &&
+		migration.StrictConsistencyScope != StrictConsistencyMigration {
 		return fmt.Errorf("invalid strict_consistency_scope %q", migration.StrictConsistencyScope)
 	}
 	if migration.ReaderParallelism+migration.WriterParallelism > migration.ConnectionLimit {
