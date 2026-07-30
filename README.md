@@ -4,9 +4,10 @@ DMTX is a clean-room Go reimplementation of DMT, guided by the reconstruction
 specification in [docs/RECREATE_DMT.md](docs/RECREATE_DMT.md).
 
 The Stage 2-supported migration path is SQLite-to-SQLite. It is executable,
-bounded, fenced, and restartable rather than a mock interface. Preliminary
-fresh-run network paths also exist in the codebase, but they do not receive the
-Stage 2 guarantees described below.
+bounded, fenced, and restartable rather than a mock interface. Stage 3 adds the
+fresh-run network adapter and capability scope described below. Its mandatory
+network/ClickHouse matrices and repository gates pass in normal and race modes.
+Stage 3 does not extend SQLite's Stage 2 restart guarantees to network routes.
 
 ## Current SQLite workflow
 
@@ -123,38 +124,48 @@ requires explicit operator confirmation:
 The same inspection commands accept the default SQLite path
 `migration.yaml.state.db`.
 
-## Preliminary network paths
+## Stage 3 fresh-run network adapters
 
-The Stage 3 adapter registry currently certifies these fresh-run
-implementations:
+The Stage 3 branch implements all 12 directed cross-engine relational pairs
+among SQLite, PostgreSQL, SQL Server, and Oracle MySQL, together with the four
+same-engine fixtures. MariaDB is independently certified as the MySQL-family
+source or target for PostgreSQL, SQL Server, and SQLite routes and for
+MariaDB-to-MariaDB. Oracle-MySQL-to-MariaDB and MariaDB-to-Oracle-MySQL are not
+claimed; unsupported cross-flavor catalog or collation semantics fail closed.
+SQLite-to-ClickHouse and distinct-database ClickHouse-to-ClickHouse provide the
+separate analytical rebuild routes.
 
-- SQLite to PostgreSQL and ClickHouse, plus MySQL/MariaDB and SQL Server
-  compatibility routes;
-- PostgreSQL to PostgreSQL, SQLite, Oracle MySQL 8.0, MariaDB 10.11, or
-  SQL Server 2022;
-- Oracle MySQL 8.0 to PostgreSQL, SQLite, or Oracle MySQL 8.0;
-- MariaDB 10.11 to PostgreSQL, SQLite, or MariaDB 10.11; and
-- SQL Server 2022 to PostgreSQL, SQLite, Oracle MySQL 8.0, MariaDB 10.11,
-  or SQL Server 2022; and
-- ClickHouse 24.8 to a distinct ClickHouse 24.8 Atomic database.
+Live certification is version-pinned:
 
-These paths remain incomplete Stage 3 implementations. They do not yet share
-SQLite's full range checkpoint, replay, fencing, resume, and fault-injection
-matrix, and they have not passed the Stage 3 native-bulk and live-engine
-conformance suite. Treat them as experimental, not as Stage 2-certified
-migrations.
+- PostgreSQL 16.x;
+- SQL Server 2022 (product major 16 and database compatibility level 160);
+- Oracle MySQL 8.0.16 or later as a source and 8.0.30 or later as a native
+  target, within the 8.0 line;
+- MariaDB 10.11.8 or later, within the 10.11 line; and
+- ClickHouse 24.8.x with Atomic source and target databases.
 
-SQLite, PostgreSQL, Oracle MySQL 8.0, MariaDB 10.11, and SQL Server 2022
-sources now compose independently with the PostgreSQL target. PostgreSQL,
-each admitted MySQL-family source, and SQL Server compose with the SQLite
-target behind shared contracts. SQLite also composes with the native
-ClickHouse 24.8 target. ClickHouse 24.8 sources compose with a distinct native
-ClickHouse target for the admitted same-engine rebuild shape. PostgreSQL and
-SQL Server sources compose with either native MySQL-family target, while each
-MySQL-family source composes with its matching native flavor. PostgreSQL and
-SQL Server sources also compose with the native SQL Server target.
-Cross-flavor Oracle-MySQL/MariaDB copies remain fail-closed where exact
-collation and catalog semantics differ.
+Every Stage 3 network route requires encrypted TLS. The MySQL/MariaDB, SQL
+Server, and ClickHouse live endpoints use CA-verified TLS. The current
+PostgreSQL adapter emits `sslmode=require`, which encrypts the connection but
+does not verify the server certificate; its live-fixture bootstrap DSN uses
+`verify-full`, but certificate verification is not claimed for the adapter.
+New major server or catalog lines require separate admission instead of
+silently inheriting these contracts.
+
+The relational targets expose their admitted rebuild and upsert capabilities:
+PostgreSQL uses transactional COPY/staging, SQL Server uses transactional TDS
+bulk copy/staging, and MySQL-family targets use guarded upserts plus the native
+bulk path described below. SQLite remains a bounded single-writer target.
+ClickHouse uses bounded native batches and is rebuild-only; upsert is rejected
+before adapter construction or target mutation.
+
+This is a fresh `dmtx run` certification boundary. It does not certify
+network-engine resume after process termination, checkpoint replay and fencing
+under faults, strict source consistency, incremental watermarks, delete
+reconciliation, or schema evolution. Those are Stage 4 concerns. Strict
+consistency is currently rejected before adapter construction;
+SQLite-to-SQLite remains the only route with the Stage 2 restartability
+guarantees documented above.
 
 The SQL Server-to-SQLite route currently supports fresh drop/recreate only.
 It preserves the admitted integral, bit, floating-point, UTF-8 text, binary,
@@ -206,12 +217,25 @@ replication. Native targets require Oracle MySQL 8.0.30 or later or MariaDB
 page-size, constraint-enforcement, and primary-key contracts before planning
 a migration.
 
+For native MySQL-family bulk loading, the target server must have global
+`local_infile=ON`, and the target account needs `CREATE TEMPORARY TABLES`.
+DMTX registers a cryptographically random, one-use in-memory reader and keeps
+the driver's arbitrary-file option disabled; it does not grant the server
+access to a client filesystem path. If `local_infile` is disabled or the local
+infile/staging command is unavailable, DMTX emits one visible warning, latches
+that writer to strict bounded inserts, and does not repeatedly retry the
+unavailable bulk path. Upsert also uses guarded strict inserts because
+`LOAD DATA` cannot preserve its conflict semantics. A native load that reports
+an unexpected row count, warning, staged count, or merge count fails without
+acknowledging the batch.
+
 ## Scope and roadmap
 
-This is not yet the full DMT compatibility target. Network-engine conformance,
+This is not yet the full DMT compatibility target. Stage 4 data semantics,
 richer schema evolution, deep validation, WebUI/TUI, and release hardening
 remain staged work. The complete specification and staged acceptance
-requirements are in [docs/RECREATE_DMT.md](docs/RECREATE_DMT.md).
+requirements are in
+[docs/RECREATE_DMT.md](docs/RECREATE_DMT.md).
 
 ## Development
 
