@@ -12,10 +12,11 @@ import "github.com/johndauphine/dmtx/internal/engine"
 // and PostgreSQL sources compose with both the native SQL Server target and
 // the admitted native MySQL-family targets where explicitly certified; the
 // SQL Server target's SQLite source remains on the compatibility route until
-// the shared value contract has a live fixture. SQL Server's SQLite target
-// route remains deferred until driver values and SQLite storage classes have
-// an exact, live-tested contract. Compatibility overrides preserve the
-// remaining routes until both sides move behind the shared contracts.
+// the shared value contract has a live fixture. SQL Server's SQLite target is
+// certified for its conservative drop/recreate contract; unsupported SQLite
+// storage and comparison shapes remain fail-closed. Compatibility overrides
+// preserve the remaining routes until both sides move behind the shared
+// contracts.
 var builtInAdapters = mustBuildAdapterRegistry(
 	[]sourceRole{
 		{
@@ -65,6 +66,7 @@ var builtInAdapters = mustBuildAdapterRegistry(
 		{source: "mysql", target: "sqlite"},
 		{source: "mysql", target: "mysql"},
 		{source: "mssql", target: "postgres"},
+		{source: "mssql", target: "sqlite"},
 		{source: "mssql", target: "mysql"},
 		{source: "mssql", target: "mssql"},
 	},

@@ -134,8 +134,8 @@ implementations:
   SQL Server 2022;
 - Oracle MySQL 8.0 to PostgreSQL, SQLite, or Oracle MySQL 8.0;
 - MariaDB 10.11 to PostgreSQL, SQLite, or MariaDB 10.11; and
-- SQL Server 2022 to PostgreSQL, Oracle MySQL 8.0, MariaDB 10.11, or
-  SQL Server 2022.
+- SQL Server 2022 to PostgreSQL, SQLite, Oracle MySQL 8.0, MariaDB 10.11,
+  or SQL Server 2022.
 
 These paths remain incomplete Stage 3 implementations. They do not yet share
 SQLite's full range checkpoint, replay, fencing, resume, and fault-injection
@@ -144,13 +144,23 @@ conformance suite. Treat them as experimental, not as Stage 2-certified
 migrations.
 
 SQLite, PostgreSQL, Oracle MySQL 8.0, MariaDB 10.11, and SQL Server 2022
-sources now compose independently with the PostgreSQL target. PostgreSQL and
-each admitted MySQL-family source compose with the SQLite target behind shared
-contracts. PostgreSQL and SQL Server sources compose with either native
-MySQL-family target, while each MySQL-family source composes with its matching
-native flavor. PostgreSQL and SQL Server sources also compose with the native
-SQL Server target. Cross-flavor Oracle-MySQL/MariaDB copies remain fail-closed
-where exact collation and catalog semantics differ.
+sources now compose independently with the PostgreSQL target. PostgreSQL,
+each admitted MySQL-family source, and SQL Server compose with the SQLite
+target behind shared contracts. PostgreSQL and SQL Server sources compose with
+either native MySQL-family target, while each MySQL-family source composes with
+its matching native flavor. PostgreSQL and SQL Server sources also compose
+with the native SQL Server target. Cross-flavor Oracle-MySQL/MariaDB copies
+remain fail-closed where exact collation and catalog semantics differ.
+
+The SQL Server-to-SQLite route currently supports fresh drop/recreate only.
+It preserves the admitted integral, bit, floating-point, UTF-8 text, binary,
+UUID, temporal, identity, and relational-object subset. Exact
+`DECIMAL`/`NUMERIC` values are admitted only with scale zero and precision at
+most 18, so every value fits SQLite's signed `INTEGER` storage. Fractional or
+wider exact numerics, padding-sensitive comparison roles, unsafe nullable
+unique indexes, unsupported foreign-key or CHECK semantics, and SQLite-global
+object-name collisions fail before target preparation. Upsert remains
+fail-closed until retained SQLite shape equivalence is fully proven.
 
 The native Oracle MySQL-to-MySQL route requires read access to
 `performance_schema.replication_connection_configuration` and

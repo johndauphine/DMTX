@@ -11,7 +11,8 @@ import (
 )
 
 type sqliteTargetAdapter struct {
-	database *sql.DB
+	database       *sql.DB
+	sqlServerRoute bool
 }
 
 func validateSQLiteTargetEndpoint(endpoint config.Endpoint) error {
@@ -49,6 +50,15 @@ func (adapter *sqliteTargetAdapter) PlanTables(
 	}
 	switch sourceEngine {
 	case "postgres", "mysql", "sqlite":
+		adapter.sqlServerRoute = false
+	case "mssql":
+		if mode != "drop_recreate" {
+			return nil, sqliteSQLServerProjectionPolicy(
+				"map SQL Server target mode",
+				mode,
+			)
+		}
+		adapter.sqlServerRoute = true
 	default:
 		return nil, fmt.Errorf(
 			"SQLite target does not support source engine %q",
@@ -58,8 +68,16 @@ func (adapter *sqliteTargetAdapter) PlanTables(
 	targetTables := make([]schema.Table, 0, len(sourceTables))
 	for _, sourceTable := range sourceTables {
 		targetTable := sourceTable
-		targetTable.Schema = ""
-		targetTable.Identity = cloneSchemaIdentity(sourceTable.Identity)
+		if sourceEngine == "mssql" {
+			var err error
+			targetTable, err = projectSQLServerTableForSQLite(sourceTable)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			targetTable.Schema = ""
+			targetTable.Identity = cloneSchemaIdentity(sourceTable.Identity)
+		}
 		if _, err := schema.DropTable(schema.SQLite, targetTable); err != nil {
 			return nil, fmt.Errorf(
 				"plan SQLite table %s: %w",
@@ -90,6 +108,14 @@ func (adapter *sqliteTargetAdapter) PlanTables(
 		}
 		targetTables = append(targetTables, targetTable)
 	}
+	if sourceEngine == "mssql" {
+		if err := validateSQLServerSQLiteTables(
+			sourceTables,
+			targetTables,
+		); err != nil {
+			return nil, err
+		}
+	}
 	return targetTables, nil
 }
 
@@ -101,6 +127,15 @@ func (adapter *sqliteTargetAdapter) PreflightTables(
 	mode, err := normalizeAdapterTargetMode(mode)
 	if err != nil {
 		return err
+	}
+	if adapter.sqlServerRoute {
+		if err := preflightSQLServerSQLiteObjectNames(
+			ctx,
+			adapter.database,
+			targetTables,
+		); err != nil {
+			return err
+		}
 	}
 	for _, targetTable := range targetTables {
 		exists, err := tableExists(ctx, adapter.database, targetTable.Name)
@@ -171,6 +206,20 @@ func (adapter *sqliteTargetAdapter) WriteBatch(
 	mode string,
 	rows [][]any,
 ) (WriteReceipt, error) {
+	if adapter.sqlServerRoute {
+		normalized, err := normalizeSQLServerSQLiteBatch(
+			table,
+			columns,
+			rows,
+		)
+		if err != nil {
+			return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: int64(len(rows)),
+			}, err
+		}
+		rows = normalized
+	}
 	return writeSQLiteBatchReceipt(
 		ctx,
 		adapter.database,

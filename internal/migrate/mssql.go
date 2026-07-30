@@ -9,9 +9,8 @@ import (
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
-// SQLServerToSQLiteWithObserver retains the typed pair entrypoint while the
-// route remains fail-closed pending an exact SQL Server-driver-to-SQLite value
-// contract and live fixture.
+// SQLServerToSQLiteWithObserver migrates the conservative SQL Server 2022
+// subset that has an exact SQLite storage and relational contract.
 func SQLServerToSQLiteWithObserver(
 	ctx context.Context,
 	cfg config.Config,

@@ -58,6 +58,11 @@ func TestComposedPairEntrypointsValidateTargetBeforeOpeningSource(t *testing.T) 
 			source: "mysql",
 			run:    MySQLToSQLiteWithObserver,
 		},
+		{
+			name:   "SQL Server",
+			source: "mssql",
+			run:    SQLServerToSQLiteWithObserver,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -73,7 +78,7 @@ func TestComposedPairEntrypointsValidateTargetBeforeOpeningSource(t *testing.T) 
 	}
 }
 
-func TestSQLServerToSQLiteRemainsDeferred(t *testing.T) {
+func TestSQLServerToSQLiteRouteIsCertified(t *testing.T) {
 	_, err := SQLServerToSQLiteWithObserver(
 		context.Background(),
 		config.Config{
@@ -82,7 +87,8 @@ func TestSQLServerToSQLiteRemainsDeferred(t *testing.T) {
 		},
 		nil,
 	)
-	if err == nil || !strings.Contains(err.Error(), "mssql-to-sqlite") {
+	if err == nil ||
+		!strings.Contains(err.Error(), "SQLite target database path is required") {
 		t.Fatalf("error = %v", err)
 	}
 }
