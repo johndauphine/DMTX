@@ -22,6 +22,22 @@ func sqliteProjectionColumn(
 	}
 }
 
+func mysqlProjectionColumn(
+	name string,
+	columnType string,
+	declaredBase string,
+	arguments ...int,
+) schema.Column {
+	return schema.Column{
+		Name: name,
+		Type: columnType,
+		DeclaredType: &schema.DeclaredType{
+			Base:      declaredBase,
+			Arguments: append([]int(nil), arguments...),
+		},
+	}
+}
+
 func basicSQLiteProjectionTable() schema.Table {
 	column := sqliteProjectionColumn("id", "INTEGER")
 	column.PrimaryKey = true
@@ -35,6 +51,498 @@ func basicSQLiteProjectionTable() schema.Table {
 			column,
 			tenant,
 		},
+	}
+}
+
+func TestPostgresTargetPlansMySQLTypesObjectsAndIdentityWithoutMutation(
+	t *testing.T,
+) {
+	fixture := func() schema.Table {
+		parseDefault := func(
+			column schema.Column,
+			value string,
+			generated bool,
+		) *schema.Expression {
+			expression, err := schema.ParseMySQLCatalogDefault(
+				column,
+				&value,
+				generated,
+			)
+			if err != nil {
+				t.Fatalf(
+					"ParseMySQLCatalogDefault(%q): %v",
+					value,
+					err,
+				)
+			}
+			return expression
+		}
+		amount := mysqlProjectionColumn(
+			"amount",
+			"numeric",
+			"decimal",
+			12,
+			3,
+		)
+		check, err := schema.ParseMySQLCatalogCheck(
+			"`amount` >= 0",
+			[]schema.Column{amount},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frontier := int64(41)
+		id := mysqlProjectionColumn("id", "bigint", "bigint")
+		id.PrimaryKey = true
+		id.PrimaryKeyPosition = 1
+		fixed := mysqlProjectionColumn("fixed", "char", "char", 4)
+		fixed.Default = parseDefault(fixed, "AB", false)
+		enabled := mysqlProjectionColumn(
+			"enabled",
+			"integer",
+			"tinyint",
+			1,
+		)
+		enabled.Default = parseDefault(enabled, "1", false)
+		verified := mysqlProjectionColumn(
+			"verified",
+			"boolean",
+			"boolean",
+		)
+		verified.Default = parseDefault(verified, "TRUE", false)
+		occurred := mysqlProjectionColumn(
+			"occurred_at",
+			"datetime",
+			"datetime",
+		)
+		occurred.Default = parseDefault(
+			occurred,
+			"CURRENT_TIMESTAMP",
+			true,
+		)
+		parentID := mysqlProjectionColumn(
+			"parent_id",
+			"bigint",
+			"bigint",
+		)
+		parentID.Nullable = true
+		return schema.Table{
+			Schema: "source_database",
+			Name:   "events",
+			Identity: &schema.Identity{
+				Column:     "id",
+				Generation: schema.IdentityByDefault,
+				Frontier:   &frontier,
+			},
+			Columns: []schema.Column{
+				id,
+				mysqlProjectionColumn(
+					"tiny_number",
+					"integer",
+					"tinyint",
+				),
+				mysqlProjectionColumn(
+					"small_number",
+					"integer",
+					"smallint",
+				),
+				mysqlProjectionColumn(
+					"medium_number",
+					"integer",
+					"mediumint",
+				),
+				mysqlProjectionColumn(
+					"regular_number",
+					"integer",
+					"int",
+				),
+				mysqlProjectionColumn(
+					"ratio",
+					"double precision",
+					"double",
+				),
+				amount,
+				fixed,
+				mysqlProjectionColumn(
+					"name",
+					"varchar",
+					"varchar",
+					40,
+				),
+				mysqlProjectionColumn(
+					"tiny_note",
+					"text",
+					"tinytext",
+				),
+				mysqlProjectionColumn("note", "text", "text"),
+				mysqlProjectionColumn(
+					"medium_note",
+					"text",
+					"mediumtext",
+				),
+				mysqlProjectionColumn(
+					"long_note",
+					"text",
+					"longtext",
+				),
+				mysqlProjectionColumn(
+					"fixed_bytes",
+					"binary",
+					"binary",
+					8,
+				),
+				mysqlProjectionColumn(
+					"varying_bytes",
+					"varbinary",
+					"varbinary",
+					64,
+				),
+				mysqlProjectionColumn(
+					"tiny_payload",
+					"blob",
+					"tinyblob",
+				),
+				mysqlProjectionColumn(
+					"payload",
+					"blob",
+					"blob",
+				),
+				mysqlProjectionColumn(
+					"medium_payload",
+					"blob",
+					"mediumblob",
+				),
+				mysqlProjectionColumn(
+					"long_payload",
+					"blob",
+					"longblob",
+				),
+				enabled,
+				verified,
+				mysqlProjectionColumn(
+					"event_day",
+					"date",
+					"date",
+				),
+				occurred,
+				mysqlProjectionColumn(
+					"updated_at",
+					"timestamp",
+					"timestamp",
+					6,
+				),
+				mysqlProjectionColumn(
+					"document",
+					"json",
+					"json",
+				),
+				parentID,
+			},
+			Indexes: []schema.Index{{
+				Name: "events_name_idx",
+				Columns: []schema.IndexColumn{{
+					Name: "name",
+				}},
+			}},
+			ForeignKeys: []schema.ForeignKey{{
+				Name:              "events_parent_fk",
+				Columns:           []string{"parent_id"},
+				ReferencedTable:   "events",
+				ReferencedColumns: []string{"id"},
+				OnUpdate:          "CASCADE",
+				OnDelete:          "SET NULL",
+				Match:             "NONE",
+			}},
+			Checks: []schema.CheckConstraint{{
+				Name:       "events_amount_ck",
+				Expression: check,
+			}},
+		}
+	}
+
+	source := fixture()
+	before := fixture()
+	adapter := &postgresTargetAdapter{namespace: "archive"}
+	planned, err := planSingleTargetTable(
+		adapter,
+		"mysql",
+		source,
+		"drop_recreate",
+	)
+	if err != nil {
+		t.Fatalf("PlanTable: %v", err)
+	}
+	if !reflect.DeepEqual(source, before) {
+		t.Fatalf(
+			"source metadata mutated:\n got: %#v\nwant: %#v",
+			source,
+			before,
+		)
+	}
+	if planned.Schema != "archive" ||
+		planned.Identity == nil ||
+		planned.Identity == source.Identity ||
+		planned.Identity.Frontier == source.Identity.Frontier ||
+		*planned.Identity.Frontier != 41 {
+		t.Fatalf("planned identity = %#v", planned.Identity)
+	}
+	if len(planned.ForeignKeys) != 1 ||
+		planned.ForeignKeys[0].Match != "SIMPLE" ||
+		source.ForeignKeys[0].Match != "NONE" {
+		t.Fatalf(
+			"planned MySQL foreign key match = %#v",
+			planned.ForeignKeys,
+		)
+	}
+
+	wantTypes := []string{
+		"bigint",
+		"integer",
+		"integer",
+		"integer",
+		"integer",
+		"double precision",
+		"numeric",
+		"text",
+		"text",
+		"text",
+		"text",
+		"text",
+		"text",
+		"bytea",
+		"bytea",
+		"bytea",
+		"bytea",
+		"bytea",
+		"bytea",
+		"integer",
+		"boolean",
+		"date",
+		"timestamp",
+		"timestamp",
+		"json",
+		"bigint",
+	}
+	wantDeclarations := map[int]*schema.DeclaredType{
+		6:  {Base: "numeric", Arguments: []int{12, 3}},
+		7:  {Base: "varchar", Arguments: []int{4}},
+		8:  {Base: "varchar", Arguments: []int{40}},
+		22: {Base: "timestamp", Arguments: []int{0}},
+		23: {Base: "timestamp", Arguments: []int{6}},
+	}
+	for index, column := range planned.Columns {
+		if column.Type != wantTypes[index] ||
+			!reflect.DeepEqual(
+				column.DeclaredType,
+				wantDeclarations[index],
+			) {
+			t.Fatalf("planned column %s = %#v", column.Name, column)
+		}
+		if source.Columns[index].Default != nil &&
+			column.Default == source.Columns[index].Default {
+			t.Fatalf(
+				"planned column %s default aliases source",
+				column.Name,
+			)
+		}
+	}
+
+	planned.Columns[6].DeclaredType.Arguments[0] = 1
+	planned.Indexes[0].Columns[0].Name = "changed"
+	planned.ForeignKeys[0].Columns[0] = "changed"
+	*planned.Identity.Frontier = 99
+	if source.Columns[6].DeclaredType.Arguments[0] != 12 ||
+		source.Indexes[0].Columns[0].Name != "name" ||
+		source.ForeignKeys[0].Columns[0] != "parent_id" ||
+		*source.Identity.Frontier != 41 {
+		t.Fatal("planned MySQL projection aliases source metadata")
+	}
+}
+
+func TestPostgresTargetRejectsUnsafeMySQLMappings(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation string
+		column    schema.Column
+		mutate    func(*schema.Table)
+	}{
+		{
+			name:      "missing declared type",
+			operation: "map MySQL declared type",
+			column: schema.Column{
+				Name: "value",
+				Type: "integer",
+			},
+		},
+		{
+			name:      "canonical type mismatch",
+			operation: "map MySQL declared type",
+			column: mysqlProjectionColumn(
+				"value",
+				"bigint",
+				"int",
+			),
+		},
+		{
+			name:      "unsigned declaration",
+			operation: "map MySQL type",
+			column: mysqlProjectionColumn(
+				"value",
+				"bigint",
+				"bigint unsigned",
+			),
+		},
+		{
+			name:      "unsigned canonical type",
+			operation: "map MySQL declared type",
+			column: mysqlProjectionColumn(
+				"value",
+				"unsigned bigint",
+				"bigint",
+			),
+		},
+		{
+			name:      "unsupported tinyint display width",
+			operation: "map MySQL type modifier",
+			column: mysqlProjectionColumn(
+				"value",
+				"integer",
+				"tinyint",
+				2,
+			),
+		},
+		{
+			name:      "integer display width",
+			operation: "map MySQL type modifier",
+			column: mysqlProjectionColumn(
+				"value",
+				"integer",
+				"int",
+				11,
+			),
+		},
+		{
+			name:      "decimal missing scale",
+			operation: "map MySQL type modifier",
+			column: mysqlProjectionColumn(
+				"value",
+				"numeric",
+				"decimal",
+				12,
+			),
+		},
+		{
+			name:      "decimal scale beyond precision",
+			operation: "map MySQL type modifier",
+			column: mysqlProjectionColumn(
+				"value",
+				"numeric",
+				"decimal",
+				4,
+				5,
+			),
+		},
+		{
+			name:      "char without length",
+			operation: "map MySQL type modifier",
+			column: mysqlProjectionColumn(
+				"value",
+				"text",
+				"char",
+			),
+		},
+		{
+			name:      "zero binary length",
+			operation: "map MySQL type modifier",
+			column: mysqlProjectionColumn(
+				"value",
+				"bytea",
+				"binary",
+				0,
+			),
+		},
+		{
+			name:      "text modifier",
+			operation: "map MySQL type modifier",
+			column: mysqlProjectionColumn(
+				"value",
+				"text",
+				"longtext",
+				100,
+			),
+		},
+		{
+			name:      "temporal precision",
+			operation: "map MySQL type modifier",
+			column: mysqlProjectionColumn(
+				"value",
+				"datetime",
+				"datetime",
+				7,
+			),
+		},
+		{
+			name:      "enum",
+			operation: "map MySQL type",
+			column: mysqlProjectionColumn(
+				"value",
+				"text",
+				"enum",
+			),
+		},
+		{
+			name:      "set",
+			operation: "map MySQL type",
+			column: mysqlProjectionColumn(
+				"value",
+				"text",
+				"set",
+			),
+		},
+		{
+			name:      "float",
+			operation: "map MySQL type",
+			column: mysqlProjectionColumn(
+				"value",
+				"double precision",
+				"float",
+			),
+		},
+		{
+			name:      "SQLite table flag",
+			operation: "map MySQL table metadata",
+			column: mysqlProjectionColumn(
+				"value",
+				"integer",
+				"int",
+			),
+			mutate: func(table *schema.Table) {
+				table.SQLiteStrict = true
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := schema.Table{
+				Name:    "unsafe_mysql",
+				Columns: []schema.Column{test.column},
+			}
+			if test.mutate != nil {
+				test.mutate(&source)
+			}
+			_, err := projectPostgresSourceTable("mysql", source)
+			var policy *schema.PolicyError
+			if !errors.As(err, &policy) ||
+				policy.Operation != test.operation ||
+				policy.Target != string(schema.Postgres) {
+				t.Fatalf(
+					"error = %v, want PostgreSQL policy operation %q",
+					err,
+					test.operation,
+				)
+			}
+		})
 	}
 }
 

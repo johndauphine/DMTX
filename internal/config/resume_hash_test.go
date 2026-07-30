@@ -60,6 +60,8 @@ func TestResumeCompatibilityHashSeparatesSafeRuntimeAndStructuralChanges(t *test
 	}{
 		{"source", func(value *Config) { value.Source.Database = "other.db" }},
 		{"source user", func(value *Config) { value.Source.User = "other" }},
+		{"source TLS mode", func(value *Config) { value.Source.SSLMode = "verify-full" }},
+		{"source TLS CA", func(value *Config) { value.Source.TLSCAFile = "/etc/dmtx/source-ca.pem" }},
 		{"target mode", func(value *Config) { value.Migration.TargetMode = "upsert" }},
 		{"include", func(value *Config) { value.Migration.IncludeTables = []string{"customers"} }},
 		{"threshold", func(value *Config) { value.Migration.LargeTableThreshold++ }},

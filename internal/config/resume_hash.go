@@ -38,22 +38,26 @@ func ResumeCompatibilityHash(value Config) (string, error) {
 }
 
 type resumeEndpoint struct {
-	Type     string `json:"type"`
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	Database string `json:"database"`
-	User     string `json:"user"`
-	Schema   string `json:"schema"`
+	Type      string `json:"type"`
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
+	Database  string `json:"database"`
+	User      string `json:"user"`
+	Schema    string `json:"schema"`
+	SSLMode   string `json:"ssl_mode"`
+	TLSCAFile string `json:"tls_ca_file"`
 }
 
 func resumeEndpointFrom(endpoint Endpoint) resumeEndpoint {
 	return resumeEndpoint{
-		Type:     endpoint.Type,
-		Host:     endpoint.Host,
-		Port:     endpoint.Port,
-		Database: endpoint.Database,
-		User:     endpoint.User,
-		Schema:   endpoint.Schema,
+		Type:      endpoint.Type,
+		Host:      endpoint.Host,
+		Port:      endpoint.Port,
+		Database:  endpoint.Database,
+		User:      endpoint.User,
+		Schema:    endpoint.Schema,
+		SSLMode:   endpoint.SSLMode,
+		TLSCAFile: endpoint.TLSCAFile,
 	}
 }
 

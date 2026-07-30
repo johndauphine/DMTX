@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/johndauphine/dmtx/internal/config"
-	"github.com/johndauphine/dmtx/internal/schema"
 )
 
 func TestMySQLDSNRequiresTLSAndEscapesCredentials(t *testing.T) {
@@ -24,16 +23,41 @@ func TestMySQLDSNRequiresConnectionIdentity(t *testing.T) {
 	}
 }
 
-func TestBuildMySQLTablePreservesCompositePrimaryKeyOrder(t *testing.T) {
-	table := buildMySQLTable("crm", "events", []schema.Column{
-		{Name: "tenant_id", Type: normalizeMySQLType("int")},
-		{Name: "event_id", Type: normalizeMySQLType("bigint")},
-		{Name: "message", Type: normalizeMySQLType("varchar"), Nullable: true},
-	}, []string{"tenant_id", "event_id"})
-	if table.Schema != "crm" || !table.Columns[0].PrimaryKey || !table.Columns[1].PrimaryKey || table.Columns[2].PrimaryKey {
-		t.Fatalf("table = %#v", table)
+func TestMySQLDSNRejectsUnsafeTLSConfiguration(t *testing.T) {
+	base := config.Endpoint{
+		Host:     "db.example.test",
+		Database: "dmtx",
+		User:     "reader",
 	}
-	if table.Columns[0].Type != "integer" || table.Columns[2].Type != "text" {
-		t.Fatalf("columns = %#v", table.Columns)
+	unsupported := base
+	unsupported.SSLMode = "disable"
+	if _, err := MySQLDSN(unsupported); err == nil {
+		t.Fatal("expected disabled MySQL TLS to be rejected")
+	}
+	missingCA := base
+	missingCA.TLSCAFile = "/path/that/does/not/exist/dmtx-ca.pem"
+	if _, err := MySQLDSN(missingCA); err == nil {
+		t.Fatal("expected unreadable MySQL TLS CA to be rejected")
+	}
+}
+
+func TestParseMySQLVersion(t *testing.T) {
+	major, minor, patch, ok := parseMySQLVersion("8.0.46")
+	if !ok || major != 8 || minor != 0 || patch != 46 {
+		t.Fatalf(
+			"version = %d.%d.%d ok=%t",
+			major,
+			minor,
+			patch,
+			ok,
+		)
+	}
+	for _, value := range []string{"8.4.0", "10.11.8-MariaDB"} {
+		if _, _, _, ok := parseMySQLVersion(value); !ok {
+			t.Fatalf("expected syntactically valid version %q", value)
+		}
+	}
+	if _, _, _, ok := parseMySQLVersion("8.0"); ok {
+		t.Fatal("expected incomplete version to be rejected")
 	}
 }

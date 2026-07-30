@@ -2,8 +2,13 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
+	"os"
 	"strings"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
@@ -27,9 +32,52 @@ func MySQLDSN(endpoint config.Endpoint) (string, error) {
 	connection.Net = "tcp"
 	connection.Addr = fmt.Sprintf("%s:%d", endpoint.Host, port)
 	connection.DBName = endpoint.Database
-	connection.TLSConfig = "true"
+	tlsConfig, err := mySQLTLSConfig(endpoint)
+	if err != nil {
+		return "", err
+	}
+	connection.TLSConfig = tlsConfig
 	connection.ParseTime = true
 	return connection.FormatDSN(), nil
+}
+
+func mySQLTLSConfig(endpoint config.Endpoint) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(endpoint.SSLMode))
+	switch mode {
+	case "", "require", "verify-full":
+	default:
+		return "", fmt.Errorf(
+			"MySQL ssl_mode %q is unsupported; use require or verify-full",
+			endpoint.SSLMode,
+		)
+	}
+	if endpoint.TLSCAFile == "" {
+		return "true", nil
+	}
+	certificate, err := os.ReadFile(endpoint.TLSCAFile)
+	if err != nil {
+		return "", fmt.Errorf("read MySQL TLS CA: %w", err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(certificate) {
+		return "", fmt.Errorf("read MySQL TLS CA: file contains no certificates")
+	}
+	digest := sha256.New()
+	_, _ = digest.Write([]byte(endpoint.Host))
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write(certificate)
+	key := "dmtx-" + hex.EncodeToString(digest.Sum(nil)[:16])
+	if err := mysqlDriver.RegisterTLSConfig(
+		key,
+		&tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    roots,
+			ServerName: endpoint.Host,
+		},
+	); err != nil {
+		return "", fmt.Errorf("configure MySQL TLS CA: %w", err)
+	}
+	return key, nil
 }
 
 // OpenMySQL verifies a MySQL or MariaDB connection without exposing its DSN.
@@ -75,92 +123,8 @@ func ListMySQLTables(ctx context.Context, database *sql.DB, namespace string) ([
 	return tables, nil
 }
 
-// InspectMySQLTable discovers deterministic column and ordered primary-key
-// metadata. Detailed modifiers remain in the adapter contract as it expands.
+// InspectMySQLTable discovers the exact MySQL 8.0 source shape supported by
+// DMTX. Unsupported catalog features fail closed before any target mutation.
 func InspectMySQLTable(ctx context.Context, database *sql.DB, namespace, name string) (schema.Table, error) {
-	rows, err := database.QueryContext(ctx, `
-		SELECT column_name, data_type, is_nullable
-		FROM information_schema.columns
-		WHERE table_schema = ? AND table_name = ?
-		ORDER BY ordinal_position
-	`, namespace, name)
-	if err != nil {
-		return schema.Table{}, fmt.Errorf("list MySQL columns: %w", err)
-	}
-	defer rows.Close()
-	var columns []schema.Column
-	for rows.Next() {
-		var column schema.Column
-		var nullable string
-		if err := rows.Scan(&column.Name, &column.Type, &nullable); err != nil {
-			return schema.Table{}, fmt.Errorf("read MySQL column: %w", err)
-		}
-		column.Type = normalizeMySQLType(column.Type)
-		column.Nullable = nullable == "YES"
-		columns = append(columns, column)
-	}
-	if err := rows.Err(); err != nil {
-		return schema.Table{}, fmt.Errorf("iterate MySQL columns: %w", err)
-	}
-	if len(columns) == 0 {
-		return schema.Table{}, fmt.Errorf("MySQL table %s.%s does not exist", namespace, name)
-	}
-	keys, err := mySQLPrimaryKeys(ctx, database, namespace, name)
-	if err != nil {
-		return schema.Table{}, err
-	}
-	return buildMySQLTable(namespace, name, columns, keys), nil
-}
-
-func mySQLPrimaryKeys(ctx context.Context, database *sql.DB, namespace, name string) ([]string, error) {
-	rows, err := database.QueryContext(ctx, `
-		SELECT column_name
-		FROM information_schema.statistics
-		WHERE table_schema = ? AND table_name = ? AND index_name = 'PRIMARY'
-		ORDER BY seq_in_index
-	`, namespace, name)
-	if err != nil {
-		return nil, fmt.Errorf("list MySQL primary key: %w", err)
-	}
-	defer rows.Close()
-	var keys []string
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			return nil, fmt.Errorf("read MySQL primary key: %w", err)
-		}
-		keys = append(keys, key)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate MySQL primary key: %w", err)
-	}
-	return keys, nil
-}
-
-func buildMySQLTable(namespace, name string, columns []schema.Column, primaryKeys []string) schema.Table {
-	keys := make(map[string]bool, len(primaryKeys))
-	for _, key := range primaryKeys {
-		keys[key] = true
-	}
-	for index := range columns {
-		columns[index].PrimaryKey = keys[columns[index].Name]
-	}
-	return schema.Table{Schema: namespace, Name: name, Columns: columns}
-}
-
-func normalizeMySQLType(value string) string {
-	switch strings.ToLower(value) {
-	case "int", "mediumint", "smallint":
-		return "integer"
-	case "bigint":
-		return "bigint"
-	case "varchar", "char", "tinytext", "mediumtext", "longtext":
-		return "text"
-	case "datetime":
-		return "datetime"
-	case "timestamp":
-		return "timestamp"
-	default:
-		return strings.ToLower(value)
-	}
+	return inspectMySQL80Table(ctx, database, namespace, name)
 }

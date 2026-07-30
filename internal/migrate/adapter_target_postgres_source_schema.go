@@ -12,10 +12,12 @@ func projectPostgresSourceTable(
 	sourceTable schema.Table,
 ) (schema.Table, error) {
 	switch sourceEngine {
-	case "postgres", "mysql", "mssql":
+	case "postgres", "mssql":
 		projected := sourceTable
 		projected.Identity = cloneSchemaIdentity(sourceTable.Identity)
 		return projected, nil
+	case "mysql":
+		return projectMySQLTableForPostgres(sourceTable)
 	case "sqlite":
 		return projectSQLiteTableForPostgres(sourceTable)
 	default:
@@ -23,6 +25,303 @@ func projectPostgresSourceTable(
 			"PostgreSQL target does not support source engine %q",
 			sourceEngine,
 		)
+	}
+}
+
+func projectMySQLTableForPostgres(
+	sourceTable schema.Table,
+) (schema.Table, error) {
+	if sourceTable.SQLiteStrict || sourceTable.SQLiteWithoutRowID {
+		return schema.Table{}, postgresMySQLPolicy(
+			"map MySQL table metadata",
+			sourceTable.Name,
+		)
+	}
+
+	projected := sourceTable
+	projected.Columns = append([]schema.Column(nil), sourceTable.Columns...)
+	projected.Indexes = clonePostgresProjectionIndexes(sourceTable.Indexes)
+	projected.ForeignKeys = clonePostgresProjectionForeignKeys(
+		sourceTable.ForeignKeys,
+	)
+	for index := range projected.ForeignKeys {
+		if strings.EqualFold(
+			strings.TrimSpace(projected.ForeignKeys[index].Match),
+			"NONE",
+		) {
+			projected.ForeignKeys[index].Match = "SIMPLE"
+		}
+	}
+	projected.Checks = append(
+		[]schema.CheckConstraint(nil),
+		sourceTable.Checks...,
+	)
+	projected.Identity = cloneSchemaIdentity(sourceTable.Identity)
+	for index, sourceColumn := range sourceTable.Columns {
+		targetType, declaration, operation, err := projectMySQLColumnForPostgres(
+			sourceColumn,
+		)
+		if err != nil {
+			value := sourceTable.Name + "." + sourceColumn.Name
+			if operation == "map MySQL type" &&
+				sourceColumn.DeclaredType != nil {
+				value = strings.TrimSpace(sourceColumn.DeclaredType.Base)
+			}
+			return schema.Table{}, postgresMySQLPolicy(operation, value)
+		}
+		projected.Columns[index].Type = targetType
+		projected.Columns[index].DeclaredType = declaration
+		projected.Columns[index].Default = cloneSchemaExpression(
+			sourceColumn.Default,
+		)
+	}
+	return projected, nil
+}
+
+// projectMySQLColumnForPostgres accepts only the structured output of MySQL
+// catalog discovery. Integer widths that PostgreSQL's portable writer does not
+// expose are widened to INTEGER. MySQL CHAR uses VARCHAR so COPY does not add
+// padding, and bounded binary values use BYTEA because PostgreSQL has no
+// length-modified binary scalar; both conversions preserve every source value.
+func projectMySQLColumnForPostgres(
+	source schema.Column,
+) (string, *schema.DeclaredType, string, error) {
+	if source.DeclaredType == nil {
+		return "", nil, "map MySQL declared type",
+			fmt.Errorf("missing declared type")
+	}
+	base := strings.ToLower(strings.TrimSpace(source.DeclaredType.Base))
+	sourceType := strings.ToLower(strings.TrimSpace(source.Type))
+	arguments := source.DeclaredType.Arguments
+	typeMatches := func(candidates ...string) bool {
+		for _, candidate := range candidates {
+			if sourceType == candidate {
+				return true
+			}
+		}
+		return false
+	}
+	noArguments := func() error {
+		if len(arguments) != 0 {
+			return fmt.Errorf("unexpected type modifiers")
+		}
+		return nil
+	}
+	modifierError := func() (string, *schema.DeclaredType, string, error) {
+		return "", nil, "map MySQL type modifier",
+			fmt.Errorf("invalid type modifiers")
+	}
+	canonicalError := func() (string, *schema.DeclaredType, string, error) {
+		return "", nil, "map MySQL declared type",
+			fmt.Errorf("declared type does not match canonical type")
+	}
+
+	switch base {
+	case "tinyint":
+		if len(arguments) > 1 ||
+			len(arguments) == 1 && arguments[0] != 1 {
+			return modifierError()
+		}
+		if len(arguments) == 1 &&
+			typeMatches("bool", "boolean") {
+			return "boolean", nil, "", nil
+		}
+		if len(arguments) == 0 &&
+			typeMatches("bool", "boolean") {
+			return canonicalError()
+		}
+		if !typeMatches("tinyint", "smallint", "integer", "int") {
+			return canonicalError()
+		}
+		return "integer", nil, "", nil
+	case "bool", "boolean":
+		if err := noArguments(); err != nil {
+			return modifierError()
+		}
+		if !typeMatches("bool", "boolean") {
+			return canonicalError()
+		}
+		return "boolean", nil, "", nil
+	case "smallint":
+		if err := noArguments(); err != nil {
+			return modifierError()
+		}
+		if !typeMatches("smallint", "integer", "int") {
+			return canonicalError()
+		}
+		return "integer", nil, "", nil
+	case "mediumint", "int", "integer":
+		if err := noArguments(); err != nil {
+			return modifierError()
+		}
+		if !typeMatches("mediumint", "int", "integer") {
+			return canonicalError()
+		}
+		return "integer", nil, "", nil
+	case "bigint":
+		if err := noArguments(); err != nil {
+			return modifierError()
+		}
+		if !typeMatches("bigint", "int8") {
+			return canonicalError()
+		}
+		return "bigint", nil, "", nil
+	case "double", "double precision":
+		if err := noArguments(); err != nil {
+			return modifierError()
+		}
+		if !typeMatches("double", "double precision", "float8") {
+			return canonicalError()
+		}
+		return "double precision", nil, "", nil
+	case "decimal", "numeric":
+		if !typeMatches("decimal", "numeric") {
+			return canonicalError()
+		}
+		if len(arguments) != 2 ||
+			arguments[0] < 1 ||
+			arguments[0] > 65 ||
+			arguments[1] < 0 ||
+			arguments[1] > arguments[0] {
+			return modifierError()
+		}
+		return "numeric", &schema.DeclaredType{
+			Base:      "numeric",
+			Arguments: append([]int(nil), arguments...),
+		}, "", nil
+	case "char", "character":
+		if !typeMatches("char", "character", "text") {
+			return canonicalError()
+		}
+		if len(arguments) != 1 ||
+			arguments[0] < 1 ||
+			arguments[0] > 255 {
+			return modifierError()
+		}
+		return "text", &schema.DeclaredType{
+			Base:      "varchar",
+			Arguments: append([]int(nil), arguments...),
+		}, "", nil
+	case "varchar", "character varying":
+		if !typeMatches(
+			"varchar",
+			"character varying",
+			"text",
+		) {
+			return canonicalError()
+		}
+		if len(arguments) != 1 ||
+			arguments[0] < 1 ||
+			arguments[0] > 65_535 {
+			return modifierError()
+		}
+		return "text", &schema.DeclaredType{
+			Base:      "varchar",
+			Arguments: append([]int(nil), arguments...),
+		}, "", nil
+	case "tinytext", "text", "mediumtext", "longtext":
+		if err := noArguments(); err != nil {
+			return modifierError()
+		}
+		if !typeMatches(
+			"tinytext",
+			"text",
+			"mediumtext",
+			"longtext",
+		) {
+			return canonicalError()
+		}
+		return "text", nil, "", nil
+	case "binary":
+		if !typeMatches("binary", "bytea") {
+			return canonicalError()
+		}
+		if len(arguments) != 1 ||
+			arguments[0] < 1 ||
+			arguments[0] > 255 {
+			return modifierError()
+		}
+		return "bytea", nil, "", nil
+	case "varbinary":
+		if !typeMatches("varbinary", "bytea") {
+			return canonicalError()
+		}
+		if len(arguments) != 1 ||
+			arguments[0] < 1 ||
+			arguments[0] > 65_535 {
+			return modifierError()
+		}
+		return "bytea", nil, "", nil
+	case "tinyblob", "blob", "mediumblob", "longblob":
+		if err := noArguments(); err != nil {
+			return modifierError()
+		}
+		if !typeMatches(
+			"tinyblob",
+			"blob",
+			"mediumblob",
+			"longblob",
+			"bytea",
+		) {
+			return canonicalError()
+		}
+		return "bytea", nil, "", nil
+	case "date":
+		if err := noArguments(); err != nil {
+			return modifierError()
+		}
+		if !typeMatches("date") {
+			return canonicalError()
+		}
+		return "date", nil, "", nil
+	case "datetime", "timestamp":
+		if !typeMatches("datetime", "timestamp") {
+			return canonicalError()
+		}
+		precision := 0
+		switch len(arguments) {
+		case 0:
+		case 1:
+			precision = arguments[0]
+		default:
+			return modifierError()
+		}
+		if precision < 0 || precision > 6 {
+			return modifierError()
+		}
+		return "timestamp", &schema.DeclaredType{
+			Base:      "timestamp",
+			Arguments: []int{precision},
+		}, "", nil
+	case "json":
+		if err := noArguments(); err != nil {
+			return modifierError()
+		}
+		if !typeMatches("json") {
+			return canonicalError()
+		}
+		return "json", nil, "", nil
+	default:
+		return "", nil, "map MySQL type",
+			fmt.Errorf("unsupported MySQL type")
+	}
+}
+
+func cloneSchemaExpression(
+	expression *schema.Expression,
+) *schema.Expression {
+	if expression == nil {
+		return nil
+	}
+	cloned := *expression
+	return &cloned
+}
+
+func postgresMySQLPolicy(operation, value string) error {
+	return &schema.PolicyError{
+		Operation: operation,
+		Type:      value,
+		Target:    string(schema.Postgres),
 	}
 }
 

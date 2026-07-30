@@ -59,6 +59,7 @@ func openMySQLSourceAdapter(
 			return endpoint.Database
 		},
 		open:           engine.OpenMySQL,
+		verify:         engine.VerifyMySQL80Source,
 		listTables:     engine.ListMySQLTables,
 		inspectTable:   engine.InspectMySQLTable,
 		readQuery:      mySQLReadQuery,

@@ -14,13 +14,15 @@ import (
 )
 
 type Endpoint struct {
-	Type     string `yaml:"type"`
-	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
-	Database string `yaml:"database"`
-	User     string `yaml:"user"`
-	Password string `yaml:"password"`
-	Schema   string `yaml:"schema"`
+	Type      string `yaml:"type"`
+	Host      string `yaml:"host"`
+	Port      int    `yaml:"port"`
+	Database  string `yaml:"database"`
+	User      string `yaml:"user"`
+	Password  string `yaml:"password"`
+	Schema    string `yaml:"schema"`
+	SSLMode   string `yaml:"ssl_mode"`
+	TLSCAFile string `yaml:"tls_ca_file"`
 }
 
 type Migration struct {
