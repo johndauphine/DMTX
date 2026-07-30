@@ -3,6 +3,7 @@ package state
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -63,6 +64,36 @@ func TestStage4MutationsRejectStaleLeaseGeneration(t *testing.T) {
 			if secondLease.Generation <= firstLease.Generation {
 				t.Fatalf("lease generations = %d, %d", firstLease.Generation, secondLease.Generation)
 			}
+			deleteDigest := strings.Repeat("a", 64)
+			deletePlan := DeleteReconciliationPlan{
+				RunID: runID, Task: key,
+				AttemptID: deleteAttempt.AttemptID,
+				PlanID:    "stale-plan", SpoolPath: "/tmp/stale-plan.db",
+				EqualityProofDigest: deleteDigest,
+				CandidateDigest:     deleteDigest,
+				Candidates:          1, BatchSize: 1,
+				BatchByteLimit: 1024, KeyWidth: 1,
+				PlannedAt: started.Add(time.Second),
+			}
+			deleteBatch := DeleteReconciliationBatch{
+				RunID: runID, Task: key,
+				AttemptID: deleteAttempt.AttemptID,
+				PlanID:    deletePlan.PlanID, Token: "stale-token",
+				Candidates: 1, EncodedBytes: 32,
+				BatchDigest: deleteDigest,
+				BeganAt:     started.Add(2 * time.Second),
+			}
+			deleteCommit := DeleteReconciliationBatchCommit{
+				RunID: runID, Task: key,
+				AttemptID: deleteAttempt.AttemptID,
+				PlanID:    deletePlan.PlanID, Token: deleteBatch.Token,
+				FirstCandidate: deleteBatch.FirstCandidate,
+				BatchDigest:    deleteDigest, Candidates: 1,
+				EncodedBytes: 32, DeletedRows: 1,
+				ReceiptDigest:    deleteDigest,
+				FailClosedReason: DeleteReconciliationReasonTargetMutationFailed,
+				CommittedAt:      started.Add(3 * time.Second),
+			}
 
 			mutations := []func() error{
 				func() error {
@@ -89,6 +120,18 @@ func TestStage4MutationsRejectStaleLeaseGeneration(t *testing.T) {
 					other.AttemptID = "delete-after-takeover"
 					_, _, err := fenced.BeginDeleteReconciliation(other)
 					return err
+				},
+				func() error {
+					return fenced.SaveDeleteReconciliationPlan(deletePlan)
+				},
+				func() error {
+					_, _, err := fenced.
+						BeginDeleteReconciliationBatch(deleteBatch)
+					return err
+				},
+				func() error {
+					return fenced.
+						CommitDeleteReconciliationBatch(deleteCommit)
 				},
 				func() error {
 					return fenced.FinishDeleteReconciliation(DeleteReconciliationResult{
@@ -201,6 +244,37 @@ func TestStage4MutationsRejectDifferentRunWithCurrentLease(t *testing.T) {
 			if err := raw.BindRunLease("run-a", lease); err != nil {
 				t.Fatalf("bind owned run target lease: %v", err)
 			}
+			deleteDigest := strings.Repeat("b", 64)
+			deletePlan := DeleteReconciliationPlan{
+				RunID: "run-b", Task: key,
+				AttemptID:           deleteAttempt.AttemptID,
+				PlanID:              "cross-run-plan",
+				SpoolPath:           "/tmp/cross-run-plan.db",
+				EqualityProofDigest: deleteDigest,
+				CandidateDigest:     deleteDigest,
+				Candidates:          1, BatchSize: 1,
+				BatchByteLimit: 1024, KeyWidth: 1,
+				PlannedAt: started.Add(time.Hour + time.Second),
+			}
+			deleteBatch := DeleteReconciliationBatch{
+				RunID: "run-b", Task: key,
+				AttemptID: deleteAttempt.AttemptID,
+				PlanID:    deletePlan.PlanID, Token: "cross-run-token",
+				Candidates: 1, EncodedBytes: 32,
+				BatchDigest: deleteDigest,
+				BeganAt:     started.Add(time.Hour + 2*time.Second),
+			}
+			deleteCommit := DeleteReconciliationBatchCommit{
+				RunID: "run-b", Task: key,
+				AttemptID: deleteAttempt.AttemptID,
+				PlanID:    deletePlan.PlanID, Token: deleteBatch.Token,
+				FirstCandidate: deleteBatch.FirstCandidate,
+				BatchDigest:    deleteDigest, Candidates: 1,
+				EncodedBytes: 32, DeletedRows: 1,
+				ReceiptDigest:    deleteDigest,
+				FailClosedReason: DeleteReconciliationReasonTargetMutationFailed,
+				CommittedAt:      started.Add(time.Hour + 3*time.Second),
+			}
 
 			fenced := FenceBackend(raw, NewLeaseGuard(leaseStore, lease)).(Stage4Backend)
 			if err := fenced.SaveSchemaSnapshot(SchemaSnapshot{
@@ -236,6 +310,18 @@ func TestStage4MutationsRejectDifferentRunWithCurrentLease(t *testing.T) {
 						Due: true, StartedAt: started.Add(time.Hour),
 					})
 					return err
+				},
+				func() error {
+					return fenced.SaveDeleteReconciliationPlan(deletePlan)
+				},
+				func() error {
+					_, _, err := fenced.
+						BeginDeleteReconciliationBatch(deleteBatch)
+					return err
+				},
+				func() error {
+					return fenced.
+						CommitDeleteReconciliationBatch(deleteCommit)
 				},
 				func() error {
 					return fenced.FinishDeleteReconciliation(DeleteReconciliationResult{

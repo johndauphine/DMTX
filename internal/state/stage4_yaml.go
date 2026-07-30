@@ -569,6 +569,113 @@ func (store YAMLStore) LoadLatestSuccessfulDeleteReconciliation(
 	return record, found, err
 }
 
+func (store YAMLStore) SaveDeleteReconciliationPlan(
+	plan DeleteReconciliationPlan,
+) error {
+	return store.update(func(document *yamlStateDocument) error {
+		if err := requireYAMLStage4Identity(
+			*document,
+			plan.RunID,
+			plan.Task,
+		); err != nil {
+			return err
+		}
+		for index := range document.DeleteReconciliations {
+			record := document.DeleteReconciliations[index]
+			if record.RunID != plan.RunID ||
+				record.Task != plan.Task ||
+				record.AttemptID != plan.AttemptID {
+				continue
+			}
+			next, err := applyDeleteReconciliationPlan(record, plan)
+			if err != nil {
+				return err
+			}
+			document.DeleteReconciliations[index] = next
+			return nil
+		}
+		return fmt.Errorf(
+			"%w: delete reconciliation %q",
+			ErrUnknownWork,
+			plan.AttemptID,
+		)
+	})
+}
+
+func (store YAMLStore) BeginDeleteReconciliationBatch(
+	batch DeleteReconciliationBatch,
+) (DeleteReconciliationBatch, bool, error) {
+	var stored DeleteReconciliationBatch
+	var created bool
+	err := store.update(func(document *yamlStateDocument) error {
+		if err := requireYAMLStage4Identity(
+			*document,
+			batch.RunID,
+			batch.Task,
+		); err != nil {
+			return err
+		}
+		for index := range document.DeleteReconciliations {
+			record := document.DeleteReconciliations[index]
+			if record.RunID != batch.RunID ||
+				record.Task != batch.Task ||
+				record.AttemptID != batch.AttemptID {
+				continue
+			}
+			next, normalized, wasCreated, err :=
+				applyBeginDeleteReconciliationBatch(record, batch)
+			if err != nil {
+				return err
+			}
+			document.DeleteReconciliations[index] = next
+			stored, created = normalized, wasCreated
+			return nil
+		}
+		return fmt.Errorf(
+			"%w: delete reconciliation %q",
+			ErrUnknownWork,
+			batch.AttemptID,
+		)
+	})
+	return stored, created, err
+}
+
+func (store YAMLStore) CommitDeleteReconciliationBatch(
+	commit DeleteReconciliationBatchCommit,
+) error {
+	return store.update(func(document *yamlStateDocument) error {
+		if err := requireYAMLStage4Identity(
+			*document,
+			commit.RunID,
+			commit.Task,
+		); err != nil {
+			return err
+		}
+		for index := range document.DeleteReconciliations {
+			record := document.DeleteReconciliations[index]
+			if record.RunID != commit.RunID ||
+				record.Task != commit.Task ||
+				record.AttemptID != commit.AttemptID {
+				continue
+			}
+			next, err := applyDeleteReconciliationBatchCommit(
+				record,
+				commit,
+			)
+			if err != nil {
+				return err
+			}
+			document.DeleteReconciliations[index] = next
+			return nil
+		}
+		return fmt.Errorf(
+			"%w: delete reconciliation %q",
+			ErrUnknownWork,
+			commit.AttemptID,
+		)
+	})
+}
+
 func (store YAMLStore) FinishDeleteReconciliation(result DeleteReconciliationResult) error {
 	if err := validateStage4Identity(result.RunID, result.Task); err != nil {
 		return err

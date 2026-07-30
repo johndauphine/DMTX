@@ -447,6 +447,44 @@ func (backend *fencedBackend) LoadLatestSuccessfulDeleteReconciliation(
 	}
 	return stage4.LoadLatestSuccessfulDeleteReconciliation(runID, task)
 }
+func (backend *fencedBackend) SaveDeleteReconciliationPlan(
+	plan DeleteReconciliationPlan,
+) error {
+	return backend.protectRun(plan.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.SaveDeleteReconciliationPlan(plan)
+	})
+}
+func (backend *fencedBackend) BeginDeleteReconciliationBatch(
+	batch DeleteReconciliationBatch,
+) (DeleteReconciliationBatch, bool, error) {
+	var stored DeleteReconciliationBatch
+	var created bool
+	err := backend.protectRun(batch.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		stored, created, err =
+			stage4.BeginDeleteReconciliationBatch(batch)
+		return err
+	})
+	return stored, created, err
+}
+func (backend *fencedBackend) CommitDeleteReconciliationBatch(
+	commit DeleteReconciliationBatchCommit,
+) error {
+	return backend.protectRun(commit.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.CommitDeleteReconciliationBatch(commit)
+	})
+}
 func (backend *fencedBackend) FinishDeleteReconciliation(result DeleteReconciliationResult) error {
 	return backend.protectRun(result.RunID, func() error {
 		stage4, err := backend.stage4Backend()

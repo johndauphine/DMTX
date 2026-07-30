@@ -1017,6 +1017,126 @@ func (store SQLiteStore) LoadLatestSuccessfulDeleteReconciliation(
 	return record, found, nil
 }
 
+func (store SQLiteStore) mutateDeleteReconciliation(
+	runID string,
+	task TaskKey,
+	attemptID string,
+	mutate func(DeleteReconciliation) (DeleteReconciliation, error),
+) error {
+	database, err := store.openStage4()
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	transaction, err := database.Begin()
+	if err != nil {
+		return fmt.Errorf("begin delete reconciliation mutation: %w", err)
+	}
+	defer transaction.Rollback()
+	taskKey, err := requireSQLiteStage4Identity(
+		transaction,
+		runID,
+		task,
+	)
+	if err != nil {
+		return err
+	}
+	previous, found, err := loadSQLiteStage4Record(
+		transaction,
+		stage4DeleteRecord,
+		runID,
+		taskKey,
+		attemptID,
+	)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf(
+			"%w: delete reconciliation %q",
+			ErrUnknownWork,
+			attemptID,
+		)
+	}
+	var record DeleteReconciliation
+	if err := json.Unmarshal([]byte(previous), &record); err != nil {
+		return fmt.Errorf("decode delete reconciliation: %w", err)
+	}
+	next, err := mutate(record)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(next)
+	if err != nil {
+		return fmt.Errorf("encode delete reconciliation mutation: %w", err)
+	}
+	if string(encoded) != previous {
+		if err := updateSQLiteStage4Record(
+			transaction,
+			stage4DeleteRecord,
+			runID,
+			taskKey,
+			attemptID,
+			previous,
+			string(encoded),
+		); err != nil {
+			return err
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit delete reconciliation mutation: %w", err)
+	}
+	return nil
+}
+
+func (store SQLiteStore) SaveDeleteReconciliationPlan(
+	plan DeleteReconciliationPlan,
+) error {
+	return store.mutateDeleteReconciliation(
+		plan.RunID,
+		plan.Task,
+		plan.AttemptID,
+		func(record DeleteReconciliation) (DeleteReconciliation, error) {
+			return applyDeleteReconciliationPlan(record, plan)
+		},
+	)
+}
+
+func (store SQLiteStore) BeginDeleteReconciliationBatch(
+	batch DeleteReconciliationBatch,
+) (DeleteReconciliationBatch, bool, error) {
+	var stored DeleteReconciliationBatch
+	var created bool
+	err := store.mutateDeleteReconciliation(
+		batch.RunID,
+		batch.Task,
+		batch.AttemptID,
+		func(record DeleteReconciliation) (DeleteReconciliation, error) {
+			next, normalized, wasCreated, err :=
+				applyBeginDeleteReconciliationBatch(record, batch)
+			if err != nil {
+				return DeleteReconciliation{}, err
+			}
+			stored, created = normalized, wasCreated
+			return next, nil
+		},
+	)
+	return stored, created, err
+}
+
+func (store SQLiteStore) CommitDeleteReconciliationBatch(
+	commit DeleteReconciliationBatchCommit,
+) error {
+	return store.mutateDeleteReconciliation(
+		commit.RunID,
+		commit.Task,
+		commit.AttemptID,
+		func(record DeleteReconciliation) (DeleteReconciliation, error) {
+			return applyDeleteReconciliationBatchCommit(record, commit)
+		},
+	)
+}
+
 func (store SQLiteStore) FinishDeleteReconciliation(result DeleteReconciliationResult) error {
 	if err := validateStage4Identity(result.RunID, result.Task); err != nil {
 		return err

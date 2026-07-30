@@ -38,10 +38,296 @@ func TestStage4BackendConformance(t *testing.T) {
 			t.Run("delete results", func(t *testing.T) {
 				testStage4DeleteReconciliation(t, factory)
 			})
+			t.Run("delete plan and batch journal", func(t *testing.T) {
+				testStage4DeleteJournal(t, factory)
+			})
 			t.Run("strict snapshot evidence", func(t *testing.T) {
 				testStage4StrictSnapshot(t, factory)
 			})
 		})
+	}
+}
+
+func testStage4DeleteJournal(
+	t *testing.T,
+	factory stage4BackendFactory,
+) {
+	t.Helper()
+	backend, reopen := factory(t)
+	stage4, runID, key, started := initializeStage4Backend(t, backend)
+	attempt := DeleteReconciliation{
+		RunID: runID, Task: key, AttemptID: "delete-journal",
+		Due: true, StartedAt: started,
+	}
+	if _, created, err := stage4.BeginDeleteReconciliation(
+		attempt,
+	); err != nil || !created {
+		t.Fatalf("begin delete journal created=%v err=%v", created, err)
+	}
+	digestOf := func(value string) string {
+		digest := sha256.Sum256([]byte(value))
+		return hex.EncodeToString(digest[:])
+	}
+	plan := DeleteReconciliationPlan{
+		RunID: runID, Task: key, AttemptID: attempt.AttemptID,
+		PlanID:              "plan-1",
+		SpoolPath:           filepath.Join(t.TempDir(), "delete-spool.db"),
+		EqualityProofDigest: digestOf("proof"),
+		CandidateDigest:     digestOf("candidates"),
+		Candidates:          2, BatchSize: 2, BatchByteLimit: 1024,
+		KeyWidth:  1,
+		PlannedAt: started.Add(time.Minute),
+	}
+	if err := stage4.SaveDeleteReconciliationPlan(plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := stage4.SaveDeleteReconciliationPlan(plan); err != nil {
+		t.Fatalf("idempotent delete plan: %v", err)
+	}
+	batch := DeleteReconciliationBatch{
+		RunID: runID, Task: key, AttemptID: attempt.AttemptID,
+		PlanID: plan.PlanID, Token: "batch-token-1",
+		Sequence: 0, FirstCandidate: 0, Candidates: 2,
+		EncodedBytes: 32,
+		BatchDigest:  digestOf("batch"),
+		BeganAt:      started.Add(2 * time.Minute),
+	}
+	stored, created, err := stage4.BeginDeleteReconciliationBatch(batch)
+	if err != nil || !created || stored != batch {
+		t.Fatalf(
+			"begin delete batch = %#v created=%v err=%v",
+			stored,
+			created,
+			err,
+		)
+	}
+	stored, created, err = stage4.BeginDeleteReconciliationBatch(batch)
+	if err != nil || created || stored != batch {
+		t.Fatalf(
+			"idempotent delete batch = %#v created=%v err=%v",
+			stored,
+			created,
+			err,
+		)
+	}
+	if err := stage4.FinishDeleteReconciliation(
+		DeleteReconciliationResult{
+			RunID: runID, Task: key,
+			AttemptID:  attempt.AttemptID,
+			Status:     DeleteReconciliationIncomplete,
+			Candidates: 2, SkippedRows: 2,
+			Reason:      "must not terminalize unresolved target receipt",
+			CompletedAt: started.Add(3 * time.Minute),
+		},
+	); err == nil {
+		t.Fatal("pending target batch became terminal")
+	}
+	commit := DeleteReconciliationBatchCommit{
+		RunID: runID, Task: key, AttemptID: attempt.AttemptID,
+		PlanID: plan.PlanID, Token: batch.Token,
+		Sequence:       batch.Sequence,
+		FirstCandidate: batch.FirstCandidate,
+		BatchDigest:    batch.BatchDigest,
+		Candidates:     batch.Candidates,
+		EncodedBytes:   batch.EncodedBytes,
+		DeletedRows:    2,
+		ReceiptDigest:  digestOf("receipt"),
+		CommittedAt:    started.Add(3 * time.Minute),
+	}
+	differentCommit := commit
+	differentCommit.EncodedBytes++
+	if err := stage4.CommitDeleteReconciliationBatch(
+		differentCommit,
+	); err == nil {
+		t.Fatal("batch commit with different encoded byte evidence succeeded")
+	}
+	if err := stage4.CommitDeleteReconciliationBatch(commit); err != nil {
+		t.Fatal(err)
+	}
+	if err := stage4.CommitDeleteReconciliationBatch(commit); err != nil {
+		t.Fatalf("idempotent delete batch commit: %v", err)
+	}
+	restored, found, err := reopen().(Stage4Backend).
+		LoadDeleteReconciliation(runID, key, attempt.AttemptID)
+	if err != nil || !found {
+		t.Fatalf("load delete journal found=%v err=%v", found, err)
+	}
+	if restored.Plan == nil || *restored.Plan != plan ||
+		restored.PendingBatch != nil ||
+		restored.Frontier != 2 ||
+		restored.CommittedBatches != 1 ||
+		restored.DeletedRows != 2 ||
+		restored.LastBatchCommit == nil ||
+		*restored.LastBatchCommit != commit {
+		t.Fatalf("delete journal evidence = %#v", restored)
+	}
+	if err := ValidateDeleteReconciliationEvidence(restored); err != nil {
+		t.Fatalf("validate delete journal evidence: %v", err)
+	}
+	malformed := restored
+	malformedCommit := *malformed.LastBatchCommit
+	malformedCommit.FirstCandidate++
+	malformed.LastBatchCommit = &malformedCommit
+	if err := ValidateDeleteReconciliationEvidence(
+		malformed,
+	); err == nil {
+		t.Fatal("malformed durable frontier evidence validated")
+	}
+	result := DeleteReconciliationResult{
+		RunID: runID, Task: key, AttemptID: attempt.AttemptID,
+		Status:     DeleteReconciliationCompleted,
+		Candidates: 2, DeletedRows: 2,
+		CompletedAt: started.Add(4 * time.Minute),
+	}
+	if err := stage4.FinishDeleteReconciliation(result); err != nil {
+		t.Fatal(err)
+	}
+	completed, found, err := reopen().(Stage4Backend).
+		LoadDeleteReconciliation(runID, key, attempt.AttemptID)
+	if err != nil || !found ||
+		completed.Status != DeleteReconciliationCompleted {
+		t.Fatalf(
+			"completed delete journal = %#v found=%v err=%v",
+			completed,
+			found,
+			err,
+		)
+	}
+
+	failAttempt := DeleteReconciliation{
+		RunID: runID, Task: key, AttemptID: "delete-fail-closed",
+		Due: true, StartedAt: started.Add(5 * time.Minute),
+	}
+	if _, created, err := stage4.BeginDeleteReconciliation(
+		failAttempt,
+	); err != nil || !created {
+		t.Fatalf("begin fail-closed delete created=%v err=%v", created, err)
+	}
+	failPlan := DeleteReconciliationPlan{
+		RunID: runID, Task: key, AttemptID: failAttempt.AttemptID,
+		PlanID:              "plan-fail-closed",
+		SpoolPath:           filepath.Join(t.TempDir(), "fail-closed.db"),
+		EqualityProofDigest: digestOf("fail-proof"),
+		CandidateDigest:     digestOf("fail-candidates"),
+		Candidates:          2, BatchSize: 1, BatchByteLimit: 1024,
+		KeyWidth:  1,
+		PlannedAt: started.Add(6 * time.Minute),
+	}
+	if err := stage4.SaveDeleteReconciliationPlan(failPlan); err != nil {
+		t.Fatal(err)
+	}
+	failBatch := DeleteReconciliationBatch{
+		RunID: runID, Task: key, AttemptID: failAttempt.AttemptID,
+		PlanID: failPlan.PlanID, Token: "fail-closed-token",
+		Sequence: 0, FirstCandidate: 0, Candidates: 1,
+		EncodedBytes: 32,
+		BatchDigest:  digestOf("fail-batch"),
+		BeganAt:      started.Add(7 * time.Minute),
+	}
+	if _, created, err := stage4.BeginDeleteReconciliationBatch(
+		failBatch,
+	); err != nil || !created {
+		t.Fatalf("begin fail-closed batch created=%v err=%v", created, err)
+	}
+	failCommit := DeleteReconciliationBatchCommit{
+		RunID: runID, Task: key, AttemptID: failAttempt.AttemptID,
+		PlanID: failPlan.PlanID, Token: failBatch.Token,
+		Sequence:         failBatch.Sequence,
+		FirstCandidate:   failBatch.FirstCandidate,
+		BatchDigest:      failBatch.BatchDigest,
+		Candidates:       failBatch.Candidates,
+		EncodedBytes:     failBatch.EncodedBytes,
+		DeletedRows:      1,
+		ReceiptDigest:    digestOf("fail-receipt"),
+		FailClosedReason: DeleteReconciliationReasonTargetMutationFailed,
+		CommittedAt:      started.Add(8 * time.Minute),
+	}
+	unsafePartial := failCommit
+	unsafePartial.DeletedRows = 0
+	unsafePartial.FailClosedReason = ""
+	if err := stage4.CommitDeleteReconciliationBatch(
+		unsafePartial,
+	); !errors.Is(err, ErrStateTransition) {
+		t.Fatalf("partial receipt without fail-closed reason error = %v", err)
+	}
+	if err := stage4.CommitDeleteReconciliationBatch(
+		failCommit,
+	); err != nil {
+		t.Fatal(err)
+	}
+	nextBatch := failBatch
+	nextBatch.Token = "must-not-mutate"
+	nextBatch.Sequence = 1
+	nextBatch.FirstCandidate = 1
+	nextBatch.BatchDigest = digestOf("must-not-mutate")
+	nextBatch.BeganAt = started.Add(9 * time.Minute)
+	if _, _, err := stage4.BeginDeleteReconciliationBatch(
+		nextBatch,
+	); !errors.Is(err, ErrStateTransition) {
+		t.Fatalf("batch after fail-closed receipt error = %v", err)
+	}
+	if err := stage4.FinishDeleteReconciliation(
+		DeleteReconciliationResult{
+			RunID: runID, Task: key, AttemptID: failAttempt.AttemptID,
+			Status: DeleteReconciliationCompleted, Candidates: 2,
+			DeletedRows: 1, SkippedRows: 1,
+			CompletedAt: started.Add(9 * time.Minute),
+		},
+	); !errors.Is(err, ErrStateTransition) {
+		t.Fatalf("fail-closed receipt completed error = %v", err)
+	}
+	const secret = "credential-and-private-row-value"
+	if err := stage4.FinishDeleteReconciliation(
+		DeleteReconciliationResult{
+			RunID: runID, Task: key, AttemptID: failAttempt.AttemptID,
+			Status: DeleteReconciliationIncomplete, Candidates: 2,
+			DeletedRows: 1, SkippedRows: 1, Reason: secret,
+			CompletedAt: started.Add(9 * time.Minute),
+		},
+	); err == nil {
+		t.Fatal("non-enumerated incomplete reason was persisted")
+	}
+	stillRunning, found, err := reopen().(Stage4Backend).
+		LoadDeleteReconciliation(runID, key, failAttempt.AttemptID)
+	if err != nil || !found ||
+		stillRunning.Status != DeleteReconciliationRunning ||
+		stillRunning.Reason != "" ||
+		stillRunning.LastBatchCommit == nil ||
+		stillRunning.LastBatchCommit.FailClosedReason !=
+			DeleteReconciliationReasonTargetMutationFailed {
+		t.Fatalf(
+			"rejected secret changed fail-closed state = %#v found=%v err=%v",
+			stillRunning,
+			found,
+			err,
+		)
+	}
+	if err := stage4.FinishDeleteReconciliation(
+		DeleteReconciliationResult{
+			RunID: runID, Task: key, AttemptID: failAttempt.AttemptID,
+			Status: DeleteReconciliationIncomplete, Candidates: 2,
+			DeletedRows: 1, SkippedRows: 1,
+			Reason:      DeleteReconciliationReasonTargetMutationFailed,
+			CompletedAt: started.Add(10 * time.Minute),
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	failClosed, found, err := reopen().(Stage4Backend).
+		LoadDeleteReconciliation(runID, key, failAttempt.AttemptID)
+	if err != nil || !found ||
+		failClosed.Status != DeleteReconciliationIncomplete ||
+		failClosed.Reason !=
+			DeleteReconciliationReasonTargetMutationFailed ||
+		failClosed.LastBatchCommit == nil ||
+		failClosed.LastBatchCommit.FailClosedReason !=
+			DeleteReconciliationReasonTargetMutationFailed {
+		t.Fatalf(
+			"reopened fail-closed state = %#v found=%v err=%v",
+			failClosed,
+			found,
+			err,
+		)
 	}
 }
 
@@ -296,7 +582,7 @@ func testStage4DeleteReconciliation(t *testing.T, factory stage4BackendFactory) 
 	if err := stage4.FinishDeleteReconciliation(DeleteReconciliationResult{
 		RunID: runID, Task: key, AttemptID: incomplete.AttemptID,
 		Status: DeleteReconciliationIncomplete, Candidates: 10, DeletedRows: 4,
-		SkippedRows: 6, Reason: "source key scan failed",
+		SkippedRows: 6, Reason: DeleteReconciliationReasonKeyScanFailed,
 		CompletedAt: started.Add(4 * time.Minute),
 	}); err != nil {
 		t.Fatal(err)

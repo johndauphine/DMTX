@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
@@ -48,6 +49,9 @@ type Stage4Backend interface {
 	BeginDeleteReconciliation(DeleteReconciliation) (DeleteReconciliation, bool, error)
 	LoadDeleteReconciliation(string, TaskKey, string) (DeleteReconciliation, bool, error)
 	LoadLatestSuccessfulDeleteReconciliation(string, TaskKey) (DeleteReconciliation, bool, error)
+	SaveDeleteReconciliationPlan(DeleteReconciliationPlan) error
+	BeginDeleteReconciliationBatch(DeleteReconciliationBatch) (DeleteReconciliationBatch, bool, error)
+	CommitDeleteReconciliationBatch(DeleteReconciliationBatchCommit) error
 	FinishDeleteReconciliation(DeleteReconciliationResult) error
 
 	SaveStrictMigrationSnapshot(StrictMigrationSnapshot) error
@@ -133,22 +137,100 @@ const (
 	DeleteReconciliationDryRun     DeleteReconciliationStatus = "dry_run"
 )
 
+// Incomplete reconciliation reasons are stable, non-sensitive codes. Driver
+// errors and row values belong in the caller's diagnostic error path, never in
+// durable state.
+const (
+	DeleteReconciliationReasonCancelled                     = "cancelled"
+	DeleteReconciliationReasonKeyReadersUnavailable         = "key_readers_unavailable"
+	DeleteReconciliationReasonMutationProtectionUnavailable = "mutation_protection_unavailable"
+	DeleteReconciliationReasonLeaseLost                     = "lease_lost"
+	DeleteReconciliationReasonUnsafeBatchLimits             = "unsafe_batch_limits"
+	DeleteReconciliationReasonPlanCreationFailed            = "plan_creation_failed"
+	DeleteReconciliationReasonKeyScanFailed                 = "key_scan_failed"
+	DeleteReconciliationReasonClockInvalid                  = "clock_invalid"
+	DeleteReconciliationReasonDurablePlanMismatch           = "durable_plan_mismatch"
+	DeleteReconciliationReasonSpoolUnavailable              = "spool_unavailable"
+	DeleteReconciliationReasonSpoolVerificationFailed       = "spool_verification_failed"
+	DeleteReconciliationReasonTargetMutationFailed          = "target_mutation_failed"
+	DeleteReconciliationReasonTargetReceiptIncomplete       = "target_receipt_incomplete"
+)
+
 // DeleteReconciliation distinguishes a reconciliation that was not due from a
 // due pass that ran and found zero candidates. Terminal records are immutable,
 // so incomplete work can never be mistaken for the durable last success.
 type DeleteReconciliation struct {
-	RunID       string                     `json:"run_id" yaml:"run_id"`
-	Task        TaskKey                    `json:"task" yaml:"task"`
-	AttemptID   string                     `json:"attempt_id" yaml:"attempt_id"`
-	Due         bool                       `json:"due" yaml:"due"`
-	DryRun      bool                       `json:"dry_run" yaml:"dry_run"`
-	Status      DeleteReconciliationStatus `json:"status" yaml:"status"`
-	Candidates  int64                      `json:"candidates" yaml:"candidates"`
-	DeletedRows int64                      `json:"deleted_rows" yaml:"deleted_rows"`
-	SkippedRows int64                      `json:"skipped_rows" yaml:"skipped_rows"`
-	Reason      string                     `json:"reason,omitempty" yaml:"reason,omitempty"`
-	StartedAt   time.Time                  `json:"started_at" yaml:"started_at"`
-	CompletedAt time.Time                  `json:"completed_at,omitempty" yaml:"completed_at,omitempty"`
+	RunID            string                           `json:"run_id" yaml:"run_id"`
+	Task             TaskKey                          `json:"task" yaml:"task"`
+	AttemptID        string                           `json:"attempt_id" yaml:"attempt_id"`
+	Due              bool                             `json:"due" yaml:"due"`
+	DryRun           bool                             `json:"dry_run" yaml:"dry_run"`
+	Status           DeleteReconciliationStatus       `json:"status" yaml:"status"`
+	Candidates       int64                            `json:"candidates" yaml:"candidates"`
+	DeletedRows      int64                            `json:"deleted_rows" yaml:"deleted_rows"`
+	SkippedRows      int64                            `json:"skipped_rows" yaml:"skipped_rows"`
+	Reason           string                           `json:"reason,omitempty" yaml:"reason,omitempty"`
+	StartedAt        time.Time                        `json:"started_at" yaml:"started_at"`
+	CompletedAt      time.Time                        `json:"completed_at,omitempty" yaml:"completed_at,omitempty"`
+	Plan             *DeleteReconciliationPlan        `json:"plan,omitempty" yaml:"plan,omitempty"`
+	Frontier         int64                            `json:"frontier,omitempty" yaml:"frontier,omitempty"`
+	CommittedBatches int64                            `json:"committed_batches,omitempty" yaml:"committed_batches,omitempty"`
+	PendingBatch     *DeleteReconciliationBatch       `json:"pending_batch,omitempty" yaml:"pending_batch,omitempty"`
+	LastBatchCommit  *DeleteReconciliationBatchCommit `json:"last_batch_commit,omitempty" yaml:"last_batch_commit,omitempty"`
+}
+
+// DeleteReconciliationPlan binds a due attempt to one immutable, disk-backed
+// target-only candidate set before the first target mutation. CandidateDigest
+// covers the complete ordered key/parameter stream; EqualityProofDigest binds
+// it to the route-specific key equality proof used to construct that stream.
+type DeleteReconciliationPlan struct {
+	RunID               string    `json:"run_id" yaml:"run_id"`
+	Task                TaskKey   `json:"task" yaml:"task"`
+	AttemptID           string    `json:"attempt_id" yaml:"attempt_id"`
+	PlanID              string    `json:"plan_id" yaml:"plan_id"`
+	SpoolPath           string    `json:"spool_path" yaml:"spool_path"`
+	EqualityProofDigest string    `json:"equality_proof_digest" yaml:"equality_proof_digest"`
+	CandidateDigest     string    `json:"candidate_digest" yaml:"candidate_digest"`
+	Candidates          int64     `json:"candidates" yaml:"candidates"`
+	BatchSize           int       `json:"batch_size" yaml:"batch_size"`
+	BatchByteLimit      int64     `json:"batch_byte_limit" yaml:"batch_byte_limit"`
+	KeyWidth            int       `json:"key_width" yaml:"key_width"`
+	PlannedAt           time.Time `json:"planned_at" yaml:"planned_at"`
+}
+
+// DeleteReconciliationBatch is persisted before its target mutation. Token is
+// the idempotency key that a target must journal atomically with the deletes.
+type DeleteReconciliationBatch struct {
+	RunID          string    `json:"run_id" yaml:"run_id"`
+	Task           TaskKey   `json:"task" yaml:"task"`
+	AttemptID      string    `json:"attempt_id" yaml:"attempt_id"`
+	PlanID         string    `json:"plan_id" yaml:"plan_id"`
+	Token          string    `json:"token" yaml:"token"`
+	Sequence       int64     `json:"sequence" yaml:"sequence"`
+	FirstCandidate int64     `json:"first_candidate" yaml:"first_candidate"`
+	Candidates     int64     `json:"candidates" yaml:"candidates"`
+	EncodedBytes   int64     `json:"encoded_bytes" yaml:"encoded_bytes"`
+	BatchDigest    string    `json:"batch_digest" yaml:"batch_digest"`
+	BeganAt        time.Time `json:"began_at" yaml:"began_at"`
+}
+
+// DeleteReconciliationBatchCommit records the target's durable idempotent
+// receipt and advances the candidate frontier atomically in the state store.
+type DeleteReconciliationBatchCommit struct {
+	RunID            string    `json:"run_id" yaml:"run_id"`
+	Task             TaskKey   `json:"task" yaml:"task"`
+	AttemptID        string    `json:"attempt_id" yaml:"attempt_id"`
+	PlanID           string    `json:"plan_id" yaml:"plan_id"`
+	Token            string    `json:"token" yaml:"token"`
+	Sequence         int64     `json:"sequence" yaml:"sequence"`
+	FirstCandidate   int64     `json:"first_candidate" yaml:"first_candidate"`
+	BatchDigest      string    `json:"batch_digest" yaml:"batch_digest"`
+	Candidates       int64     `json:"candidates" yaml:"candidates"`
+	EncodedBytes     int64     `json:"encoded_bytes" yaml:"encoded_bytes"`
+	DeletedRows      int64     `json:"deleted_rows" yaml:"deleted_rows"`
+	ReceiptDigest    string    `json:"receipt_digest" yaml:"receipt_digest"`
+	FailClosedReason string    `json:"fail_closed_reason,omitempty" yaml:"fail_closed_reason,omitempty"`
+	CommittedAt      time.Time `json:"committed_at" yaml:"committed_at"`
 }
 
 // DeleteReconciliationResult completes one due reconciliation. Completed,
@@ -464,6 +546,14 @@ func normalizeDeleteReconciliation(record DeleteReconciliation) (DeleteReconcili
 	if record.Candidates != 0 || record.DeletedRows != 0 || record.SkippedRows != 0 {
 		return DeleteReconciliation{}, fmt.Errorf("%w: new delete reconciliation contains result counts", ErrStateTransition)
 	}
+	if record.Plan != nil || record.Frontier != 0 ||
+		record.CommittedBatches != 0 || record.PendingBatch != nil ||
+		record.LastBatchCommit != nil {
+		return DeleteReconciliation{}, fmt.Errorf(
+			"%w: new delete reconciliation contains plan or batch evidence",
+			ErrStateTransition,
+		)
+	}
 	record.StartedAt = record.StartedAt.UTC()
 	switch {
 	case !record.Due:
@@ -497,6 +587,532 @@ func normalizeDeleteReconciliation(record DeleteReconciliation) (DeleteReconcili
 	return record, nil
 }
 
+func validateDeleteDigest(label, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s is required", label)
+	}
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != sha256.Size ||
+		value != strings.ToLower(value) {
+		return fmt.Errorf("%s must be a lowercase SHA-256 digest", label)
+	}
+	return nil
+}
+
+func validateDeleteReconciliationIncompleteReason(reason string) error {
+	switch reason {
+	case DeleteReconciliationReasonCancelled,
+		DeleteReconciliationReasonKeyReadersUnavailable,
+		DeleteReconciliationReasonMutationProtectionUnavailable,
+		DeleteReconciliationReasonLeaseLost,
+		DeleteReconciliationReasonUnsafeBatchLimits,
+		DeleteReconciliationReasonPlanCreationFailed,
+		DeleteReconciliationReasonKeyScanFailed,
+		DeleteReconciliationReasonClockInvalid,
+		DeleteReconciliationReasonDurablePlanMismatch,
+		DeleteReconciliationReasonSpoolUnavailable,
+		DeleteReconciliationReasonSpoolVerificationFailed,
+		DeleteReconciliationReasonTargetMutationFailed,
+		DeleteReconciliationReasonTargetReceiptIncomplete:
+		return nil
+	default:
+		return fmt.Errorf(
+			"delete reconciliation incomplete reason %q is not a stable code",
+			reason,
+		)
+	}
+}
+
+func validateDeleteReconciliationPlan(
+	record DeleteReconciliation,
+	plan DeleteReconciliationPlan,
+) (DeleteReconciliationPlan, error) {
+	if record.Status != DeleteReconciliationRunning ||
+		!record.Due || record.DryRun {
+		return DeleteReconciliationPlan{}, fmt.Errorf(
+			"%w: delete plan requires a running mutating reconciliation",
+			ErrStateTransition,
+		)
+	}
+	if plan.RunID != record.RunID || plan.Task != record.Task ||
+		plan.AttemptID != record.AttemptID {
+		return DeleteReconciliationPlan{}, fmt.Errorf(
+			"%w: delete plan identity differs",
+			ErrImmutableEvidence,
+		)
+	}
+	if strings.TrimSpace(plan.PlanID) == "" {
+		return DeleteReconciliationPlan{}, fmt.Errorf(
+			"delete reconciliation plan ID is required",
+		)
+	}
+	if strings.TrimSpace(plan.SpoolPath) == "" {
+		return DeleteReconciliationPlan{}, fmt.Errorf(
+			"delete reconciliation spool path is required",
+		)
+	}
+	if !filepath.IsAbs(plan.SpoolPath) {
+		return DeleteReconciliationPlan{}, fmt.Errorf(
+			"delete reconciliation spool path must be absolute",
+		)
+	}
+	if err := validateDeleteDigest(
+		"delete reconciliation equality proof digest",
+		plan.EqualityProofDigest,
+	); err != nil {
+		return DeleteReconciliationPlan{}, err
+	}
+	if err := validateDeleteDigest(
+		"delete reconciliation candidate digest",
+		plan.CandidateDigest,
+	); err != nil {
+		return DeleteReconciliationPlan{}, err
+	}
+	if plan.Candidates < 0 {
+		return DeleteReconciliationPlan{}, fmt.Errorf(
+			"delete reconciliation candidate count must not be negative",
+		)
+	}
+	if plan.BatchSize <= 0 || plan.BatchByteLimit <= 0 ||
+		plan.KeyWidth <= 0 {
+		return DeleteReconciliationPlan{}, fmt.Errorf(
+			"delete reconciliation plan batch size, byte limit, and key width must be positive",
+		)
+	}
+	if plan.PlannedAt.IsZero() ||
+		plan.PlannedAt.Before(record.StartedAt) {
+		return DeleteReconciliationPlan{}, fmt.Errorf(
+			"delete reconciliation plan time is absent or precedes the attempt",
+		)
+	}
+	plan.PlannedAt = plan.PlannedAt.UTC()
+	return plan, nil
+}
+
+func applyDeleteReconciliationPlan(
+	record DeleteReconciliation,
+	plan DeleteReconciliationPlan,
+) (DeleteReconciliation, error) {
+	if err := ValidateDeleteReconciliationEvidence(record); err != nil {
+		return DeleteReconciliation{}, fmt.Errorf(
+			"invalid stored delete reconciliation: %w",
+			err,
+		)
+	}
+	plan, err := validateDeleteReconciliationPlan(record, plan)
+	if err != nil {
+		return DeleteReconciliation{}, err
+	}
+	if record.Plan != nil {
+		if reflect.DeepEqual(*record.Plan, plan) {
+			return record, nil
+		}
+		return DeleteReconciliation{}, fmt.Errorf(
+			"%w: delete reconciliation plan differs",
+			ErrImmutableEvidence,
+		)
+	}
+	if record.Frontier != 0 || record.CommittedBatches != 0 ||
+		record.PendingBatch != nil || record.LastBatchCommit != nil ||
+		record.Candidates != 0 || record.DeletedRows != 0 ||
+		record.SkippedRows != 0 {
+		return DeleteReconciliation{}, fmt.Errorf(
+			"%w: delete reconciliation already contains progress",
+			ErrStateTransition,
+		)
+	}
+	next := record
+	next.Plan = &plan
+	next.Candidates = plan.Candidates
+	return next, nil
+}
+
+func validateDeleteReconciliationBatch(
+	record DeleteReconciliation,
+	batch DeleteReconciliationBatch,
+) (DeleteReconciliationBatch, error) {
+	if record.Status != DeleteReconciliationRunning ||
+		record.Plan == nil {
+		return DeleteReconciliationBatch{}, fmt.Errorf(
+			"%w: delete batch requires a running planned reconciliation",
+			ErrStateTransition,
+		)
+	}
+	if record.LastBatchCommit != nil &&
+		record.LastBatchCommit.FailClosedReason != "" {
+		return DeleteReconciliationBatch{}, fmt.Errorf(
+			"%w: delete reconciliation is fail-closed after its last target receipt",
+			ErrStateTransition,
+		)
+	}
+	if batch.RunID != record.RunID || batch.Task != record.Task ||
+		batch.AttemptID != record.AttemptID ||
+		batch.PlanID != record.Plan.PlanID {
+		return DeleteReconciliationBatch{}, fmt.Errorf(
+			"%w: delete batch identity differs",
+			ErrImmutableEvidence,
+		)
+	}
+	if strings.TrimSpace(batch.Token) == "" {
+		return DeleteReconciliationBatch{}, fmt.Errorf(
+			"delete reconciliation batch token is required",
+		)
+	}
+	if batch.Sequence != record.CommittedBatches ||
+		batch.FirstCandidate != record.Frontier {
+		return DeleteReconciliationBatch{}, fmt.Errorf(
+			"%w: delete batch does not begin at the durable frontier",
+			ErrStateTransition,
+		)
+	}
+	if batch.Candidates <= 0 ||
+		batch.Candidates > int64(record.Plan.BatchSize) ||
+		batch.EncodedBytes <= 0 ||
+		batch.EncodedBytes > record.Plan.BatchByteLimit ||
+		batch.FirstCandidate < 0 ||
+		batch.FirstCandidate > record.Candidates ||
+		batch.Candidates >
+			record.Candidates-batch.FirstCandidate {
+		return DeleteReconciliationBatch{}, fmt.Errorf(
+			"%w: delete batch candidate range is invalid",
+			ErrStateTransition,
+		)
+	}
+	if err := validateDeleteDigest(
+		"delete reconciliation batch digest",
+		batch.BatchDigest,
+	); err != nil {
+		return DeleteReconciliationBatch{}, err
+	}
+	if batch.BeganAt.IsZero() ||
+		batch.BeganAt.Before(record.Plan.PlannedAt) {
+		return DeleteReconciliationBatch{}, fmt.Errorf(
+			"delete reconciliation batch time is absent or precedes its plan",
+		)
+	}
+	batch.BeganAt = batch.BeganAt.UTC()
+	return batch, nil
+}
+
+func applyBeginDeleteReconciliationBatch(
+	record DeleteReconciliation,
+	batch DeleteReconciliationBatch,
+) (DeleteReconciliation, DeleteReconciliationBatch, bool, error) {
+	if err := ValidateDeleteReconciliationEvidence(record); err != nil {
+		return DeleteReconciliation{}, DeleteReconciliationBatch{}, false,
+			fmt.Errorf(
+				"invalid stored delete reconciliation: %w",
+				err,
+			)
+	}
+	batch, err := validateDeleteReconciliationBatch(record, batch)
+	if err != nil {
+		return DeleteReconciliation{}, DeleteReconciliationBatch{}, false, err
+	}
+	if record.PendingBatch != nil {
+		if reflect.DeepEqual(*record.PendingBatch, batch) {
+			return record, *record.PendingBatch, false, nil
+		}
+		return DeleteReconciliation{}, DeleteReconciliationBatch{}, false,
+			fmt.Errorf(
+				"%w: pending delete reconciliation batch differs",
+				ErrImmutableEvidence,
+			)
+	}
+	next := record
+	next.PendingBatch = &batch
+	return next, batch, true, nil
+}
+
+func validateDeleteReconciliationBatchCommit(
+	record DeleteReconciliation,
+	commit DeleteReconciliationBatchCommit,
+) (DeleteReconciliationBatchCommit, error) {
+	if record.Status != DeleteReconciliationRunning ||
+		record.Plan == nil || record.PendingBatch == nil {
+		return DeleteReconciliationBatchCommit{}, fmt.Errorf(
+			"%w: delete batch commit requires a pending batch",
+			ErrStateTransition,
+		)
+	}
+	pending := record.PendingBatch
+	if commit.RunID != record.RunID || commit.Task != record.Task ||
+		commit.AttemptID != record.AttemptID ||
+		commit.PlanID != record.Plan.PlanID ||
+		commit.Token != pending.Token ||
+		commit.Sequence != pending.Sequence ||
+		commit.FirstCandidate != pending.FirstCandidate ||
+		commit.BatchDigest != pending.BatchDigest ||
+		commit.Candidates != pending.Candidates ||
+		commit.EncodedBytes != pending.EncodedBytes {
+		return DeleteReconciliationBatchCommit{}, fmt.Errorf(
+			"%w: delete batch receipt differs from its pending intent",
+			ErrImmutableEvidence,
+		)
+	}
+	if commit.DeletedRows < 0 ||
+		commit.DeletedRows > commit.Candidates {
+		return DeleteReconciliationBatchCommit{}, fmt.Errorf(
+			"delete batch receipt has invalid deleted-row count",
+		)
+	}
+	if commit.FailClosedReason != "" {
+		if err := validateDeleteReconciliationIncompleteReason(
+			commit.FailClosedReason,
+		); err != nil {
+			return DeleteReconciliationBatchCommit{}, err
+		}
+	}
+	if commit.DeletedRows != commit.Candidates &&
+		commit.FailClosedReason == "" {
+		return DeleteReconciliationBatchCommit{}, fmt.Errorf(
+			"%w: partial delete receipt must fail closed atomically with its frontier",
+			ErrStateTransition,
+		)
+	}
+	if err := validateDeleteDigest(
+		"delete reconciliation receipt digest",
+		commit.ReceiptDigest,
+	); err != nil {
+		return DeleteReconciliationBatchCommit{}, err
+	}
+	if commit.CommittedAt.IsZero() ||
+		commit.CommittedAt.Before(pending.BeganAt) {
+		return DeleteReconciliationBatchCommit{}, fmt.Errorf(
+			"delete batch receipt time is absent or precedes its intent",
+		)
+	}
+	commit.CommittedAt = commit.CommittedAt.UTC()
+	return commit, nil
+}
+
+func applyDeleteReconciliationBatchCommit(
+	record DeleteReconciliation,
+	commit DeleteReconciliationBatchCommit,
+) (DeleteReconciliation, error) {
+	if err := ValidateDeleteReconciliationEvidence(record); err != nil {
+		return DeleteReconciliation{}, fmt.Errorf(
+			"invalid stored delete reconciliation: %w",
+			err,
+		)
+	}
+	if !commit.CommittedAt.IsZero() {
+		commit.CommittedAt = commit.CommittedAt.UTC()
+	}
+	if record.PendingBatch == nil && record.LastBatchCommit != nil &&
+		reflect.DeepEqual(*record.LastBatchCommit, commit) {
+		return record, nil
+	}
+	commit, err := validateDeleteReconciliationBatchCommit(record, commit)
+	if err != nil {
+		return DeleteReconciliation{}, err
+	}
+	next := record
+	next.Frontier += commit.Candidates
+	next.CommittedBatches++
+	next.DeletedRows += commit.DeletedRows
+	next.PendingBatch = nil
+	next.LastBatchCommit = &commit
+	return next, nil
+}
+
+// ValidateDeleteReconciliationEvidence rejects malformed loaded state before a
+// caller uses terminal status for scheduling/validation or resumes mutation.
+func ValidateDeleteReconciliationEvidence(
+	record DeleteReconciliation,
+) error {
+	if err := validateStage4Identity(record.RunID, record.Task); err != nil {
+		return err
+	}
+	if strings.TrimSpace(record.AttemptID) == "" ||
+		record.StartedAt.IsZero() {
+		return fmt.Errorf(
+			"delete reconciliation identity and start time are required",
+		)
+	}
+	if record.Candidates < 0 || record.DeletedRows < 0 ||
+		record.SkippedRows < 0 ||
+		record.DeletedRows+record.SkippedRows > record.Candidates {
+		return fmt.Errorf(
+			"delete reconciliation contains invalid result counts",
+		)
+	}
+	if record.Plan == nil {
+		if record.Frontier != 0 || record.CommittedBatches != 0 ||
+			record.PendingBatch != nil || record.LastBatchCommit != nil {
+			return fmt.Errorf(
+				"delete reconciliation has progress without a plan",
+			)
+		}
+	} else {
+		plan, err := validateDeleteReconciliationPlan(
+			DeleteReconciliation{
+				RunID: record.RunID, Task: record.Task,
+				AttemptID: record.AttemptID, Due: true,
+				Status:    DeleteReconciliationRunning,
+				StartedAt: record.StartedAt,
+			},
+			*record.Plan,
+		)
+		if err != nil {
+			return err
+		}
+		if plan.Candidates != record.Candidates ||
+			record.Frontier < 0 ||
+			record.Frontier > record.Candidates ||
+			record.DeletedRows > record.Frontier ||
+			record.CommittedBatches < 0 ||
+			record.CommittedBatches > record.Frontier {
+			return fmt.Errorf(
+				"delete reconciliation plan progress is inconsistent",
+			)
+		}
+		if record.PendingBatch != nil {
+			if _, err := validateDeleteReconciliationBatch(
+				record,
+				*record.PendingBatch,
+			); err != nil {
+				return err
+			}
+		}
+		if record.Frontier == 0 {
+			if record.CommittedBatches != 0 ||
+				record.LastBatchCommit != nil {
+				return fmt.Errorf(
+					"delete reconciliation has batch evidence before its frontier",
+				)
+			}
+		} else {
+			if record.CommittedBatches <= 0 ||
+				record.LastBatchCommit == nil {
+				return fmt.Errorf(
+					"delete reconciliation frontier lacks batch evidence",
+				)
+			}
+			last := record.LastBatchCommit
+			if last.RunID != record.RunID ||
+				last.Task != record.Task ||
+				last.AttemptID != record.AttemptID ||
+				last.PlanID != record.Plan.PlanID ||
+				strings.TrimSpace(last.Token) == "" ||
+				last.Sequence != record.CommittedBatches-1 ||
+				last.Candidates <= 0 ||
+				last.Candidates > int64(record.Plan.BatchSize) ||
+				last.FirstCandidate < 0 ||
+				last.Candidates > record.Frontier ||
+				last.FirstCandidate !=
+					record.Frontier-last.Candidates ||
+				last.EncodedBytes <= 0 ||
+				last.EncodedBytes >
+					record.Plan.BatchByteLimit ||
+				last.DeletedRows < 0 ||
+				last.DeletedRows > last.Candidates ||
+				last.CommittedAt.IsZero() ||
+				last.CommittedAt.Before(record.Plan.PlannedAt) {
+				return fmt.Errorf(
+					"delete reconciliation last batch evidence is invalid",
+				)
+			}
+			if err := validateDeleteDigest(
+				"delete reconciliation last batch digest",
+				last.BatchDigest,
+			); err != nil {
+				return err
+			}
+			if err := validateDeleteDigest(
+				"delete reconciliation last receipt digest",
+				last.ReceiptDigest,
+			); err != nil {
+				return err
+			}
+			if last.FailClosedReason != "" {
+				if err := validateDeleteReconciliationIncompleteReason(
+					last.FailClosedReason,
+				); err != nil {
+					return err
+				}
+			}
+			if last.DeletedRows != last.Candidates &&
+				last.FailClosedReason == "" {
+				return fmt.Errorf(
+					"delete reconciliation partial receipt is not fail-closed",
+				)
+			}
+		}
+	}
+	switch record.Status {
+	case DeleteReconciliationRunning:
+		if !record.Due || !record.CompletedAt.IsZero() ||
+			record.Reason != "" || record.SkippedRows != 0 {
+			return fmt.Errorf(
+				"running delete reconciliation has terminal evidence",
+			)
+		}
+	case DeleteReconciliationNotDue:
+		if record.Due || record.DryRun || record.Reason == "" ||
+			record.CompletedAt.IsZero() || record.Plan != nil ||
+			record.Candidates != 0 || record.DeletedRows != 0 ||
+			record.SkippedRows != 0 {
+			return fmt.Errorf(
+				"not-due delete reconciliation evidence is invalid",
+			)
+		}
+	case DeleteReconciliationCompleted:
+		if !record.Due || record.DryRun ||
+			record.CompletedAt.IsZero() || record.PendingBatch != nil ||
+			record.DeletedRows != record.Candidates ||
+			record.SkippedRows != 0 ||
+			record.Plan != nil && record.Frontier != record.Candidates ||
+			record.LastBatchCommit != nil &&
+				record.LastBatchCommit.FailClosedReason != "" {
+			return fmt.Errorf(
+				"completed delete reconciliation evidence is invalid",
+			)
+		}
+	case DeleteReconciliationIncomplete:
+		if !record.Due || record.CompletedAt.IsZero() ||
+			strings.TrimSpace(record.Reason) == "" ||
+			record.PendingBatch != nil ||
+			record.SkippedRows != record.Candidates-record.DeletedRows {
+			return fmt.Errorf(
+				"incomplete delete reconciliation evidence is invalid",
+			)
+		}
+		if err := validateDeleteReconciliationIncompleteReason(
+			record.Reason,
+		); err != nil {
+			return err
+		}
+		if record.LastBatchCommit != nil &&
+			record.LastBatchCommit.FailClosedReason != "" &&
+			record.Reason != record.LastBatchCommit.FailClosedReason {
+			return fmt.Errorf(
+				"incomplete delete reconciliation reason differs from its fail-closed receipt",
+			)
+		}
+	case DeleteReconciliationDryRun:
+		if !record.Due || !record.DryRun ||
+			record.CompletedAt.IsZero() || record.DeletedRows != 0 ||
+			record.Plan != nil {
+			return fmt.Errorf(
+				"dry-run delete reconciliation evidence is invalid",
+			)
+		}
+	default:
+		return fmt.Errorf(
+			"delete reconciliation has invalid status %q",
+			record.Status,
+		)
+	}
+	if !record.CompletedAt.IsZero() &&
+		record.CompletedAt.Before(record.StartedAt) {
+		return fmt.Errorf(
+			"delete reconciliation completion precedes its start",
+		)
+	}
+	return nil
+}
+
 func deleteReconciliationBeginMatches(stored, requested DeleteReconciliation) bool {
 	return stored.RunID == requested.RunID &&
 		stored.Task == requested.Task &&
@@ -508,6 +1124,12 @@ func deleteReconciliationBeginMatches(stored, requested DeleteReconciliation) bo
 }
 
 func applyDeleteReconciliationResult(record DeleteReconciliation, result DeleteReconciliationResult) (DeleteReconciliation, error) {
+	if err := ValidateDeleteReconciliationEvidence(record); err != nil {
+		return DeleteReconciliation{}, fmt.Errorf(
+			"invalid stored delete reconciliation: %w",
+			err,
+		)
+	}
 	if result.RunID != record.RunID || result.Task != record.Task || result.AttemptID != record.AttemptID {
 		return DeleteReconciliation{}, fmt.Errorf("%w: delete reconciliation identity differs", ErrImmutableEvidence)
 	}
@@ -526,6 +1148,25 @@ func applyDeleteReconciliationResult(record DeleteReconciliation, result DeleteR
 	if result.SkippedRows > result.Candidates-result.DeletedRows {
 		return DeleteReconciliation{}, fmt.Errorf("deleted and skipped rows exceed delete candidates")
 	}
+	if record.Plan != nil {
+		if result.Candidates != record.Candidates ||
+			result.DeletedRows != record.DeletedRows {
+			return DeleteReconciliation{}, fmt.Errorf(
+				"%w: delete result differs from durable plan progress",
+				ErrImmutableEvidence,
+			)
+		}
+		if result.Status == DeleteReconciliationCompleted &&
+			(record.PendingBatch != nil ||
+				record.Frontier != record.Candidates ||
+				record.LastBatchCommit != nil &&
+					record.LastBatchCommit.FailClosedReason != "") {
+			return DeleteReconciliation{}, fmt.Errorf(
+				"%w: delete plan is not fully committed",
+				ErrStateTransition,
+			)
+		}
+	}
 	switch result.Status {
 	case DeleteReconciliationCompleted:
 		if record.DryRun {
@@ -542,8 +1183,18 @@ func applyDeleteReconciliationResult(record DeleteReconciliation, result DeleteR
 			return DeleteReconciliation{}, fmt.Errorf("%w: invalid dry-run result", ErrStateTransition)
 		}
 	case DeleteReconciliationIncomplete:
-		if strings.TrimSpace(result.Reason) == "" {
-			return DeleteReconciliation{}, fmt.Errorf("incomplete delete reconciliation reason is required")
+		if err := validateDeleteReconciliationIncompleteReason(
+			result.Reason,
+		); err != nil {
+			return DeleteReconciliation{}, err
+		}
+		if record.LastBatchCommit != nil &&
+			record.LastBatchCommit.FailClosedReason != "" &&
+			result.Reason != record.LastBatchCommit.FailClosedReason {
+			return DeleteReconciliation{}, fmt.Errorf(
+				"%w: incomplete result differs from its fail-closed receipt",
+				ErrImmutableEvidence,
+			)
 		}
 	default:
 		return DeleteReconciliation{}, fmt.Errorf("%w: terminal delete reconciliation status %q", ErrStateTransition, result.Status)
@@ -560,6 +1211,12 @@ func applyDeleteReconciliationResult(record DeleteReconciliation, result DeleteR
 			return record, nil
 		}
 		return DeleteReconciliation{}, fmt.Errorf("%w: delete reconciliation result differs", ErrImmutableEvidence)
+	}
+	if err := ValidateDeleteReconciliationEvidence(completed); err != nil {
+		return DeleteReconciliation{}, fmt.Errorf(
+			"invalid delete reconciliation result: %w",
+			err,
+		)
 	}
 	return completed, nil
 }
