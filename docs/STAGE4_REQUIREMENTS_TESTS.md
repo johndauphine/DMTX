@@ -626,14 +626,21 @@ Verified by locating every non-test reference per field.
 
 | Setting | Reachable consumers | Assessment |
 | --- | --- | --- |
-| `checkpoint_frequency` | none outside `internal/config` | Silently inert. Durability comes from per-range acknowledgement, which is finer-grained, so this is a truthfulness defect rather than data loss. Decide: drive a real periodic save, or remove as superseded. |
+| `checkpoint_frequency` | none outside `internal/config` | Silently inert. Durability comes from per-range acknowledgement, which is finer-grained, so this is a truthfulness defect rather than data loss. `TestResumeCompatibilityHashSeparatesSafeRuntimeAndStructuralChanges` classifies it as a safe runtime change, which is the right classification for a periodic-save cadence — so here too the design intent is coherent and only the consumer is missing. Decide: drive a real periodic save, or remove as superseded. |
 | `upsert_merge_size` | none outside `internal/config` | Silently inert. Likely superseded by chunk sizing; confirm and remove, or wire it. |
-| `large_table_threshold` | none outside `internal/config`, though it does alter `resume_hash.go` | Silently inert **and** hash-affecting: changing it can invalidate a resume without changing any behavior. That combination is the worst of the five. |
+| `large_table_threshold` | none outside `internal/config`; participates in the structural resume projection | Silently inert. Its hash membership is **deliberate**, not accidental: `TestResumeCompatibilityHashSeparatesSafeRuntimeAndStructuralChanges` explicitly asserts the threshold is structural, so the design clearly intends it to drive partitioning. The gap is the missing consumer, not the hash. Do **not** "fix" this by removing it from the hash — that would cement the setting as inert. Today the observable effect is that changing it invalidates a resume while changing no behavior. |
 | `runtime_tuning_interval` | none outside `internal/config` | Consistent with Section 8.3, which already records general runtime adjustment as absent. Defensible, but the setting should reject or warn until implemented. |
 | `history_retention_days` | none outside `internal/config` | Defensibly deferred: the Stage 5 boundary assigns history retention to Stage 5. Should still not accept a value it will ignore. |
 
 `read_ahead` was checked alongside these and **is** consumed, in
 `resource_plan.go` and `sqlite_transfer_pipeline.go`.
+
+These are **missing consumers, not design errors.** Each field's resume-hash
+classification is already correct for its intended behavior — structural for
+`large_table_threshold`, safe-runtime for `checkpoint_frequency` — which means
+the surrounding design anticipated the implementation that never landed. Treat
+this block as unfinished wiring rather than as configuration to delete
+reflexively.
 
 No fixture closes this block. The required work is a decision per row —
 implement, reject at parse, or remove — followed by a test that the setting
@@ -713,7 +720,10 @@ Reordered 2026-07-31. The two original top risks are closed.
 8. **Five operator-facing settings are inert.** See the inert-configuration
    audit below. They parse, validate, and in some cases alter the resume
    compatibility hash, but no transfer, state, or lifecycle path reads them. An
-   operator tuning them gets silence, not an error.
+   operator tuning them gets silence, not an error. Their hash classifications
+   are already correct for the intended behavior, so this is unfinished wiring
+   rather than a design flaw — the fix is to implement or reject, not to strip
+   them out of the resume projection.
 8. **Closed:** network resume now exists
    (`TestStage4PostgresTLSToSQLiteNetworkCrashResumeLive`,
    `TestStage4AdapterNetworkResumeReplansChangedRangeCount`, and the
