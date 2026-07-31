@@ -360,9 +360,19 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
-	if err := store.Append(state.Run{ID: run.ID, Source: run.Source, Target: run.Target, Outcome: state.Success, Resumable: false, Reason: resumeSuccessReason, StartedAt: run.StartedAt, EndedAt: time.Now().UTC()}); err != nil {
-		fmt.Fprintf(stderr, "record resumed migration state: %v\n", err)
+	published, err := publishStage4RunSuccess(
+		observer.tableCheckpointObserver,
+		resumeSuccessReason,
+	)
+	if err != nil {
+		fmt.Fprintf(stderr, "publish resumed migration state: %v\n", err)
 		return StateError
+	}
+	if !published {
+		if err := store.Append(state.Run{ID: run.ID, Source: run.Source, Target: run.Target, Outcome: state.Success, Resumable: false, Reason: resumeSuccessReason, StartedAt: run.StartedAt, EndedAt: time.Now().UTC()}); err != nil {
+			fmt.Fprintf(stderr, "record resumed migration state: %v\n", err)
+			return StateError
+		}
 	}
 	if err := appLifecycleBoundary("resume_success_persisted"); err != nil {
 		fmt.Fprintf(stderr, "resume lifecycle: %v\n", err)

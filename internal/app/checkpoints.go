@@ -115,6 +115,38 @@ func (observer tableCheckpointObserver) Stage4RunContext() (
 	return run, nil
 }
 
+// publishStage4RunSuccess routes successful completion through one atomic
+// Stage 4 publication when the route composed aggregate evidence, and reports
+// false when it did not so the caller records success by its ordinary path.
+//
+// Callers must append their validation audit first: terminal repair refuses a
+// successful run whose validation evidence is missing, so the durable success
+// must never precede it. The publication itself deliberately does not observe
+// the migration's cancellable context — the transfer already succeeded and its
+// lease was reverified, so a late signal must not strand the outcome.
+func publishStage4RunSuccess(
+	observer tableCheckpointObserver,
+	reason string,
+) (bool, error) {
+	run, err := observer.Stage4RunContext()
+	if err != nil {
+		return false, stateCheckpointError("resolve Stage 4 run context", err)
+	}
+	published, err := migrate.PublishStage4RunCompletion(
+		context.Background(),
+		run,
+		reason,
+		time.Now().UTC(),
+	)
+	if err != nil {
+		return false, stateCheckpointError(
+			"publish Stage 4 run completion",
+			err,
+		)
+	}
+	return published, nil
+}
+
 func (observer tableCheckpointObserver) ObserveStage4SchemaDecisions(
 	ctx context.Context,
 	report migrate.Stage4SchemaDecisionReport,

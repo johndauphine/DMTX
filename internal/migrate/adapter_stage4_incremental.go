@@ -495,14 +495,11 @@ func migrateWithStage4IncrementalAdapters(
 	); err != nil {
 		return result, err
 	}
-	if err := completeStage4SchemaGateSentinels(
-		ctx,
-		prepared.run,
-		prepared.gate,
-		prepared.evolution,
-	); err != nil {
-		return result, err
-	}
+	// The schema sentinels are deliberately left running. This route publishes a
+	// durable table inventory and per-table receipts, so PublishStage4RunCompletion
+	// completes the sentinels and the run outcome in one mutation once the caller
+	// has recorded its validation evidence. Completing them here would make that
+	// publication fail closed on already-terminal sentinels.
 	result.Validated = true
 	return result, nil
 }

@@ -97,7 +97,7 @@ terminal but the run outcome is not. The audit found the fix is not one slice.
 | --- | --- |
 | `EnsureStage4TableInventory` | `adapter_stage4_incremental.go:290` only |
 | `CompleteStage4Table` | `adapter_stage4_incremental.go:440`, `:463` only |
-| `CompleteStage4Run` | none |
+| `CompleteStage4Run` | `migrate.PublishStage4RunCompletion` (added by step 2) |
 
 The stable-network route (which owns the delete slice) finalizes through
 `observer.AfterTable` plus `completeStage4AdapterWork` as separate mutations,
@@ -154,17 +154,41 @@ so it is reachable only on the date-based incremental route.
    calls these yet; `migrate` must reach them by the same
    `state.Stage4AggregateBackend` type assertion used at
    `adapter_stage4_incremental.go:108`.
-2. Compose run completion on the date-based incremental route only: carry the
-   reason and completion time into `Stage4RunContext`, move sentinel completion
-   into the aggregate publication for that route, and keep every other route on
-   the existing `store.Append`, fail-closed.
+2. **Done.** `migrate.PublishStage4RunCompletion` completes every durable schema
+   sentinel and publishes the successful run in one mutation. It recovers table
+   completions and sentinels from durable state rather than in-memory context,
+   so a resumed process publishes exactly what the original would have, and no
+   field was added to `migrate.Result` (that struct is the JSON stdout
+   contract). The date-based incremental route no longer calls
+   `completeStage4SchemaGateSentinels`; its sentinels stay running until
+   publication. `internal/app/app.go` and `internal/app/resume.go` attempt the
+   publication after their `validation_completed` audit and fall back to
+   `store.Append` when it reports false.
+
+   Two decisions worth preserving. The publication must stay caller-driven and
+   run *after* the validation audit: terminal repair refuses a successful run
+   whose validation evidence is missing, so publishing inside `migrate` would
+   strand any run that crashed in that gap. And it deliberately uses
+   `context.Background()` rather than the cancellable migration context, so a
+   late signal cannot strand an outcome whose transfer already succeeded and
+   whose lease was reverified.
+
+   Route discrimination is state-driven: a durable table inventory is the marker
+   that a route composed aggregate evidence. No inventory means skip and fall
+   back; an inventory with incomplete composition fails closed. Step 3 therefore
+   inherits aggregate completion as soon as the network route publishes an
+   inventory.
+
+   Coverage gap: the app's fallback branch is covered by the existing SQLite
+   route tests, but the published-true branch needs a PostgreSQL incremental
+   route through `app`, which is live-only. Add it to the TLS matrix rerun.
 3. Then rework stable-network inventory timing as its own slice.
 
 ## Immediate safe next steps
 
 1. Re-read `git status --short --branch`. Do not include
    `docs/STAGE4_REQUIREMENTS_TESTS.md` in any operation.
-2. Implement step 2 of the revised sequencing above.
+2. Implement step 3 of the revised sequencing above.
 3. Rerun the PostgreSQL TLS live matrix when the approval quota permits it.
 4. After the aggregate slices, continue the requirements/test map in
    `docs/STAGE4_REQUIREMENTS_TESTS.md`, especially deterministic tuning/dry-run,

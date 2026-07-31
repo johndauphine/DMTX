@@ -244,21 +244,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
-	if err := store.Append(state.Run{
-		ID:             runID,
-		Source:         cfg.Source.Database,
-		Target:         cfg.Target.Database,
-		SourceEngine:   cfg.Source.Type,
-		SourceIdentity: sourceIdentity,
-		TargetIdentity: targetIdentity,
-		Outcome:        state.Success,
-		Resumable:      false,
-		Reason:         runSuccessReason,
-		StartedAt:      started,
-		EndedAt:        time.Now().UTC(),
-	}); err != nil {
-		fmt.Fprintf(stderr, "record completed migration state: %v\n", err)
+	published, err := publishStage4RunSuccess(observer, runSuccessReason)
+	if err != nil {
+		fmt.Fprintf(stderr, "publish completed migration state: %v\n", err)
 		return StateError
+	}
+	if !published {
+		if err := store.Append(state.Run{
+			ID:             runID,
+			Source:         cfg.Source.Database,
+			Target:         cfg.Target.Database,
+			SourceEngine:   cfg.Source.Type,
+			SourceIdentity: sourceIdentity,
+			TargetIdentity: targetIdentity,
+			Outcome:        state.Success,
+			Resumable:      false,
+			Reason:         runSuccessReason,
+			StartedAt:      started,
+			EndedAt:        time.Now().UTC(),
+		}); err != nil {
+			fmt.Fprintf(stderr, "record completed migration state: %v\n", err)
+			return StateError
+		}
 	}
 	if err := appLifecycleBoundary("run_success_persisted"); err != nil {
 		fmt.Fprintf(stderr, "run lifecycle: %v\n", err)
