@@ -25,10 +25,8 @@ func (adapter *postgresTargetAdapter) postgresDatabaseHandle() *sql.DB {
 }
 
 func validatePostgresTargetEndpoint(endpoint config.Endpoint) error {
-	if endpoint.Host == "" || endpoint.Database == "" || endpoint.User == "" {
-		return fmt.Errorf("PostgreSQL host, database, and user are required")
-	}
-	return nil
+	_, err := engine.PostgresDSN(endpoint)
+	return err
 }
 
 func openPostgresTargetAdapter(

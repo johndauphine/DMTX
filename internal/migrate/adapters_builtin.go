@@ -28,7 +28,11 @@ var builtInAdapters = mustBuildAdapterRegistry(
 			validate: validateSQLiteSourceEndpoint,
 			open:     openSQLiteSourceAdapter,
 		},
-		{engine: "postgres", open: openPostgresSourceAdapter},
+		{
+			engine:   "postgres",
+			validate: validatePostgresSourceEndpoint,
+			open:     openPostgresSourceAdapter,
+		},
 		{engine: "mysql", open: openMySQLSourceAdapter},
 		{engine: "mssql", open: openSQLServerSourceAdapter},
 		{
