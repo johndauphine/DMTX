@@ -102,8 +102,8 @@ S4.8 **partial**; S4.9 **blocked on the live matrix rerun**.
 
 | Normative behavior | Current evidence | Remaining proof |
 |---|---|---|
-| Connect, run deterministic source and target preflight, discover/filter schema, report drift/policy, select pagination, and disclose tuning/provenance. | **Partial:** `TestRunDryRunDiscoversSQLiteWithoutMutatingTargetOrState`; `DryRun` currently avoids the target, state, lease, and audit and reports only source row counts. | S4.8: `TestStage4DryRunReportsTargetPreflightDriftPaginationAndTuning` and `TestStage4DryRunNetworkRouteMatrixLive`. |
-| Estimate rows/duration only when evidence exists and show delete due/candidate state. | **Missing.** | S4.5/S4.8: `TestDryRunLabelsEstimateProvenance` and `TestDeleteReconcileDryRunReportsDueCandidates`. |
+| Connect, run deterministic source and target preflight, discover/filter schema, report drift/policy, select pagination, and disclose tuning/provenance. | **Partial, advanced 2026-07-31.** Tuning disclosure now lands: `Plan.Tuning` reports connection limit, workers, readers, writers, queue depth, chunk rows, and memory budget, each with selection provenance, derived from the same resolver the migration uses. Proven by `TestStage4DryRunDisclosesTuningAndDeletePolicy` and `TestStage4DryRunTuningMatchesResolvedPlan`. Still absent: target preflight, schema drift reporting, and pagination selection. | S4.8: target preflight and drift/pagination disclosure, then `TestStage4DryRunNetworkRouteMatrixLive`. |
+| Estimate rows/duration only when evidence exists and show delete due/candidate state. | **Partial, advanced 2026-07-31.** `Plan.Deletes` discloses the configured mode, schedule, interval, and primary-key requirement, and carries `due_state_known: false` so a caller cannot present policy as due-ness. Proven by `TestStage4DryRunDisclosesTuningAndDeletePolicy`. Due-ness and candidate counts genuinely require durable last-success evidence, which a dry run must not read — so closing that half needs a decision about whether dry-run may open state read-only. | `TestDryRunLabelsEstimateProvenance` remains missing; `TestDeleteReconcileDryRunReportsDueCandidates` is blocked on the state-access decision above. |
 | Never mutate target data/schema, state progress, task success, watermarks, or deletes. | **Covered base for SQLite only:** `TestRunDryRunDiscoversSQLiteWithoutMutatingTargetOrState`. | S4.8: `TestStage4DryRunHasZeroMutationAcrossCertifiedRoutesLive`. |
 | AI advice is advisory and cannot replace deterministic facts. | **Stage 5 boundary.** | Stage 5 fixture: `TestAIAdviceCannotAlterDryRunFacts`. |
 
@@ -595,11 +595,19 @@ fixtures in `schema_contract_test.go`; the earlier claim that `freeze`,
 unsafe-evolution matrix had no fixtures was wrong. What remains is
 `TestStage4SchemaContractTargetMatrixLive` — gated on block G.
 
-### E. Dry-run (Section 7.2)
+### E. Dry-run (Section 7.2) — started 2026-07-31
 
-Still avoids target, state, lease, and audit, and reports only source row
-counts. Needs target preflight, drift, pagination, tuning disclosure, delete
-due/candidate reporting, and estimate provenance.
+Tuning disclosure with provenance and delete-policy disclosure have landed, and
+the zero-mutation guarantee is now asserted rather than assumed. Remaining:
+
+- target preflight (dry-run currently never opens the target)
+- schema drift reporting
+- pagination selection disclosure
+- estimate provenance labelling
+- delete due/candidate state — **blocked on a decision**: due-ness needs the
+  durable last-success time, and dry-run's contract is that it opens no state.
+  Either admit a read-only state open for dry-run, or accept that due-ness is
+  unavailable and keep `due_state_known: false` permanently.
 
 ### F. Small named gaps
 
