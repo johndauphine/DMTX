@@ -11,8 +11,12 @@ checkout another branch.
 - Main was not changed, and nothing was pushed or merged.
 - The worktree is clean except for `docs/STAGE4_REQUIREMENTS_TESTS.md`.
 
-`docs/STAGE4_REQUIREMENTS_TESTS.md` is an existing user-owned untracked
-requirements map. Do not edit, stage, or delete it.
+`docs/STAGE4_REQUIREMENTS_TESTS.md` is the requirements map. It was user-owned
+and off-limits until 2026-07-31, when John directed that it be continued; it is
+now maintained alongside the code. Refresh it when a slice lands rather than
+letting it drift — the version committed on 2026-07-31 had to be reconciled
+against roughly 450 tests it never named. Its "Remaining work to declare Stage 4
+complete" section is the current definition of done.
 
 ## What is already committed
 
