@@ -306,6 +306,78 @@ func TestExecuteIncrementalBaselinePersistsFenceBeforeReadAndCommitsExactFence(t
 	}
 }
 
+func TestExecuteIncrementalArmPersistsFenceBeforeDeferredTransferAndUsesAggregatePublisher(
+	t *testing.T,
+) {
+	plan := incrementalTestPlan(t)
+	store := newIncrementalFakeState()
+	started := time.Date(2026, 7, 31, 9, 0, 0, 0, time.UTC)
+	upper := started.Add(time.Hour)
+	request := incrementalTestRequest(store, plan, started)
+	request.ArmOnly = true
+	request.Transfer = nil
+	request.SampleUpperFence = fixedIncrementalFence(upper)
+
+	armed, err := ExecuteIncrementalTable(
+		context.Background(),
+		request,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !armed.Armed || armed.Completed || !armed.CreatedAttempt ||
+		armed.Attempt.UpperFence == nil ||
+		!armed.Attempt.UpperFence.Value.Equal(upper) ||
+		!store.hasActive() || store.commit.AttemptID != "" {
+		t.Fatalf(
+			"armed result=%#v active=%#v commit=%#v",
+			armed,
+			store.active,
+			store.commit,
+		)
+	}
+
+	var published state.IncrementalCommit
+	request.ArmOnly = false
+	request.SampleUpperFence = nil
+	request.Transfer = func(
+		_ context.Context,
+		read IncrementalReadPlan,
+	) error {
+		if !read.Resumed || read.Scope != IncrementalReadFullTable ||
+			read.PositionalRestoreAllowed {
+			t.Fatalf("armed execution read = %#v", read)
+		}
+		return nil
+	}
+	request.PublishCompletion = func(
+		_ context.Context,
+		commit state.IncrementalCommit,
+	) error {
+		published = commit
+		return nil
+	}
+	result, err := ExecuteIncrementalTable(
+		context.Background(),
+		request,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Completed || !result.ResumedAttempt ||
+		published.AttemptID != request.AttemptID ||
+		published.Watermark == nil ||
+		!published.Watermark.Value.Equal(upper) ||
+		store.commit.AttemptID != "" {
+		t.Fatalf(
+			"execution result=%#v published=%#v legacy=%#v",
+			result,
+			published,
+			store.commit,
+		)
+	}
+}
+
 func TestExecuteIncrementalBaselineWithOnlyNullTimestampsCommitsNil(t *testing.T) {
 	plan := incrementalTestPlan(t)
 	store := newIncrementalFakeState()

@@ -90,12 +90,20 @@ func requireStage4AdapterConfigurationSeams(cfg config.Config) error {
 		)
 	}
 	if len(cfg.Migration.DateUpdatedColumns) != 0 {
-		return NewTransferError(
-			ErrorClassPolicy,
-			fmt.Errorf(
-				"Stage 4 date-based incremental migration requires a composed adapter incremental-window seam",
-			),
+		mode, err := normalizeAdapterTargetMode(
+			cfg.Migration.TargetMode,
 		)
+		if err != nil {
+			return err
+		}
+		if mode != "upsert" {
+			return NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 date-based incremental migration requires target mode upsert",
+				),
+			)
+		}
 	}
 	if cfg.Migration.Deletes.Mode == config.DeleteModeReconcile {
 		return NewTransferError(
@@ -174,6 +182,7 @@ type stage4AdapterPrepared struct {
 	work                               []stage4AdapterWork
 	network                            *networkStateCoordinator
 	evolution                          *stage4AdapterTargetSchemaEvolution
+	incremental                        *stage4AdapterIncrementalPrepared
 }
 
 type stage4AdapterWork struct {
@@ -207,6 +216,18 @@ func migrateWithStage4Adapters(
 	)
 	if err != nil {
 		return Result{}, err
+	}
+	if prepared.incremental != nil {
+		return migrateWithStage4IncrementalAdapters(
+			ctx,
+			cfg,
+			observer,
+			source,
+			target,
+			prepared,
+			false,
+			nil,
+		)
 	}
 	var networkExecution *stage4AdapterNetworkExecution
 	if mode == "upsert" {
@@ -792,6 +813,18 @@ func resumeWithStage4Adapters(
 	if err != nil {
 		return Result{}, err
 	}
+	if prepared.incremental != nil {
+		return migrateWithStage4IncrementalAdapters(
+			ctx,
+			cfg,
+			observer,
+			source,
+			target,
+			prepared,
+			true,
+			validated,
+		)
+	}
 	// Static route, target, dependency, replay, and resource admission precedes
 	// BeforeTables and every per-table durable reset/ensure operation.
 	networkExecution, err := admitStage4AdapterNetworkTransfer(
@@ -1181,6 +1214,20 @@ func prepareStage4AdapterRun(
 	)
 	if err != nil {
 		return result, err
+	}
+	if len(cfg.Migration.DateUpdatedColumns) != 0 {
+		result.incremental, result.work, err =
+			prepareStage4AdapterIncremental(
+				ctx,
+				cfg,
+				source,
+				target,
+				result,
+			)
+		if err != nil {
+			return result, err
+		}
+		return result, nil
 	}
 	if mode == "upsert" &&
 		stage4AdapterNetworkRelationalEngine(source.Engine()) {

@@ -426,6 +426,15 @@ type IncrementalCompletedTableVerifier func(
 	state.IncrementalAttempt,
 ) error
 
+// IncrementalCompletionPublisher atomically publishes an incremental
+// watermark with the enclosing table-success evidence. Production Stage 4
+// composition supplies the aggregate table completion backend here; the
+// legacy state commit remains only for isolated core callers.
+type IncrementalCompletionPublisher func(
+	context.Context,
+	state.IncrementalCommit,
+) error
+
 type IncrementalExecutionRequest struct {
 	State                IncrementalState
 	RunID                string
@@ -438,7 +447,9 @@ type IncrementalExecutionRequest struct {
 	VerifyDurableBinding IncrementalDurableBindingVerifier
 	VerifyCompletedTable IncrementalCompletedTableVerifier
 	Transfer             IncrementalTransfer
+	PublishCompletion    IncrementalCompletionPublisher
 	CompletionTime       func() time.Time
+	ArmOnly              bool
 }
 
 type IncrementalExecutionResult struct {
@@ -447,6 +458,7 @@ type IncrementalExecutionResult struct {
 	CreatedAttempt   bool
 	ResumedAttempt   bool
 	AlreadyCompleted bool
+	Armed            bool
 	Completed        bool
 }
 
@@ -463,7 +475,7 @@ func ExecuteIncrementalTable(
 	if err := validateIncrementalTablePlan(request.Plan); err != nil {
 		return IncrementalExecutionResult{}, NewTransferError(ErrorClassPolicy, err)
 	}
-	if request.Transfer == nil {
+	if request.Transfer == nil && !request.ArmOnly {
 		return IncrementalExecutionResult{}, NewTransferError(
 			ErrorClassPolicy,
 			errors.New("incremental transfer callback is required"),
@@ -471,6 +483,12 @@ func ExecuteIncrementalTable(
 	}
 	if request.Plan.FullTableUpsert {
 		read := incrementalFullTableRead(request.Plan, false)
+		if request.ArmOnly {
+			return IncrementalExecutionResult{
+				Read:  read,
+				Armed: true,
+			}, nil
+		}
 		if err := request.Transfer(ctx, read); err != nil {
 			return IncrementalExecutionResult{Read: read}, fmt.Errorf(
 				"transfer full-table upsert for %s: %w",
@@ -626,6 +644,10 @@ func ExecuteIncrementalTable(
 		return result, NewTransferError(ErrorClassPolicy, err)
 	}
 	result.Read = read
+	if request.ArmOnly {
+		result.Armed = true
+		return result, nil
+	}
 	if err := request.Transfer(ctx, read); err != nil {
 		return result, fmt.Errorf(
 			"transfer incremental table %s: %w",
@@ -650,17 +672,24 @@ func ExecuteIncrementalTable(
 	if watermark == nil {
 		watermark = result.Attempt.LowerWatermark
 	}
-	if err := request.State.CommitIncrementalAttempt(state.IncrementalCommit{
+	commit := state.IncrementalCommit{
 		RunID:        request.RunID,
 		Task:         request.Task,
 		AttemptID:    result.Attempt.AttemptID,
 		TopologyHash: request.TopologyHash,
 		Watermark:    cloneTimestampWatermark(watermark),
 		CompletedAt:  completedAt,
-	}); err != nil {
+	}
+	var commitErr error
+	if request.PublishCompletion != nil {
+		commitErr = request.PublishCompletion(ctx, commit)
+	} else {
+		commitErr = request.State.CommitIncrementalAttempt(commit)
+	}
+	if commitErr != nil {
 		return result, incrementalPostTransferStateError(
 			"atomically complete incremental table and watermark",
-			err,
+			commitErr,
 		)
 	}
 	result.Completed = true

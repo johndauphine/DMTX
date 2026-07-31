@@ -292,14 +292,6 @@ func TestStage4AdapterFailsBeforeTargetPlanningWhenRequiredSeamIsMissing(
 			targetMode: "upsert",
 		},
 		{
-			name: "date incremental",
-			configure: func(cfg *config.Config) {
-				cfg.Migration.DateUpdatedColumns = []string{"updated_at"}
-			},
-			wantError:  "incremental-window seam",
-			targetMode: "upsert",
-		},
-		{
 			name: "delete reconciliation",
 			configure: func(cfg *config.Config) {
 				cfg.Migration.Deletes.Mode = config.DeleteModeReconcile
