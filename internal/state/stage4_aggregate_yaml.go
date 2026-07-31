@@ -1,6 +1,9 @@
 package state
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 func (store YAMLStore) EnsureStage4TableInventory(
 	inventory Stage4TableInventory,
@@ -139,6 +142,84 @@ func (store YAMLStore) EnsureStage4TableInventory(
 		return stage4AggregateError("table inventory", err)
 	}
 	return nil
+}
+
+func (store YAMLStore) LoadStage4TableInventory(
+	runID string,
+) (Stage4TableInventoryReceipt, bool, error) {
+	if strings.TrimSpace(runID) == "" {
+		return Stage4TableInventoryReceipt{}, false, stage4AggregateError(
+			"table inventory read",
+			fmt.Errorf("run ID is required"),
+		)
+	}
+	var receipt Stage4TableInventoryReceipt
+	var found bool
+	err := store.read(func(document yamlStateDocument) error {
+		var stored Stage4TableInventoryReceipt
+		for _, candidate := range document.Stage4TableInventories {
+			if candidate.Inventory.RunID != runID {
+				continue
+			}
+			if found {
+				return fmt.Errorf(
+					"%w: duplicate Stage 4 table inventory",
+					ErrImmutableEvidence,
+				)
+			}
+			stored, found = candidate, true
+		}
+		if !found {
+			return nil
+		}
+		normalized, err := normalizeStoredStage4TableInventory(stored)
+		if err != nil {
+			return err
+		}
+		receipt = normalized
+		return nil
+	})
+	if err != nil {
+		return Stage4TableInventoryReceipt{}, false, stage4AggregateError(
+			"table inventory read",
+			err,
+		)
+	}
+	return receipt, found, nil
+}
+
+func (store YAMLStore) LoadStage4TableCompletions(
+	runID string,
+) ([]Stage4TableCompletionReceipt, error) {
+	if strings.TrimSpace(runID) == "" {
+		return nil, stage4AggregateError(
+			"table completion read",
+			fmt.Errorf("run ID is required"),
+		)
+	}
+	var receipts []Stage4TableCompletionReceipt
+	err := store.read(func(document yamlStateDocument) error {
+		var stored []Stage4TableCompletionReceipt
+		for _, candidate := range document.Stage4TableCompletions {
+			if candidate.Completion.RunID != runID {
+				continue
+			}
+			stored = append(stored, candidate)
+		}
+		normalized, err := normalizeStoredStage4TableCompletions(
+			runID,
+			stored,
+		)
+		if err != nil {
+			return err
+		}
+		receipts = normalized
+		return nil
+	})
+	if err != nil {
+		return nil, stage4AggregateError("table completion read", err)
+	}
+	return receipts, nil
 }
 
 func (store YAMLStore) CompleteStage4Table(

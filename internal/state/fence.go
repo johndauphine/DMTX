@@ -173,6 +173,18 @@ func (backend *fencedAggregateBackend) CompleteStage4Run(
 	})
 }
 
+func (backend *fencedAggregateBackend) LoadStage4TableInventory(
+	runID string,
+) (Stage4TableInventoryReceipt, bool, error) {
+	return backend.aggregate.LoadStage4TableInventory(runID)
+}
+
+func (backend *fencedAggregateBackend) LoadStage4TableCompletions(
+	runID string,
+) ([]Stage4TableCompletionReceipt, error) {
+	return backend.aggregate.LoadStage4TableCompletions(runID)
+}
+
 func (backend *fencedBackend) protect(operation func() error) error {
 	return backend.guard.Protect(context.Background(), operation)
 }

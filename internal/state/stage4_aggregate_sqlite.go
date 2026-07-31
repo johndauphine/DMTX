@@ -189,6 +189,103 @@ func requireSQLiteStage4InventoryPrerequisites(
 	return nil
 }
 
+func (store SQLiteStore) LoadStage4TableInventory(
+	runID string,
+) (Stage4TableInventoryReceipt, bool, error) {
+	if strings.TrimSpace(runID) == "" {
+		return Stage4TableInventoryReceipt{}, false, stage4AggregateError(
+			"table inventory read",
+			fmt.Errorf("run ID is required"),
+		)
+	}
+	receipt, found, err := store.loadStage4TableInventory(runID)
+	if err != nil {
+		return Stage4TableInventoryReceipt{}, false, stage4AggregateError(
+			"table inventory read",
+			err,
+		)
+	}
+	return receipt, found, nil
+}
+
+func (store SQLiteStore) loadStage4TableInventory(
+	runID string,
+) (Stage4TableInventoryReceipt, bool, error) {
+	database, err := store.openStage4()
+	if err != nil {
+		return Stage4TableInventoryReceipt{}, false, err
+	}
+	defer database.Close()
+	transaction, err := database.Begin()
+	if err != nil {
+		return Stage4TableInventoryReceipt{}, false, fmt.Errorf(
+			"begin Stage 4 table inventory read: %w",
+			err,
+		)
+	}
+	defer transaction.Rollback()
+
+	stored, found, err := readSQLiteStage4TableInventory(transaction, runID)
+	if err != nil || !found {
+		return Stage4TableInventoryReceipt{}, found, err
+	}
+	receipt, err := normalizeStoredStage4TableInventory(stored)
+	if err != nil {
+		return Stage4TableInventoryReceipt{}, false, err
+	}
+	if receipt.Inventory.RunID != runID {
+		return Stage4TableInventoryReceipt{}, false, fmt.Errorf(
+			"%w: Stage 4 table inventory run identity differs",
+			ErrImmutableEvidence,
+		)
+	}
+	return receipt, true, nil
+}
+
+func (store SQLiteStore) LoadStage4TableCompletions(
+	runID string,
+) ([]Stage4TableCompletionReceipt, error) {
+	if strings.TrimSpace(runID) == "" {
+		return nil, stage4AggregateError(
+			"table completion read",
+			fmt.Errorf("run ID is required"),
+		)
+	}
+	receipts, err := store.loadStage4TableCompletions(runID)
+	if err != nil {
+		return nil, stage4AggregateError("table completion read", err)
+	}
+	return receipts, nil
+}
+
+func (store SQLiteStore) loadStage4TableCompletions(
+	runID string,
+) ([]Stage4TableCompletionReceipt, error) {
+	database, err := store.openStage4()
+	if err != nil {
+		return nil, err
+	}
+	defer database.Close()
+	transaction, err := database.Begin()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"begin aggregate table completion read: %w",
+			err,
+		)
+	}
+	defer transaction.Rollback()
+
+	stored, err := readSQLiteAggregateTableReceipts(transaction, runID)
+	if err != nil {
+		return nil, err
+	}
+	receipts := make([]Stage4TableCompletionReceipt, 0, len(stored))
+	for _, receipt := range stored {
+		receipts = append(receipts, receipt)
+	}
+	return normalizeStoredStage4TableCompletions(runID, receipts)
+}
+
 func (store SQLiteStore) CompleteStage4Table(
 	completion Stage4TableCompletion,
 ) error {

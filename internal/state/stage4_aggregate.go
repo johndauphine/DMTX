@@ -19,6 +19,13 @@ type Stage4AggregateBackend interface {
 	EnsureStage4TableInventory(Stage4TableInventory) error
 	CompleteStage4Table(Stage4TableCompletion) error
 	CompleteStage4Run(Stage4RunCompletion) error
+
+	// LoadStage4TableInventory and LoadStage4TableCompletions read back the
+	// durable aggregate evidence a run publication must reproduce exactly.
+	// A process that did not publish a receipt itself — every resume — has no
+	// other way to recover the byte-identical completion it must supply.
+	LoadStage4TableInventory(string) (Stage4TableInventoryReceipt, bool, error)
+	LoadStage4TableCompletions(string) ([]Stage4TableCompletionReceipt, error)
 }
 
 // Stage4RangeCompletion identifies the exact acknowledged range frontier that
@@ -362,6 +369,73 @@ func normalizeStoredStage4TableInventory(
 	}
 	stored.Inventory = normalized
 	return stored, nil
+}
+
+// normalizeStoredStage4TableCompletion re-derives one stored table receipt and
+// proves it still matches its own digest, so a caller can never rebuild a run
+// publication from tampered or partially written completion evidence.
+func normalizeStoredStage4TableCompletion(
+	stored Stage4TableCompletionReceipt,
+) (Stage4TableCompletionReceipt, error) {
+	normalized, err := normalizeStage4TableCompletion(stored.Completion)
+	if err != nil {
+		return Stage4TableCompletionReceipt{}, err
+	}
+	if err := validateStage4TableCompletionReceipt(
+		stored,
+		normalized,
+	); err != nil {
+		return Stage4TableCompletionReceipt{}, err
+	}
+	stored.Completion = normalized
+	return stored, nil
+}
+
+// normalizeStoredStage4TableCompletions returns every validated receipt for one
+// run ordered by ordinary table, which is the exact order
+// normalizeStage4RunCompletion imposes on Stage4RunCompletion.Tables.
+func normalizeStoredStage4TableCompletions(
+	runID string,
+	stored []Stage4TableCompletionReceipt,
+) ([]Stage4TableCompletionReceipt, error) {
+	receipts := make([]Stage4TableCompletionReceipt, 0, len(stored))
+	tables := make(map[string]struct{}, len(stored))
+	tasks := make(map[TaskKey]struct{}, len(stored))
+	for _, candidate := range stored {
+		receipt, err := normalizeStoredStage4TableCompletion(candidate)
+		if err != nil {
+			return nil, err
+		}
+		completion := receipt.Completion
+		if completion.RunID != runID {
+			return nil, fmt.Errorf(
+				"%w: aggregate table receipt run identity differs",
+				ErrImmutableEvidence,
+			)
+		}
+		if _, duplicate := tables[completion.Table]; duplicate {
+			return nil, fmt.Errorf(
+				"%w: duplicate aggregate table receipt for table %q",
+				ErrImmutableEvidence,
+				completion.Table,
+			)
+		}
+		if _, duplicate := tasks[completion.Task]; duplicate {
+			return nil, fmt.Errorf(
+				"%w: duplicate aggregate table receipt for task %#v",
+				ErrImmutableEvidence,
+				completion.Task,
+			)
+		}
+		tables[completion.Table] = struct{}{}
+		tasks[completion.Task] = struct{}{}
+		receipts = append(receipts, receipt)
+	}
+	sort.Slice(receipts, func(left, right int) bool {
+		return receipts[left].Completion.Table <
+			receipts[right].Completion.Table
+	})
+	return receipts, nil
 }
 
 func validateStage4InventoryAuthorizesTable(
