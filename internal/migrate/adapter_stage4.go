@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -131,16 +133,17 @@ type adapterStage4ValidationProbeProvider interface {
 }
 
 type stage4AdapterPrepared struct {
-	run          Stage4RunContext
-	gate         Stage4SchemaGateResult
-	configDigest string
-	mode         string
-	plans        []adapterTablePlan
-	names        []string
-	targetTables []schema.Table
-	validation   ValidationCoreProbe
-	work         []stage4AdapterWork
-	network      *networkStateCoordinator
+	run           Stage4RunContext
+	gate          Stage4SchemaGateResult
+	configDigest  string
+	mode          string
+	plans         []adapterTablePlan
+	names         []string
+	targetTables  []schema.Table
+	validation    ValidationCoreProbe
+	sourceCatalog map[stage4RichTableKey]schema.Table
+	work          []stage4AdapterWork
+	network       *networkStateCoordinator
 }
 
 type stage4AdapterWork struct {
@@ -175,12 +178,67 @@ func migrateWithStage4Adapters(
 	if err != nil {
 		return Result{}, err
 	}
+	var networkExecution *stage4AdapterNetworkExecution
+	if mode == "upsert" {
+		networkExecution, err = admitStage4AdapterNetworkTransfer(
+			ctx,
+			cfg,
+			observer,
+			source,
+			target,
+			prepared,
+			nil,
+		)
+		if err != nil {
+			return Result{}, err
+		}
+	}
+	if networkExecution != nil {
+		if err := checkpointStage4AdapterTableSet(
+			ctx,
+			observer,
+			prepared.names,
+		); err != nil {
+			return Result{}, err
+		}
+		result, err := runStage4AdapterStableNetworkTables(
+			ctx,
+			cfg,
+			observer,
+			target,
+			prepared,
+			networkExecution,
+			false,
+			nil,
+		)
+		if err != nil {
+			return result, err
+		}
+		if err := publishStage4SchemaGate(
+			ctx,
+			prepared.run,
+			prepared.gate,
+		); err != nil {
+			return result, err
+		}
+		result.Validated = true
+		return result, nil
+	}
 	if err := checkpointStage4AdapterWork(
 		ctx,
 		observer,
 		prepared,
 	); err != nil {
 		return Result{}, err
+	}
+	if networkExecution != nil {
+		if err := bindStage4AdapterNetworkRestoresAndValidate(
+			ctx,
+			observer,
+			networkExecution,
+		); err != nil {
+			return Result{}, err
+		}
 	}
 
 	if _, err := protectAdapterTargetMutationOnce(
@@ -199,11 +257,11 @@ func migrateWithStage4Adapters(
 	}
 
 	copiedRows := make([]int, len(prepared.plans))
-	for index, plan := range prepared.plans {
-		if err := ctx.Err(); err != nil {
-			return Result{}, err
-		}
-		if observer != nil {
+	if networkExecution != nil {
+		for _, plan := range prepared.plans {
+			if err := ctx.Err(); err != nil {
+				return Result{}, err
+			}
 			if err := observer.BeforeTable(
 				ctx,
 				plan.source.Name,
@@ -218,20 +276,49 @@ func migrateWithStage4Adapters(
 				)
 			}
 		}
-		copied, err := copyAdapterRows(
+		copiedRows, err = runStage4AdapterNetworkTransfer(
 			ctx,
 			observer,
-			source,
-			target,
-			plan.source,
-			plan.target,
-			plan.columns,
-			mode,
+			networkExecution,
 		)
 		if err != nil {
 			return Result{}, err
 		}
-		copiedRows[index] = copied
+	} else {
+		for index, plan := range prepared.plans {
+			if err := ctx.Err(); err != nil {
+				return Result{}, err
+			}
+			if observer != nil {
+				if err := observer.BeforeTable(
+					ctx,
+					plan.source.Name,
+				); err != nil {
+					return Result{}, NewTransferError(
+						ErrorClassState,
+						fmt.Errorf(
+							"checkpoint before %s: %w",
+							plan.source.Name,
+							err,
+						),
+					)
+				}
+			}
+			copied, copyErr := copyAdapterRows(
+				ctx,
+				observer,
+				source,
+				target,
+				plan.source,
+				plan.target,
+				plan.columns,
+				mode,
+			)
+			if copyErr != nil {
+				return Result{}, copyErr
+			}
+			copiedRows[index] = copied
+		}
 	}
 
 	if _, err := protectAdapterTargetMutationOnce(
@@ -301,6 +388,236 @@ func migrateWithStage4Adapters(
 	return result, nil
 }
 
+func checkpointStage4AdapterTableSet(
+	ctx context.Context,
+	observer TableObserver,
+	names []string,
+) error {
+	setObserver, err := requireStage4TableSetObserver(observer)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := setObserver.BeforeTables(
+		ctx,
+		append([]string(nil), names...),
+	); err != nil {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("checkpoint Stage 4 table set: %w", err),
+		)
+	}
+	return ctx.Err()
+}
+
+func runStage4AdapterStableNetworkTables(
+	ctx context.Context,
+	cfg config.Config,
+	observer TableObserver,
+	target targetAdapter,
+	prepared stage4AdapterPrepared,
+	execution *stage4AdapterNetworkExecution,
+	resume bool,
+	completed map[string]int,
+) (result Result, resultErr error) {
+	for planIndex, plan := range prepared.plans {
+		if rows, complete := completed[plan.source.Name]; complete {
+			if err := execution.advanceCompletedTable(
+				ctx,
+				planIndex,
+				rows,
+			); err != nil {
+				return result, err
+			}
+			result.Tables++
+			result.Rows += rows
+			continue
+		}
+		tableExecution, err := execution.openTable(
+			ctx,
+			planIndex,
+			resume,
+		)
+		if err != nil {
+			return result, err
+		}
+		copied, err := runStage4AdapterStableNetworkTable(
+			ctx,
+			cfg,
+			observer,
+			target,
+			prepared,
+			planIndex,
+			tableExecution,
+			resume,
+		)
+		if err != nil {
+			return result, err
+		}
+		result.Tables++
+		result.Rows += copied
+	}
+	return result, nil
+}
+
+func runStage4AdapterStableNetworkTable(
+	ctx context.Context,
+	cfg config.Config,
+	observer TableObserver,
+	target targetAdapter,
+	prepared stage4AdapterPrepared,
+	planIndex int,
+	execution *stage4AdapterNetworkTableExecution,
+	resume bool,
+) (_ int, resultErr error) {
+	if execution == nil {
+		return 0, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 stable table execution is unavailable"),
+		)
+	}
+	defer func() {
+		if closeErr := execution.Close(); closeErr != nil {
+			if resultErr == nil {
+				resultErr = closeErr
+			} else {
+				resultErr = errors.Join(resultErr, closeErr)
+			}
+		}
+	}()
+	plan := prepared.plans[planIndex]
+	name := plan.source.Name
+	if resume {
+		if err := checkAdapterResumeContext(
+			ctx,
+			"checkpoint before "+name,
+		); err != nil {
+			return 0, err
+		}
+	}
+	if err := observer.BeforeTable(ctx, name); err != nil {
+		return 0, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("checkpoint before %s: %w", name, err),
+		)
+	}
+	mutationObserver := observer
+	if resume {
+		mutationObserver = adapterResumeMutationGuard{
+			ctx:      ctx,
+			delegate: observer,
+			boundary: "mutate resumed Stage 4 table " + name,
+		}
+	}
+	if _, err := protectAdapterTargetMutationOnce(
+		ctx,
+		mutationObserver,
+		"prepare Stage 4 table "+name,
+		func() error {
+			return target.PrepareTables(
+				ctx,
+				[]schema.Table{
+					cloneStage4RichTable(plan.target),
+				},
+				prepared.mode,
+			)
+		},
+	); err != nil {
+		return 0, err
+	}
+	copied, err := execution.run(ctx, mutationObserver)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := protectAdapterTargetMutationOnce(
+		ctx,
+		mutationObserver,
+		"finalize Stage 4 table "+name,
+		func() error {
+			return target.FinalizeTables(
+				ctx,
+				[]schema.Table{
+					cloneStage4RichTable(plan.target),
+				},
+				prepared.mode,
+			)
+		},
+	); err != nil {
+		return 0, err
+	}
+	if err := validateStage4AdapterStableTable(
+		ctx,
+		cfg,
+		observer,
+		execution.source,
+		execution.parent.source,
+		target,
+		prepared,
+		planIndex,
+	); err != nil {
+		return 0, err
+	}
+	if err := completeStage4AdapterWorkItem(
+		ctx,
+		prepared.run,
+		execution.work,
+	); err != nil {
+		return 0, fmt.Errorf(
+			"complete Stage 4 work for %s: %w",
+			name,
+			err,
+		)
+	}
+	if err := observer.AfterTable(ctx, name, copied); err != nil {
+		return 0, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("checkpoint after %s: %w", name, err),
+		)
+	}
+	return copied, nil
+}
+
+func validateStage4AdapterStableTable(
+	ctx context.Context,
+	cfg config.Config,
+	observer TableObserver,
+	source sourceAdapter,
+	providerSource sourceAdapter,
+	target targetAdapter,
+	prepared stage4AdapterPrepared,
+	planIndex int,
+) error {
+	plan := cloneStage4AdapterNetworkTablePlan(
+		prepared.plans[planIndex],
+	)
+	probe, err := stage4AdapterValidationProbe(
+		cfg,
+		observer,
+		source,
+		target,
+		[]adapterTablePlan{plan},
+		providerSource,
+	)
+	if err != nil {
+		return err
+	}
+	tablePrepared := prepared
+	tablePrepared.plans = []adapterTablePlan{plan}
+	tablePrepared.validation = probe
+	tablePrepared.gate.ValidationTables = []schema.Table{
+		cloneStage4RichTable(plan.source),
+	}
+	return validateStage4AdapterRun(
+		ctx,
+		cfg,
+		source,
+		target,
+		tablePrepared,
+	)
+}
+
 func resumeWithStage4Adapters(
 	ctx context.Context,
 	cfg config.Config,
@@ -313,8 +630,7 @@ func resumeWithStage4Adapters(
 ) (Result, error) {
 	const mode = "upsert"
 
-	requiredTaskObserver, err := requireStage4TableSetObserver(observer)
-	if err != nil {
+	if _, err := requireStage4TableSetObserver(observer); err != nil {
 		return Result{}, err
 	}
 	if taskObserver == nil {
@@ -337,193 +653,54 @@ func resumeWithStage4Adapters(
 	if err != nil {
 		return Result{}, err
 	}
-	if err := checkAdapterResumeContext(
+	validated, err := validateCompletedStage4NetworkTableCheckpoints(
 		ctx,
-		"validate completed Stage 4 table checkpoints",
-	); err != nil {
-		return Result{}, err
-	}
-	validated, err := validateCompletedAdapterTableCheckpoints(
-		ctx,
-		source,
 		target,
 		prepared.plans,
 		completed,
+		cfg.Migration.Deletes.Mode == config.DeleteModeReconcile,
 	)
 	if err != nil {
 		return Result{}, err
 	}
-	if err := verifyStage4ResumeWorkEvidence(
-		ctx,
-		prepared.run,
-		prepared.work,
-		validated,
-		true,
-	); err != nil {
-		return Result{}, err
-	}
-	if err := checkAdapterResumeContext(
-		ctx,
-		"checkpoint Stage 4 table set",
-	); err != nil {
-		return Result{}, err
-	}
-	if err := requiredTaskObserver.BeforeTables(
-		ctx,
-		append([]string(nil), prepared.names...),
-	); err != nil {
-		return Result{}, NewTransferError(
-			ErrorClassState,
-			fmt.Errorf("checkpoint Stage 4 table set: %w", err),
-		)
-	}
-	if err := ensureStage4AdapterWork(
-		ctx,
-		prepared.run,
-		prepared.work,
-	); err != nil {
-		return Result{}, err
-	}
-	if err := verifyStage4ResumeWorkEvidence(
-		ctx,
-		prepared.run,
-		prepared.work,
-		validated,
-		false,
-	); err != nil {
-		return Result{}, err
-	}
-
-	result := resultForValidatedAdapterCheckpoints(validated)
-	incompletePlans := make([]adapterTablePlan, 0, len(prepared.plans))
-	incompleteTargets := make([]schema.Table, 0, len(prepared.plans))
-	for _, plan := range prepared.plans {
-		if _, complete := validated[plan.source.Name]; complete {
-			continue
-		}
-		incompletePlans = append(incompletePlans, plan)
-		incompleteTargets = append(incompleteTargets, plan.target)
-	}
-
-	copiedRows := make([]int, len(incompletePlans))
-	if len(incompletePlans) != 0 {
-		prepareObserver := adapterResumeMutationGuard{
-			ctx:      ctx,
-			delegate: observer,
-			boundary: "prepare incomplete Stage 4 resume tables",
-		}
-		if _, err := protectAdapterTargetMutationOnce(
-			ctx,
-			prepareObserver,
-			"prepare incomplete Stage 4 resume tables",
-			func() error {
-				return target.PrepareTables(
-					ctx,
-					incompleteTargets,
-					mode,
-				)
-			},
-		); err != nil {
-			return result, err
-		}
-		for index, plan := range incompletePlans {
-			name := plan.source.Name
-			if err := checkAdapterResumeContext(
-				ctx,
-				"checkpoint before "+name,
-			); err != nil {
-				return result, err
-			}
-			if err := observer.BeforeTable(ctx, name); err != nil {
-				return result, NewTransferError(
-					ErrorClassState,
-					fmt.Errorf(
-						"checkpoint before %s: %w",
-						name,
-						err,
-					),
-				)
-			}
-			writeObserver := adapterResumeMutationGuard{
-				ctx:      ctx,
-				delegate: observer,
-				boundary: "write Stage 4 resumed table " + name,
-			}
-			copied, err := copyAdapterRows(
-				ctx,
-				writeObserver,
-				source,
-				target,
-				plan.source,
-				plan.target,
-				plan.columns,
-				mode,
-			)
-			if err != nil {
-				return result, err
-			}
-			copiedRows[index] = copied
-		}
-		finalizeObserver := adapterResumeMutationGuard{
-			ctx:      ctx,
-			delegate: observer,
-			boundary: "finalize incomplete Stage 4 resume tables",
-		}
-		if _, err := protectAdapterTargetMutationOnce(
-			ctx,
-			finalizeObserver,
-			"finalize incomplete Stage 4 resume tables",
-			func() error {
-				return target.FinalizeTables(
-					ctx,
-					incompleteTargets,
-					mode,
-				)
-			},
-		); err != nil {
-			return result, err
-		}
-	}
-
-	if err := validateStage4AdapterRun(
+	// Static route, target, dependency, replay, and resource admission precedes
+	// BeforeTables and every per-table durable reset/ensure operation.
+	networkExecution, err := admitStage4AdapterNetworkTransfer(
 		ctx,
 		cfg,
+		observer,
 		source,
 		target,
 		prepared,
-	); err != nil {
-		return result, err
+		nil,
+	)
+	if err != nil {
+		return resultForValidatedAdapterCheckpoints(validated), err
 	}
-	for index, plan := range incompletePlans {
-		if err := checkAdapterResumeContext(
-			ctx,
-			"checkpoint completed Stage 4 table "+plan.source.Name,
-		); err != nil {
-			return result, err
-		}
-		copied := copiedRows[index]
-		if err := observer.AfterTable(
-			ctx,
-			plan.source.Name,
-			copied,
-		); err != nil {
-			return result, NewTransferError(
-				ErrorClassState,
-				fmt.Errorf(
-					"checkpoint after %s: %w",
-					plan.source.Name,
-					err,
-				),
-			)
-		}
-		result.Tables++
-		result.Rows += copied
-	}
-	if err := completeStage4AdapterWork(
+	if err := networkExecution.prevalidateCompletedTables(
 		ctx,
-		prepared.run,
-		prepared.work,
+		validated,
 	); err != nil {
+		return resultForValidatedAdapterCheckpoints(validated), err
+	}
+	if err := checkpointStage4AdapterTableSet(
+		ctx,
+		observer,
+		prepared.names,
+	); err != nil {
+		return resultForValidatedAdapterCheckpoints(validated), err
+	}
+	result, err := runStage4AdapterStableNetworkTables(
+		ctx,
+		cfg,
+		observer,
+		target,
+		prepared,
+		networkExecution,
+		true,
+		validated,
+	)
+	if err != nil {
 		return result, err
 	}
 	if err := publishStage4SchemaGate(
@@ -535,6 +712,87 @@ func resumeWithStage4Adapters(
 	}
 	result.Validated = true
 	return result, nil
+}
+
+func validateCompletedStage4NetworkTableCheckpoints(
+	ctx context.Context,
+	target targetAdapter,
+	plans []adapterTablePlan,
+	completed CompletedTableCheckpoints,
+	reconciliationStrict bool,
+) (map[string]int, error) {
+	selected := make(map[string]adapterTablePlan, len(plans))
+	for _, plan := range plans {
+		if _, duplicate := selected[plan.source.Name]; duplicate {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"selected Stage 4 plan contains duplicate table %s",
+					plan.source.Name,
+				),
+			)
+		}
+		selected[plan.source.Name] = plan
+	}
+	for name := range completed {
+		if _, exists := selected[name]; !exists {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"completed checkpoint references table %s outside the current selection",
+					name,
+				),
+			)
+		}
+	}
+	validated := make(map[string]int, len(completed))
+	for _, plan := range plans {
+		checkpoint, complete := completed[plan.source.Name]
+		if !complete {
+			continue
+		}
+		if checkpoint.Rows < 0 {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"completed checkpoint for %s has invalid row count %d",
+					plan.source.Name,
+					checkpoint.Rows,
+				),
+			)
+		}
+		if err := checkAdapterResumeContext(
+			ctx,
+			"count completed target table "+plan.source.Name,
+		); err != nil {
+			return nil, err
+		}
+		targetRows, err := target.CountRows(ctx, plan.target)
+		if err != nil {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"validate completed checkpoint for %s against target: %w",
+					plan.source.Name,
+					err,
+				),
+			)
+		}
+		if targetRows < checkpoint.Rows ||
+			reconciliationStrict && targetRows != checkpoint.Rows {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"completed checkpoint for %s is not reusable: checkpoint has %d rows and target has %d rows",
+					plan.source.Name,
+					checkpoint.Rows,
+					targetRows,
+				),
+			)
+		}
+		validated[plan.source.Name] = checkpoint.Rows
+	}
+	return validated, nil
 }
 
 func prepareStage4AdapterRun(
@@ -563,6 +821,16 @@ func prepareStage4AdapterRun(
 	)
 	if err != nil {
 		return result, err
+	}
+	result.sourceCatalog = make(
+		map[stage4RichTableKey]schema.Table,
+		len(discovered),
+	)
+	for _, table := range discovered {
+		result.sourceCatalog[stage4RichTableKey{
+			schema: table.Schema,
+			table:  table.Name,
+		}] = cloneStage4RichTable(table)
 	}
 	configDigest, err := config.Hash(cfg)
 	if err != nil {
@@ -717,6 +985,14 @@ func prepareStage4AdapterRun(
 	)
 	if err != nil {
 		return result, err
+	}
+	if mode == "upsert" &&
+		stage4AdapterNetworkRelationalEngine(source.Engine()) {
+		// Relational network pagination, retained width, and durable ranges are
+		// intentionally deferred until the runner owns one table-scoped stable
+		// source view. Global preparation remains read-only and connection
+		// bounded.
+		return result, nil
 	}
 	result.work, err = bindStage4AdapterPagination(
 		ctx,
@@ -916,6 +1192,7 @@ func stage4AdapterValidationProbe(
 	source sourceAdapter,
 	target targetAdapter,
 	plans []adapterTablePlan,
+	providerSources ...sourceAdapter,
 ) (ValidationCoreProbe, error) {
 	mode := cfg.Migration.Validation.Mode
 	if mode == "" || mode == config.ValidationCountOnly {
@@ -925,7 +1202,23 @@ func stage4AdapterValidationProbe(
 			plans:  stage4AdapterPlansBySource(plans),
 		}, nil
 	}
-	provider := stage4ValidationProvider(observer, source, target)
+	providerSource := source
+	if len(providerSources) > 1 {
+		return nil, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"Stage 4 validation accepts at most one provider source",
+			),
+		)
+	}
+	if len(providerSources) == 1 {
+		providerSource = providerSources[0]
+	}
+	provider := stage4ValidationProvider(
+		observer,
+		providerSource,
+		target,
+	)
 	if provider == nil {
 		return nil, NewTransferError(
 			ErrorClassPolicy,
@@ -1294,6 +1587,11 @@ func buildStage4AdapterWork(
 				err,
 			)
 		}
+		var sourceIdentityFrontier, targetIdentityFrontier *int64
+		if mode != "upsert" {
+			sourceIdentityFrontier = stage4IdentityFrontier(plan.source)
+			targetIdentityFrontier = stage4IdentityFrontier(plan.target)
+		}
 		wire := struct {
 			Version                int      `json:"version"`
 			ConfigDigest           string   `json:"config_digest"`
@@ -1309,8 +1607,8 @@ func buildStage4AdapterWork(
 			Mode:                   mode,
 			SourceCanonical:        string(sourceCanonical),
 			TargetCanonical:        string(targetCanonical),
-			SourceIdentityFrontier: stage4IdentityFrontier(plan.source),
-			TargetIdentityFrontier: stage4IdentityFrontier(plan.target),
+			SourceIdentityFrontier: sourceIdentityFrontier,
+			TargetIdentityFrontier: targetIdentityFrontier,
 			Projection:             append([]string(nil), plan.columns...),
 		}
 		encoded, err := json.Marshal(wire)
@@ -1722,8 +2020,8 @@ func verifyStage4ResumeWorkEvidence(
 		}
 	}
 	for _, item := range work {
-		_, checkpointComplete := validated[item.task.Table]
-		task, _, found, err := exactStage4AdapterWork(
+		checkpointRows, checkpointComplete := validated[item.task.Table]
+		task, ranges, found, err := exactStage4AdapterWork(
 			inventory,
 			item,
 			allowMissingIncomplete && !checkpointComplete,
@@ -1742,6 +2040,41 @@ func verifyStage4ResumeWorkEvidence(
 					item.task.Table,
 				),
 			)
+		}
+		if checkpointComplete {
+			var structuredRows int64
+			for _, workRange := range ranges {
+				if workRange.Status != "completed" {
+					return NewTransferError(
+						ErrorClassState,
+						fmt.Errorf(
+							"Stage 4 ordinary checkpoint marks table %s complete but structured range %s is not complete",
+							item.task.Table,
+							workRange.ID,
+						),
+					)
+				}
+				if workRange.RowsDone >
+					math.MaxInt64-structuredRows {
+					return NewTransferError(
+						ErrorClassState,
+						fmt.Errorf(
+							"Stage 4 structured row total overflows for table %s",
+							item.task.Table,
+						),
+					)
+				}
+				structuredRows += workRange.RowsDone
+			}
+			if structuredRows != int64(checkpointRows) {
+				return NewTransferError(
+					ErrorClassState,
+					fmt.Errorf(
+						"Stage 4 ordinary checkpoint row total differs from completed structured ranges for table %s",
+						item.task.Table,
+					),
+				)
+			}
 		}
 	}
 	return nil

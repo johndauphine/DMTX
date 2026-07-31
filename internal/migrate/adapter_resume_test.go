@@ -210,10 +210,10 @@ func TestAdapterResumeValidatesCompletedCountsBeforeTaskOrMutation(
 		want       string
 	}{
 		{
-			name:       "source mismatch",
+			name:       "source drift with target superset",
 			checkpoint: 1,
-			targetRows: 1,
-			want:       "checkpoint has 1 rows, source has 2 rows, target has 1 rows",
+			targetRows: 3,
+			want:       "checkpoint has 1 rows, source has 2 rows, target has 3 rows",
 		},
 		{
 			name:       "target mismatch",
@@ -260,6 +260,91 @@ func TestAdapterResumeValidatesCompletedCountsBeforeTaskOrMutation(
 				}
 			}
 		})
+	}
+}
+
+func TestAdapterResumeCompletedUpsertAllowsTargetSuperset(t *testing.T) {
+	events := make([]string, 0)
+	source := validAdapterRunnerSource(&events)
+	target := &resumeLifecycleTarget{
+		recordingAdapterTarget: &recordingAdapterTarget{
+			events: &events,
+			rowsByTable: map[string]int{
+				"items": 3,
+			},
+		},
+	}
+
+	result, err := executeResumeWithRegistry(
+		context.Background(),
+		resumeTestConfig(),
+		CompletedTableCheckpoints{
+			"items": {Rows: 2},
+		},
+		recordingTableObserver{events: &events},
+		newResumeTestRegistry(t, source, target),
+	)
+	if err != nil {
+		t.Fatalf("executeResumeWithRegistry: %v", err)
+	}
+	if result != (Result{Tables: 1, Rows: 2, Validated: true}) {
+		t.Fatalf("result = %#v", result)
+	}
+	if len(target.preparedTables) != 0 ||
+		len(target.written) != 0 ||
+		len(target.finalizedTables) != 0 {
+		t.Fatalf(
+			"completed superset resume mutated target: prepare=%v write=%v finalize=%v",
+			target.preparedTables,
+			target.written,
+			target.finalizedTables,
+		)
+	}
+}
+
+func TestAdapterResumeStrictReconciliationRejectsTargetSuperset(
+	t *testing.T,
+) {
+	events := make([]string, 0)
+	source := validAdapterRunnerSource(&events)
+	target := &resumeLifecycleTarget{
+		recordingAdapterTarget: &recordingAdapterTarget{
+			events: &events,
+			rowsByTable: map[string]int{
+				"items": 3,
+			},
+		},
+	}
+	cfg := resumeTestConfig()
+	cfg.Migration.Deletes.Mode = config.DeleteModeReconcile
+
+	result, err := executeResumeWithRegistry(
+		context.Background(),
+		cfg,
+		CompletedTableCheckpoints{
+			"items": {Rows: 2},
+		},
+		recordingTableObserver{events: &events},
+		newResumeTestRegistry(t, source, target),
+	)
+	if result != (Result{}) ||
+		ClassifyTransferError(err) != ErrorClassState ||
+		!strings.Contains(
+			err.Error(),
+			"checkpoint has 2 rows, source has 2 rows, target has 3 rows",
+		) {
+		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+	for _, event := range events {
+		if strings.HasPrefix(event, "before") ||
+			event == "target_prepare" ||
+			event == "target_write" ||
+			event == "target_finalize" {
+			t.Fatalf(
+				"strict checkpoint mismatch reached task or mutation: %v",
+				events,
+			)
+		}
 	}
 }
 

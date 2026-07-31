@@ -327,11 +327,12 @@ func validateStage4AdapterPagination(
 		switch plan.Strategy {
 		case PaginationIntegerKeyset, PaginationTupleKeyset:
 			for _, key := range plan.Keys {
-				if key.Kind != KeyInteger {
+				if key.Kind != KeyInteger &&
+					key.Kind != KeyBytes {
 					return NewTransferError(
 						ErrorClassPolicy,
 						fmt.Errorf(
-							"keyset pagination requires exact signed-integer keys",
+							"keyset pagination requires exact integer or binary keys",
 						),
 					)
 				}
@@ -384,9 +385,9 @@ func validateStage4AdapterPagination(
 				}
 			}
 			if previousUpper != nil &&
-				!stage4AdapterIntegerTupleAfter(
-					planned.Upper,
-					previousUpper,
+				!adapterPaginationKeyTupleAfter(
+					*planned.Upper,
+					*previousUpper,
 				) {
 				return NewTransferError(
 					ErrorClassPolicy,
@@ -422,38 +423,6 @@ func validateStage4AdapterPagination(
 		)
 	}
 	return nil
-}
-
-func stage4AdapterIntegerTupleAfter(
-	value *KeyTuple,
-	previous *KeyTuple,
-) bool {
-	if value == nil || previous == nil ||
-		len(*value) != len(*previous) {
-		return false
-	}
-	for index := range *value {
-		current, currentErr := strconv.ParseInt(
-			(*value)[index].Encoded,
-			10,
-			64,
-		)
-		prior, priorErr := strconv.ParseInt(
-			(*previous)[index].Encoded,
-			10,
-			64,
-		)
-		if currentErr != nil || priorErr != nil {
-			return false
-		}
-		switch {
-		case current > prior:
-			return true
-		case current < prior:
-			return false
-		}
-	}
-	return false
 }
 
 func validateStage4AdapterKeyTuple(
@@ -708,7 +677,11 @@ func newStage4AdapterNetworkCoordinator(
 			rangeIndex++
 		}
 	}
-	coordinator, err := newNetworkStateCoordinator(run, bindings)
+	coordinator, err := newNetworkStateCoordinator(
+		run,
+		bindings,
+		withDeferredNetworkTaskCompletion(),
+	)
 	if err != nil {
 		return nil, NewTransferError(
 			ErrorClassState,

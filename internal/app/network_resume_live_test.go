@@ -169,6 +169,7 @@ target:
   ssl_mode: require
 migration:
   target_mode: upsert
+  runtime_tuning: false
   include_tables: [items]
 `, sourcePath, endpoint.Host, endpoint.Port, endpoint.Database,
 		endpoint.User, endpoint.Password, endpoint.Schema)

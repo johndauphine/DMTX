@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -932,7 +933,10 @@ func TestStage4AdapterResumeRejectsCompletedCheckpointWithoutStructuredWork(
 		target,
 	)
 	if err == nil ||
-		!strings.Contains(err.Error(), "missing Stage 4 work task") {
+		!strings.Contains(
+			err.Error(),
+			"lacks exact durable network work",
+		) {
 		t.Fatalf("missing structured work error = %v", err)
 	}
 	for _, forbidden := range []string{
@@ -951,13 +955,329 @@ func TestStage4AdapterResumeRejectsCompletedCheckpointWithoutStructuredWork(
 	}
 }
 
-func TestStage4AdapterResumeAdmitsCompletedRangeForIncompleteTable(
+func TestStage4AdapterResumeRejectsCompletedCheckpointWithRunningStructuredRange(
 	t *testing.T,
 ) {
 	events := make([]string, 0)
 	source := &recordingAdapterSource{
 		events: &events,
 		table:  stage4AdapterTestTable(),
+	}
+	target := &recordingAdapterTarget{
+		events:      &events,
+		rowsByTable: map[string]int{"items": 2},
+	}
+	backend := state.YAMLStore{
+		Path: filepath.Join(t.TempDir(), "state.yaml"),
+	}
+	runID := "stage4-completed-checkpoint-running-range"
+	initializeStage4LifecycleRun(
+		t,
+		backend,
+		runID,
+		time.Now().Add(-time.Minute),
+	)
+	run := stage4LifecycleRunContext(
+		t,
+		backend,
+		runID,
+		true,
+	)
+	observer := stage4AdapterObserver{
+		recordingTableObserver: recordingTableObserver{events: &events},
+		run:                    run,
+	}
+	cfg := stage4AdapterTestConfig(
+		t,
+		"source-password",
+		"target-password",
+	)
+	cfg.Migration.TargetMode = "upsert"
+	cfg.Migration.Partitions = 2
+
+	prepared, err := prepareStage4AdapterRun(
+		context.Background(),
+		cfg,
+		observer,
+		source,
+		target,
+		"upsert",
+		run,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared = bindStage4AdapterTestStableNetworkWork(
+		t,
+		context.Background(),
+		cfg,
+		source,
+		prepared,
+	)
+	if err := ensureStage4AdapterWork(
+		context.Background(),
+		run,
+		prepared.work,
+	); err != nil {
+		t.Fatal(err)
+	}
+	item := prepared.work[0]
+	if len(item.ranges) != 2 {
+		t.Fatalf("network ranges = %#v", item.ranges)
+	}
+	if err := backend.CompleteRange(
+		runID,
+		item.task,
+		item.ranges[0].ID,
+		item.topology,
+		0,
+		time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	_, ranges, err := backend.ListWork(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var completedRanges, runningRanges int
+	for _, workRange := range ranges {
+		if workRange.Task != item.task {
+			continue
+		}
+		switch workRange.Status {
+		case "completed":
+			completedRanges++
+		case "running":
+			runningRanges++
+		}
+	}
+	if completedRanges != 1 || runningRanges != 1 {
+		t.Fatalf(
+			"structured range states completed=%d running=%d: %#v",
+			completedRanges,
+			runningRanges,
+			ranges,
+		)
+	}
+
+	events = events[:0]
+	_, err = resumeWithAdapters(
+		context.Background(),
+		cfg,
+		CompletedTableCheckpoints{
+			"items": {Rows: 2},
+		},
+		observer,
+		observer,
+		source,
+		target,
+	)
+	if err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"lacks exact durable network work",
+		) {
+		t.Fatalf("running structured range error = %v", err)
+	}
+	for _, forbidden := range []string{
+		"before_tables:items",
+		"before:items",
+		"target_prepare",
+		"target_write",
+		"target_finalize",
+	} {
+		if stage4AdapterEventIndex(events, forbidden) >= 0 {
+			t.Fatalf(
+				"running structured range crossed %s: %v",
+				forbidden,
+				events,
+			)
+		}
+	}
+}
+
+func TestStage4AdapterResumeRejectsCompletedCheckpointWithMismatchedStructuredRows(
+	t *testing.T,
+) {
+	events := make([]string, 0)
+	source := &recordingAdapterSource{
+		events: &events,
+		table:  stage4AdapterTestTable(),
+	}
+	target := &recordingAdapterTarget{
+		events:      &events,
+		rowsByTable: map[string]int{"items": 2},
+	}
+	backend := state.YAMLStore{
+		Path: filepath.Join(t.TempDir(), "state.yaml"),
+	}
+	runID := "stage4-completed-checkpoint-mismatched-structured-rows"
+	initializeStage4LifecycleRun(
+		t,
+		backend,
+		runID,
+		time.Now().Add(-time.Minute),
+	)
+	run := stage4LifecycleRunContext(
+		t,
+		backend,
+		runID,
+		true,
+	)
+	observer := stage4AdapterObserver{
+		recordingTableObserver: recordingTableObserver{events: &events},
+		run:                    run,
+	}
+	cfg := stage4AdapterTestConfig(
+		t,
+		"source-password",
+		"target-password",
+	)
+	cfg.Migration.TargetMode = "upsert"
+	cfg.Migration.Partitions = 2
+
+	prepared, err := prepareStage4AdapterRun(
+		context.Background(),
+		cfg,
+		observer,
+		source,
+		target,
+		"upsert",
+		run,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared = bindStage4AdapterTestStableNetworkWork(
+		t,
+		context.Background(),
+		cfg,
+		source,
+		prepared,
+	)
+	if err := ensureStage4AdapterWork(
+		context.Background(),
+		run,
+		prepared.work,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared.network.bindings) != 2 {
+		t.Fatalf(
+			"network bindings = %#v",
+			prepared.network.bindings,
+		)
+	}
+	for _, binding := range prepared.network.bindings {
+		if err := prepared.network.checkpoint(
+			context.Background(),
+			NetworkRangeCheckpoint{
+				RangeIndex:   binding.RangeIndex,
+				TopologyHash: binding.Initial.TopologyHash,
+				Frontier: AckFrontier{
+					RangeID: fmt.Sprintf(
+						"range/%d",
+						binding.RangeIndex,
+					),
+				},
+				Complete: true,
+			},
+		); err != nil {
+			t.Fatalf(
+				"complete empty structured range %d: %v",
+				binding.RangeIndex,
+				err,
+			)
+		}
+	}
+	item := prepared.work[0]
+	if err := backend.CompleteWorkTask(
+		runID,
+		item.task,
+		item.topology,
+		time.Now().UTC(),
+	); err != nil {
+		t.Fatalf("complete structured task: %v", err)
+	}
+	tasks, ranges, err := backend.ListWork(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var taskStatus string
+	for _, task := range tasks {
+		if task.Key == item.task {
+			taskStatus = task.Status
+		}
+	}
+	var completedRanges int
+	var structuredRows int64
+	for _, workRange := range ranges {
+		if workRange.Task != item.task {
+			continue
+		}
+		if workRange.Status == "completed" {
+			completedRanges++
+		}
+		structuredRows += workRange.RowsDone
+	}
+	if taskStatus != "completed" ||
+		completedRanges != 2 ||
+		structuredRows != 0 {
+		t.Fatalf(
+			"completed structured evidence task=%q ranges=%d rows=%d: tasks=%#v ranges=%#v",
+			taskStatus,
+			completedRanges,
+			structuredRows,
+			tasks,
+			ranges,
+		)
+	}
+
+	events = events[:0]
+	_, err = resumeWithAdapters(
+		context.Background(),
+		cfg,
+		CompletedTableCheckpoints{
+			"items": {Rows: 2},
+		},
+		observer,
+		observer,
+		source,
+		target,
+	)
+	if err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"checkpoint differs from durable ranges",
+		) {
+		t.Fatalf("mismatched structured row total error = %v", err)
+	}
+	for _, forbidden := range []string{
+		"before_tables:items",
+		"before:items",
+		"target_prepare",
+		"target_write",
+		"target_finalize",
+	} {
+		if stage4AdapterEventIndex(events, forbidden) >= 0 {
+			t.Fatalf(
+				"mismatched structured row total crossed %s: %v",
+				forbidden,
+				events,
+			)
+		}
+	}
+}
+
+func TestStage4AdapterResumeResetsIncompletePlanBeforeInteriorInsertReplay(
+	t *testing.T,
+) {
+	events := make([]string, 0)
+	source := &recordingAdapterSource{
+		events: &events,
+		table:  stage4AdapterTestTable(),
+		ids:    []int64{10, 30, 50},
+		rows:   []string{"ten", "thirty", "fifty"},
 	}
 	target := &recordingAdapterTarget{events: &events}
 	backend := state.YAMLStore{
@@ -986,7 +1306,7 @@ func TestStage4AdapterResumeAdmitsCompletedRangeForIncompleteTable(
 		"target-password",
 	)
 	cfg.Migration.TargetMode = "upsert"
-	cfg.Migration.Partitions = 2
+	cfg.Migration.Partitions = 1
 	prepared, err := prepareStage4AdapterRun(
 		context.Background(),
 		cfg,
@@ -999,6 +1319,13 @@ func TestStage4AdapterResumeAdmitsCompletedRangeForIncompleteTable(
 	if err != nil {
 		t.Fatal(err)
 	}
+	prepared = bindStage4AdapterTestStableNetworkWork(
+		t,
+		context.Background(),
+		cfg,
+		source,
+		prepared,
+	)
 	if err := ensureStage4AdapterWork(
 		context.Background(),
 		run,
@@ -1007,18 +1334,76 @@ func TestStage4AdapterResumeAdmitsCompletedRangeForIncompleteTable(
 		t.Fatal(err)
 	}
 	item := prepared.work[0]
-	if err := backend.CompleteRange(
-		runID,
-		item.task,
-		stage4AdapterCopyRangeID,
-		item.topology,
-		0,
-		time.Now().UTC(),
+	firstFrontier, err := adapterRangePageEncodeFrontier(
+		[]int64{30},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(item.ranges) != 1 {
+		t.Fatalf("network ranges = %#v", item.ranges)
+	}
+	firstIssued := NetworkIssuedChunk{
+		RangeIndex:  0,
+		Sequence:    0,
+		Rows:        2,
+		EndFrontier: firstFrontier,
+		Fingerprint: strings.Repeat("a", 64),
+		Exhausted:   false,
+	}
+	if err := prepared.network.recordIssued(
+		context.Background(),
+		firstIssued,
 	); err != nil {
 		t.Fatal(err)
 	}
-	if len(item.ranges) != 2 {
-		t.Fatalf("network ranges = %#v", item.ranges)
+	firstRows := [][]any{
+		{int64(10), []byte("ten")},
+		{int64(30), []byte("thirty")},
+	}
+	write := prepared.network.wrapWrite(
+		observer,
+		func(
+			ctx context.Context,
+			_ NetworkWriteRequest,
+		) (WriteReceipt, error) {
+			return target.WriteStage4NetworkBatch(
+				ctx,
+				prepared.plans[0].target,
+				prepared.plans[0].columns,
+				firstRows,
+			)
+		},
+	)
+	if _, err := write(
+		context.Background(),
+		NetworkWriteRequest{
+			Range: NetworkRangePlan{
+				RangeIndex:   0,
+				TopologyHash: item.topology,
+			},
+			Sequence: 0,
+			Mode:     NetworkWriteIdempotentUpsert,
+			Rows:     firstRows,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.network.checkpoint(
+		context.Background(),
+		NetworkRangeCheckpoint{
+			RangeIndex:   0,
+			TopologyHash: item.topology,
+			Frontier: AckFrontier{
+				RangeID:      stage4AdapterCopyRangeID,
+				NextSequence: 1,
+				Rows:         2,
+			},
+			FrontierBytes: firstFrontier,
+			Complete:      false,
+		},
+	); err != nil {
+		t.Fatal(err)
 	}
 	restores, err := prepared.network.loadRestores(
 		context.Background(),
@@ -1026,11 +1411,16 @@ func TestStage4AdapterResumeAdmitsCompletedRangeForIncompleteTable(
 	if err != nil {
 		t.Fatalf("restore partial network work: %v", err)
 	}
-	if len(restores) != 2 ||
-		!restores[0].Complete ||
-		restores[1].Complete {
+	if len(restores) != 1 ||
+		restores[0].Complete ||
+		restores[0].RowsDone != 2 {
 		t.Fatalf("partial network restores = %#v", restores)
 	}
+	// The inserted key is behind the saved keyset frontier while the old
+	// min/max and topology remain unchanged. Resume must reset the entire
+	// incomplete task, not reuse the positional frontier and skip id=20.
+	source.ids = []int64{10, 20, 30, 50}
+	source.rows = []string{"ten", "twenty", "thirty", "fifty"}
 	events = events[:0]
 	result, err := resumeWithAdapters(
 		context.Background(),
@@ -1042,15 +1432,34 @@ func TestStage4AdapterResumeAdmitsCompletedRangeForIncompleteTable(
 		target,
 	)
 	if err != nil {
-		t.Fatalf("resume partially completed network work: %v", err)
+		t.Fatalf("resume reset network work: %v", err)
 	}
-	if result != (Result{Tables: 1, Rows: 2, Validated: true}) {
-		t.Fatalf("partial network resume result = %#v", result)
+	if result != (Result{Tables: 1, Rows: 4, Validated: true}) {
+		t.Fatalf("reset network resume result = %#v", result)
 	}
 	if stage4AdapterEventIndex(events, "target_prepare") < 0 ||
 		stage4AdapterEventIndex(events, "target_write") <
 			stage4AdapterEventIndex(events, "target_prepare") {
-		t.Fatalf("partial network resume order = %v", events)
+		t.Fatalf("reset network resume order = %v", events)
+	}
+	targetRows, err := target.CountRows(
+		context.Background(),
+		prepared.plans[0].target,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if targetRows != 4 {
+		t.Fatalf("target rows after reset replay = %d, want 4", targetRows)
+	}
+	var sawInterior bool
+	for _, row := range target.captured {
+		if len(row) != 0 && row[0] == int64(20) {
+			sawInterior = true
+		}
+	}
+	if !sawInterior {
+		t.Fatalf("reset replay skipped interior key: %#v", target.captured)
 	}
 }
 
@@ -1805,6 +2214,61 @@ func TestStage4AdapterWorkTopologyIncludesCanonicalDefaults(
 	}
 }
 
+func TestStage4AdapterUpsertWorkTopologyIgnoresIdentityFrontier(
+	t *testing.T,
+) {
+	source := stage4AdapterTestTable()
+	sourceFrontier := int64(2)
+	source.Identity = &schema.Identity{
+		Column:     "id",
+		Generation: schema.IdentityByDefault,
+		Frontier:   &sourceFrontier,
+	}
+	target := cloneStage4RichTable(source)
+	target.Schema = ""
+	targetFrontier := int64(7)
+	target.Identity.Frontier = &targetFrontier
+	first, err := buildStage4AdapterWork(
+		"configuration",
+		"upsert",
+		[]adapterTablePlan{{
+			source:  source,
+			target:  target,
+			columns: adapterColumnNames(source),
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	laterSource := cloneStage4RichTable(source)
+	laterTarget := cloneStage4RichTable(target)
+	laterSourceFrontier := int64(200)
+	laterTargetFrontier := int64(700)
+	laterSource.Identity.Frontier = &laterSourceFrontier
+	laterTarget.Identity.Frontier = &laterTargetFrontier
+	second, err := buildStage4AdapterWork(
+		"configuration",
+		"upsert",
+		[]adapterTablePlan{{
+			source:  laterSource,
+			target:  laterTarget,
+			columns: adapterColumnNames(laterSource),
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || len(second) != 1 ||
+		first[0].topology != second[0].topology {
+		t.Fatalf(
+			"mutable identity frontier changed upsert work topology: first=%#v second=%#v",
+			first,
+			second,
+		)
+	}
+}
+
 func TestStage4AdapterCountProbeNeverRelabelsExactCountAsEstimate(
 	t *testing.T,
 ) {
@@ -2011,6 +2475,60 @@ func stage4AdapterTestTable() schema.Table {
 			{Name: "payload", Type: "text"},
 		},
 	}
+}
+
+func bindStage4AdapterTestStableNetworkWork(
+	t *testing.T,
+	ctx context.Context,
+	cfg config.Config,
+	source sourceAdapter,
+	prepared stage4AdapterPrepared,
+) stage4AdapterPrepared {
+	t.Helper()
+	if len(prepared.plans) != len(prepared.work) {
+		t.Fatal("deferred Stage 4 test work is incomplete")
+	}
+	bound := make([]stage4AdapterWork, len(prepared.work))
+	for index := range prepared.plans {
+		session, err := OpenAdapterStableNetworkTableSource(
+			ctx,
+			source,
+			prepared.plans[index].source,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stable, err := session.Source()
+		if err != nil {
+			_ = session.Close()
+			t.Fatal(err)
+		}
+		items, err := bindStage4AdapterPagination(
+			ctx,
+			stable,
+			cfg.Migration.Partitions,
+			[]stage4AdapterWork{prepared.work[index]},
+			[]adapterTablePlan{prepared.plans[index]},
+		)
+		closeErr := session.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		bound[index] = items[0]
+	}
+	coordinator, err := newStage4AdapterNetworkCoordinator(
+		prepared.run,
+		bound,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared.work = bound
+	prepared.network = coordinator
+	return prepared
 }
 
 func stage4AdapterTestConfig(

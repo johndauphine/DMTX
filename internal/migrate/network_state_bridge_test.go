@@ -230,6 +230,126 @@ func TestNetworkStateCoordinatorCompletesOnlyDurableFrontier(
 	}
 }
 
+func TestNetworkStateCoordinatorDefersTaskCompletion(t *testing.T) {
+	for _, stateKind := range []string{"sqlite", "yaml"} {
+		t.Run(stateKind, func(t *testing.T) {
+			run := newNetworkStateTestRun(
+				t,
+				stateKind,
+				"network-deferred-task-completion",
+			)
+			coordinator := newNetworkStateTestCoordinator(
+				t,
+				run,
+				withDeferredNetworkTaskCompletion(),
+			)
+			ctx := context.Background()
+			if err := coordinator.ensurePlans(ctx); err != nil {
+				t.Fatal(err)
+			}
+			checkpoint := NetworkRangeCheckpoint{
+				RangeIndex:   0,
+				TopologyHash: "topology-a",
+				Frontier: AckFrontier{
+					RangeID: "range/0",
+				},
+				Complete: true,
+			}
+			if err := coordinator.checkpoint(ctx, checkpoint); err != nil {
+				t.Fatalf("complete deferred range: %v", err)
+			}
+			task, workRange := networkStateTestSnapshot(t, run)
+			if task.Status != "running" ||
+				workRange.Status != "completed" {
+				t.Fatalf(
+					"deferred checkpoint task=%#v range=%#v",
+					task,
+					workRange,
+				)
+			}
+
+			reopened := newNetworkStateTestCoordinator(
+				t,
+				run,
+				withDeferredNetworkTaskCompletion(),
+			)
+			restores, err := reopened.loadRestores(ctx)
+			if err != nil {
+				t.Fatalf("load deferred restores: %v", err)
+			}
+			if len(restores) != 1 || !restores[0].Complete {
+				t.Fatalf("deferred restores = %#v", restores)
+			}
+			task, workRange = networkStateTestSnapshot(t, run)
+			if task.Status != "running" ||
+				workRange.Status != "completed" {
+				t.Fatalf(
+					"deferred reload task=%#v range=%#v",
+					task,
+					workRange,
+				)
+			}
+
+			if err := reopened.completeTaskIfReady(
+				ctx,
+				reopened.bindings[0],
+			); err != nil {
+				t.Fatalf("complete deferred task explicitly: %v", err)
+			}
+			task, workRange = networkStateTestSnapshot(t, run)
+			if task.Status != "completed" ||
+				workRange.Status != "completed" {
+				t.Fatalf(
+					"explicit completion task=%#v range=%#v",
+					task,
+					workRange,
+				)
+			}
+		})
+	}
+}
+
+func TestNetworkStateCoordinatorDefaultsToEagerTaskCompletion(
+	t *testing.T,
+) {
+	for _, stateKind := range []string{"sqlite", "yaml"} {
+		t.Run(stateKind, func(t *testing.T) {
+			run := newNetworkStateTestRun(
+				t,
+				stateKind,
+				"network-default-eager-task-completion",
+			)
+			coordinator := newNetworkStateTestCoordinator(t, run)
+			ctx := context.Background()
+			if err := coordinator.ensurePlans(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := coordinator.checkpoint(
+				ctx,
+				NetworkRangeCheckpoint{
+					RangeIndex:   0,
+					TopologyHash: "topology-a",
+					Frontier: AckFrontier{
+						RangeID: "range/0",
+					},
+					Complete: true,
+				},
+			); err != nil {
+				t.Fatalf("complete eager range: %v", err)
+			}
+			task, workRange := networkStateTestSnapshot(t, run)
+			if task.Status != "completed" ||
+				workRange.Status != "completed" {
+				t.Fatalf(
+					"default eager task=%#v range=%#v",
+					task,
+					workRange,
+				)
+			}
+		})
+	}
+}
+
 func TestNetworkStateCoordinatorComposesWithTransferCoreAndResume(
 	t *testing.T,
 ) {
@@ -1037,6 +1157,7 @@ func (backend networkStateTamperBackend) ListWork(
 func newNetworkStateTestCoordinator(
 	t *testing.T,
 	run Stage4RunContext,
+	options ...networkStateCoordinatorOption,
 ) *networkStateCoordinator {
 	t.Helper()
 	coordinator, err := newNetworkStateCoordinator(
@@ -1057,6 +1178,7 @@ func newNetworkStateTestCoordinator(
 				UpperInclusive: true,
 			},
 		}},
+		options...,
 	)
 	if err != nil {
 		t.Fatalf("new network state coordinator: %v", err)

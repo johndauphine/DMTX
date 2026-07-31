@@ -9,11 +9,14 @@ import (
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
-// ExecuteResume resumes a certified composed-adapter migration. Completed
-// tables are reused only after their durable row count agrees exactly with
-// both the current source and target. Incomplete upsert tables are replayed
-// from the beginning so the target adapter's idempotent upsert contract is the
-// only row-level recovery primitive required by this first network-resume
+// ExecuteResume resumes a certified composed-adapter migration. A completed
+// Stage 4 network table is reused from its exact durable range evidence without
+// reopening a later source snapshot, provided the target still contains at
+// least the checkpointed rows. Other adapter paths validate completed row
+// counts against the current source. A completed strict reconciliation also
+// requires exact target equality. Incomplete upsert tables are replayed from
+// the beginning so the target adapter's idempotent upsert contract is the only
+// row-level recovery primitive required by this first network-resume
 // implementation.
 //
 // Drop/recreate resume remains fail-closed: safely resuming a rebuild requires
@@ -366,6 +369,7 @@ func resumeWithAdaptersAdmission(
 		target,
 		plans,
 		completed,
+		cfg.Migration.Deletes.Mode == config.DeleteModeReconcile,
 	)
 	if err != nil {
 		return Result{}, err
@@ -578,6 +582,7 @@ func validateCompletedAdapterTableCheckpoints(
 	target targetAdapter,
 	plans []adapterTablePlan,
 	completed CompletedTableCheckpoints,
+	reconciliationStrict bool,
 ) (map[string]int, error) {
 	selected := make(map[string]adapterTablePlan, len(plans))
 	for _, plan := range plans {
@@ -660,7 +665,10 @@ func validateCompletedAdapterTableCheckpoints(
 		); err != nil {
 			return nil, err
 		}
-		if checkpoint.Rows != sourceRows || checkpoint.Rows != targetRows {
+		sourceChanged := checkpoint.Rows != sourceRows
+		targetChanged := targetRows < sourceRows ||
+			reconciliationStrict && targetRows != sourceRows
+		if sourceChanged || targetChanged {
 			return nil, NewTransferError(
 				ErrorClassState,
 				fmt.Errorf(

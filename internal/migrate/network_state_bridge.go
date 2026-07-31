@@ -27,15 +27,32 @@ type networkStateRangeBinding struct {
 // target attempt authorization before the driver call, and advances state only
 // to the core's lowest contiguous acknowledgement frontier.
 type networkStateCoordinator struct {
-	run      Stage4RunContext
-	bindings []networkStateRangeBinding
-	byIndex  map[uint64]networkStateRangeBinding
-	now      func() time.Time
+	run                 Stage4RunContext
+	bindings            []networkStateRangeBinding
+	byIndex             map[uint64]networkStateRangeBinding
+	now                 func() time.Time
+	deferTaskCompletion bool
+}
+
+type networkStateCoordinatorOptions struct {
+	deferTaskCompletion bool
+}
+
+type networkStateCoordinatorOption func(*networkStateCoordinatorOptions)
+
+// withDeferredNetworkTaskCompletion keeps range durability separate from the
+// enclosing task lifecycle. The option is applied only during construction, so
+// concurrent checkpoint and restore calls only read immutable configuration.
+func withDeferredNetworkTaskCompletion() networkStateCoordinatorOption {
+	return func(options *networkStateCoordinatorOptions) {
+		options.deferTaskCompletion = true
+	}
 }
 
 func newNetworkStateCoordinator(
 	run Stage4RunContext,
 	bindings []networkStateRangeBinding,
+	options ...networkStateCoordinatorOption,
 ) (*networkStateCoordinator, error) {
 	if err := run.Validate(); err != nil {
 		return nil, fmt.Errorf("network state context: %w", err)
@@ -43,11 +60,19 @@ func newNetworkStateCoordinator(
 	if len(bindings) == 0 {
 		return nil, fmt.Errorf("network state bindings are required")
 	}
+	settings := networkStateCoordinatorOptions{}
+	for _, option := range options {
+		if option == nil {
+			return nil, fmt.Errorf("network state coordinator option is nil")
+		}
+		option(&settings)
+	}
 	result := &networkStateCoordinator{
-		run:      run,
-		bindings: make([]networkStateRangeBinding, len(bindings)),
-		byIndex:  make(map[uint64]networkStateRangeBinding, len(bindings)),
-		now:      func() time.Time { return time.Now().UTC() },
+		run:                 run,
+		bindings:            make([]networkStateRangeBinding, len(bindings)),
+		byIndex:             make(map[uint64]networkStateRangeBinding, len(bindings)),
+		now:                 func() time.Time { return time.Now().UTC() },
+		deferTaskCompletion: settings.deferTaskCompletion,
 	}
 	copy(result.bindings, bindings)
 	sort.Slice(result.bindings, func(left, right int) bool {
@@ -213,6 +238,12 @@ func (coordinator *networkStateCoordinator) loadRestores(
 	restores, err := coordinator.restoresFromSnapshot(snapshot)
 	if err != nil {
 		return nil, err
+	}
+	if coordinator.deferTaskCompletion {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return restores, nil
 	}
 	if _, err := coordinator.recoverCompletedTasks(
 		ctx,
@@ -885,6 +916,9 @@ func (coordinator *networkStateCoordinator) checkpoint(
 				),
 			)
 		}
+	}
+	if coordinator.deferTaskCompletion {
+		return ctx.Err()
 	}
 	return coordinator.completeTaskIfReady(ctx, binding)
 }
