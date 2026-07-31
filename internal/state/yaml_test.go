@@ -39,7 +39,8 @@ func TestYAMLStoreWritesPrivateCompleteDocument(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.HasPrefix(data, []byte("version: 3\n")) || bytes.HasPrefix(bytes.TrimSpace(data), []byte("{")) {
+	versionPrefix := []byte(fmt.Sprintf("version: %d\n", yamlStateVersion))
+	if !bytes.HasPrefix(data, versionPrefix) || bytes.HasPrefix(bytes.TrimSpace(data), []byte("{")) {
 		t.Fatalf("state is not a YAML document:\n%s", data)
 	}
 	var document yamlStateDocument

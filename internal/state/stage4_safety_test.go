@@ -921,9 +921,9 @@ func TestStage4StrictMigrationSnapshotOwnsEveryTableEvidence(t *testing.T) {
 }
 
 func TestStage4StateUpgradesPreserveEarlierState(t *testing.T) {
-	t.Run("yaml-v2", func(t *testing.T) {
+	t.Run("yaml-v3", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "state.yaml")
-		legacy := `version: 2
+		legacy := `version: 3
 runs:
   - id: legacy
     source: source
@@ -972,7 +972,7 @@ work_ranges:
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.HasPrefix(string(data), "version: 3\n") {
+		if !strings.HasPrefix(string(data), "version: 4\n") {
 			t.Fatalf("upgraded YAML version:\n%s", data)
 		}
 		tasks, ranges, err := store.ListWork("legacy")

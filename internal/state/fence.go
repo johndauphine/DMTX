@@ -118,11 +118,19 @@ func (guard *LeaseGuard) Release() error {
 // supplied lease generation. Reads remain available for diagnosis after loss.
 func FenceBackend(backend Backend, guard *LeaseGuard) Backend {
 	stage4, _ := backend.(Stage4Backend)
-	return &fencedBackend{
+	fenced := &fencedBackend{
 		backend: backend,
 		ranges:  backend.(RangeBackend),
 		stage4:  stage4,
 		guard:   guard,
+	}
+	aggregate, ok := backend.(Stage4AggregateBackend)
+	if !ok {
+		return fenced
+	}
+	return &fencedAggregateBackend{
+		fencedBackend: fenced,
+		aggregate:     aggregate,
 	}
 }
 
@@ -131,6 +139,38 @@ type fencedBackend struct {
 	ranges  RangeBackend
 	stage4  Stage4Backend
 	guard   *LeaseGuard
+}
+
+// fencedAggregateBackend is a conditional capability wrapper. Backends that
+// do not implement aggregate Stage 4 completion must not appear to implement
+// it merely because they were passed through FenceBackend.
+type fencedAggregateBackend struct {
+	*fencedBackend
+	aggregate Stage4AggregateBackend
+}
+
+func (backend *fencedAggregateBackend) EnsureStage4TableInventory(
+	inventory Stage4TableInventory,
+) error {
+	return backend.protectRun(inventory.RunID, func() error {
+		return backend.aggregate.EnsureStage4TableInventory(inventory)
+	})
+}
+
+func (backend *fencedAggregateBackend) CompleteStage4Table(
+	completion Stage4TableCompletion,
+) error {
+	return backend.protectRun(completion.RunID, func() error {
+		return backend.aggregate.CompleteStage4Table(completion)
+	})
+}
+
+func (backend *fencedAggregateBackend) CompleteStage4Run(
+	completion Stage4RunCompletion,
+) error {
+	return backend.protectRun(completion.RunID, func() error {
+		return backend.aggregate.CompleteStage4Run(completion)
+	})
 }
 
 func (backend *fencedBackend) protect(operation func() error) error {
@@ -547,4 +587,9 @@ var (
 	_ Backend       = (*fencedBackend)(nil)
 	_ RangeBackend  = (*fencedBackend)(nil)
 	_ Stage4Backend = (*fencedBackend)(nil)
+
+	_ Backend                = (*fencedAggregateBackend)(nil)
+	_ RangeBackend           = (*fencedAggregateBackend)(nil)
+	_ Stage4Backend          = (*fencedAggregateBackend)(nil)
+	_ Stage4AggregateBackend = (*fencedAggregateBackend)(nil)
 )
