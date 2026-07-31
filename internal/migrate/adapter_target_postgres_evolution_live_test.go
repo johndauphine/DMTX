@@ -661,6 +661,111 @@ func TestPostgresTargetEvolutionRealPlannerLive(t *testing.T) {
 			projection.CurrentTables(),
 		)
 	}
+
+	// A PostgreSQL source can legally reuse an index name in a different
+	// source schema. Both schemas collapse into this one target namespace, so a
+	// later lexically earlier table must receive an alternate name without
+	// renaming the retained index that already exists on the target.
+	added := schema.Table{
+		Schema: "other_source",
+		Name:   "aardvark",
+		Columns: []schema.Column{
+			{
+				Name: "id", Type: "bigint",
+				PrimaryKey: true, PrimaryKeyPosition: 1,
+			},
+			{Name: "code", Type: "text"},
+		},
+		Indexes: []schema.Index{{
+			Name: "parents_code_key",
+			Columns: []schema.IndexColumn{{
+				Name: "code", Collation: "BINARY",
+			}},
+		}},
+	}
+	nextSourceTables := append(
+		cloneTargetSchemaEvolutionTables(sourceTables),
+		added,
+	)
+	nextGate := stage4TargetSchemaProjectionGate(
+		t,
+		sourceTables,
+		nextSourceTables,
+		"upsert",
+		false,
+	)
+	nextProjection, err := BuildStage4TargetSchemaEvolutionProjection(
+		nextGate,
+		"postgres",
+		adapter,
+		"upsert",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedParents := stage4TargetSchemaProjectionFindTable(
+		t,
+		nextProjection.CurrentTables(),
+		"parents",
+	)
+	addedAardvark := stage4TargetSchemaProjectionFindTable(
+		t,
+		nextProjection.CurrentTables(),
+		"aardvark",
+	)
+	if retainedParents.Indexes[0].Name != "parents_code_key" ||
+		addedAardvark.Indexes[0].Name == "" ||
+		addedAardvark.Indexes[0].Name == "parents_code_key" {
+		t.Fatalf(
+			"retained/new live index names = %q/%q",
+			retainedParents.Indexes[0].Name,
+			addedAardvark.Indexes[0].Name,
+		)
+	}
+	nextRequest, err := NewTargetSchemaEvolutionRequest(
+		schema.Postgres,
+		nextProjection,
+		adapter.TargetSchemaEvolutionCreatePlanner(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextPlan, err := adapter.PreflightTargetSchemaEvolution(
+		ctx,
+		nextRequest,
+	)
+	if err != nil {
+		t.Fatalf("preflight live retained-name table add: %v", err)
+	}
+	if nextPlan.Complete() || nextPlan.OperationCount() < 2 {
+		t.Fatalf(
+			"live retained-name add complete=%v operations=%d",
+			nextPlan.Complete(),
+			nextPlan.OperationCount(),
+		)
+	}
+	if err := adapter.ApplyTargetSchemaEvolutionPlan(
+		ctx,
+		nextPlan,
+	); err != nil {
+		t.Fatalf("apply live retained-name table add: %v", err)
+	}
+	nextComplete, err := adapter.PreflightTargetSchemaEvolution(
+		ctx,
+		nextRequest,
+	)
+	if err != nil {
+		t.Fatalf("re-preflight live retained-name table add: %v", err)
+	}
+	if !nextComplete.Complete() ||
+		nextComplete.Digest() != nextPlan.Digest() {
+		t.Fatalf(
+			"live retained-name add complete=%v digest=%s want=%s",
+			nextComplete.Complete(),
+			nextComplete.Digest(),
+			nextPlan.Digest(),
+		)
+	}
 }
 
 func assertPostgresEvolutionLockTimeout(
