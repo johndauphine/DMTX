@@ -779,6 +779,7 @@ func postgresSourceForeignKeyFromCatalog(
 	}
 	result := schema.ForeignKey{
 		Name:              catalog.name,
+		ReferencedSchema:  catalog.referencedSchema,
 		ReferencedTable:   catalog.referencedTable,
 		OnUpdate:          onUpdate,
 		OnDelete:          onDelete,

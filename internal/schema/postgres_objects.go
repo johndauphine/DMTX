@@ -444,6 +444,16 @@ func validatePostgresForeignKey(
 	); err != nil {
 		return nil, err
 	}
+	referencedSchema := foreignKey.ReferencedSchema
+	if referencedSchema == "" {
+		referencedSchema = table.source.Schema
+	} else if err := validateSourceObjectIdentifier(
+		"referenced namespace",
+		referencedSchema,
+		false,
+	); err != nil {
+		return nil, err
+	}
 	if err := validatePostgresForeignKeyColumns(
 		table,
 		foreignKey.Columns,
@@ -452,13 +462,14 @@ func validatePostgresForeignKey(
 		return nil, err
 	}
 	referenced := tables[postgresSourceTableKey(
-		table.source.Schema,
+		referencedSchema,
 		foreignKey.ReferencedTable,
 	)]
 	if referenced == nil {
 		return nil, postgresObjectPolicy(
 			"create PostgreSQL foreign key",
-			"unknown referenced table "+foreignKey.ReferencedTable,
+			"unknown referenced table "+
+				referencedSchema+"."+foreignKey.ReferencedTable,
 		)
 	}
 
@@ -969,21 +980,77 @@ func postgresCheckSortKey(check CheckConstraint) string {
 }
 
 func postgresForeignKeySortKey(foreignKey ForeignKey) string {
-	parts := []string{foreignKey.Name}
-	parts = append(parts, foreignKey.Columns...)
-	parts = append(parts, foreignKey.ReferencedTable)
-	parts = append(parts, foreignKey.ReferencedColumns...)
-	parts = append(
-		parts,
+	var key strings.Builder
+	appendPostgresForeignKeySortField(&key, "name", foreignKey.Name)
+	appendPostgresForeignKeySortFields(
+		&key,
+		"columns",
+		foreignKey.Columns,
+	)
+	appendPostgresForeignKeySortField(
+		&key,
+		"referenced_schema",
+		foreignKey.ReferencedSchema,
+	)
+	appendPostgresForeignKeySortField(
+		&key,
+		"referenced_table",
+		foreignKey.ReferencedTable,
+	)
+	appendPostgresForeignKeySortFields(
+		&key,
+		"referenced_columns",
+		foreignKey.ReferencedColumns,
+	)
+	appendPostgresForeignKeySortField(
+		&key,
+		"on_update",
 		strings.ToUpper(strings.Join(strings.Fields(
 			foreignKey.OnUpdate,
 		), " ")),
+	)
+	appendPostgresForeignKeySortField(
+		&key,
+		"on_delete",
 		strings.ToUpper(strings.Join(strings.Fields(
 			foreignKey.OnDelete,
 		), " ")),
+	)
+	appendPostgresForeignKeySortField(
+		&key,
+		"match",
 		strings.ToUpper(strings.TrimSpace(foreignKey.Match)),
 	)
-	return strings.Join(parts, "\x00")
+	return key.String()
+}
+
+func appendPostgresForeignKeySortFields(
+	key *strings.Builder,
+	name string,
+	values []string,
+) {
+	appendPostgresForeignKeySortField(
+		key,
+		name+"_count",
+		strconv.Itoa(len(values)),
+	)
+	for _, value := range values {
+		appendPostgresForeignKeySortField(key, name+"_item", value)
+	}
+}
+
+func appendPostgresForeignKeySortField(
+	key *strings.Builder,
+	name string,
+	value string,
+) {
+	key.WriteString(strconv.Itoa(len(name)))
+	key.WriteByte(':')
+	key.WriteString(name)
+	key.WriteByte('=')
+	key.WriteString(strconv.Itoa(len(value)))
+	key.WriteByte(':')
+	key.WriteString(value)
 }
 
 func indexDisplayName(table Table, index Index) string {

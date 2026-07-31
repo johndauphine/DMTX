@@ -264,6 +264,50 @@ func TestSchemaSnapshotRejectsAmbiguousIdentity(t *testing.T) {
 	}
 }
 
+func TestSchemaSnapshotRejectsMalformedReferencedSchema(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name   string
+		schema string
+	}{
+		{name: "NUL", schema: "identity\x00archive"},
+		{name: "invalid UTF-8", schema: string([]byte{0xff})},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			table := snapshotTestChildTable()
+			table.ForeignKeys[0].ReferencedSchema = test.schema
+			if _, err := NewSchemaSnapshot([]Table{table}); err == nil ||
+				!strings.Contains(err.Error(), "referenced schema") {
+				t.Fatalf("malformed referenced schema error = %v", err)
+			}
+		})
+	}
+
+	prefix := []byte(
+		`{"version":1,"tables":[{"schema":"","name":"items",` +
+			`"mysql_collation":"","clickhouse_order_by":null,` +
+			`"columns":[],"indexes":[],"foreign_keys":[{` +
+			`"name":"items_parent_fk","columns":["parent_id"],` +
+			`"referenced_schema":"`,
+	)
+	suffix := []byte(
+		`","referenced_table":"parents","referenced_columns":["id"],` +
+			`"on_update":"NO ACTION","on_delete":"NO ACTION",` +
+			`"match":"SIMPLE"}],"checks":[],` +
+			`"sqlite_without_rowid":false,"sqlite_strict":false}]}`,
+	)
+	malformedJSON := append(prefix, byte(0xff))
+	malformedJSON = append(malformedJSON, suffix...)
+	if _, err := ParseSchemaSnapshot(malformedJSON); err == nil ||
+		!strings.Contains(err.Error(), "invalid UTF-8") {
+		t.Fatalf("raw invalid UTF-8 snapshot error = %v", err)
+	}
+}
+
 func snapshotTestParentTable() Table {
 	frontier := int64(41)
 	return Table{

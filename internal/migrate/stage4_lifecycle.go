@@ -740,6 +740,7 @@ func selectStage4ForeignKeys(
 		snapshot := schema.SnapshotForeignKey{
 			Name:              value.Name,
 			Columns:           append([]string(nil), value.Columns...),
+			ReferencedSchema:  value.ReferencedSchema,
 			ReferencedTable:   value.ReferencedTable,
 			ReferencedColumns: append([]string(nil), value.ReferencedColumns...),
 			OnUpdate:          value.OnUpdate,
@@ -849,7 +850,34 @@ func cloneStage4RichColumn(value schema.Column) schema.Column {
 	result := value
 	if value.DeclaredType != nil {
 		declared := *value.DeclaredType
-		declared.Arguments = append([]int(nil), value.DeclaredType.Arguments...)
+		declared.Arguments = cloneStage4Ints(value.DeclaredType.Arguments)
+		declared.Length = cloneStage4Int64(value.DeclaredType.Length)
+		declared.Precision = cloneStage4Int64(value.DeclaredType.Precision)
+		declared.Scale = cloneStage4Int64(value.DeclaredType.Scale)
+		declared.FractionalSecondPrecision = cloneStage4Int64(
+			value.DeclaredType.FractionalSecondPrecision,
+		)
+		if value.DeclaredType.Spatial != nil {
+			spatial := *value.DeclaredType.Spatial
+			if value.DeclaredType.Spatial.SRID != nil {
+				srid := *value.DeclaredType.Spatial.SRID
+				spatial.SRID = &srid
+			}
+			declared.Spatial = &spatial
+		}
+		if value.DeclaredType.MySQL != nil {
+			mysql := *value.DeclaredType.MySQL
+			mysql.BitWidth = cloneStage4Int64(
+				value.DeclaredType.MySQL.BitWidth,
+			)
+			mysql.EnumMembers = cloneStage4Strings(
+				value.DeclaredType.MySQL.EnumMembers,
+			)
+			mysql.SetMembers = cloneStage4Strings(
+				value.DeclaredType.MySQL.SetMembers,
+			)
+			declared.MySQL = &mysql
+		}
 		result.DeclaredType = &declared
 	}
 	if value.Default != nil {
@@ -857,6 +885,28 @@ func cloneStage4RichColumn(value schema.Column) schema.Column {
 		result.Default = &expression
 	}
 	return result
+}
+
+func cloneStage4Int64(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneStage4Ints(value []int) []int {
+	if value == nil {
+		return nil
+	}
+	return append([]int{}, value...)
+}
+
+func cloneStage4Strings(value []string) []string {
+	if value == nil {
+		return nil
+	}
+	return append([]string{}, value...)
 }
 
 func cloneStage4RichIndex(value schema.Index) schema.Index {

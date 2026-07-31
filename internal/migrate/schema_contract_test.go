@@ -1150,6 +1150,32 @@ func TestSchemaContractDiscardRowProjectsWholeRun(t *testing.T) {
 	}
 }
 
+func TestSchemaContractReferencedTableMatchesQualifiedIdentity(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	owner := schema.SnapshotTable{Schema: "sales", Name: "events"}
+	foreignKey := schema.SnapshotForeignKey{
+		ReferencedSchema: "identity",
+		ReferencedTable:  "accounts",
+	}
+	if !schemaContractReferencedTableMatches(
+		owner,
+		foreignKey,
+		schemaContractTableKey{schema: "identity", table: "accounts"},
+	) {
+		t.Fatal("qualified referenced table did not match exact identity")
+	}
+	if schemaContractReferencedTableMatches(
+		owner,
+		foreignKey,
+		schemaContractTableKey{schema: "sales", table: "accounts"},
+	) {
+		t.Fatal("qualified reference matched owner-schema same-name table")
+	}
+}
+
 func TestSchemaContractDiscardRowDominatesDependentObjectEvolution(
 	t *testing.T,
 ) {

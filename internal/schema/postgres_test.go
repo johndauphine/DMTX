@@ -80,6 +80,108 @@ func TestPostgresRendersDeclaredScalarTypesAndSafeDefaults(t *testing.T) {
 	}
 }
 
+func TestPostgresRendersExtendedNumericModifiersWhileOtherTargetsReject(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		arguments []int
+		want      string
+	}{
+		{arguments: []int{2, -3}, want: "NUMERIC(2,-3)"},
+		{arguments: []int{3, 5}, want: "NUMERIC(3,5)"},
+	} {
+		declared := DeclaredType{
+			Base:      "numeric",
+			Arguments: test.arguments,
+		}
+		got, err := renderPostgresDeclaredType(declared)
+		if err != nil {
+			t.Fatalf("render PostgreSQL %#v: %v", test.arguments, err)
+		}
+		if got != test.want {
+			t.Fatalf(
+				"render PostgreSQL %#v = %q, want %q",
+				test.arguments,
+				got,
+				test.want,
+			)
+		}
+		if _, err := renderMySQLDeclaredType(declared); err == nil {
+			t.Fatalf("MySQL accepted PostgreSQL NUMERIC %#v", test.arguments)
+		}
+		if _, err := renderSQLServerDeclaredColumn(Column{
+			Name:         "value",
+			Type:         "numeric",
+			DeclaredType: &declared,
+		}); err == nil {
+			t.Fatalf(
+				"SQL Server accepted PostgreSQL NUMERIC %#v",
+				test.arguments,
+			)
+		}
+	}
+}
+
+func TestPostgresExtendedNumericDefaultsRemainExact(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name      string
+		arguments []int
+		value     string
+		valid     bool
+	}{
+		{
+			name:      "negative scale exact",
+			arguments: []int{2, -3},
+			value:     "12000",
+			valid:     true,
+		},
+		{
+			name:      "negative scale would round",
+			arguments: []int{2, -3},
+			value:     "12345",
+		},
+		{
+			name:      "scale beyond precision exact",
+			arguments: []int{3, 5},
+			value:     "0.00123",
+			valid:     true,
+		},
+		{
+			name:      "scale beyond precision overflows",
+			arguments: []int{3, 5},
+			value:     "0.01234",
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := CreateTable(Postgres, Table{
+				Name: "numeric_defaults",
+				Columns: []Column{{
+					Name: "value",
+					Type: "numeric",
+					DeclaredType: &DeclaredType{
+						Base:      "numeric",
+						Arguments: test.arguments,
+					},
+					Default: postgresTestDefault(t, test.value),
+				}},
+			})
+			if test.valid && err != nil {
+				t.Fatalf("exact PostgreSQL NUMERIC default: %v", err)
+			}
+			if !test.valid && err == nil {
+				t.Fatal("inexact PostgreSQL NUMERIC default was accepted")
+			}
+		})
+	}
+}
+
 func TestPostgresCurrentDefaultsUseUTCStatementTime(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -140,13 +242,13 @@ func TestPostgresScalarRendererFailsClosed(t *testing.T) {
 			},
 		},
 		{
-			name: "numeric scale beyond precision",
+			name: "numeric scale out of PostgreSQL range",
 			column: Column{
 				Name: "value",
 				Type: "numeric",
 				DeclaredType: &DeclaredType{
 					Base:      "numeric",
-					Arguments: []int{4, 5},
+					Arguments: []int{4, 1001},
 				},
 			},
 		},

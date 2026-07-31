@@ -1153,6 +1153,7 @@ func sqlServerSourceForeignKeyFromCatalog(
 	}
 	result := schema.ForeignKey{
 		Name:              catalog.name,
+		ReferencedSchema:  catalog.referencedNamespace,
 		ReferencedTable:   catalog.referencedTable,
 		OnUpdate:          onUpdate,
 		OnDelete:          onDelete,

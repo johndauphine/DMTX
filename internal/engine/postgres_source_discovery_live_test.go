@@ -334,6 +334,22 @@ func postgresSourceDiscoveryFixture(
 					Type:     "jsonb",
 					Nullable: true,
 				},
+				{
+					Name: "rounded_bucket",
+					Type: "numeric",
+					DeclaredType: &schema.DeclaredType{
+						Base:      "numeric",
+						Arguments: []int{2, -3},
+					},
+				},
+				{
+					Name: "fractional_ratio",
+					Type: "numeric",
+					DeclaredType: &schema.DeclaredType{
+						Base:      "numeric",
+						Arguments: []int{3, 5},
+					},
+				},
 			},
 			Indexes: []schema.Index{{
 				Name:   "accounts_code_uq",
@@ -404,6 +420,16 @@ func assertPostgresSourceDiscoveryFixture(
 		!reflect.DeepEqual(
 			accounts.Columns[5].DeclaredType.Arguments,
 			[]int{3},
+		) ||
+		accounts.Columns[7].DeclaredType == nil ||
+		!reflect.DeepEqual(
+			accounts.Columns[7].DeclaredType.Arguments,
+			[]int{2, -3},
+		) ||
+		accounts.Columns[8].DeclaredType == nil ||
+		!reflect.DeepEqual(
+			accounts.Columns[8].DeclaredType.Arguments,
+			[]int{3, 5},
 		) {
 		t.Fatalf("account modifiers = %#v", accounts.Columns)
 	}

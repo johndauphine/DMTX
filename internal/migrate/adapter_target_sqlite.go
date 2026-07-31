@@ -95,6 +95,14 @@ func (adapter *sqliteTargetAdapter) PlanTables(
 			targetTable.Schema = ""
 			targetTable.Identity = cloneSchemaIdentity(sourceTable.Identity)
 		}
+		if err := rebaseProjectedForeignKeySchemas(
+			sourceTable.Schema,
+			"",
+			"SQLite",
+			&targetTable,
+		); err != nil {
+			return nil, err
+		}
 		if _, err := schema.DropTable(schema.SQLite, targetTable); err != nil {
 			return nil, fmt.Errorf(
 				"plan SQLite table %s: %w",

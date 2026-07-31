@@ -111,6 +111,14 @@ func (adapter *mysqlTargetAdapter) PlanTables(
 			return nil, err
 		}
 		targetTable.Schema = adapter.namespace
+		if err := rebaseProjectedForeignKeySchemas(
+			sourceTable.Schema,
+			adapter.namespace,
+			"MySQL",
+			&targetTable,
+		); err != nil {
+			return nil, err
+		}
 		targetTables = append(targetTables, targetTable)
 	}
 	if sourceEngine == "sqlite" {

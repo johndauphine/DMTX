@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
+	"unicode/utf8"
 )
 
 const SchemaSnapshotVersion = 1
@@ -51,8 +53,30 @@ type SnapshotColumn struct {
 }
 
 type SnapshotDeclaredType struct {
-	Base      string `json:"base"`
-	Arguments []int  `json:"arguments"`
+	Base                      string                       `json:"base"`
+	Arguments                 []int                        `json:"arguments"`
+	Length                    *int64                       `json:"length,omitempty"`
+	Precision                 *int64                       `json:"precision,omitempty"`
+	Scale                     *int64                       `json:"scale,omitempty"`
+	FractionalSecondPrecision *int64                       `json:"fractional_second_precision,omitempty"`
+	Spatial                   *SnapshotSpatialTypeMetadata `json:"spatial,omitempty"`
+	MySQL                     *SnapshotMySQLTypeMetadata   `json:"mysql,omitempty"`
+}
+
+type SnapshotCatalogType = SnapshotDeclaredType
+
+type SnapshotSpatialTypeMetadata struct {
+	Subtype SpatialSubtype `json:"subtype"`
+	SRID    *uint32        `json:"srid,omitempty"`
+}
+
+type SnapshotMySQLTypeMetadata struct {
+	Unsigned    bool     `json:"unsigned,omitempty"`
+	Zerofill    bool     `json:"zerofill,omitempty"`
+	TinyIntOne  bool     `json:"tinyint_one,omitempty"`
+	BitWidth    *int64   `json:"bit_width,omitempty"`
+	EnumMembers []string `json:"enum_members,omitempty"`
+	SetMembers  []string `json:"set_members,omitempty"`
 }
 
 type SnapshotIndexColumn struct {
@@ -71,6 +95,7 @@ type SnapshotIndex struct {
 type SnapshotForeignKey struct {
 	Name              string   `json:"name"`
 	Columns           []string `json:"columns"`
+	ReferencedSchema  string   `json:"referenced_schema,omitempty"`
 	ReferencedTable   string   `json:"referenced_table"`
 	ReferencedColumns []string `json:"referenced_columns"`
 	OnUpdate          string   `json:"on_update"`
@@ -119,10 +144,8 @@ func NewSchemaSnapshot(tables []Table) (SchemaSnapshot, error) {
 				PrimaryKeyPosition: column.PrimaryKeyPosition,
 			}
 			if column.DeclaredType != nil {
-				convertedColumn.DeclaredType = &SnapshotDeclaredType{
-					Base:      column.DeclaredType.Base,
-					Arguments: cloneInts(column.DeclaredType.Arguments),
-				}
+				convertedColumn.DeclaredType =
+					snapshotDeclaredTypeFromCatalog(*column.DeclaredType)
 			}
 			if column.Default != nil {
 				value := column.Default.CanonicalSQL()
@@ -150,6 +173,7 @@ func NewSchemaSnapshot(tables []Table) (SchemaSnapshot, error) {
 			converted.ForeignKeys[foreignKeyPosition] = SnapshotForeignKey{
 				Name:              foreignKey.Name,
 				Columns:           cloneStrings(foreignKey.Columns),
+				ReferencedSchema:  foreignKey.ReferencedSchema,
 				ReferencedTable:   foreignKey.ReferencedTable,
 				ReferencedColumns: cloneStrings(foreignKey.ReferencedColumns),
 				OnUpdate:          foreignKey.OnUpdate,
@@ -172,6 +196,11 @@ func NewSchemaSnapshot(tables []Table) (SchemaSnapshot, error) {
 // versions, and ambiguous duplicate identities instead of silently accepting
 // state that a newer or older binary may interpret differently.
 func ParseSchemaSnapshot(data []byte) (SchemaSnapshot, error) {
+	if !utf8.Valid(data) {
+		return SchemaSnapshot{}, fmt.Errorf(
+			"decode schema snapshot: invalid UTF-8",
+		)
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var snapshot SchemaSnapshot
@@ -309,10 +338,18 @@ func normalizeSnapshotTable(table SnapshotTable) (SnapshotTable, error) {
 		columns[column.Name] = struct{}{}
 		normalizedColumn := column
 		if column.DeclaredType != nil {
-			normalizedColumn.DeclaredType = &SnapshotDeclaredType{
-				Base:      column.DeclaredType.Base,
-				Arguments: cloneInts(column.DeclaredType.Arguments),
+			if err := validateSnapshotCatalogBoundary(
+				*column.DeclaredType,
+			); err != nil {
+				return SnapshotTable{}, fmt.Errorf(
+					"schema snapshot table %s column %s: %w",
+					snapshotQualifiedName(table),
+					column.Name,
+					err,
+				)
 			}
+			normalizedColumn.DeclaredType =
+				cloneSnapshotDeclaredType(column.DeclaredType)
 		}
 		if column.Default != nil {
 			value := *column.Default
@@ -333,6 +370,19 @@ func normalizeSnapshotTable(table SnapshotTable) (SnapshotTable, error) {
 		return snapshotObjectKey(normalized.Indexes[left]) <
 			snapshotObjectKey(normalized.Indexes[right])
 	})
+	for _, foreignKey := range normalized.ForeignKeys {
+		if !utf8.ValidString(foreignKey.ReferencedSchema) ||
+			strings.ContainsRune(
+				foreignKey.ReferencedSchema,
+				'\x00',
+			) {
+			return SnapshotTable{}, fmt.Errorf(
+				"schema snapshot table %s foreign key %s has an invalid referenced schema",
+				snapshotQualifiedName(table),
+				foreignKey.Name,
+			)
+		}
+	}
 	sort.Slice(normalized.ForeignKeys, func(left, right int) bool {
 		return snapshotObjectKey(normalized.ForeignKeys[left]) <
 			snapshotObjectKey(normalized.ForeignKeys[right])
@@ -384,6 +434,7 @@ func cloneSnapshotForeignKeys(foreignKeys []SnapshotForeignKey) []SnapshotForeig
 		result[index] = SnapshotForeignKey{
 			Name:              value.Name,
 			Columns:           cloneStrings(value.Columns),
+			ReferencedSchema:  value.ReferencedSchema,
 			ReferencedTable:   value.ReferencedTable,
 			ReferencedColumns: cloneStrings(value.ReferencedColumns),
 			OnUpdate:          value.OnUpdate,
@@ -392,6 +443,105 @@ func cloneSnapshotForeignKeys(foreignKeys []SnapshotForeignKey) []SnapshotForeig
 		}
 	}
 	return result
+}
+
+func validateSnapshotCatalogBoundary(value SnapshotDeclaredType) error {
+	catalog := snapshotDeclaredTypeToCatalog(value)
+	if strings.TrimSpace(catalog.Base) == "" {
+		return fmt.Errorf("has an empty declared type")
+	}
+	if len(catalog.Arguments) > 2 {
+		return fmt.Errorf(
+			"declared type %q has too many modifiers: %v",
+			catalog.Base,
+			catalog.Arguments,
+		)
+	}
+	base := canonicalCatalogBase(catalog.Base)
+	for index, argument := range catalog.Arguments {
+		postgresNumericScale := (base == "numeric" ||
+			base == "decimal") &&
+			index == 1
+		if argument < 0 && !postgresNumericScale {
+			return fmt.Errorf(
+				"declared type %q has a negative modifier: %d",
+				catalog.Base,
+				argument,
+			)
+		}
+	}
+	return ValidateCatalogType(catalog)
+}
+
+func snapshotDeclaredTypeFromCatalog(
+	value DeclaredType,
+) *SnapshotDeclaredType {
+	result := &SnapshotDeclaredType{
+		Base:                      value.Base,
+		Arguments:                 cloneInts(value.Arguments),
+		Length:                    cloneInt64Pointer(value.Length),
+		Precision:                 cloneInt64Pointer(value.Precision),
+		Scale:                     cloneInt64Pointer(value.Scale),
+		FractionalSecondPrecision: cloneInt64Pointer(value.FractionalSecondPrecision),
+	}
+	if value.Spatial != nil {
+		result.Spatial = &SnapshotSpatialTypeMetadata{
+			Subtype: value.Spatial.Subtype,
+			SRID:    cloneUint32Pointer(value.Spatial.SRID),
+		}
+	}
+	if value.MySQL != nil {
+		result.MySQL = &SnapshotMySQLTypeMetadata{
+			Unsigned:    value.MySQL.Unsigned,
+			Zerofill:    value.MySQL.Zerofill,
+			TinyIntOne:  value.MySQL.TinyIntOne,
+			BitWidth:    cloneInt64Pointer(value.MySQL.BitWidth),
+			EnumMembers: cloneOptionalStrings(value.MySQL.EnumMembers),
+			SetMembers:  cloneOptionalStrings(value.MySQL.SetMembers),
+		}
+	}
+	return result
+}
+
+func snapshotDeclaredTypeToCatalog(
+	value SnapshotDeclaredType,
+) DeclaredType {
+	result := DeclaredType{
+		Base:                      value.Base,
+		Arguments:                 cloneInts(value.Arguments),
+		Length:                    cloneInt64Pointer(value.Length),
+		Precision:                 cloneInt64Pointer(value.Precision),
+		Scale:                     cloneInt64Pointer(value.Scale),
+		FractionalSecondPrecision: cloneInt64Pointer(value.FractionalSecondPrecision),
+	}
+	if value.Spatial != nil {
+		result.Spatial = &SpatialTypeMetadata{
+			Subtype: value.Spatial.Subtype,
+			SRID:    cloneUint32Pointer(value.Spatial.SRID),
+		}
+	}
+	if value.MySQL != nil {
+		result.MySQL = &MySQLTypeMetadata{
+			Unsigned:    value.MySQL.Unsigned,
+			Zerofill:    value.MySQL.Zerofill,
+			TinyIntOne:  value.MySQL.TinyIntOne,
+			BitWidth:    cloneInt64Pointer(value.MySQL.BitWidth),
+			EnumMembers: cloneOptionalStrings(value.MySQL.EnumMembers),
+			SetMembers:  cloneOptionalStrings(value.MySQL.SetMembers),
+		}
+	}
+	return result
+}
+
+func cloneSnapshotDeclaredType(
+	value *SnapshotDeclaredType,
+) *SnapshotDeclaredType {
+	if value == nil {
+		return nil
+	}
+	return snapshotDeclaredTypeFromCatalog(
+		snapshotDeclaredTypeToCatalog(*value),
+	)
 }
 
 func rejectDuplicateSnapshotObjects[T any](
@@ -442,4 +592,27 @@ func cloneInts(values []int) []int {
 		return []int{}
 	}
 	return append([]int(nil), values...)
+}
+
+func cloneOptionalStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	return append([]string{}, values...)
+}
+
+func cloneInt64Pointer(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneUint32Pointer(value *uint32) *uint32 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }

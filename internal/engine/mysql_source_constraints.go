@@ -586,11 +586,12 @@ func discoverMySQL80SourceForeignKeys(
 				)
 			}
 			foreignKeys = append(foreignKeys, schema.ForeignKey{
-				Name:            catalog.name,
-				ReferencedTable: catalog.referencedTable.String,
-				OnUpdate:        catalog.onUpdate,
-				OnDelete:        catalog.onDelete,
-				Match:           catalog.match,
+				Name:             catalog.name,
+				ReferencedSchema: catalog.referencedSchema.String,
+				ReferencedTable:  catalog.referencedTable.String,
+				OnUpdate:         catalog.onUpdate,
+				OnDelete:         catalog.onDelete,
+				Match:            catalog.match,
 			})
 			current = &foreignKeys[len(foreignKeys)-1]
 			uniqueName = catalog.uniqueConstraintName.String

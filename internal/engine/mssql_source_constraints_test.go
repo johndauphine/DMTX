@@ -530,6 +530,7 @@ func TestSQLServerSourceForeignKeyFromCatalogPreservesOrderAndActions(
 	}
 	expected := schema.ForeignKey{
 		Name:              "FK_orders_parent",
+		ReferencedSchema:  "dbo",
 		ReferencedTable:   "parents",
 		Columns:           []string{"tenant_id", "parent_id"},
 		ReferencedColumns: []string{"tenant_id", "parent_id"},

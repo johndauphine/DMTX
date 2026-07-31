@@ -268,6 +268,51 @@ func TestValidateMySQLRetainedTableShapeReportsFirstMismatch(t *testing.T) {
 	}
 }
 
+func TestValidateMySQLRetainedTableShapeAcceptsRebasedOwnerRelativeForeignKey(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	planned := mysqlNativeTestTable()
+	planned.Schema = "target"
+	planned.ForeignKeys = []schema.ForeignKey{{
+		Name:              "items_parent_fk",
+		Columns:           []string{"id"},
+		ReferencedTable:   "parents",
+		ReferencedColumns: []string{"id"},
+		OnUpdate:          "NO ACTION",
+		OnDelete:          "CASCADE",
+		Match:             "NONE",
+	}}
+	actual := planned
+	actual.ForeignKeys = append(
+		[]schema.ForeignKey(nil),
+		planned.ForeignKeys...,
+	)
+	actual.ForeignKeys[0].ReferencedSchema = "target"
+
+	if err := validateMySQLRetainedTableShape(
+		planned,
+		actual,
+	); err == nil {
+		t.Fatal("unqualified planned reference matched qualified catalog shape")
+	}
+	if err := rebaseProjectedForeignKeySchemas(
+		"",
+		"target",
+		"MySQL",
+		&planned,
+	); err != nil {
+		t.Fatalf("rebase owner-relative foreign key: %v", err)
+	}
+	if err := validateMySQLRetainedTableShape(
+		planned,
+		actual,
+	); err != nil {
+		t.Fatalf("rebased retained shape was rejected: %v", err)
+	}
+}
+
 func TestValidateMySQLRetainedColumnTreatsUUIDAsPhysicalVarchar36(
 	t *testing.T,
 ) {

@@ -790,9 +790,19 @@ func validateSQLServerForeignKey(
 			"invalid column count on "+name,
 		)
 	}
+	referencedSchema := foreignKey.ReferencedSchema
+	if referencedSchema == "" {
+		referencedSchema = table.source.Schema
+	} else if err := validateSQLServerIdentifier(
+		"referenced schema",
+		referencedSchema,
+		false,
+	); err != nil {
+		return nil, "", err
+	}
 	var referenced *sqlServerTargetTable
 	for index := range tables {
-		if strings.EqualFold(tables[index].source.Schema, table.source.Schema) &&
+		if strings.EqualFold(tables[index].source.Schema, referencedSchema) &&
 			strings.EqualFold(
 				tables[index].source.Name,
 				foreignKey.ReferencedTable,
@@ -1621,9 +1631,14 @@ func sqlServerCheckSortKey(check CheckConstraint) string {
 }
 
 func sqlServerForeignKeySortKey(foreignKey ForeignKey) string {
-	return strings.Join([]string{
+	parts := []string{
 		foreignKey.Name,
 		strings.Join(foreignKey.Columns, "\x01"),
+	}
+	if foreignKey.ReferencedSchema != "" {
+		parts = append(parts, foreignKey.ReferencedSchema)
+	}
+	parts = append(parts,
 		foreignKey.ReferencedTable,
 		strings.Join(foreignKey.ReferencedColumns, "\x01"),
 		strings.ToUpper(strings.Join(strings.Fields(
@@ -1633,7 +1648,8 @@ func sqlServerForeignKeySortKey(foreignKey ForeignKey) string {
 			foreignKey.OnDelete,
 		), " ")),
 		strings.ToUpper(strings.TrimSpace(foreignKey.Match)),
-	}, "\x00")
+	)
+	return strings.Join(parts, "\x00")
 }
 
 func sqlServerTableSortKey(table Table) string {

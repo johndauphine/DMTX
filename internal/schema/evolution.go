@@ -142,14 +142,15 @@ func validateEvolutionCatalogTable(table Table) error {
 				"schema contract",
 			)
 		}
-		if column.DeclaredType != nil &&
-			strings.TrimSpace(column.DeclaredType.Base) == "" {
-			return evolutionPolicy(
-				operation,
-				"declared type is incomplete for "+
-					table.Name+"."+column.Name,
-				"schema contract",
-			)
+		if column.DeclaredType != nil {
+			if err := ValidateDeclaredType(*column.DeclaredType); err != nil {
+				return evolutionPolicy(
+					operation,
+					"declared type is invalid for "+
+						table.Name+"."+column.Name+": "+err.Error(),
+					"schema contract",
+				)
+			}
 		}
 		if column.Default != nil &&
 			!validEvolutionCatalogDefault(*column.Default) {
@@ -390,6 +391,9 @@ func validateEvolutionCatalogForeignKey(
 	if !validEvolutionCatalogIdentifier(
 		foreignKey.ReferencedTable,
 		false,
+	) || !validEvolutionCatalogIdentifier(
+		foreignKey.ReferencedSchema,
+		true,
 	) {
 		return evolutionPolicy(
 			operation,
@@ -456,15 +460,15 @@ func evolutionCatalogReferencedTable(
 	foreignKey ForeignKey,
 ) (Table, error) {
 	const operation = "prove complete evolution catalog"
-	// ForeignKey has no referenced-schema field. The neutral relation model,
-	// like the PostgreSQL and MySQL object planners, therefore interprets the
-	// name inside its owner's schema. A table found only in another schema is
-	// not proof of a cross-schema relation.
+	referencedSchema := foreignKey.ReferencedSchema
+	if referencedSchema == "" {
+		referencedSchema = owner.Schema
+	}
 	matches := make([]Table, 0, 1)
 	for _, candidate := range tables {
 		if evolutionIdentifiersMayAlias(
 			candidate.Schema,
-			owner.Schema,
+			referencedSchema,
 		) && evolutionIdentifiersMayAlias(
 			candidate.Name,
 			foreignKey.ReferencedTable,
@@ -476,18 +480,20 @@ func evolutionCatalogReferencedTable(
 		return Table{}, evolutionPolicy(
 			operation,
 			"foreign key from "+owner.Name+
-				" has a missing or ambiguous owner-schema table "+
+				" has a missing or ambiguous referenced table "+
+				referencedSchema+"."+
 				foreignKey.ReferencedTable,
 			"schema contract",
 		)
 	}
 	referenced := matches[0]
 	if referenced.Name != foreignKey.ReferencedTable ||
-		referenced.Schema != owner.Schema {
+		referenced.Schema != referencedSchema {
 		return Table{}, evolutionPolicy(
 			operation,
 			"foreign key from "+owner.Name+
-				" has an unproved unqualified table reference "+
+				" has an unproved qualified table reference "+
+				referencedSchema+"."+
 				foreignKey.ReferencedTable,
 			"schema contract",
 		)
@@ -1494,8 +1500,14 @@ func evolutionDeclaredTypeRelation(
 	previousBase := normalizeEvolutionType(previous.Base)
 	currentBase := normalizeEvolutionType(current.Base)
 	if equivalentEvolutionDeclaredBase(previousBase, currentBase) &&
-		reflect.DeepEqual(previous.Arguments, current.Arguments) {
+		evolutionDeclaredModifiersEqual(previous, current) {
 		return evolutionTypeEqual
+	}
+	if catalogTypeUsesStructuredModifiers(previous) ||
+		catalogTypeUsesStructuredModifiers(current) {
+		// Named catalog modifiers are preserved by the evolution proof, but no
+		// widening is inferred until every target renderer consumes them.
+		return evolutionTypeInvalid
 	}
 	if rank, ok := evolutionIntegerRank(previousBase); ok {
 		currentRank, currentOK := evolutionIntegerRank(currentBase)
@@ -1597,6 +1609,10 @@ func evolutionDeclaredWideningMatchesGeneric(
 func evolutionTypeEvidenceConsistent(column Column) bool {
 	if column.DeclaredType == nil {
 		return true
+	}
+	if catalogTypeUsesStructuredModifiers(*column.DeclaredType) &&
+		ValidateDeclaredType(*column.DeclaredType) != nil {
+		return false
 	}
 	generic := canonicalEvolutionGenericType(column.Type)
 	base := normalizeEvolutionType(column.DeclaredType.Base)
@@ -1865,7 +1881,34 @@ func cloneEvolutionDeclaredType(value *DeclaredType) *DeclaredType {
 	if value.Arguments != nil {
 		cloned.Arguments = append([]int{}, value.Arguments...)
 	}
+	cloned.Length = cloneInt64Pointer(value.Length)
+	cloned.Precision = cloneInt64Pointer(value.Precision)
+	cloned.Scale = cloneInt64Pointer(value.Scale)
+	cloned.FractionalSecondPrecision = cloneInt64Pointer(
+		value.FractionalSecondPrecision,
+	)
+	if value.Spatial != nil {
+		spatial := *value.Spatial
+		spatial.SRID = cloneUint32Pointer(value.Spatial.SRID)
+		cloned.Spatial = &spatial
+	}
+	if value.MySQL != nil {
+		mysql := *value.MySQL
+		mysql.BitWidth = cloneInt64Pointer(value.MySQL.BitWidth)
+		mysql.EnumMembers = cloneOptionalStrings(value.MySQL.EnumMembers)
+		mysql.SetMembers = cloneOptionalStrings(value.MySQL.SetMembers)
+		cloned.MySQL = &mysql
+	}
 	return &cloned
+}
+
+func evolutionDeclaredModifiersEqual(
+	previous,
+	current DeclaredType,
+) bool {
+	previous.Base = ""
+	current.Base = ""
+	return reflect.DeepEqual(previous, current)
 }
 
 func cloneEvolutionStrings(value []string) []string {

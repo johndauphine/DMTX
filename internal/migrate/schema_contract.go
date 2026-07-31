@@ -2008,6 +2008,10 @@ func schemaContractReferencedTableMatches(
 	key schemaContractTableKey,
 ) bool {
 	reference := foreignKey.ReferencedTable
+	if foreignKey.ReferencedSchema != "" {
+		return foreignKey.ReferencedSchema == key.schema &&
+			reference == key.table
+	}
 	if reference == key.schema+"."+key.table && key.schema != "" {
 		return true
 	}

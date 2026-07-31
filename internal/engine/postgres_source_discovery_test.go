@@ -48,6 +48,8 @@ func TestPostgresSourceColumnFromCatalogPreservesExactModifiers(
 	t *testing.T,
 ) {
 	numericModifier := int32(4 + (12 << 16) + 2)
+	negativeScaleModifier := int32(4 + (2 << 16) + ((-3) & 0x7ff))
+	wideScaleModifier := int32(4 + (3 << 16) + 5)
 	tests := []struct {
 		name     string
 		catalog  postgresSourceColumnCatalog
@@ -97,6 +99,38 @@ func TestPostgresSourceColumnFromCatalogPreservesExactModifiers(
 				DeclaredType: &schema.DeclaredType{
 					Base:      "numeric",
 					Arguments: []int{12, 2},
+				},
+			},
+		},
+		{
+			name: "numeric negative scale",
+			catalog: validPostgresSourceColumnCatalog(
+				"bucket",
+				"numeric",
+				negativeScaleModifier,
+			),
+			expected: schema.Column{
+				Name: "bucket",
+				Type: "numeric",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "numeric",
+					Arguments: []int{2, -3},
+				},
+			},
+		},
+		{
+			name: "numeric scale exceeds precision",
+			catalog: validPostgresSourceColumnCatalog(
+				"ratio",
+				"numeric",
+				wideScaleModifier,
+			),
+			expected: schema.Column{
+				Name: "ratio",
+				Type: "numeric",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "numeric",
+					Arguments: []int{3, 5},
 				},
 			},
 		},
@@ -205,6 +239,24 @@ func TestPostgresSourceColumnFromCatalogFailsClosed(t *testing.T) {
 			mutate: func(value *postgresSourceColumnCatalog) {
 				value.typeName = "time"
 				value.typeModifier = 7
+			},
+		},
+		{
+			name: "numeric scale below PostgreSQL range",
+			mutate: func(value *postgresSourceColumnCatalog) {
+				value.typeName = "numeric"
+				value.typeModifier = int32(
+					4 + (2 << 16) + ((-1001) & 0x7ff),
+				)
+			},
+		},
+		{
+			name: "numeric scale above PostgreSQL range",
+			mutate: func(value *postgresSourceColumnCatalog) {
+				value.typeName = "numeric"
+				value.typeModifier = int32(
+					4 + (2 << 16) + (1001 & 0x7ff),
+				)
 			},
 		},
 		{
@@ -410,6 +462,7 @@ func TestPostgresSourceForeignKeyFromCatalog(t *testing.T) {
 	want := schema.ForeignKey{
 		Name:              "events_account_fkey",
 		Columns:           []string{"tenant_id", "account_id"},
+		ReferencedSchema:  "source",
 		ReferencedTable:   "accounts",
 		ReferencedColumns: []string{"tenant_id", "id"},
 		OnUpdate:          "CASCADE",

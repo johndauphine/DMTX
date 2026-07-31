@@ -197,8 +197,12 @@ func planPostgresRetainedIndexesAndForeignKeys(
 			)
 		}
 		for index, source := range foreignKeys {
+			referencedSchema := source.ReferencedSchema
+			if referencedSchema == "" {
+				referencedSchema = table.Schema
+			}
 			referencedKey := postgresRetainedTableKey(
-				table.Schema,
+				referencedSchema,
 				source.ReferencedTable,
 			)
 			referenced, ok := byName[referencedKey]
@@ -814,6 +818,9 @@ func postgresRetainedForeignKeySortKey(
 ) string {
 	parts := []string{foreignKey.Name}
 	parts = append(parts, foreignKey.Columns...)
+	if foreignKey.ReferencedSchema != "" {
+		parts = append(parts, foreignKey.ReferencedSchema)
+	}
 	parts = append(parts, foreignKey.ReferencedTable)
 	parts = append(parts, foreignKey.ReferencedColumns...)
 	parts = append(

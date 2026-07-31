@@ -305,7 +305,10 @@ func compareSnapshotTable(previous, current SnapshotTable) ([]SchemaDriftFact, e
 			))
 		default:
 			if previousColumn.Type != currentColumn.Type ||
-				!reflect.DeepEqual(previousColumn.DeclaredType, currentColumn.DeclaredType) {
+				!reflect.DeepEqual(
+					previousColumn.DeclaredType,
+					currentColumn.DeclaredType,
+				) {
 				facts = append(facts, newSchemaDriftFact(
 					SchemaContractDataType,
 					SchemaDriftDataTypeChanged,
@@ -938,8 +941,7 @@ func validateSnapshotForDrift(snapshot SchemaSnapshot) error {
 }
 
 func validateSnapshotDeclaredType(value SnapshotDeclaredType) error {
-	base := strings.ToLower(strings.Join(strings.Fields(value.Base), " "))
-	if base == "" {
+	if strings.TrimSpace(value.Base) == "" {
 		return fmt.Errorf("has an empty declared type")
 	}
 	if len(value.Arguments) > 2 {
@@ -958,45 +960,10 @@ func validateSnapshotDeclaredType(value SnapshotDeclaredType) error {
 			)
 		}
 	}
-	if len(value.Arguments) == 0 {
-		return nil
+	if err := ValidateCatalogType(
+		snapshotDeclaredTypeToCatalog(value),
+	); err != nil {
+		return err
 	}
-
-	invalid := func() error {
-		return fmt.Errorf(
-			"declared type %q has invalid modifiers: %v",
-			value.Base,
-			value.Arguments,
-		)
-	}
-	switch base {
-	case "numeric", "decimal":
-		precision := value.Arguments[0]
-		if precision <= 0 {
-			return invalid()
-		}
-		if len(value.Arguments) == 2 && value.Arguments[1] > precision {
-			return invalid()
-		}
-		return nil
-	case "char", "character", "character varying", "varchar",
-		"varying character", "binary", "varbinary", "nchar",
-		"native character", "nvarchar", "float":
-		if len(value.Arguments) != 1 || value.Arguments[0] <= 0 {
-			return invalid()
-		}
-		return nil
-	case "tinyint":
-		if len(value.Arguments) != 1 || value.Arguments[0] != 1 {
-			return invalid()
-		}
-		return nil
-	case "time", "datetime", "timestamp", "timestamptz":
-		if len(value.Arguments) != 1 || value.Arguments[0] > 6 {
-			return invalid()
-		}
-		return nil
-	default:
-		return invalid()
-	}
+	return nil
 }

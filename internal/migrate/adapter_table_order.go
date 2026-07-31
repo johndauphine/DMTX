@@ -44,8 +44,12 @@ func orderAdapterSourceTablesForMode(
 	for _, child := range ordered {
 		childKey := adapterSourceTableKey(child.Schema, child.Name)
 		for _, foreignKey := range child.ForeignKeys {
+			referencedSchema := foreignKey.ReferencedSchema
+			if referencedSchema == "" {
+				referencedSchema = child.Schema
+			}
 			parentKey := adapterSourceTableKey(
-				child.Schema,
+				referencedSchema,
 				foreignKey.ReferencedTable,
 			)
 			if _, selected := byKey[parentKey]; !selected {
@@ -98,7 +102,12 @@ func orderAdapterSourceTablesForMode(
 
 func hasInScopeSelfReference(table schema.Table) bool {
 	for _, foreignKey := range table.ForeignKeys {
-		if foreignKey.ReferencedTable == table.Name {
+		referencedSchema := foreignKey.ReferencedSchema
+		if referencedSchema == "" {
+			referencedSchema = table.Schema
+		}
+		if referencedSchema == table.Schema &&
+			foreignKey.ReferencedTable == table.Name {
 			return true
 		}
 	}

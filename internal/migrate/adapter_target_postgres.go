@@ -91,6 +91,14 @@ func (adapter *postgresTargetAdapter) PlanTables(
 			return nil, err
 		}
 		targetTable := postgresTargetTable(projected, adapter.namespace)
+		if err := rebaseProjectedForeignKeySchemas(
+			sourceTable.Schema,
+			adapter.namespace,
+			"PostgreSQL",
+			&targetTable,
+		); err != nil {
+			return nil, err
+		}
 		if _, err := schema.DropTable(schema.Postgres, targetTable); err != nil {
 			return nil, fmt.Errorf(
 				"plan PostgreSQL table %s: %w",

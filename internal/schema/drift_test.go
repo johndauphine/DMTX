@@ -507,7 +507,7 @@ func TestCompareSchemaSnapshotsFailsClosedOnMalformedOrAmbiguousInput(t *testing
 					Columns: []SnapshotColumn{{
 						Name: "id", Type: "numeric",
 						DeclaredType: &SnapshotDeclaredType{
-							Base: "decimal", Arguments: []int{2, 9},
+							Base: "decimal", Arguments: []int{2, 1001},
 						},
 					}},
 				}},

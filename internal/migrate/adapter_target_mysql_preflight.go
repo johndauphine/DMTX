@@ -249,6 +249,7 @@ func validateMySQLRetainedTableShape(
 			)
 		}
 		if expected.Name != found.Name ||
+			expected.ReferencedSchema != found.ReferencedSchema ||
 			expected.ReferencedTable != found.ReferencedTable ||
 			expected.OnUpdate != found.OnUpdate ||
 			expected.OnDelete != found.OnDelete ||

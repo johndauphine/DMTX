@@ -99,7 +99,8 @@ func postgresNumericModifiers(
 	if len(value.Arguments) == 2 {
 		scale = value.Arguments[1]
 	}
-	if precision < 1 || precision > 1000 || scale < 0 || scale > precision {
+	if precision < 1 || precision > 1000 ||
+		scale < -1000 || scale > 1000 {
 		return 0, 0, false
 	}
 	return precision, scale, true
@@ -265,14 +266,45 @@ func validatePostgresDecimalLiteral(
 		(fraction != "" && !decimalDigits(fraction)) {
 		return fmt.Errorf("invalid numeric")
 	}
-	for len(fraction) > scale {
-		if fraction[len(fraction)-1] != '0' {
+	if scale >= 0 {
+		for len(fraction) > scale {
+			if fraction[len(fraction)-1] != '0' {
+				return fmt.Errorf("numeric exceeds scale")
+			}
+			fraction = fraction[:len(fraction)-1]
+		}
+		integerDigits := len(strings.TrimLeft(whole, "0"))
+		integerCapacity := precision - scale
+		if integerCapacity >= 0 {
+			if integerDigits > integerCapacity {
+				return fmt.Errorf("numeric exceeds precision")
+			}
+			return nil
+		}
+		if integerDigits != 0 {
+			return fmt.Errorf("numeric exceeds precision")
+		}
+		requiredLeadingZeroes := -integerCapacity
+		for index := 0; index < requiredLeadingZeroes && index < len(fraction); index++ {
+			if fraction[index] != '0' {
+				return fmt.Errorf("numeric exceeds precision")
+			}
+		}
+		return nil
+	}
+
+	for _, digit := range fraction {
+		if digit != '0' {
 			return fmt.Errorf("numeric exceeds scale")
 		}
-		fraction = fraction[:len(fraction)-1]
 	}
-	integerDigits := len(strings.TrimLeft(whole, "0"))
-	if integerDigits > precision-scale {
+	roundingDigits := -scale
+	for index := len(whole) - 1; index >= 0 && index >= len(whole)-roundingDigits; index-- {
+		if whole[index] != '0' {
+			return fmt.Errorf("numeric exceeds scale")
+		}
+	}
+	if len(strings.TrimLeft(whole, "0")) > precision-scale {
 		return fmt.Errorf("numeric exceeds precision")
 	}
 	return nil

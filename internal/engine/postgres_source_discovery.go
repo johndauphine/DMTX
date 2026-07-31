@@ -535,7 +535,7 @@ func postgresSourceNumericModifiers(
 		scale -= 2048
 	}
 	if precision < 1 || precision > 1000 ||
-		scale < 0 || scale > precision {
+		scale < -1000 || scale > 1000 {
 		return 0, 0, false
 	}
 	return precision, scale, true

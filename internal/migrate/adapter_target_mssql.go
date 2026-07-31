@@ -89,6 +89,14 @@ func (adapter *sqlServerTargetAdapter) PlanTables(
 			return nil, err
 		}
 		targetTable.Schema = adapter.namespace
+		if err := rebaseProjectedForeignKeySchemas(
+			sourceTable.Schema,
+			adapter.namespace,
+			"SQL Server",
+			&targetTable,
+		); err != nil {
+			return nil, err
+		}
 		if _, err := schema.DropSQLServerTable(targetTable); err != nil {
 			return nil, fmt.Errorf(
 				"plan SQL Server table %s drop: %w",

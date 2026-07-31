@@ -735,6 +735,124 @@ func TestStage4SchemaGateTypeDiscardRetainsSuccessfulEvidenceWithoutRichProjecti
 	}
 }
 
+func TestSelectStage4ForeignKeysIncludesReferencedSchemaInIdentity(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	rich := []schema.ForeignKey{
+		{
+			Name:              "events_accounts_fk",
+			Columns:           []string{"account_id"},
+			ReferencedSchema:  "identity",
+			ReferencedTable:   "accounts",
+			ReferencedColumns: []string{"id"},
+		},
+		{
+			Name:              "events_accounts_fk",
+			Columns:           []string{"account_id"},
+			ReferencedSchema:  "archive",
+			ReferencedTable:   "accounts",
+			ReferencedColumns: []string{"id"},
+		},
+	}
+	requested := []schema.SnapshotForeignKey{{
+		Name:              "events_accounts_fk",
+		Columns:           []string{"account_id"},
+		ReferencedSchema:  "identity",
+		ReferencedTable:   "accounts",
+		ReferencedColumns: []string{"id"},
+	}}
+	selected, err := selectStage4ForeignKeys(rich, requested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 1 ||
+		selected[0].ReferencedSchema != "identity" {
+		t.Fatalf("selected foreign keys = %#v", selected)
+	}
+
+	requested[0].ReferencedSchema = "missing"
+	if _, err := selectStage4ForeignKeys(rich, requested); err == nil {
+		t.Fatal("unknown qualified foreign-key identity unexpectedly selected")
+	}
+}
+
+func TestCloneStage4RichColumnDoesNotAliasStructuredCatalogType(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	length := int64(80)
+	width := int64(12)
+	srid := uint32(4326)
+	sources := []schema.Column{
+		{
+			Name: "label",
+			Type: "text",
+			DeclaredType: &schema.DeclaredType{
+				Base:   "varchar",
+				Length: &length,
+			},
+		},
+		{
+			Name: "position",
+			Type: "geometry",
+			DeclaredType: &schema.DeclaredType{
+				Base: "geometry",
+				Spatial: &schema.SpatialTypeMetadata{
+					Subtype: schema.SpatialSubtypePoint,
+					SRID:    &srid,
+				},
+			},
+		},
+		{
+			Name: "flags",
+			Type: "binary",
+			DeclaredType: &schema.DeclaredType{
+				Base:  "bit",
+				MySQL: &schema.MySQLTypeMetadata{BitWidth: &width},
+			},
+		},
+		{
+			Name: "choice",
+			Type: "text",
+			DeclaredType: &schema.DeclaredType{
+				Base: "enum",
+				MySQL: &schema.MySQLTypeMetadata{
+					EnumMembers: []string{"a", "b"},
+				},
+			},
+		},
+		{
+			Name: "tags",
+			Type: "text",
+			DeclaredType: &schema.DeclaredType{
+				Base: "set",
+				MySQL: &schema.MySQLTypeMetadata{
+					SetMembers: []string{"x", "y"},
+				},
+			},
+		},
+	}
+	clones := make([]schema.Column, len(sources))
+	for index, source := range sources {
+		clones[index] = cloneStage4RichColumn(source)
+	}
+	*clones[0].DeclaredType.Length = 1
+	*clones[1].DeclaredType.Spatial.SRID = 0
+	*clones[2].DeclaredType.MySQL.BitWidth = 1
+	clones[3].DeclaredType.MySQL.EnumMembers[0] = "changed"
+	clones[4].DeclaredType.MySQL.SetMembers[0] = "changed"
+	if *sources[0].DeclaredType.Length != 80 ||
+		*sources[1].DeclaredType.Spatial.SRID != 4326 ||
+		*sources[2].DeclaredType.MySQL.BitWidth != 12 ||
+		sources[3].DeclaredType.MySQL.EnumMembers[0] != "a" ||
+		sources[4].DeclaredType.MySQL.SetMembers[0] != "x" {
+		t.Fatal("Stage 4 rich-column clone retained structured metadata aliases")
+	}
+}
+
 func TestStage4SchemaGateRepresentsRetainedDropsAsTargetCatalogRequirement(
 	t *testing.T,
 ) {
