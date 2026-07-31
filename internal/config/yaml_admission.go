@@ -21,6 +21,7 @@ const (
 	migrationYAMLStringList
 	migrationYAMLSchemaContract
 	migrationYAMLValidation
+	migrationYAMLPreflight
 	migrationYAMLDeletes
 )
 
@@ -47,6 +48,7 @@ var migrationYAMLFields = map[string]migrationYAMLKind{
 	"schema_contract":          migrationYAMLSchemaContract,
 	"schema_evolution":         migrationYAMLSchemaContract,
 	"validation":               migrationYAMLValidation,
+	"preflight":                migrationYAMLPreflight,
 	"deletes":                  migrationYAMLDeletes,
 	"history_retention_days":   migrationYAMLInt,
 	"tuning":                   migrationYAMLNonBlank,
@@ -62,6 +64,10 @@ var validationYAMLFields = map[string]migrationYAMLKind{
 	"fail_on_mismatch":          migrationYAMLBool,
 	"fail_on_timeout":           migrationYAMLBool,
 	"fail_on_estimate_mismatch": migrationYAMLBool,
+}
+
+var preflightYAMLFields = map[string]migrationYAMLKind{
+	"skip_checks": migrationYAMLStringList,
 }
 
 var deletesYAMLFields = map[string]migrationYAMLKind{
@@ -332,6 +338,17 @@ func inspectYAMLValue(
 			field,
 			node,
 			validationYAMLFields,
+			topLevel,
+			explicit,
+		)
+	case migrationYAMLPreflight:
+		if node.Kind != yaml.MappingNode {
+			return fmt.Errorf("%s must be a mapping", field)
+		}
+		return inspectYAMLMapping(
+			field,
+			node,
+			preflightYAMLFields,
 			topLevel,
 			explicit,
 		)

@@ -52,6 +52,7 @@ type Migration struct {
 	// only the preferred name.
 	SchemaEvolution       *SchemaContract  `yaml:"schema_evolution,omitempty" json:"-"`
 	Validation            ValidationPolicy `yaml:"validation"`
+	Preflight             PreflightPolicy  `yaml:"preflight"`
 	Deletes               DeletePolicy     `yaml:"deletes"`
 	HistoryRetentionDays  int              `yaml:"history_retention_days"`
 	Tuning                TuningMode       `yaml:"tuning"`

@@ -41,6 +41,9 @@ func (migration *Migration) captureParsedBaseline() {
 	baseline.DateUpdatedColumns = cloneStringSlice(
 		migration.DateUpdatedColumns,
 	)
+	baseline.Preflight.SkipChecks = cloneStringSlice(
+		migration.Preflight.SkipChecks,
+	)
 	if migration.SchemaContract != nil {
 		contract := *migration.SchemaContract
 		baseline.SchemaContract = &contract
@@ -109,6 +112,11 @@ func sameMigrationField(left, right Migration, field string) bool {
 	case "validation.fail_on_estimate_mismatch":
 		return left.Validation.FailOnEstimateMismatch ==
 			right.Validation.FailOnEstimateMismatch
+	case "preflight.skip_checks":
+		return slices.Equal(
+			left.Preflight.SkipChecks,
+			right.Preflight.SkipChecks,
+		)
 	case "deletes.mode":
 		return left.Deletes.Mode == right.Deletes.Mode
 	case "deletes.target_behavior":
@@ -239,6 +247,8 @@ func (migration Migration) programmaticFieldSet(field string) bool {
 		return migration.Validation.FailOnTimeout
 	case "validation.fail_on_estimate_mismatch":
 		return migration.Validation.FailOnEstimateMismatch
+	case "preflight.skip_checks":
+		return migration.Preflight.SkipChecks != nil
 	case "deletes.mode":
 		return migration.Deletes.Mode != ""
 	case "deletes.target_behavior":

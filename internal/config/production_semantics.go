@@ -112,6 +112,13 @@ type ValidationPolicy struct {
 	FailOnEstimateMismatch bool           `yaml:"fail_on_estimate_mismatch" json:"fail_on_estimate_mismatch"`
 }
 
+// PreflightPolicy contains only explicit operator exceptions. Probe evidence
+// and effective skip provenance are runtime facts and must not be persisted
+// back into configuration.
+type PreflightPolicy struct {
+	SkipChecks []string `yaml:"skip_checks,omitempty" json:"skip_checks"`
+}
+
 type DeleteMode string
 type DeleteTargetBehavior string
 type DeleteSchedule string
@@ -269,6 +276,12 @@ func validateProductionSemantics(migration Migration) error {
 		)
 	}
 
+	if err := validatePreflightSkipChecks(
+		migration.Preflight.SkipChecks,
+	); err != nil {
+		return err
+	}
+
 	switch migration.Deletes.Mode {
 	case DeleteModeOff:
 		if migration.fieldWasSet("deletes.target_behavior") ||
@@ -334,6 +347,76 @@ func validateProductionSemantics(migration Migration) error {
 		return fmt.Errorf(
 			"migration.runtime_tuning_interval must be positive",
 		)
+	}
+	return nil
+}
+
+func validatePreflightSkipChecks(selectors []string) error {
+	seen := make(map[string]struct{}, len(selectors))
+	for index, selector := range selectors {
+		if selector != "all" {
+			if err := validatePreflightSelector(selector); err != nil {
+				return fmt.Errorf(
+					"migration.preflight.skip_checks[%d] %w",
+					index,
+					err,
+				)
+			}
+		}
+		if _, duplicate := seen[selector]; duplicate {
+			return fmt.Errorf(
+				"migration.preflight.skip_checks contains duplicate %q",
+				selector,
+			)
+		}
+		seen[selector] = struct{}{}
+	}
+	return nil
+}
+
+func validatePreflightSelector(value string) error {
+	if value == "" || strings.TrimSpace(value) != value {
+		return fmt.Errorf(
+			"must be non-empty without surrounding whitespace",
+		)
+	}
+	if len(value) > 256 {
+		return fmt.Errorf("must not exceed 256 bytes")
+	}
+	segments := strings.Split(value, ".")
+	if len(segments) < 2 {
+		return fmt.Errorf(
+			"must contain at least two dotted identifiers",
+		)
+	}
+	for _, segment := range segments {
+		if segment == "" {
+			return fmt.Errorf("contains an empty identifier")
+		}
+		if len(segment) > 64 {
+			return fmt.Errorf("identifier must not exceed 64 bytes")
+		}
+		for index := 0; index < len(segment); index++ {
+			character := segment[index]
+			if index == 0 {
+				if character < 'a' || character > 'z' {
+					return fmt.Errorf(
+						"identifier %q must start with a lowercase ASCII letter",
+						segment,
+					)
+				}
+				continue
+			}
+			if character >= 'a' && character <= 'z' ||
+				character >= '0' && character <= '9' ||
+				character == '_' {
+				continue
+			}
+			return fmt.Errorf(
+				"identifier %q contains an unsupported character",
+				segment,
+			)
+		}
 	}
 	return nil
 }

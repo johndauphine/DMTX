@@ -30,6 +30,7 @@ var canonicalMigrationIntentFieldOrder = []string{
 	"validation.fail_on_mismatch",
 	"validation.fail_on_timeout",
 	"validation.fail_on_estimate_mismatch",
+	"preflight.skip_checks",
 	"deletes.mode",
 	"deletes.target_behavior",
 	"deletes.reconcile.schedule",
@@ -154,6 +155,14 @@ func (migration Migration) MarshalYAML() (any, error) {
 		wire.Validation = &validation
 	}
 
+	if migration.fieldWasSet("preflight.skip_checks") {
+		wire.Preflight = &canonicalPreflightYAML{
+			SkipChecks: pointerTo(
+				cloneStringSlice(migration.Preflight.SkipChecks),
+			),
+		}
+	}
+
 	deletes := canonicalDeletesYAML{}
 	if migration.fieldWasSet("deletes.mode") {
 		deletes.Mode = pointerTo(migration.Deletes.Mode)
@@ -235,12 +244,17 @@ type canonicalMigrationYAML struct {
 	FailOnSchemaDrift      *bool                    `yaml:"fail_on_schema_drift,omitempty"`
 	SchemaContract         *SchemaContract          `yaml:"schema_contract,omitempty"`
 	Validation             *canonicalValidationYAML `yaml:"validation,omitempty"`
+	Preflight              *canonicalPreflightYAML  `yaml:"preflight,omitempty"`
 	Deletes                *canonicalDeletesYAML    `yaml:"deletes,omitempty"`
 	HistoryRetentionDays   *int                     `yaml:"history_retention_days,omitempty"`
 	Tuning                 *TuningMode              `yaml:"tuning,omitempty"`
 	RuntimeTuning          *bool                    `yaml:"runtime_tuning,omitempty"`
 	RuntimeTuningInterval  *time.Duration           `yaml:"runtime_tuning_interval,omitempty"`
 	AllowPartial           *bool                    `yaml:"allow_partial,omitempty"`
+}
+
+type canonicalPreflightYAML struct {
+	SkipChecks *[]string `yaml:"skip_checks,omitempty"`
 }
 
 type canonicalValidationYAML struct {
