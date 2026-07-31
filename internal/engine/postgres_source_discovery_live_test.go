@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -28,9 +29,19 @@ func TestInspectPostgres16SourceSchemaLive(t *testing.T) {
 	if parsed.TLSConfig == nil {
 		t.Fatal("DMTX_TEST_POSTGRES_DSN must require TLS")
 	}
+	if !postgresTLSConfigVerifiesServer(parsed.TLSConfig) {
+		t.Fatal(
+			"DMTX_TEST_POSTGRES_DSN must verify the PostgreSQL server certificate",
+		)
+	}
 	for _, fallback := range parsed.Fallbacks {
 		if fallback.TLSConfig == nil {
 			t.Fatal("DMTX_TEST_POSTGRES_DSN fallback must require TLS")
+		}
+		if !postgresTLSConfigVerifiesServer(fallback.TLSConfig) {
+			t.Fatal(
+				"DMTX_TEST_POSTGRES_DSN fallback must verify the PostgreSQL server certificate",
+			)
 		}
 	}
 
@@ -216,6 +227,12 @@ func TestInspectPostgres16SourceSchemaLive(t *testing.T) {
 		)
 		assertPostgresSourcePolicyError(t, err, "identity generation")
 	})
+}
+
+func postgresTLSConfigVerifiesServer(config *tls.Config) bool {
+	return config != nil &&
+		config.RootCAs != nil &&
+		(!config.InsecureSkipVerify || config.VerifyPeerCertificate != nil)
 }
 
 func postgresSourceDiscoveryFixture(
