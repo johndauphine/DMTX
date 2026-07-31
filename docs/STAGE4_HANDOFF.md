@@ -77,6 +77,63 @@ non-incremental delete-reconciliation route. It includes:
 
 The implementation is intentionally fail-closed outside this certified route.
 
+## Live TLS matrix: RUN 2026-07-31
+
+**The 2026-08-06 block did not apply.** It was a Codex approval-service quota,
+not a property of this repository or environment. All five TLS containers were
+already running and healthy, and the matrix was executed directly. Do not
+re-propagate the "blocked until 2026-08-06" claim; it is wrong.
+
+Working DSNs (local test containers, throwaway credentials):
+
+```sh
+export DMTX_TEST_POSTGRES_DSN="postgres://dmtx:dmtx_test_only@127.0.0.1:55432/dmtx_test?sslmode=verify-full&sslrootcert=/private/tmp/dmtx-postgres16-tls.zlfSES/server.crt"
+export DMTX_TEST_MYSQL_CA=/private/tmp/dmtx-mysql80-tls/certs/ca.pem
+export DMTX_TEST_MARIADB_CA=/private/tmp/dmtx-mysql80-tls/certs/ca.pem
+export DMTX_TEST_MSSQL_CA=/private/tmp/dmtx-mssql2022-tls/certs/ca.pem
+export DMTX_TEST_MYSQL_DSN="dmtx:dmtx_test_only@tcp(127.0.0.1:53306)/dmtx?tls=dmtx_test"
+export DMTX_TEST_MARIADB_DSN="dmtx:dmtx_test_only@tcp(127.0.0.1:54306)/dmtx_source?tls=dmtx_mariadb_test"
+export DMTX_TEST_MSSQL_DSN="sqlserver://sa:TestPass2024@127.0.0.1:51433?database=master&encrypt=true&tlsmin=1.2&guid+conversion=true&certificate=/private/tmp/dmtx-mssql2022-tls/certs/ca.pem"
+```
+
+The TLS config names are fixed by the fixtures: `dmtx_test` for MySQL,
+`dmtx_mariadb_test` for MariaDB. SQL Server additionally requires
+`guid conversion=true` and `tlsmin=1.2`.
+
+### Result
+
+`app`, `audit`, `config`, `contract`, `engine`, `schema`, and `state` all pass
+with live TLS enabled. **Every PostgreSQL Stage 4 live route passes**, including
+delete composition, delete crash-resume, incremental composition, schema
+evolution, deep validation, and network crash-resume.
+
+Six failures remain, all in `internal/migrate`, and **every one was verified
+pre-existing** by rerunning it in a detached worktree at `ccc985b`, the
+pre-session commit. The 2026-07-31 session introduced no live regression.
+
+| Failing test | Cause |
+| --- | --- |
+| `TestPostgresToSQLiteCommonFixtureLive` | Stage 3. `renderSQLiteForeignKey` in `internal/schema/sqlite.go` refuses any foreign key with a non-empty `ReferencedSchema`. The fixture's FK references a schema-qualified table, so planning fails before the destructive-acknowledgement gate is reached and the test sees a schema error instead of the safety message. |
+| `TestMySQLToSQLiteCommonFixtureLive` | Same qualified-FK rejection. |
+| `TestMariaDBToSQLiteCommonFixtureLive` | Same qualified-FK rejection. |
+| `TestStage4MySQLStableRunnerLiveTLS` | Times out after 20s: "stable source with one connection: context deadline exceeded". |
+| `TestStage4MariaDBStableRunnerLiveTLS` | Same 20s timeout. |
+| `TestStage4SQLServerStableRunnerLiveTLS` | Same shape, 60s timeout. |
+
+### What to fix first
+
+The qualified-FK cluster is one root cause and looks tractable: when the
+referenced table is itself part of the migration, the planner should resolve the
+reference to the unqualified target table rather than refuse it. Refusal is only
+correct when the reference escapes the migrated set. Fixing it at the renderer
+would be wrong — the renderer cannot know the mapping; fix it in the
+source-to-SQLite projection.
+
+The three single-connection timeouts are a separate root cause and are the more
+serious of the two: they are Stage 4 routes on three engines, and a deadline
+exceeded under a one-connection budget suggests the stable-source path acquires
+more than one connection somewhere on those engines.
+
 ## Decisions waiting on John
 
 Three items are blocked on a product decision, not on effort. Nothing further in

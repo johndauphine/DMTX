@@ -27,9 +27,10 @@ inventory.
 Two cautions on reading the refreshed rows. First, an implemented route is
 usually **one certified cell, not a family**: PostgreSQL-to-PostgreSQL upsert is
 proven where the row matrix asks for six engines. Second, non-live proof does
-not close a row whose acceptance requires TLS live evidence; the live matrix
-has not been rerun since 2026-07-31 because the approval quota is exhausted
-until 2026-08-06.
+not close a row whose acceptance requires TLS live evidence — but the live
+matrix **was** run on 2026-07-31 against all five TLS containers. Results, DSNs,
+and the six pre-existing failures are recorded in the live-matrix section of
+`docs/STAGE4_HANDOFF.md`.
 
 Where a row cites the Stage 3 route or common-fixture matrix, the exact current
 fixture names are the ones enumerated in `STAGE3_REQUIREMENTS_TESTS.md`; this
@@ -715,8 +716,11 @@ behavior to eliminate.
 
 Every live row above reflects a tree from before the last hardening. The full
 TLS matrix must be rerun, and the application's aggregate publication path needs
-its first live coverage. **Blocked until 2026-08-06** by the approval quota; do
-not work around that limit.
+its first live coverage. **RUN on 2026-07-31.** The 2026-08-06 date was a Codex approval-service quota
+and never applied here; all five TLS containers were already healthy. See the
+live-matrix section of `docs/STAGE4_HANDOFF.md` for working DSNs and results:
+every PostgreSQL Stage 4 route passes, and the six remaining failures were each
+verified pre-existing at the pre-session commit.
 
 Stage 4 cannot be declared complete while any of A through G, including F2, is
 open. Local
@@ -760,10 +764,13 @@ Reordered 2026-07-31. The two original top risks are closed.
    acceptance sections ask for six-engine matrices. This is now the single
    largest distance between "implemented" and "complete", and it is easy to
    mistake a green suite for coverage.
-2. **The live TLS matrix has not been rerun since the last hardening.** The
-   approval quota is exhausted until 2026-08-06. Until it runs, every live row
-   in this document reflects an earlier tree, and `go test ./...` passing locally
-   proves nothing about the live gates.
+2. **Six live failures, all pre-existing.** The matrix ran on 2026-07-31 and
+   every PostgreSQL Stage 4 route passed. What did not: three
+   `*ToSQLiteCommonFixtureLive` fixtures blocked by one qualified-foreign-key
+   rejection, and three `TestStage4*StableRunnerLiveTLS` routes (MySQL, MariaDB,
+   SQL Server) timing out under a one-connection budget. Each was confirmed
+   failing at `ccc985b` too, so none is a regression. The three timeouts are the
+   sharper risk: they are Stage 4 routes on three engines.
 3. **Validation logic is implemented but proven on one engine.** Section 12's
    contracts are covered by roughly 50 non-live fixtures; what is missing is the
    per-engine live matrix. The risk is inverted from what it looks like: the
