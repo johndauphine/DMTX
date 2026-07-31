@@ -603,7 +603,19 @@ correction matters for planning — do not assume a block is endpoint-blocked
 just because its neighbours are.
 
 MySQL, MariaDB, and SQL Server still need their supported scope implemented,
-and those genuinely do need live servers. Every ClickHouse scope must reject —
+and those genuinely do need live servers — for a specific reason worth stating,
+because it is not the same reason the other blocks are endpoint-gated.
+
+SQLite could be finished locally because it is embedded: its tests open a real
+database, so the engine itself judges whether the stable view behaves. That is
+also how the journal-mode blocking behaviour was discovered rather than assumed.
+The other three have no embedded mode. Their contracts are precisely the parts
+a fake cannot adjudicate — `LOCK TABLES` acquisition and release windows, InnoDB
+engine and privilege verification, SQL Server lock escalation and database
+snapshot semantics. An opener written against a mock would have its correctness
+*defined by the mock*, producing code that looks finished and is unverified
+exactly where it matters. Do not implement these against fakes to make the block
+look closed; implement them when a server can contradict you. Every ClickHouse scope must reject —
 already covered by `TestBuiltInRoutesRejectUncertifiedStrictConsistencyScopes`,
 which walks every certified pair and both scopes through `ValidateMigration`,
 so rejection precedes any connection. PostgreSQL remains the reference
