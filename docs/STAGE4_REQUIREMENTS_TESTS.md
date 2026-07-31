@@ -90,7 +90,7 @@ S4.8 **partial**; S4.9 **blocked on the live matrix rerun**.
 | Initialize cancellation and data-plane lifecycle hooks before mutation. | **Partial:** `TestStage2RunSIGTERMPersistsCancelledOutcome` and `TestSQLiteToSQLiteNotifiesTableCheckpointBoundaries`. | S4.8: `TestStage4CancellationInstalledBeforePreflight`; logs, metrics, traces, notifications, and their presentation remain Stage 5, with `TestLifecycleInitializesOperatorSinksBeforeMutation` reserved for that stage. |
 | Run preflight before destructive mutation; discover/filter source schema and side objects deterministically. | **Covered base:** `TestAdapterRunnerPreflightFailurePreventsTasksAndMutation`, `TestAdapterRunnerRunsDestructivePreflightBeforeCheckpointOrMutation`, `TestSelectTablesUsesDeterministicSourceOrder`, and Stage 3 source-discovery/live fixtures. | S4.8: `TestStage4StructuredPreflightPrecedesAllTargetMutation`; include schema-contract and strict prerequisites. |
 | Compare the filtered schema to the latest successful deterministic snapshot and enforce policy. | **Missing as composed behavior.** Uncommitted S4.1 configuration/state primitives are in progress, but they do not yet enforce a contract in the lifecycle. | S4.1/S4.3: `TestFreshRunSelectsLatestApplicableSchemaSnapshot` and `TestFreshRunEnforcesSchemaContractBeforeMutation`. |
-| Derive effective tuning without overwriting pinned intent. | **Partial:** resource-plan provenance and safety clamps are covered by `TestResolveEffectiveTransferPlanUserCeilingCanOnlyLowerDetectedLimit`. | S4.8: `TestFreshRunDerivesTuningWithoutOverwritingPinnedValues`. Long-lived tuning history and advisory presentation are Stage 5. |
+| Derive effective tuning without overwriting pinned intent. | **Covered:** `TestDeterministicTuningPreservesPinnedIntent` proves requested/derived provenance per field, pinned values surviving derivation unchanged, downward-only labelled clamping, and repeat-resolution determinism; `TestResolveEffectiveTransferPlanUserCeilingCanOnlyLowerDetectedLimit` covers the memory ceiling. Configuration rejects unsatisfiable pins outright rather than clamping them, which is stronger than this row required. | Long-lived tuning history and advisory presentation are Stage 5. |
 | Establish migration-scoped strict source epoch before partition planning or target DDL. | **Missing:** supported strict modes are currently rejected. | S4.6: `TestStrictMigrationEpochPrecedesPlanningAndTargetDDL` plus source-specific live fixtures. |
 | Create every durable transfer task before target drop/truncate/create. | **Covered base:** `TestTaskInitializationFailurePrecedesTargetMutation`, `TestAdapterRunnerOrdersAllTableLifecycle`, and `TestAdapterRunnerRunsDestructivePreflightBeforeCheckpointOrMutation`. | S4.2: `TestStage4NetworkTasksDurableBeforeTargetMutationLive` for every target family. |
 | Prepare by target mode, transfer bounded rows, and finalize supported sequences/indexes/FKs/checks. | **Covered base:** Stage 2 bounded SQLite tests and Stage 3 native-target lifecycle/common fixtures. | S4.2: repeat through the resumable range protocol in `TestStage4CertifiedRelationalTransferLifecycleLive`. |
@@ -594,8 +594,8 @@ due/candidate reporting, and estimate provenance.
 
 ### F. Small named gaps
 
+- ~~`TestDeterministicTuningPreservesPinnedIntent`~~ — **closed 2026-07-31**
 - `TestDeleteReconcileDryRunReportsDueCandidates` — reporting half of dry-run
-- `TestDeterministicTuningPreservesPinnedIntent`
 - `TestClickHouseIncrementalRejectedBeforeMutationLive`
 - `TestClickHouseDeleteReconcileRejectedBeforeMutationLive`
 - `TestTargetLeaseTwoProcessRace`, `TestDifferentCanonicalTargetsRunConcurrently`
@@ -634,12 +634,13 @@ The Stage 4 deliverable in Section 20 also names spatial/type metadata and
 deterministic tuning. Those contracts cross-reference Sections 5, 6, and 14,
 which are outside this document's requested Sections 7–13 audit. They still
 require separate closeout fixtures before Stage 4 can be declared complete.
-Two of the three now exist: `TestStage4CanonicalSpatialMetadataRoundTrip` and
+All three now exist: `TestStage4CanonicalSpatialMetadataRoundTrip` and
 `TestStage4SpatialMetadataRouteMatrixLive`, joined by
 `TestStage4SpatialMetadataRouteMatrixFailsClosedBeforeMutation`,
 `TestStage4SpatialValidationUsesExactBinaryRepresentation`, and
 `TestStage4CanonicalTypeMetadataRoundTrip`.
-`TestDeterministicTuningPreservesPinnedIntent` remains **missing**.
+`TestDeterministicTuningPreservesPinnedIntent` was added 2026-07-31 and closes
+the deterministic tuning contract.
 
 ## Highest-risk gaps
 
