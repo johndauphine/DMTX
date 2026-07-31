@@ -175,6 +175,21 @@ func projectPostgresTableForSQLite(
 				source.Name+"."+sourceForeignKey.Name,
 			)
 		}
+		// SQLite has a single namespace, so a reference inside the migrated
+		// schema is expressible only unqualified — the SQLite database *is*
+		// that schema. Clearing the qualifier here is what makes the reference
+		// renderable at all. A reference that escapes the source schema points
+		// at a relation this migration does not carry and genuinely cannot be
+		// represented, so it stays refused.
+		switch sourceForeignKey.ReferencedSchema {
+		case "", source.Schema:
+			foreignKey.ReferencedSchema = ""
+		default:
+			return schema.Table{}, sqlitePostgresProjectionPolicy(
+				"map PostgreSQL cross-schema foreign key",
+				source.Name+"."+sourceForeignKey.Name,
+			)
+		}
 		switch strings.ToUpper(strings.TrimSpace(
 			sourceForeignKey.Match,
 		)) {
