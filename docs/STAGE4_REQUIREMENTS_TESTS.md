@@ -9,6 +9,13 @@ Stage 1 through Stage 3 tests are regression evidence only unless a row below
 says that they satisfy the complete requirement. A proposed fixture name
 identifies work that does not yet have sufficient automated proof.
 
+**Audit saturation note.** The 2026-07-31 reconciliation corrected eight rows
+that claimed work was unimplemented when it was finished. The last sweep
+returned one correction in three checks, so the drift is largely worked out —
+but treat any row still asserting "absent", "missing", or "in progress" as
+suspect until re-verified by name against the test inventory, because that is
+how every one of the eight read before it was checked.
+
 **Refreshed 2026-07-31** against branch `codex/stage-4-production-semantics`.
 The original revision of this document was written when Stage 4 had not
 started; roughly 450 Stage 4 tests now exist that it never named, and several
@@ -115,7 +122,7 @@ S4.8 **partial**; S4.9 **blocked on the live matrix rerun**.
 | Durable tasks precede drop; all selected targets drop before recreate; DDL is deterministic; partial preparation names rerun recovery. | **Covered base:** `TestTaskInitializationFailurePrecedesTargetMutation`, `TestSQLiteTargetPreparationDropsAllTablesBeforeAnyCreate`, `TestMySQLTargetPreparationUsesOneLockedDropBeforeCreates`, `TestClickHousePrepareDropsEveryTableBeforeCreatingAny`, and target live lifecycle tests. | S4.2: `TestStage4RebuildPreparationOrderingWithDurableTasksLive`. |
 | Rebuild transfers into empty tables and finalizes identity/secondary objects after data. | **Covered base:** Stage 3 native same-engine/common fixtures and `TestAdapterRunnerOrdersAllTableLifecycle`. | S4.2 crash fixture: `TestStage4RebuildFinalizeAfterResumedTransferLive`. |
 | Resume may suppress backup acknowledgement only with durable proof of the same unchanged run and owned target contents. | **Missing as a complete rule.** | S4.2: `TestRebuildResumeSuppressesAcknowledgementOnlyWithOwnedRunEvidence` and `TestRebuildResumeRechecksAcknowledgementAfterConfigOrTargetChange`. |
-| Upsert requires target capability, complete source/target PKs, and existing tables unless contract evolution creates new ones. | **Partial:** `TestCapabilityValidationPrecedesAdapterConstruction`, `TestAdapterRunnerRejectsMissingPrimaryKeyBeforeTargetMutation`, and retained-target preflight tests. Contract-authorized table creation is absent. | S4.3: `TestUpsertCreatesNewTableOnlyUnderEvolveContract`. |
+| Upsert requires target capability, complete source/target PKs, and existing tables unless contract evolution creates new ones. | **Covered; the "contract-authorized creation is absent" note is obsolete.** `TestPrepareStage4SchemaGateFirstUpsertEvolveAuthorizesExactCreates` proves an evolve contract authorizes exactly the intended creates, and `TestPrepareStage4SchemaGateFirstBaselineDoesNotImplicitlyAuthorizeCreates` proves a baseline does not, with `TestStage4TargetSchemaEvolutionProjectionAcceptsExplicitFirstRunCreates` on the projection side. Retained: `TestCapabilityValidationPrecedesAdapterConstruction`, `TestAdapterRunnerRejectsMissingPrimaryKeyBeforeTargetMutation`. | Live matrix. |
 | Upsert inserts new rows, updates changed non-key values, retains target-only rows, and preserves existing sequence/index/FK/check objects. | **Covered base:** `TestUpsertUpdatesSourceColumnsWithoutReplacingTargetRow`, `TestAdapterRunnerUpsertAllowsTargetOnlyRows`, and Stage 3 retained-object/native upsert tests. | S4.2/S4.5: `TestStage4UpsertRetainedObjectsSurviveCrashResumeLive`; delete reconciliation is the only allowed target-only removal. |
 | Upsert is idempotent under retry and complete-window replay. | **Partial for SQLite:** `TestSQLiteUpsertReplaysAfterRowNumberCheckpointFailure`. Native fresh-run writer tests do not prove durable replay. | S4.2/S4.4: `TestStage4CertifiedRelationalUpsertReplayMatrixLive`. |
 
