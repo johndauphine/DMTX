@@ -308,7 +308,7 @@ Every strict fixture must run with concurrent source writes and under
 | Full local and YAML backends share restartability behavior. | **Covered:** `TestBackendConformance`, `TestRangeBackendConformance`, `TestRangeAttemptBackendConformance`, and `TestStage4BackendConformance` — the proposed extension now exists. | None. |
 | Persist run/tasks/ranges plus incremental watermarks/fences, delete results, schema snapshots, strict evidence, event counters, config hash, and lease metadata. | **Covered:** `TestStage4BackendConformance` plus `TestStage4AggregateCompletionConformance`, `TestStage4AggregateReadConformance`, `TestStage4CanonicalSpatialMetadataRoundTrip`, `TestStage4CanonicalTypeMetadataRoundTrip`, `TestStage4ReusableEvidenceUsesBackendIndependentTotalOrder`. | Event counters have no named fixture; confirm whether they are Stage 5. |
 | A pre-mutation table inventory may be replanned, and is fixed once any table publishes terminal evidence. | **Covered (requirement added 2026-07-31):** `TestStage4AggregateInventoryRevision` proves replan before terminal evidence, refusal after it, and immutable schema authority across a revision. See the note below on why the window exists. | Route matrix should exercise a replanned resume live. |
-| YAML writes complete temporary state, flush/replace atomically, and serialize compare/write across processes. | **Covered base:** `TestYAMLStoreWritesPrivateCompleteDocument`, `TestYAMLStoreSerializesConcurrentProcesses`, `TestYAMLReplacementIsValidAcrossMidReplacementHardKills`. | Rerun after schema expansion in `TestStage4YAMLAtomicReplacementCrashMatrix`. |
+| YAML writes complete temporary state, flush/replace atomically, and serialize compare/write across processes. | **Covered base:** `TestYAMLStoreWritesPrivateCompleteDocument`, `TestYAMLStoreSerializesConcurrentProcesses`, `TestYAMLReplacementIsValidAcrossMidReplacementHardKills`. | **Covered:** `TestStage4YAMLAtomicReplacementCrashMatrix` hard-kills a writer on both sides of the replacement against a document carrying run, ordinary task, structured work and ranges, schema sentinel and snapshot, and a table inventory, then proves every record still decodes and every receipt still matches its digest. |
 | Full backend auto-migrates private schema forward without credentials. | **Covered base for earlier history:** `TestLegacyStateUpgradePreservesCompletedHistory`. | `TestStage4StateUpgradePreservesNewEvidence`, `TestStage4StateUpgradeRejectsAmbiguousIncompleteEvidence`. Encrypted profiles/tuning history are Stage 5 data; release-wide upgrade matrix is Stage 6. |
 
 **Why the inventory revision window exists.** The durable table inventory pins
@@ -443,7 +443,7 @@ it cannot implement safely until separately admitted.
 | Acceptance item | Evidence or required fixture |
 |---|---|
 | Full/YAML backends share restartability conformance. | **Covered base;** extend with `TestStage4BackendConformance`. |
-| YAML replacement survives crash/concurrent writers. | **Covered base;** rerun expanded `TestStage4YAMLAtomicReplacementCrashMatrix`. |
+| YAML replacement survives crash/concurrent writers. | **Covered:** `TestStage4YAMLAtomicReplacementCrashMatrix`. |
 | Unknown/required-write failures prevent success. | **Covered:** `TestStage4EveryRequiredWriteFailureReturnsStateExitSix`. |
 | Task creation fails before mutation. | **Covered base;** network live regression required. |
 | Periodic failure may be superseded only by audited final save. | **Missing:** two proposed periodic-checkpoint fixtures. |
