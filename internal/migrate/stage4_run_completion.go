@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/johndauphine/dmtx/internal/state"
@@ -19,6 +20,129 @@ func stage4SentinelRangeID(task state.TaskKey) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// completeStage4AdapterNetworkTable publishes one table's terminal evidence.
+// A run that owns a durable table inventory publishes the ordinary task, the
+// structured task, and every range in one atomic mutation. Runs without an
+// inventory predate aggregate composition and keep the older pair, so a resume
+// that began before this route composed is never stranded.
+func completeStage4AdapterNetworkTable(
+	ctx context.Context,
+	observer TableObserver,
+	run Stage4RunContext,
+	aggregate state.Stage4AggregateBackend,
+	item stage4AdapterWork,
+	table string,
+	rows int,
+) error {
+	if aggregate == nil {
+		if err := completeStage4AdapterWorkItem(ctx, run, item); err != nil {
+			return err
+		}
+		if err := observer.AfterTable(ctx, table, rows); err != nil {
+			return NewTransferError(
+				ErrorClassState,
+				fmt.Errorf("checkpoint after %s: %w", table, err),
+			)
+		}
+		return nil
+	}
+	completion, err := stage4AdapterNetworkTableCompletion(
+		ctx,
+		run,
+		item,
+		table,
+		rows,
+	)
+	if err != nil {
+		return err
+	}
+	if err := aggregate.CompleteStage4Table(completion); err != nil {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"atomically complete Stage 4 table %s: %w",
+				table,
+				err,
+			),
+		)
+	}
+	return nil
+}
+
+// stage4AdapterNetworkTableCompletion derives the exact terminal evidence from
+// the durable range frontier rather than from in-memory progress, so a replayed
+// completion reproduces byte-identical evidence. The copied row count must
+// already agree with the durable ranges; a disagreement is a state defect and
+// fails closed rather than publishing a reconciled total.
+func stage4AdapterNetworkTableCompletion(
+	ctx context.Context,
+	run Stage4RunContext,
+	item stage4AdapterWork,
+	table string,
+	rows int,
+) (state.Stage4TableCompletion, error) {
+	if err := ctx.Err(); err != nil {
+		return state.Stage4TableCompletion{}, err
+	}
+	_, durableRanges, err := run.Backend.ListWork(run.RunID)
+	if err != nil {
+		return state.Stage4TableCompletion{}, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"read Stage 4 work before completing %s: %w",
+				table,
+				err,
+			),
+		)
+	}
+	ranges := make([]state.Stage4RangeCompletion, 0, len(item.ranges))
+	var rowsDone int64
+	for _, workRange := range durableRanges {
+		if workRange.RunID != run.RunID || workRange.Task != item.task {
+			continue
+		}
+		ranges = append(ranges, state.Stage4RangeCompletion{
+			ID:           workRange.ID,
+			NextSequence: workRange.NextSequence,
+		})
+		rowsDone += workRange.RowsDone
+	}
+	if len(ranges) != len(item.ranges) {
+		return state.Stage4TableCompletion{}, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"Stage 4 table %s has %d durable ranges, not the planned %d",
+				table,
+				len(ranges),
+				len(item.ranges),
+			),
+		)
+	}
+	if rowsDone != int64(rows) {
+		return state.Stage4TableCompletion{}, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"Stage 4 table %s copied %d rows but its durable ranges total %d",
+				table,
+				rows,
+				rowsDone,
+			),
+		)
+	}
+	sort.Slice(ranges, func(left, right int) bool {
+		return ranges[left].ID < ranges[right].ID
+	})
+	return state.Stage4TableCompletion{
+		RunID:        run.RunID,
+		Table:        table,
+		Task:         item.task,
+		TopologyHash: item.topology,
+		Ranges:       ranges,
+		RowsDone:     rows,
+		CompletedAt:  time.Now().UTC(),
+	}, nil
 }
 
 // PublishStage4RunCompletion completes every durable Stage 4 schema sentinel and

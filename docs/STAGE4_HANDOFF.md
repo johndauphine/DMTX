@@ -182,7 +182,44 @@ so it is reachable only on the date-based incremental route.
    Coverage gap: the app's fallback branch is covered by the existing SQLite
    route tests, but the published-true branch needs a PostgreSQL incremental
    route through `app`, which is live-only. Add it to the TLS matrix rerun.
-3. **In progress.** Stable-network aggregate composition. `planTable` is now
+3. **Done.** Stable-network aggregate composition, landed as two commits.
+
+   `b2ad045` opens a narrow revision window in the state layer. A resumed run
+   whose source grew during an outage replans its range set, and the inventory
+   pins the exact range identities a table completion is validated against, so
+   freezing the first plan made such a run *unrecoverable* rather than merely
+   failed. `EnsureStage4TableInventory` now replaces a differing inventory when
+   the run has zero aggregate receipts and zero completed ordinary tables; the
+   schema authority stays immutable across a revision, and the window closes
+   permanently once any table publishes terminal evidence.
+
+   The route commit then publishes the inventory on fresh runs in the only order
+   the state layer accepts — plan every table without writing durable work,
+   stage the schema snapshot, publish the inventory, checkpoint the ordinary
+   table set, commit the work plans — and replaces the separate
+   `completeStage4AdapterWorkItem` plus `observer.AfterTable` pair with one
+   `CompleteStage4Table` on both the stable-network and PostgreSQL delete
+   routes. On resume the inventory is adopted, and revised by a plan-only
+   prepass when no table has completed yet.
+
+   Consequences worth knowing. A composed route no longer emits `AfterTable`;
+   the ordinary task is completed by the aggregate mutation, exactly as on the
+   incremental route. A failed table completion now leaves no terminal evidence
+   at all rather than a structurally complete table whose ordinary checkpoint
+   never landed. Runs without an inventory — anything resumed from before this
+   change — keep the older pair, so nothing in flight is stranded.
+
+   Test observers in `internal/migrate` now persist ordinary table rows the way
+   the application's checkpoint observer does, creating only missing ones on
+   resume. An observer that merely records events cannot represent a Stage 4 run
+   any more, because aggregate completion reconciles the ordinary task.
+
+   Earlier note in this file claimed the change reversed a deliberately-tested
+   "tasks before snapshot" ordering invariant. That was wrong: staging moved
+   inside the aggregate-capability guard, and all three evolution tests pass
+   untouched because they exercise non-composed routes.
+
+   Superseded planning notes follow for context. `planTable` is now
    split out of `openTable` in `adapter_stage4_network_runner.go`: it
    materializes a table's exact pagination plan, range inventory, and transfer
    plan while writing nothing durable, and hands back the open session. The
@@ -227,7 +264,8 @@ so it is reachable only on the date-based incremental route.
 
 1. Re-read `git status --short --branch`. Do not include
    `docs/STAGE4_REQUIREMENTS_TESTS.md` in any operation.
-2. Implement step 3 of the revised sequencing above.
+2. Continue the requirements/test map; the aggregate composition slices are
+   complete for the incremental, stable-network, and PostgreSQL delete routes.
 3. Rerun the PostgreSQL TLS live matrix when the approval quota permits it.
 4. After the aggregate slices, continue the requirements/test map in
    `docs/STAGE4_REQUIREMENTS_TESTS.md`, especially deterministic tuning/dry-run,

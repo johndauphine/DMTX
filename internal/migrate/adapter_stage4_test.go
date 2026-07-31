@@ -20,6 +20,128 @@ type stage4AdapterObserver struct {
 	run Stage4RunContext
 }
 
+// stage4AdapterObserver persists the ordinary table rows the application's own
+// checkpoint observer creates. Aggregate table completion reconciles the
+// ordinary task in the same mutation as the structured work, so an observer
+// that only records events cannot represent a production Stage 4 run.
+func (observer stage4AdapterObserver) BeforeTables(
+	ctx context.Context,
+	tables []string,
+) error {
+	if err := observer.recordingTableObserver.BeforeTables(
+		ctx,
+		tables,
+	); err != nil {
+		return err
+	}
+	return stage4AdapterTestCreateTasks(observer.run, tables)
+}
+
+func (observer stage4AdapterObserver) BeforeTable(
+	ctx context.Context,
+	table string,
+) error {
+	if err := observer.recordingTableObserver.BeforeTable(
+		ctx,
+		table,
+	); err != nil {
+		return err
+	}
+	return stage4AdapterTestCreateTask(observer.run, table)
+}
+
+func (observer stage4AdapterObserver) AfterTable(
+	ctx context.Context,
+	table string,
+	rows int,
+) error {
+	if err := observer.recordingTableObserver.AfterTable(
+		ctx,
+		table,
+		rows,
+	); err != nil {
+		return err
+	}
+	return stage4AdapterTestCompleteTask(observer.run, table, rows)
+}
+
+func stage4AdapterTestBackend(run Stage4RunContext) (state.Backend, bool) {
+	backend, ok := run.Backend.(state.Backend)
+	return backend, ok && strings.TrimSpace(run.RunID) != ""
+}
+
+func stage4AdapterTestCreateTasks(
+	run Stage4RunContext,
+	tables []string,
+) error {
+	backend, ok := stage4AdapterTestBackend(run)
+	if !ok {
+		return nil
+	}
+	// A resumed run already owns its ordinary rows, exactly as the application's
+	// resume observer only creates the table checkpoints that are missing.
+	existing, err := backend.ListTasks(run.RunID)
+	if err != nil {
+		return err
+	}
+	known := make(map[string]struct{}, len(existing))
+	for _, task := range existing {
+		known[task.Table] = struct{}{}
+	}
+	started := time.Now().UTC()
+	tasks := make([]state.Task, 0, len(tables))
+	for _, table := range tables {
+		if _, found := known[table]; found {
+			continue
+		}
+		tasks = append(tasks, state.Task{
+			RunID:     run.RunID,
+			Table:     table,
+			StartedAt: started,
+		})
+	}
+	if len(tasks) == 0 {
+		return nil
+	}
+	return backend.CreateTasks(tasks)
+}
+
+func stage4AdapterTestCreateTask(
+	run Stage4RunContext,
+	table string,
+) error {
+	backend, ok := stage4AdapterTestBackend(run)
+	if !ok {
+		return nil
+	}
+	tasks, err := backend.ListTasks(run.RunID)
+	if err != nil {
+		return err
+	}
+	for _, task := range tasks {
+		if task.Table == table {
+			return nil
+		}
+	}
+	return backend.CreateTask(state.Task{
+		RunID:     run.RunID,
+		Table:     table,
+		StartedAt: time.Now().UTC(),
+	})
+}
+
+func stage4AdapterTestCompleteTask(
+	run Stage4RunContext,
+	table string,
+	rows int,
+) error {
+	backend, ok := stage4AdapterTestBackend(run)
+	if !ok {
+		return nil
+	}
+	return backend.CompleteTask(run.RunID, table, rows, time.Now().UTC())
+}
+
 type stage4AdapterUnprotectedObserver struct {
 	recordingTableObserver
 	run Stage4RunContext

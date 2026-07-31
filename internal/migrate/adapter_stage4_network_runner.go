@@ -73,6 +73,13 @@ type stage4AdapterNetworkExecution struct {
 	nextGlobalRange   uint64
 	finalizeWork      func(stage4AdapterWork) (stage4AdapterWork, error)
 	deleteTransferred map[int]stage4AdapterPostgresDeleteTransferredTable
+
+	// aggregate is non-nil only once this run owns a durable Stage 4 table
+	// inventory, which is the proof that every table must publish its terminal
+	// evidence through one atomic completion instead of the separate ordinary
+	// and structured mutations. Runs that predate the inventory keep the older
+	// pair so an in-flight resume is never stranded.
+	aggregate state.Stage4AggregateBackend
 }
 
 // stage4AdapterNetworkWave is one table's exact range set. Tables execute in
@@ -789,6 +796,52 @@ func (execution *stage4AdapterNetworkExecution) openTable(
 	execution.mu.Lock()
 	execution.nextGlobalRange += uint64(len(tableExecution.ranges))
 	execution.mu.Unlock()
+	return tableExecution, nil
+}
+
+// planTableOnce plans one table under the same single-binding guard openTable
+// uses, and advances the shared global range offset so the next table's ranges
+// keep migration-global identities. The caller owns the returned session and
+// commits the durable work plan later.
+func (execution *stage4AdapterNetworkExecution) planTableOnce(
+	ctx context.Context,
+	planIndex int,
+) (*stage4AdapterNetworkTableExecution, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if planIndex < 0 || planIndex >= len(execution.prepared.plans) ||
+		planIndex >= len(execution.prepared.work) {
+		return nil, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 stable table index is outside the plan"),
+		)
+	}
+	execution.mu.Lock()
+	if execution.binding || execution.bound || execution.started {
+		execution.mu.Unlock()
+		return nil, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"Stage 4 deferred network execution is already active or consumed",
+			),
+		)
+	}
+	execution.binding = true
+	globalOffset := execution.nextGlobalRange
+	execution.mu.Unlock()
+
+	tableExecution, err := execution.planTable(ctx, planIndex, globalOffset)
+
+	execution.mu.Lock()
+	execution.binding = false
+	if err == nil {
+		execution.nextGlobalRange += uint64(len(tableExecution.ranges))
+	}
+	execution.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	return tableExecution, nil
 }
 

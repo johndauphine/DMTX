@@ -868,21 +868,19 @@ func runStage4AdapterPostgresDeleteNetworkTables(
 		if ordinaryCompleted[planIndex] {
 			continue
 		}
-		if err := completeStage4AdapterWorkItem(
+		if err := completeStage4AdapterNetworkTable(
 			ctx,
+			observer,
 			prepared.run,
+			execution.aggregate,
 			finalWork[planIndex],
+			plan.source.Name,
+			rows[planIndex],
 		); err != nil {
 			return result, fmt.Errorf(
 				"complete Stage 4 PostgreSQL delete work for %s: %w",
 				plan.source.Name,
 				err,
-			)
-		}
-		if err := observer.AfterTable(ctx, plan.source.Name, rows[planIndex]); err != nil {
-			return result, NewTransferError(
-				ErrorClassState,
-				fmt.Errorf("checkpoint after %s: %w", plan.source.Name, err),
 			)
 		}
 	}

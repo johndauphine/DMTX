@@ -634,6 +634,23 @@ func checkpointStage4AdapterStableNetworkWork(
 			),
 		)
 	}
+	if !resume && len(completed) == 0 {
+		return checkpointStage4AdapterFreshStableNetworkWork(
+			ctx,
+			observer,
+			execution,
+		)
+	}
+	if err := adoptStage4AdapterNetworkInventory(execution); err != nil {
+		return err
+	}
+	if err := reviseStage4AdapterNetworkInventoryOnResume(
+		ctx,
+		execution,
+		completed,
+	); err != nil {
+		return err
+	}
 	if err := checkpointStage4AdapterTableSet(
 		ctx,
 		observer,
@@ -750,6 +767,200 @@ func checkpointStage4AdapterStableNetworkWork(
 		}
 	}
 	return ctx.Err()
+}
+
+// checkpointStage4AdapterFreshStableNetworkWork establishes the exact Stage 4
+// table inventory before any ordinary task or table work exists, which is the
+// only order EnsureStage4TableInventory accepts. Planning is therefore kept
+// apart from the durable write: every table is planned and its stable session
+// closed, the inventory is published, the ordinary table set is checkpointed,
+// and only then is each planned work plan committed. Execution still reopens
+// each table and requires the newly observed plan to match the durable one.
+func checkpointStage4AdapterFreshStableNetworkWork(
+	ctx context.Context,
+	observer TableObserver,
+	execution *stage4AdapterNetworkExecution,
+) error {
+	defer func() {
+		execution.mu.Lock()
+		execution.nextGlobalRange = 0
+		execution.mu.Unlock()
+	}()
+	planned := make(
+		[]*stage4AdapterNetworkTableExecution,
+		len(execution.prepared.plans),
+	)
+	for planIndex := range execution.prepared.plans {
+		tableExecution, err := execution.planTableOnce(ctx, planIndex)
+		if err != nil {
+			return err
+		}
+		if closeErr := tableExecution.session.Close(); closeErr != nil {
+			return fmt.Errorf(
+				"close Stage 4 stable source after planning %s: %w",
+				execution.prepared.plans[planIndex].source.Name,
+				closeErr,
+			)
+		}
+		planned[planIndex] = tableExecution
+	}
+	if err := publishStage4AdapterNetworkInventory(
+		ctx,
+		execution,
+		planned,
+	); err != nil {
+		return err
+	}
+	if err := checkpointStage4AdapterTableSet(
+		ctx,
+		observer,
+		execution.prepared.names,
+	); err != nil {
+		return err
+	}
+	for _, tableExecution := range planned {
+		if err := tableExecution.resetOrEnsurePlan(ctx, false); err != nil {
+			return err
+		}
+		if err := tableExecution.bindRestoresAndValidate(ctx); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+// publishStage4AdapterNetworkInventory records the exact selected table set as
+// immutable pre-mutation authority. A backend without aggregate completion
+// leaves the run on the older separate-mutation path rather than failing, so
+// the route stays usable wherever aggregate state is unavailable.
+func publishStage4AdapterNetworkInventory(
+	ctx context.Context,
+	execution *stage4AdapterNetworkExecution,
+	planned []*stage4AdapterNetworkTableExecution,
+) error {
+	aggregate, ok := execution.prepared.run.Backend.(state.Stage4AggregateBackend)
+	if !ok || nilStage4AggregateBackend(aggregate) {
+		return nil
+	}
+	// The inventory binds itself to the validated source schema, so that
+	// snapshot must already be durable. Staging is idempotent; the target
+	// schema stage restages the identical evidence later.
+	if err := stageStage4SchemaGateSnapshots(
+		ctx,
+		execution.prepared.run,
+		execution.prepared.gate,
+		execution.prepared.evolution,
+	); err != nil {
+		return err
+	}
+	inventory := state.Stage4TableInventory{
+		RunID:                execution.prepared.run.RunID,
+		SchemaTask:           execution.prepared.gate.Task,
+		SchemaTopologyHash:   execution.prepared.gate.TopologyHash,
+		SchemaSnapshotDigest: execution.prepared.gate.PendingSnapshot.Digest,
+		Tables: make(
+			[]state.Stage4TableInventoryEntry,
+			len(planned),
+		),
+	}
+	for index, tableExecution := range planned {
+		ranges := make(
+			[]state.Stage4InventoryRange,
+			len(tableExecution.work.ranges),
+		)
+		for rangeIndex, workRange := range tableExecution.work.ranges {
+			ranges[rangeIndex] = state.Stage4InventoryRange{
+				ID: workRange.ID,
+			}
+		}
+		inventory.Tables[index] = state.Stage4TableInventoryEntry{
+			Table:        tableExecution.work.task.Table,
+			Task:         tableExecution.work.task,
+			Strategy:     tableExecution.work.strategy,
+			TopologyHash: tableExecution.work.topology,
+			Ranges:       ranges,
+		}
+	}
+	if err := aggregate.EnsureStage4TableInventory(inventory); err != nil {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"publish immutable Stage 4 network table inventory before table checkpoints: %w",
+				err,
+			),
+		)
+	}
+	execution.aggregate = aggregate
+	return nil
+}
+
+// reviseStage4AdapterNetworkInventoryOnResume republishes the table inventory
+// when a resumed run legitimately replans. A source that grew during an outage
+// yields a different partition count, and the durable inventory pins the exact
+// range identities a table completion is validated against, so it must follow
+// the replan. The revision window is enforced by the state layer and closes as
+// soon as any table publishes terminal evidence, which is why a resume that
+// already carries completed tables keeps the inventory it was given.
+func reviseStage4AdapterNetworkInventoryOnResume(
+	ctx context.Context,
+	execution *stage4AdapterNetworkExecution,
+	completed map[string]int,
+) error {
+	if execution.aggregate == nil || len(completed) != 0 {
+		return nil
+	}
+	defer func() {
+		execution.mu.Lock()
+		execution.nextGlobalRange = 0
+		execution.mu.Unlock()
+	}()
+	planned := make(
+		[]*stage4AdapterNetworkTableExecution,
+		len(execution.prepared.plans),
+	)
+	for planIndex := range execution.prepared.plans {
+		tableExecution, err := execution.planTableOnce(ctx, planIndex)
+		if err != nil {
+			return err
+		}
+		if closeErr := tableExecution.session.Close(); closeErr != nil {
+			return fmt.Errorf(
+				"close Stage 4 stable source after replanning %s: %w",
+				execution.prepared.plans[planIndex].source.Name,
+				closeErr,
+			)
+		}
+		planned[planIndex] = tableExecution
+	}
+	return publishStage4AdapterNetworkInventory(ctx, execution, planned)
+}
+
+// adoptStage4AdapterNetworkInventory binds a resumed run to the inventory its
+// original attempt published. A run without one predates aggregate composition
+// and must keep completing tables through the older separate mutations.
+func adoptStage4AdapterNetworkInventory(
+	execution *stage4AdapterNetworkExecution,
+) error {
+	aggregate, ok := execution.prepared.run.Backend.(state.Stage4AggregateBackend)
+	if !ok || nilStage4AggregateBackend(aggregate) {
+		return nil
+	}
+	_, found, err := aggregate.LoadStage4TableInventory(
+		execution.prepared.run.RunID,
+	)
+	if err != nil {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"read Stage 4 network table inventory before resume: %w",
+				err,
+			),
+		)
+	}
+	if found {
+		execution.aggregate = aggregate
+	}
+	return nil
 }
 
 func runStage4AdapterStableNetworkTables(
@@ -899,21 +1110,19 @@ func runStage4AdapterStableNetworkTable(
 	); err != nil {
 		return 0, err
 	}
-	if err := completeStage4AdapterWorkItem(
+	if err := completeStage4AdapterNetworkTable(
 		ctx,
+		observer,
 		prepared.run,
+		execution.parent.aggregate,
 		execution.work,
+		name,
+		copied,
 	); err != nil {
 		return 0, fmt.Errorf(
 			"complete Stage 4 work for %s: %w",
 			name,
 			err,
-		)
-	}
-	if err := observer.AfterTable(ctx, name, copied); err != nil {
-		return 0, NewTransferError(
-			ErrorClassState,
-			fmt.Errorf("checkpoint after %s: %w", name, err),
 		)
 	}
 	return copied, nil

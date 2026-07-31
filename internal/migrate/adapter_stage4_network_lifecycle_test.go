@@ -15,8 +15,29 @@ import (
 
 type stage4NetworkFaultObserver struct {
 	stage4AdapterObserver
-	beforeErr error
-	afterErr  error
+	beforeErr    error
+	afterErr     error
+	aggregateErr error
+}
+
+// stage4NetworkFailingAggregateBackend fails the atomic table completion that
+// replaced the separate ordinary checkpoint on a composed route, so the stable
+// session must still be closed at that terminal failure point.
+type stage4NetworkFailingAggregateBackend struct {
+	state.YAMLStore
+	err error
+	// table scopes the failure to one ordinary table, which is how a baseline
+	// leaves an earlier table durably complete and a later one not.
+	table string
+}
+
+func (backend stage4NetworkFailingAggregateBackend) CompleteStage4Table(
+	completion state.Stage4TableCompletion,
+) error {
+	if backend.table != "" && completion.Table != backend.table {
+		return backend.YAMLStore.CompleteStage4Table(completion)
+	}
+	return backend.err
 }
 
 type stage4NetworkShortCountTarget struct {
@@ -213,26 +234,34 @@ func TestStage4AdapterNetworkFreshCheckpointsEveryTableBeforeAnyWrite(
 	if beforeTables >= firstWrite {
 		t.Fatalf("global table-set admission followed mutation: %v", events)
 	}
+	// A composed route publishes each table's terminal evidence through one
+	// aggregate completion, so the execution segment closes on the table's own
+	// stable close rather than on a separate ordinary AfterTable checkpoint.
 	previousClose := beforeTables
 	for _, name := range []string{"items", "widgets"} {
 		before := stage4AdapterEventIndex(events, "before:"+name)
-		after := stage4AdapterEventIndex(events, "after:"+name)
+		if stage4AdapterEventIndex(events, "after:"+name) >= 0 {
+			t.Fatalf(
+				"composed table %s published a separate ordinary checkpoint: %v",
+				name,
+				events,
+			)
+		}
 		closeIndex := -1
-		for index := after + 1; index < len(events); index++ {
+		for index := before + 1; index < len(events); index++ {
 			if events[index] == "source_stable_close:"+name {
 				closeIndex = index
 				break
 			}
 		}
-		if before <= previousClose || after <= before ||
-			closeIndex <= after {
+		if before <= previousClose || closeIndex <= before {
 			t.Fatalf(
 				"table %s did not own one complete execution stable lifecycle after its durable planning prepass: %v",
 				name,
 				events,
 			)
 		}
-		segment := events[before : after+1]
+		segment := events[before:closeIndex]
 		prepare := stage4AdapterEventIndex(segment, "target_prepare")
 		write := stage4AdapterEventIndex(segment, "target_write")
 		finalize := stage4AdapterEventIndex(segment, "target_finalize")
@@ -247,6 +276,36 @@ func TestStage4AdapterNetworkFreshCheckpointsEveryTableBeforeAnyWrite(
 			)
 		}
 		previousClose = closeIndex
+	}
+
+	// The composed route must leave the exact aggregate evidence a run
+	// publication requires: one immutable inventory and one receipt per table,
+	// with the ordinary task made terminal by that same mutation.
+	inventory, found, err := backend.LoadStage4TableInventory(runID)
+	if err != nil || !found {
+		t.Fatalf("durable table inventory found=%v err=%v", found, err)
+	}
+	if len(inventory.Inventory.Tables) != 2 {
+		t.Fatalf("table inventory = %#v", inventory.Inventory)
+	}
+	receipts, err := backend.LoadStage4TableCompletions(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(receipts) != 2 {
+		t.Fatalf("aggregate table receipts = %#v", receipts)
+	}
+	ordinary, err := backend.ListTasks(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ordinary) != 2 {
+		t.Fatalf("ordinary tasks = %#v", ordinary)
+	}
+	for _, task := range ordinary {
+		if task.Status != "completed" || task.RowsDone != 2 {
+			t.Fatalf("ordinary task = %#v", task)
+		}
 	}
 
 	tasks, ranges, err := backend.ListWork(runID)
@@ -1088,12 +1147,14 @@ func TestStage4AdapterNetworkClosesStableSessionOnEveryTableFailure(
 			},
 		},
 		{
-			name: "after table",
+			name: "aggregate completion",
 			configure: func(
 				observer *stage4NetworkFaultObserver,
 				target *recordingAdapterTarget,
 			) targetAdapter {
-				observer.afterErr = errors.New("forced after-table failure")
+				observer.aggregateErr = errors.New(
+					"forced aggregate table completion failure",
+				)
 				return target
 			},
 		},
@@ -1130,6 +1191,17 @@ func TestStage4AdapterNetworkClosesStableSessionOnEveryTableFailure(
 				},
 			}
 			target := testCase.configure(&observer, baseTarget)
+			if observer.aggregateErr != nil {
+				observer.run = stage4LifecycleRunContext(
+					t,
+					stage4NetworkFailingAggregateBackend{
+						YAMLStore: backend,
+						err:       observer.aggregateErr,
+					},
+					runID,
+					false,
+				)
+			}
 			cfg := stage4AdapterTestConfig(
 				t,
 				"source-password",
@@ -1259,12 +1331,16 @@ func TestStage4AdapterNetworkMissingAggregateCheckpointResetsWholeTable(
 			},
 			run: stage4LifecycleRunContext(
 				t,
-				rawBackend,
+				stage4NetworkFailingAggregateBackend{
+					YAMLStore: rawBackend,
+					err: errors.New(
+						"forced aggregate checkpoint failure",
+					),
+				},
 				runID,
 				false,
 			),
 		},
-		afterErr: errors.New("forced aggregate checkpoint failure"),
 	}
 	if _, err := migrateWithAdapters(
 		context.Background(),
@@ -1280,25 +1356,41 @@ func TestStage4AdapterNetworkMissingAggregateCheckpointResetsWholeTable(
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A composed route publishes the ordinary task, the structured task, and the
+	// receipt in one mutation, so a failed completion must leave no terminal
+	// table evidence at all rather than a structurally complete table whose
+	// ordinary checkpoint never landed.
 	networkTaskComplete := false
-	completedRanges := 0
 	for _, task := range tasks {
 		if task.Key.Type == stage4AdapterNetworkTaskType {
 			networkTaskComplete = task.Status == "completed"
 		}
 	}
-	for _, workRange := range ranges {
-		if workRange.Task.Type == stage4AdapterNetworkTaskType &&
-			workRange.Status == "completed" {
-			completedRanges++
-		}
-	}
-	if !networkTaskComplete || completedRanges != 2 {
+	if networkTaskComplete {
 		t.Fatalf(
-			"failed aggregate checkpoint lost structured completion: tasks=%#v ranges=%#v",
+			"failed aggregate checkpoint left partial structured completion: tasks=%#v ranges=%#v",
 			tasks,
 			ranges,
 		)
+	}
+	receipts, err := rawBackend.LoadStage4TableCompletions(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(receipts) != 0 {
+		t.Fatalf("failed aggregate checkpoint published receipts: %#v", receipts)
+	}
+	ordinary, err := rawBackend.ListTasks(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, task := range ordinary {
+		if task.Status == "completed" {
+			t.Fatalf(
+				"failed aggregate checkpoint completed an ordinary task: %#v",
+				task,
+			)
+		}
 	}
 
 	faultBackend := &stage4NetworkLifecycleFaultBackend{
@@ -1542,11 +1634,18 @@ func TestStage4AdapterNetworkResumeOffsetsAfterCompletedTable(
 	)
 	cfg.Migration.TargetMode = "upsert"
 	cfg.Migration.Partitions = 2
+	// The baseline must leave the first table durably complete and the second
+	// not, which is the only shape a production resume observes: the completed
+	// set is derived from the ordinary task status it is about to be given.
 	freshObserver := stage4AdapterObserver{
 		recordingTableObserver: recordingTableObserver{events: &events},
 		run: stage4LifecycleRunContext(
 			t,
-			backend,
+			stage4NetworkFailingAggregateBackend{
+				YAMLStore: backend,
+				err:       errors.New("forced widgets completion failure"),
+				table:     "widgets",
+			},
 			runID,
 			false,
 		),
@@ -1557,8 +1656,8 @@ func TestStage4AdapterNetworkResumeOffsetsAfterCompletedTable(
 		freshObserver,
 		source,
 		target,
-	); err != nil {
-		t.Fatalf("complete two-table baseline: %v", err)
+	); err == nil {
+		t.Fatal("baseline unexpectedly completed the second table")
 	}
 
 	events = events[:0]
@@ -1755,12 +1854,16 @@ func TestStage4AdapterNetworkResumeReplansChangedRangeCount(
 			},
 			run: stage4LifecycleRunContext(
 				t,
-				backend,
+				stage4NetworkFailingAggregateBackend{
+					YAMLStore: backend,
+					err: errors.New(
+						"forced aggregate checkpoint failure",
+					),
+				},
 				runID,
 				false,
 			),
 		},
-		afterErr: errors.New("forced aggregate checkpoint failure"),
 	}
 	if _, err := migrateWithAdapters(
 		context.Background(),
