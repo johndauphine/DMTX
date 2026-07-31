@@ -761,6 +761,48 @@ func (execution *stage4AdapterNetworkExecution) openTable(
 		execution.mu.Unlock()
 	}()
 
+	tableExecution, err := execution.planTable(
+		ctx,
+		planIndex,
+		globalOffset,
+		stableSessions...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	// planTable hands back an open session, so the durable write below owns
+	// closing it on failure exactly as the single-phase form used to.
+	defer func() {
+		if resultErr == nil {
+			return
+		}
+		if closeErr := tableExecution.session.Close(); closeErr != nil {
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	if err := tableExecution.resetOrEnsurePlan(ctx, resume); err != nil {
+		return nil, err
+	}
+	if err := tableExecution.bindRestoresAndValidate(ctx); err != nil {
+		return nil, err
+	}
+	execution.mu.Lock()
+	execution.nextGlobalRange += uint64(len(tableExecution.ranges))
+	execution.mu.Unlock()
+	return tableExecution, nil
+}
+
+// planTable materializes one table's exact stable pagination plan, range
+// inventory, and transfer plan without writing any durable work. Keeping the
+// durable write separate lets a caller establish the complete Stage 4 table
+// inventory while no table work or ordinary task exists yet, which is what
+// EnsureStage4TableInventory requires. The caller owns the returned session.
+func (execution *stage4AdapterNetworkExecution) planTable(
+	ctx context.Context,
+	planIndex int,
+	globalOffset uint64,
+	stableSessions ...*adapterStableNetworkTableSession,
+) (_ *stage4AdapterNetworkTableExecution, resultErr error) {
 	plan := cloneStage4AdapterNetworkTablePlan(
 		execution.prepared.plans[planIndex],
 	)
@@ -1001,15 +1043,6 @@ func (execution *stage4AdapterNetworkExecution) openTable(
 			Ranges:       localPlans,
 		},
 	}
-	if err := tableExecution.resetOrEnsurePlan(ctx, resume); err != nil {
-		return nil, err
-	}
-	if err := tableExecution.bindRestoresAndValidate(ctx); err != nil {
-		return nil, err
-	}
-	execution.mu.Lock()
-	execution.nextGlobalRange += uint64(len(ranges))
-	execution.mu.Unlock()
 	return tableExecution, nil
 }
 

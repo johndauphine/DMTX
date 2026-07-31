@@ -182,7 +182,46 @@ so it is reachable only on the date-based incremental route.
    Coverage gap: the app's fallback branch is covered by the existing SQLite
    route tests, but the published-true branch needs a PostgreSQL incremental
    route through `app`, which is live-only. Add it to the TLS matrix rerun.
-3. Then rework stable-network inventory timing as its own slice.
+3. **In progress.** Stable-network aggregate composition. `planTable` is now
+   split out of `openTable` in `adapter_stage4_network_runner.go`: it
+   materializes a table's exact pagination plan, range inventory, and transfer
+   plan while writing nothing durable, and hands back the open session. The
+   extraction is behavior-preserving — `openTable` still owns the guard, the
+   session close on failure, the durable write, and the global range offset
+   advance, in that order.
+
+   **The remaining work must land as one coupled slice, not two.** Publishing a
+   table inventory without also publishing per-table receipts would break every
+   stable-network migration: `PublishStage4RunCompletion` treats a durable
+   inventory as proof the route composed aggregate evidence, and
+   `validateStage4RunInventory` then requires exactly one
+   `CompleteStage4Table` receipt per inventory table. An inventory with zero
+   receipts fails closed at the end of an otherwise successful run. So the
+   ordering change and `CompleteStage4Table` adoption on this route are a single
+   atomic change.
+
+   Ordering the change needs, on a fresh run only:
+
+   1. plan every table with `planTable`, collecting task/strategy/topology and
+      range IDs, closing each session;
+   2. `EnsureStage4TableInventory` from the collected plans;
+   3. `checkpointStage4AdapterTableSet` (this is what creates ordinary tasks,
+      and it currently runs *first*, which is the whole problem);
+   4. commit the durable work plans.
+
+   On resume, do not rebuild the inventory: completed tables are skipped so the
+   exact original inventory cannot be reconstructed, and ordinary tasks already
+   exist. Read it with `LoadStage4TableInventory` instead. A resumed run whose
+   inventory was never published simply has none, and
+   `PublishStage4RunCompletion` already degrades to the ordinary `store.Append`
+   path for it.
+
+   Also still required on this route: replace the `observer.AfterTable` plus
+   `completeStage4AdapterWork` pair with `CompleteStage4Table`, including in
+   `runStage4AdapterPostgresDeleteNetworkTables`. Verify first that the sum of
+   durable range `RowsDone` equals the ordinary copied count per table —
+   `applyStage4TableCompletion` enforces that equality and it is unproven on
+   this route.
 
 ## Immediate safe next steps
 
