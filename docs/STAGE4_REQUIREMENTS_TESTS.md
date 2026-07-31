@@ -207,7 +207,7 @@ SQL Server, Oracle MySQL, MariaDB, SQLite, and ClickHouse rebuild.
 
 | Normative behavior | Current evidence | Remaining proof |
 |---|---|---|
-| Retry recognized transient network/server/lock errors with bounded exponential backoff, cancellation, and three default retries. | **Covered generic primitive:** `TestRetryUsesDefaultThreeRetryBudget`, `TestRetryTransientSuccessAndCancellationDuringBackoff`. Engine-specific classifiers are absent. | `TestPostgresRetryClassification`, `TestSQLServerRetryClassification`, `TestMySQLRetryClassification`, `TestMariaDBRetryClassification`, `TestSQLiteRetryClassification`, `TestClickHouseRetryClassification`. |
+| Retry recognized transient network/server/lock errors with bounded exponential backoff, cancellation, and three default retries. | **Covered.** The claim that engine-specific classifiers are absent is obsolete: `internal/migrate/engine_retry.go` implements `classifyPostgresRetry`, `classifyMySQLRetry` (also serving MariaDB), `classifySQLServerRetry`, `classifySQLiteRetry`, and `classifyClickHouseRetry`, wired into the transfer core at three call sites in `network_transfer_core.go`. `TestClassifyEngineRetryMatrix` covers all six engines by SQLSTATE or server code, alongside `TestClassifyEngineRetryRequiresSafeReplayBoundary`, `TestClassifyEngineRetryTransportBoundaries`, `TestClassifyEngineRetryUnknownCommitRejectsAllTransportEvidence`, `TestClassifyEngineRetryStructuralServerErrorBeatsJoinedTransport`, `TestClassifyEngineRetryPreservesExplicitClassAndCancellation`, `TestClassifyEngineRetryRejectsUnknownInputsAndIsDeterministic`, `TestWrapEngineRetryErrorComposesWithBoundedRetry`, plus the generic budget/backoff primitives. The six proposed per-engine fixture names were never used. | Live per-engine fault injection belongs in the S4.9 matrix. |
 | Never blindly retry conversion, DDL policy, PK, schema contract, validation, lease, or state failures. | **Covered generic primitive:** `TestRetryStopsForStableNonTransientClasses`. | S4.2/S4.3/S4.7 route composition: `TestStage4StableFailureClassesNeverRetryLive`. |
 | Possibly committed rebuild replay is insert-only and duplicate-safe by complete PK; it never updates an existing row. | **Covered only for SQLite:** `TestSQLiteIssuedReplayUsesInsertOnlyConflictIgnore`, `TestStage2SQLiteTupleKeysetWriteBeforeAckResumesExactRows`. | `TestPostgresInsertOnlyReplayLive`, `TestSQLServerInsertOnlyReplayLive`, `TestMySQLInsertOnlyReplayLive`, `TestMariaDBInsertOnlyReplayLive`; target without a safe path: `TestUnsafeReplayRequiresTableRestart`. |
 
@@ -340,7 +340,7 @@ permanently at the first terminal table evidence.
 | Task exists durably before destructive mutation. | **Covered base:** `TestTaskInitializationFailurePrecedesTargetMutation`. | Network live regression in S4.2. |
 | Unresolved periodic/final/task/watermark/run-completion write failure prevents success with state exit 6. | **Covered:** `TestStage4EveryRequiredWriteFailureReturnsStateExitSix` drives each required write to failure and proves it classifies as a state failure and maps to exit 6; `TestStage4RequiredWriteFailureOutranksTransferClassification` pins the precedence so a durable write failure is never reported as a transfer error. Retained context: `TestAdapterRunnerReturnsOnlyCompletedProgressWhenLaterCheckpointFails`, `TestSQLitePartialResultKeepsRowsAfterAggregateCheckpointFailure`, `TestMigrationAttemptDisposition`. | The run-completion write is covered by `publishStage4RunSuccess` returning a state-classified error; a live route proof belongs in the S4.9 matrix. |
 | Unknown task writes reject. | **Covered base:** `TestSQLiteStoreRequiresKnownRunningTaskForCompletion`, range backend unknown-work checks. | Add every new Stage 4 write to `TestStage4UnknownTaskWritesReject`. |
-| Periodic save may degrade only if final safe frontier supersedes it, with audit evidence. | **Missing as complete behavior.** | `TestPeriodicCheckpointFailureCanBeSupersededAndAudited`, `TestPeriodicCheckpointFailureWithoutFinalSaveIsFatal`. |
+| Periodic save may degrade only if final safe frontier supersedes it, with audit evidence. | **Missing, and deeper than a test gap.** Verified 2026-07-31: `migration.checkpoint_frequency` is parsed, defaulted to 10, range-validated, and folded into the resume compatibility hash, but no code outside `internal/config` ever reads it. There is no periodic checkpoint to supersede. Durability today comes from per-range acknowledgement, which is finer-grained than any configured frequency, so this is a truthfulness defect rather than a data-loss one: an operator who sets the value believes they are controlling cadence and nothing happens. | Decide first whether the setting should drive a real periodic save or be removed as superseded by range acknowledgement. Only then are `TestPeriodicCheckpointFailureCanBeSupersededAndAudited` and `TestPeriodicCheckpointFailureWithoutFinalSaveIsFatal` meaningful. |
 | State failure after target commit directs repair-and-resume, not competing fresh run. | **Partial:** errors remain resumable, but remedy contract is absent. | `TestPostCommitStateFailureNamesRepairAndResume`. |
 
 ### 11.4 Exclusive target lease and fencing
@@ -596,13 +596,40 @@ due/candidate reporting, and estimate provenance.
 
 - ~~`TestDeterministicTuningPreservesPinnedIntent`~~ — **closed 2026-07-31**
 - `TestDeleteReconcileDryRunReportsDueCandidates` — reporting half of dry-run
-- `TestClickHouseIncrementalRejectedBeforeMutationLive`
+- `TestClickHouseIncrementalRejectedBeforeMutationLive` — the non-live half is
+  already covered by `TestRequireIncrementalSourceRejectsClickHouse`; only the
+  live sentinel is open
 - `TestClickHouseDeleteReconcileRejectedBeforeMutationLive`
 - ~~`TestTargetLeaseTwoProcessRace`, `TestDifferentCanonicalTargetsRunConcurrently`~~ — **closed 2026-07-31**
 - ~~`TestStage4EveryRequiredWriteFailureReturnsStateExitSix`~~ — **closed 2026-07-31**
-- periodic-checkpoint supersession pair (Section 11.3)
-- engine retry classifiers (Section 8.6) — six fixtures
+- periodic-checkpoint supersession pair (Section 11.3) — **blocked on a product
+  decision, not effort**: `checkpoint_frequency` is an inert setting today, so
+  there is nothing to supersede. Resolve whether it drives a real periodic save
+  or is removed as superseded by per-range acknowledgement
+- ~~engine retry classifiers (Section 8.6)~~ — **already covered**; verified 2026-07-31, all six engines in `TestClassifyEngineRetryMatrix`
 - `TestStage4LiveMatrixEnvironmentRequired`
+
+### F2. Inert configuration audit
+
+Added 2026-07-31. Every field below is parsed, defaulted, and validated in
+`internal/config`, and never read by any transfer, state, or lifecycle path.
+Verified by locating every non-test reference per field.
+
+| Setting | Reachable consumers | Assessment |
+| --- | --- | --- |
+| `checkpoint_frequency` | none outside `internal/config` | Silently inert. Durability comes from per-range acknowledgement, which is finer-grained, so this is a truthfulness defect rather than data loss. Decide: drive a real periodic save, or remove as superseded. |
+| `upsert_merge_size` | none outside `internal/config` | Silently inert. Likely superseded by chunk sizing; confirm and remove, or wire it. |
+| `large_table_threshold` | none outside `internal/config`, though it does alter `resume_hash.go` | Silently inert **and** hash-affecting: changing it can invalidate a resume without changing any behavior. That combination is the worst of the five. |
+| `runtime_tuning_interval` | none outside `internal/config` | Consistent with Section 8.3, which already records general runtime adjustment as absent. Defensible, but the setting should reject or warn until implemented. |
+| `history_retention_days` | none outside `internal/config` | Defensibly deferred: the Stage 5 boundary assigns history retention to Stage 5. Should still not accept a value it will ignore. |
+
+`read_ahead` was checked alongside these and **is** consumed, in
+`resource_plan.go` and `sqlite_transfer_pipeline.go`.
+
+No fixture closes this block. The required work is a decision per row —
+implement, reject at parse, or remove — followed by a test that the setting
+either takes effect or is refused. Accepting a value that does nothing is the
+behavior to eliminate.
 
 ### G. The live gate
 
@@ -611,7 +638,8 @@ TLS matrix must be rerun, and the application's aggregate publication path needs
 its first live coverage. **Blocked until 2026-08-06** by the approval quota; do
 not work around that limit.
 
-Stage 4 cannot be declared complete while any of A through G is open. Local
+Stage 4 cannot be declared complete while any of A through G, including F2, is
+open. Local
 `go test ./...` passing is necessary and nowhere near sufficient.
 
 ## Stage 5 and Stage 6 boundary
@@ -673,6 +701,10 @@ Reordered 2026-07-31. The two original top risks are closed.
 7. **The application's aggregate publication path has no live coverage.** The
    composed run completion is proven at the migrate layer, but the `app` branch
    that calls it is reachable only through a PostgreSQL route.
+8. **Five operator-facing settings are inert.** See the inert-configuration
+   audit below. They parse, validate, and in some cases alter the resume
+   compatibility hash, but no transfer, state, or lifecycle path reads them. An
+   operator tuning them gets silence, not an error.
 8. **Closed:** network resume now exists
    (`TestStage4PostgresTLSToSQLiteNetworkCrashResumeLive`,
    `TestStage4AdapterNetworkResumeReplansChangedRangeCount`, and the
