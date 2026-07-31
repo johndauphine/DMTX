@@ -592,7 +592,16 @@ Every certified-cell implementation needs its family. Missing, by name:
 - `TestStage4SchemaContractTargetMatrixLive`
 - `TestStage4ValidationRouteMatrixLive`
 - `TestStage4CertifiedRelationalCrashResumeMatrixLive` (both state backends)
-- `TestStage4CertifiedRelationalTransferLifecycleLive`
+- ~~`TestStage4CertifiedRelationalTransferLifecycleLive`~~ — **satisfied
+  2026-07-31** by the per-engine stable-runner sentinels rather than a new
+  fixture: `TestStage4MySQLStableRunnerLiveTLS`,
+  `TestStage4MariaDBStableRunnerLiveTLS`,
+  `TestStage4SQLServerStableRunnerLiveTLS`, and the PostgreSQL network
+  lifecycle tests. These previously asserted only the returned `Result`; they
+  now also assert the durable work task and range are terminal with the exact
+  row count, which is what "through the resumable range protocol" requires. A
+  route that transferred correctly but left durable evidence unfinished would
+  formerly have passed.
 - `TestStage4CertifiedRelationalUpsertReplayMatrixLive`
 
 ### B. Validation (Section 12) — logic done, live matrix open

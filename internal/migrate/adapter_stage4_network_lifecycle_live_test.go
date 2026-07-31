@@ -838,6 +838,18 @@ func runStage4RelationalStableRunnerLive(
 			result,
 		)
 	}
+	// A returned Result only says the call succeeded. The transfer-lifecycle
+	// requirement is that the run completed *through the resumable range
+	// protocol*, so the durable work task and its range must both be terminal
+	// with the exact row count. Without this, a route that transferred correctly
+	// but left its durable evidence unfinished would pass.
+	assertStage4NetworkLifecycleCompleted(
+		t,
+		backend,
+		runID,
+		tableName,
+		3,
+	)
 }
 
 func stage4RelationalStableRunnerConfig(
