@@ -323,6 +323,81 @@ func TestDeleteReconcileRequiresExplicitSafeEqualityProof(t *testing.T) {
 	}
 }
 
+func TestDeleteReconcileTaskAdmissionIsExact(t *testing.T) {
+	for _, taskType := range []string{
+		"table-copy",
+		stage4AdapterNetworkTaskType,
+	} {
+		t.Run("admits_"+taskType, func(t *testing.T) {
+			request := deleteTestRequest(t)
+			request.Task.Type = taskType
+			plan, err := validateDeleteReconcileRequest(
+				request,
+				&deleteTestCanonicalizer{},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(plan.sourcePrimaryKey) != 2 ||
+				len(plan.targetPrimaryKey) != 2 {
+				t.Fatalf("delete key plan = %#v", plan)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name      string
+		taskType  string
+		partition string
+	}{
+		{
+			name:     "rejects_analytical_task",
+			taskType: "analytical-table-copy",
+		},
+		{
+			name:     "rejects_unknown_task",
+			taskType: "unknown-table-copy",
+		},
+		{
+			name:      "rejects_partitioned_legacy_task",
+			taskType:  "table-copy",
+			partition: "partition/0",
+		},
+		{
+			name:      "rejects_partitioned_network_task",
+			taskType:  stage4AdapterNetworkTaskType,
+			partition: "partition/0",
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			request := deleteTestRequest(t)
+			request.Task.Type = test.taskType
+			request.Task.Partition = test.partition
+			backend := newDeleteFakeState()
+			source := &deleteFakeSource{}
+			target := &deleteFakeTarget{parameterLimit: 100}
+			_, err := deleteTestReconciler(
+				request,
+				backend,
+				source,
+				target,
+			).reconcile(context.Background(), request)
+			if err == nil || !strings.Contains(
+				err.Error(),
+				"authenticated unpartitioned relational table-copy task",
+			) {
+				t.Fatalf("task admission error = %v", err)
+			}
+			assertDeleteStateWriteCalls(t, backend, 0, 0, 0, 0, 0)
+			if source.openCalls != 0 || target.openCalls != 0 ||
+				target.applyCalls != 0 {
+				t.Fatal("rejected delete task crossed state or adapter admission")
+			}
+		})
+	}
+}
+
 func TestDeleteReconcileCandidatePlanAndBatchIntentPrecedeMutation(
 	t *testing.T,
 ) {
@@ -1322,6 +1397,57 @@ func TestDeleteReconcileTerminalCleanupFailureIsVisible(t *testing.T) {
 			linkInfo,
 			statErr,
 		)
+	}
+}
+
+func TestDeleteReconcileTerminalReplayCleansCrashLeftoverSpool(t *testing.T) {
+	request := deleteTestRequest(t)
+	backend := newDeleteFakeState()
+	source := &deleteFakeSource{}
+	target := &deleteFakeTarget{
+		rows:           [][]any{{"a", int64(1)}},
+		parameterLimit: 100,
+		state:          backend,
+	}
+	reconciler := deleteTestReconciler(
+		request,
+		backend,
+		source,
+		target,
+	)
+	outcome, err := reconciler.reconcile(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Record.Status != state.DeleteReconciliationCompleted ||
+		outcome.Record.Plan == nil {
+		t.Fatalf("completed delete outcome = %#v", outcome)
+	}
+	spoolPath := outcome.Record.Plan.SpoolPath
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("initial terminal spool still exists: %v", err)
+	}
+	if err := os.WriteFile(spoolPath, []byte("crash-leftover"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	applyCalls := target.applyCalls
+	openCalls := source.openCalls
+	replayed, err := reconciler.reconcile(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Record.Status != state.DeleteReconciliationCompleted ||
+		!replayed.StrictCountValidation || target.applyCalls != applyCalls ||
+		source.openCalls != openCalls {
+		t.Fatalf(
+			"terminal replay outcome=%#v source opens=%d target applies=%d",
+			replayed,
+			source.openCalls,
+			target.applyCalls,
+		)
+	}
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("terminal replay did not remove crash-leftover spool: %v", err)
 	}
 }
 

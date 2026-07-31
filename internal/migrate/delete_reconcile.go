@@ -280,10 +280,16 @@ func validateDeleteReconcileRequest(
 			err,
 		)
 	}
-	if request.Task.Type != "table-copy" ||
-		request.Task.Partition != "" {
+	switch request.Task.Type {
+	case "table-copy", stage4AdapterNetworkTaskType:
+	default:
 		return deleteKeyPlan{}, fmt.Errorf(
-			"delete reconciliation requires one unpartitioned table-copy task",
+			"delete reconciliation requires one authenticated unpartitioned relational table-copy task",
+		)
+	}
+	if request.Task.Partition != "" {
+		return deleteKeyPlan{}, fmt.Errorf(
+			"delete reconciliation requires one authenticated unpartitioned relational table-copy task",
 		)
 	}
 	if request.SourceTable.Name == "" ||
@@ -1858,7 +1864,20 @@ func (reconciler deleteReconciler) reconcileMutating(
 		}
 		if existing.Status !=
 			state.DeleteReconciliationRunning {
-			return terminalDeleteReconcileOutcome(existing)
+			outcome, terminalErr := terminalDeleteReconcileOutcome(existing)
+			var cleanupErr error
+			if existing.Plan != nil {
+				if err := removeDeleteSpoolPath(
+					request.SpoolDirectory,
+					existing.Plan.SpoolPath,
+				); err != nil {
+					cleanupErr = fmt.Errorf(
+						"terminal delete reconciliation spool cleanup failed: %w",
+						err,
+					)
+				}
+			}
+			return outcome, errors.Join(terminalErr, cleanupErr)
 		}
 	}
 	dueFacts, err := reconciler.loadLatestDueFacts(request)

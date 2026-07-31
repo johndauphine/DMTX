@@ -70,8 +70,9 @@ type stage4AdapterNetworkExecution struct {
 	resources   config.EffectiveTransferPlan
 	retryPolicy RetryPolicy
 
-	nextGlobalRange uint64
-	finalizeWork    func(stage4AdapterWork) (stage4AdapterWork, error)
+	nextGlobalRange   uint64
+	finalizeWork      func(stage4AdapterWork) (stage4AdapterWork, error)
+	deleteTransferred map[int]stage4AdapterPostgresDeleteTransferredTable
 }
 
 // stage4AdapterNetworkWave is one table's exact range set. Tables execute in
@@ -97,7 +98,8 @@ type stage4AdapterNetworkTableExecution struct {
 }
 
 type stage4AdapterNetworkAdmissionOptions struct {
-	strictSnapshotComposition bool
+	strictSnapshotComposition       bool
+	deleteReconciliationComposition bool
 }
 
 type stage4AdapterNetworkAdmissionOption func(
@@ -107,6 +109,12 @@ type stage4AdapterNetworkAdmissionOption func(
 func withStage4StrictSnapshotComposition() stage4AdapterNetworkAdmissionOption {
 	return func(options *stage4AdapterNetworkAdmissionOptions) {
 		options.strictSnapshotComposition = true
+	}
+}
+
+func withStage4DeleteReconciliationComposition() stage4AdapterNetworkAdmissionOption {
+	return func(options *stage4AdapterNetworkAdmissionOptions) {
+		options.deleteReconciliationComposition = true
 	}
 }
 
@@ -2134,12 +2142,38 @@ func requireStage4AdapterNetworkMode(
 			),
 		)
 	}
-	if cfg.Migration.Deletes.Mode != "" &&
-		cfg.Migration.Deletes.Mode != config.DeleteModeOff {
+	deleteEnabled := false
+	switch cfg.Migration.Deletes.Mode {
+	case "", config.DeleteModeOff:
+	case config.DeleteModeReconcile:
+		deleteEnabled = true
+	default:
 		return NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
-				"Stage 4 delete reconciliation requires a composed network delete runner",
+				"Stage 4 network runner received unsupported delete mode %q",
+				cfg.Migration.Deletes.Mode,
+			),
+		)
+	}
+	if deleteEnabled !=
+		options.deleteReconciliationComposition {
+		class := ErrorClassPolicy
+		message := "Stage 4 delete reconciliation requires a composed network delete runner"
+		if !deleteEnabled {
+			class = ErrorClassState
+			message = "Stage 4 network delete composition was enabled without delete reconciliation"
+		}
+		return NewTransferError(
+			class,
+			fmt.Errorf("%s", message),
+		)
+	}
+	if deleteEnabled != (prepared.deletes != nil) {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"Stage 4 prepared delete reconciliation differs from network admission",
 			),
 		)
 	}

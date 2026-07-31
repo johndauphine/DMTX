@@ -106,12 +106,51 @@ func requireStage4AdapterConfigurationSeams(cfg config.Config) error {
 		}
 	}
 	if cfg.Migration.Deletes.Mode == config.DeleteModeReconcile {
-		return NewTransferError(
-			ErrorClassPolicy,
-			fmt.Errorf(
-				"Stage 4 delete reconciliation requires a composed adapter delete seam",
-			),
+		mode, err := normalizeAdapterTargetMode(
+			cfg.Migration.TargetMode,
 		)
+		if err != nil {
+			return err
+		}
+		if mode != "upsert" {
+			return NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 delete reconciliation requires target mode upsert",
+				),
+			)
+		}
+		sourceEngine, sourceErr := config.CanonicalEngine(
+			cfg.Source.Type,
+		)
+		targetEngine, targetErr := config.CanonicalEngine(
+			cfg.Target.Type,
+		)
+		if sourceErr != nil || targetErr != nil ||
+			sourceEngine != "postgres" || targetEngine != "postgres" {
+			return NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 delete reconciliation is currently certified only for PostgreSQL-to-PostgreSQL",
+				),
+			)
+		}
+		if cfg.Migration.StrictConsistency {
+			return NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 PostgreSQL delete reconciliation is not yet certified inside one strict snapshot epoch",
+				),
+			)
+		}
+		if len(cfg.Migration.DateUpdatedColumns) != 0 {
+			return NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 PostgreSQL delete reconciliation is certified for full-table work, not incremental windows",
+				),
+			)
+		}
 	}
 	if cfg.Migration.StrictConsistency {
 		mode, err := normalizeAdapterTargetMode(
@@ -200,6 +239,8 @@ type stage4AdapterPrepared struct {
 	network                            *networkStateCoordinator
 	evolution                          *stage4AdapterTargetSchemaEvolution
 	incremental                        *stage4AdapterIncrementalPrepared
+	deletes                            *stage4AdapterPostgresDeletePrepared
+	deleteReconciliationStrict         map[stage4RichTableKey]bool
 }
 
 type stage4AdapterWork struct {
@@ -263,6 +304,12 @@ func migrateWithStage4Adapters(
 				withStage4StrictSnapshotComposition(),
 			)
 		}
+		if prepared.deletes != nil {
+			networkOptions = append(
+				networkOptions,
+				withStage4DeleteReconciliationComposition(),
+			)
+		}
 		networkExecution, err = admitStage4AdapterNetworkTransfer(
 			ctx,
 			cfg,
@@ -300,6 +347,14 @@ func migrateWithStage4Adapters(
 		); err != nil {
 			return Result{}, err
 		}
+		if err := prevalidateStage4AdapterPostgresDeleteCompletedTargets(
+			ctx,
+			target,
+			prepared,
+			networkExecution,
+		); err != nil {
+			return Result{}, err
+		}
 		if err := applyStage4AdapterTargetSchema(
 			ctx,
 			observer,
@@ -316,16 +371,30 @@ func migrateWithStage4Adapters(
 		); err != nil {
 			return Result{}, err
 		}
-		result, err := runStage4AdapterStableNetworkTables(
-			ctx,
-			cfg,
-			observer,
-			target,
-			prepared,
-			networkExecution,
-			false,
-			nil,
-		)
+		var result Result
+		if prepared.deletes != nil {
+			result, err = runStage4AdapterPostgresDeleteNetworkTables(
+				ctx,
+				cfg,
+				observer,
+				target,
+				prepared,
+				networkExecution,
+				false,
+				nil,
+			)
+		} else {
+			result, err = runStage4AdapterStableNetworkTables(
+				ctx,
+				cfg,
+				observer,
+				target,
+				prepared,
+				networkExecution,
+				false,
+				nil,
+			)
+		}
 		if err != nil {
 			return result, err
 		}
@@ -587,7 +656,82 @@ func checkpointStage4AdapterStableNetworkWork(
 			); err != nil {
 				return err
 			}
+			if execution.prepared.deletes != nil {
+				bound, found, err :=
+					execution.classifyStage4AdapterPostgresDeleteTransferredTable(
+						ctx,
+						planIndex,
+					)
+				if err != nil {
+					return err
+				}
+				if !found || !bound.taskCompleted || bound.rows != rows {
+					return NewTransferError(
+						ErrorClassState,
+						fmt.Errorf(
+							"completed Stage 4 PostgreSQL delete table %s lacks exact durable transfer evidence",
+							plan.source.Name,
+						),
+					)
+				}
+				strict, err := authenticateStage4AdapterPostgresDeleteTerminal(
+					ctx,
+					execution.prepared.deletes,
+					planIndex,
+					bound.work,
+				)
+				if err != nil {
+					return err
+				}
+				bound.ordinaryCompleted = true
+				bound.terminalAuthenticated = true
+				bound.terminalStrict = strict
+				if err := execution.bindStage4AdapterPostgresDeleteTransferredTable(
+					planIndex,
+					bound,
+				); err != nil {
+					return err
+				}
+			}
 			continue
+		}
+		if resume && execution.prepared.deletes != nil {
+			bound, found, err :=
+				execution.classifyStage4AdapterPostgresDeleteTransferredTable(
+					ctx,
+					planIndex,
+				)
+			if err != nil {
+				return err
+			}
+			if found {
+				if bound.taskCompleted {
+					strict, err := authenticateStage4AdapterPostgresDeleteTerminal(
+						ctx,
+						execution.prepared.deletes,
+						planIndex,
+						bound.work,
+					)
+					if err != nil {
+						return err
+					}
+					bound.terminalAuthenticated = true
+					bound.terminalStrict = strict
+				}
+				if err := execution.bindStage4AdapterPostgresDeleteTransferredTable(
+					planIndex,
+					bound,
+				); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := execution.rejectStage4AdapterPostgresDeleteAttemptBeforeReplay(
+				ctx,
+				planIndex,
+			); err != nil {
+				return err
+			}
 		}
 		tableExecution, err := execution.openTable(
 			ctx,
@@ -862,7 +1006,7 @@ func resumeWithStage4Adapters(
 		target,
 		prepared.plans,
 		completed,
-		cfg.Migration.Deletes.Mode == config.DeleteModeReconcile,
+		false,
 	)
 	if err != nil {
 		return Result{}, err
@@ -886,6 +1030,12 @@ func resumeWithStage4Adapters(
 		networkOptions = append(
 			networkOptions,
 			withStage4StrictSnapshotComposition(),
+		)
+	}
+	if prepared.deletes != nil {
+		networkOptions = append(
+			networkOptions,
+			withStage4DeleteReconciliationComposition(),
 		)
 	}
 	networkExecution, err := admitStage4AdapterNetworkTransfer(
@@ -929,6 +1079,14 @@ func resumeWithStage4Adapters(
 	); err != nil {
 		return resultForValidatedAdapterCheckpoints(validated), err
 	}
+	if err := prevalidateStage4AdapterPostgresDeleteCompletedTargets(
+		ctx,
+		target,
+		prepared,
+		networkExecution,
+	); err != nil {
+		return resultForValidatedAdapterCheckpoints(validated), err
+	}
 	if err := applyStage4AdapterTargetSchema(
 		ctx,
 		observer,
@@ -945,16 +1103,30 @@ func resumeWithStage4Adapters(
 	); err != nil {
 		return resultForValidatedAdapterCheckpoints(validated), err
 	}
-	result, err := runStage4AdapterStableNetworkTables(
-		ctx,
-		cfg,
-		observer,
-		target,
-		prepared,
-		networkExecution,
-		true,
-		validated,
-	)
+	var result Result
+	if prepared.deletes != nil {
+		result, err = runStage4AdapterPostgresDeleteNetworkTables(
+			ctx,
+			cfg,
+			observer,
+			target,
+			prepared,
+			networkExecution,
+			true,
+			validated,
+		)
+	} else {
+		result, err = runStage4AdapterStableNetworkTables(
+			ctx,
+			cfg,
+			observer,
+			target,
+			prepared,
+			networkExecution,
+			true,
+			validated,
+		)
+	}
 	if err != nil {
 		return result, err
 	}
@@ -1289,6 +1461,20 @@ func prepareStage4AdapterRun(
 	)
 	if err != nil {
 		return result, err
+	}
+	if cfg.Migration.Deletes.Mode == config.DeleteModeReconcile {
+		result.deletes, err =
+			prepareStage4AdapterPostgresDeleteComposition(
+				ctx,
+				cfg,
+				observer,
+				source,
+				target,
+				result,
+			)
+		if err != nil {
+			return result, err
+		}
 	}
 	if len(cfg.Migration.DateUpdatedColumns) != 0 {
 		result.incremental, result.work, err =
@@ -2454,10 +2640,30 @@ func stage4AdapterValidationTableSpecs(
 			value := count
 			strictSourceRows = &value
 		}
+		reconciliationStrict := false
+		if prepared.deletes != nil {
+			key := stage4RichTableKey{
+				schema: table.Schema,
+				table:  table.Name,
+			}
+			strict, ok := prepared.deleteReconciliationStrict[key]
+			if !ok {
+				return nil, NewTransferError(
+					ErrorClassState,
+					fmt.Errorf(
+						"prepared Stage 4 delete-reconciliation outcome for validation table (%q, %q) is missing",
+						table.Schema,
+						table.Name,
+					),
+				)
+			}
+			reconciliationStrict = strict
+		}
 		specs = append(specs, ValidationTableSpec{
 			Table:                   table,
 			Projection:              adapterColumnNames(table),
 			StrictSourceRows:        strictSourceRows,
+			ReconciliationStrict:    reconciliationStrict,
 			PrimaryKeyEqualityProof: primaryKeyEqualityProof,
 		})
 	}

@@ -296,7 +296,7 @@ func TestStage4AdapterFailsBeforeTargetPlanningWhenRequiredSeamIsMissing(
 			configure: func(cfg *config.Config) {
 				cfg.Migration.Deletes.Mode = config.DeleteModeReconcile
 			},
-			wantError:  "delete seam",
+			wantError:  "only for PostgreSQL-to-PostgreSQL",
 			targetMode: "upsert",
 		},
 		{
