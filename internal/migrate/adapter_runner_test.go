@@ -5,11 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/schema"
 )
+
+// Validation intentionally probes source and target concurrently. These
+// recorders share a single event slice in tests, so count-event writes need
+// the same synchronization that production adapters receive from database/sql.
+var recordingAdapterCountEventsMu sync.Mutex
 
 type recordingAdapterSource struct {
 	events *[]string
@@ -96,6 +102,8 @@ func (source *recordingAdapterSource) CountRows(
 	context.Context,
 	schema.Table,
 ) (int, error) {
+	recordingAdapterCountEventsMu.Lock()
+	defer recordingAdapterCountEventsMu.Unlock()
 	*source.events = append(*source.events, "source_count")
 	return len(source.payloads()), nil
 }
@@ -272,6 +280,8 @@ func (target *recordingAdapterTarget) CountRows(
 	_ context.Context,
 	table schema.Table,
 ) (int, error) {
+	recordingAdapterCountEventsMu.Lock()
+	defer recordingAdapterCountEventsMu.Unlock()
 	*target.events = append(*target.events, "target_count")
 	if target.rowsByTable == nil {
 		return 0, nil

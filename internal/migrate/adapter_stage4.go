@@ -951,10 +951,44 @@ func stage4AdapterPlansBySource(
 }
 
 type stage4AdapterCountProbe struct {
-	mu     sync.Mutex
-	source sourceAdapter
-	target targetAdapter
-	plans  map[stage4RichTableKey]adapterTablePlan
+	source     sourceAdapter
+	target     targetAdapter
+	plans      map[stage4RichTableKey]adapterTablePlan
+	sourceGate stage4AdapterProbeGate
+	targetGate stage4AdapterProbeGate
+}
+
+// stage4AdapterProbeGate serializes operations against one adapter while
+// allowing a caller that has already timed out or been canceled to stop
+// waiting. Source and target use separate gates so independent engines remain
+// concurrent.
+type stage4AdapterProbeGate struct {
+	once  sync.Once
+	token chan struct{}
+}
+
+func (gate *stage4AdapterProbeGate) acquire(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	gate.once.Do(func() {
+		gate.token = make(chan struct{}, 1)
+		gate.token <- struct{}{}
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate.token:
+		if err := ctx.Err(); err != nil {
+			gate.release()
+			return err
+		}
+		return nil
+	}
+}
+
+func (gate *stage4AdapterProbeGate) release() {
+	gate.token <- struct{}{}
 }
 
 func (probe *stage4AdapterCountProbe) ExactCount(
@@ -962,32 +996,88 @@ func (probe *stage4AdapterCountProbe) ExactCount(
 	side ValidationSide,
 	table schema.Table,
 ) (int64, error) {
-	probe.mu.Lock()
-	defer probe.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	plan, err := probe.plan(table)
 	if err != nil {
 		return 0, err
 	}
-	var count int
+	var (
+		count int
+		gate  *stage4AdapterProbeGate
+	)
+	switch side {
+	case ValidationSource:
+		gate = &probe.sourceGate
+	case ValidationTarget:
+		gate = &probe.targetGate
+	default:
+		return 0, fmt.Errorf("unknown Stage 4 validation side %q", side)
+	}
+	if err := gate.acquire(ctx); err != nil {
+		return 0, err
+	}
+	defer gate.release()
 	switch side {
 	case ValidationSource:
 		count, err = probe.source.CountRows(ctx, plan.source)
 	case ValidationTarget:
 		count, err = probe.target.CountRows(ctx, plan.target)
-	default:
-		return 0, fmt.Errorf("unknown Stage 4 validation side %q", side)
 	}
 	return int64(count), err
 }
 
 func (probe *stage4AdapterCountProbe) EstimateCount(
-	context.Context,
-	ValidationSide,
-	schema.Table,
+	ctx context.Context,
+	side ValidationSide,
+	table schema.Table,
 ) (int64, error) {
-	return 0, fmt.Errorf(
-		"Stage 4 adapter count estimate is unavailable; exact count was not relabeled",
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	plan, err := probe.plan(table)
+	if err != nil {
+		return 0, err
+	}
+	var (
+		estimator adapterRowCountEstimator
+		selected  schema.Table
+		gate      *stage4AdapterProbeGate
 	)
+	switch side {
+	case ValidationSource:
+		estimator, _ = probe.source.(adapterRowCountEstimator)
+		selected = plan.source
+		gate = &probe.sourceGate
+	case ValidationTarget:
+		estimator, _ = probe.target.(adapterRowCountEstimator)
+		selected = plan.target
+		gate = &probe.targetGate
+	default:
+		return 0, fmt.Errorf("unknown Stage 4 validation side %q", side)
+	}
+	if estimator == nil {
+		return 0, fmt.Errorf(
+			"Stage 4 %s count estimate is unavailable; exact count was not relabeled",
+			side,
+		)
+	}
+	if err := gate.acquire(ctx); err != nil {
+		return 0, err
+	}
+	defer gate.release()
+	estimate, err := estimator.EstimateRows(ctx, selected)
+	if err != nil {
+		return 0, err
+	}
+	if estimate < 0 {
+		return 0, fmt.Errorf(
+			"Stage 4 %s count estimate is negative",
+			side,
+		)
+	}
+	return estimate, nil
 }
 
 func (probe *stage4AdapterCountProbe) NullCounts(
