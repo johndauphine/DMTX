@@ -7,9 +7,13 @@ checkout another branch.
 ## Current repository state
 
 - Branch: `codex/stage-4-production-semantics`
-- HEAD: `1afd447 stage4: reconcile PostgreSQL deletes`
-- Main was not changed, and nothing was pushed or merged.
-- The worktree is clean except for `docs/STAGE4_REQUIREMENTS_TESTS.md`.
+- HEAD: `0a75352 stage4: correct the upsert contract-creation row`
+- 76 commits ahead of `main`. Main was not changed; nothing was pushed or merged.
+- The worktree is **fully clean**. `docs/STAGE4_REQUIREMENTS_TESTS.md` is now
+  tracked and committed.
+
+Verified green at HEAD: `go test ./... -count=1`, `go vet ./...`, `gofmt -l`,
+and `git diff --check`.
 
 `docs/STAGE4_REQUIREMENTS_TESTS.md` is the requirements map. It was user-owned
 and off-limits until 2026-07-31, when John directed that it be continued; it is
@@ -26,13 +30,31 @@ type metadata, deterministic preflight, PostgreSQL incremental windows,
 PostgreSQL strict consistency, PostgreSQL delete reconciliation, and supporting
 atomic state primitives. The most recent commits are:
 
+The 2026-07-31 session added thirteen commits on top of the delete slice:
+
 ```text
+0a75352 stage4: correct the upsert contract-creation row
+ee1b9e3 stage4: reconcile four more stale requirement rows
+08cf998 stage4: crash-test YAML replacement with expanded evidence
+5ab55aa stage4: record the dry-run target preflight hazard
+eb26238 stage4: disclose dry-run pagination selection
+d263bac stage4: require the complete live matrix environment
+275b1b6 stage4: label dry-run row count provenance
+7826093 stage4: disclose dry-run tuning and delete policy
+95e2557 stage4: refine the inert configuration assessment
+88c9f53 stage4: correct the schema-contract section of the requirements map
+1df2b0f stage4: record the inert configuration audit
+1bb4eec stage4: prove cross-process target lease exclusivity
+6f7dc6f stage4: prove every required-write failure exits state
+943b7a9 stage4: prove deterministic tuning preserves pinned intent
+5ee4c7a stage4: correct the validation section of the requirements map
+9f07eba stage4: reconcile the requirements map with committed evidence
+5b6d6bd stage4: compose stable network aggregate completion
+b2ad045 stage4: allow pre-mutation table inventory revision
+83e60c1 stage4: separate stable network planning from durable work
+554d5e0 stage4: publish run completion atomically
+4190435 stage4: read aggregate completion evidence
 1afd447 stage4: reconcile PostgreSQL deletes
-ccc985b stage4: compose production preflight
-a77c015 stage4: compose PostgreSQL strict consistency
-df0d4bb stage4: harden PostgreSQL delete authority
-4d70f42 stage4: publish completion atomically
-db1e2b6 stage4: compose PostgreSQL schema evolution
 ```
 
 These commits do not prove that the full Stage 4 matrix is complete.
@@ -54,6 +76,26 @@ non-incremental delete-reconciliation route. It includes:
 - path-confined retry cleanup for crash-leftover terminal spools.
 
 The implementation is intentionally fail-closed outside this certified route.
+
+## Decisions waiting on John
+
+Three items are blocked on a product decision, not on effort. Nothing further in
+those areas should be built until they are answered.
+
+1. **Target preflight in dry-run.** How should a not-yet-existing target be
+   treated? For a `drop_recreate` migration into a fresh SQLite file, absence is
+   the normal case, not an error. See the hazard note in the requirements map:
+   `db.Ping()` creates a SQLite file, so a naive preflight would violate
+   dry-run's zero-mutation guarantee.
+2. **May dry-run open state read-only?** Delete due-ness needs the durable
+   last-success time. Today `Plan.Deletes.DueStateKnown` is permanently false
+   and the reporting half of the requirement cannot close either way until this
+   is settled.
+3. **The five inert settings** (`checkpoint_frequency`, `upsert_merge_size`,
+   `large_table_threshold`, `runtime_tuning_interval`, `history_retention_days`).
+   Implement, reject at parse, or remove — per row. See block F2 in the
+   requirements map; note the warning there against "fixing" them by stripping
+   them from the resume projection.
 
 ## Verification already obtained
 
@@ -266,24 +308,39 @@ so it is reachable only on the date-based incremental route.
 
 ## Immediate safe next steps
 
-1. Re-read `git status --short --branch`. Do not include
-   `docs/STAGE4_REQUIREMENTS_TESTS.md` in any operation.
-2. Continue the requirements/test map; the aggregate composition slices are
-   complete for the incremental, stable-network, and PostgreSQL delete routes.
-3. Rerun the PostgreSQL TLS live matrix when the approval quota permits it
-   (retry date 2026-08-06). **Arm the exit gate**: set
-   `DMTX_STAGE4_LIVE_REQUIRED=1` so `TestStage4LiveMatrixEnvironmentRequired`
-   fails on any missing endpoint. Every live fixture skips on an unset DSN, so
-   an unarmed run against a half-provisioned environment reports success while
-   proving almost nothing.
-4. After the aggregate slices, continue the requirements/test map in
-   `docs/STAGE4_REQUIREMENTS_TESTS.md`, especially deterministic tuning/dry-run,
-   broader certified relational routes, schema/validation/spatial coverage, and
-   ClickHouse boundaries. Keep unsupported combinations explicitly fail-closed.
+1. Re-read `git status --short --branch`. The worktree should be clean.
+2. **Rerun the TLS live matrix once the approval quota permits it** (retry date
+   2026-08-06). **Arm the exit gate**: set `DMTX_STAGE4_LIVE_REQUIRED=1` so
+   `TestStage4LiveMatrixEnvironmentRequired` fails on any missing endpoint.
+   Every live fixture skips on an unset DSN, so an unarmed run against a
+   half-provisioned environment reports success while proving almost nothing.
+   This is the highest-value action available and it unblocks most of what
+   remains.
+3. Get answers to the three decisions above before building in those areas.
+4. Then work the requirements map's "Remaining work to declare Stage 4
+   complete" list. After the 2026-07-31 reconciliation the largest genuine gaps
+   are strict consistency for MySQL, MariaDB, SQL Server, and SQLite; the
+   per-engine live route matrices; and dry-run target preflight and drift
+   reporting. Keep unsupported combinations explicitly fail-closed.
+
+**Read the map before assuming anything is unbuilt.** Eight rows that read
+"missing" or "in progress" on 2026-07-31 turned out to be finished under
+different fixture names. Verify by name against the test inventory first:
+`grep -rho "^func Test[A-Za-z0-9_]*" internal/ | sed 's/func //' | sort -u`
 
 ## Do not claim Stage 4 complete yet
 
-Stage 4 remains incomplete. The current evidence is strong for the bounded
-PostgreSQL delete slice and several committed primitives, but the aggregate
-production composition, final TLS rerun, and broader matrix acceptance are
-still outstanding.
+Stage 4 remains incomplete, but the shape of "incomplete" changed on
+2026-07-31. Aggregate production composition **landed** for the incremental,
+stable-network, and PostgreSQL delete routes. The reconciliation then showed
+that validation, schema contract, and engine retry classification were already
+finished under fixture names the map never used.
+
+What is genuinely outstanding is now mostly **the live gate**, not unbuilt
+logic: the TLS matrix rerun, per-engine route matrices, strict consistency for
+four engines, and dry-run target preflight and drift reporting.
+
+Stage 4 cannot be declared complete until the live matrix runs. That is a
+calendar constraint (2026-08-06), not an effort one — no amount of local work
+closes it, and a locally green `go test ./...` is not evidence about the live
+gates.
