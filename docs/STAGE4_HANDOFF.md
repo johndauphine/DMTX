@@ -7,13 +7,14 @@ checkout another branch.
 ## Current repository state
 
 - Branch: `codex/stage-4-production-semantics`
-- HEAD: `0a75352 stage4: correct the upsert contract-creation row`
-- 76 commits ahead of `main`. Main was not changed; nothing was pushed or merged.
+- HEAD: `20bcbb1 stage4: project intra-schema foreign keys into SQLite`
+- Main was not changed; nothing was pushed or merged.
 - The worktree is **fully clean**. `docs/STAGE4_REQUIREMENTS_TESTS.md` is now
   tracked and committed.
 
-Verified green at HEAD: `go test ./... -count=1`, `go vet ./...`, `gofmt -l`,
-and `git diff --check`.
+Verified green at HEAD, **including the full live TLS matrix**:
+`go test ./... -count=1` and `go test -race ./... -count=1` with every live
+endpoint enabled, plus `go vet ./...`, `gofmt -l`, and `git diff --check`.
 
 `docs/STAGE4_REQUIREMENTS_TESTS.md` is the requirements map. It was user-owned
 and off-limits until 2026-07-31, when John directed that it be continued; it is
@@ -30,9 +31,20 @@ type metadata, deterministic preflight, PostgreSQL incremental windows,
 PostgreSQL strict consistency, PostgreSQL delete reconciliation, and supporting
 atomic state primitives. The most recent commits are:
 
-The 2026-07-31 session added thirteen commits on top of the delete slice:
+The 2026-07-31 session added the commits below on top of the delete slice. The
+last three matter most: the live matrix was run for the first time, and the two
+real bugs it exposed were fixed.
 
 ```text
+20bcbb1 stage4: project intra-schema foreign keys into SQLite
+c3762af stage4: count validation through the stable source view
+170bdb0 stage4: run the live TLS matrix and record results
+bea627f stage4: record why the remaining strict engines need servers
+54cd53e stage4: compose SQLite strict through the coordinator
+06753d0 stage4: close the strict rejection row
+efd6958 stage4: implement SQLite strict consistency
+36496f6 stage4: prove run record round-trip and token redaction
+c67c2c7 stage4: refresh the handoff to current state
 0a75352 stage4: correct the upsert contract-creation row
 ee1b9e3 stage4: reconcile four more stale requirement rows
 08cf998 stage4: crash-test YAML replacement with expanded evidence
@@ -100,39 +112,40 @@ The TLS config names are fixed by the fixtures: `dmtx_test` for MySQL,
 `dmtx_mariadb_test` for MariaDB. SQL Server additionally requires
 `guid conversion=true` and `tlsmin=1.2`.
 
-### Result
+### Result: the whole matrix is green
 
-`app`, `audit`, `config`, `contract`, `engine`, `schema`, and `state` all pass
-with live TLS enabled. **Every PostgreSQL Stage 4 live route passes**, including
-delete composition, delete crash-resume, incremental composition, schema
-evolution, deep validation, and network crash-resume.
+`go test ./... -count=1` and `go test -race ./... -count=1` both pass with every
+live TLS endpoint enabled. All eight packages green under both.
 
-Six failures remain, all in `internal/migrate`, and **every one was verified
-pre-existing** by rerunning it in a detached worktree at `ccc985b`, the
-pre-session commit. The 2026-07-31 session introduced no live regression.
+The run initially surfaced six failures, all in `internal/migrate`. Each was
+verified **pre-existing** by rerunning it in a detached worktree at `ccc985b`,
+the pre-session commit — the 2026-07-31 session introduced no live regression.
+They resolved to two root causes, both now fixed.
 
-| Failing test | Cause |
-| --- | --- |
-| `TestPostgresToSQLiteCommonFixtureLive` | Stage 3. `renderSQLiteForeignKey` in `internal/schema/sqlite.go` refuses any foreign key with a non-empty `ReferencedSchema`. The fixture's FK references a schema-qualified table, so planning fails before the destructive-acknowledgement gate is reached and the test sees a schema error instead of the safety message. |
-| `TestMySQLToSQLiteCommonFixtureLive` | Same qualified-FK rejection. |
-| `TestMariaDBToSQLiteCommonFixtureLive` | Same qualified-FK rejection. |
-| `TestStage4MySQLStableRunnerLiveTLS` | Times out after 20s: "stable source with one connection: context deadline exceeded". |
-| `TestStage4MariaDBStableRunnerLiveTLS` | Same 20s timeout. |
-| `TestStage4SQLServerStableRunnerLiveTLS` | Same shape, 60s timeout. |
+**1. Validation counted through the pool while the stable view held the only
+connection** (`c3762af`). `stage4AdapterValidationProbe` returned early for
+`count_only` mode and built the probe from the pool adapter, ignoring the
+`providerSource` the caller supplied. The deeper validation modes used it
+correctly; only the default mode did not. MySQL, MariaDB, and SQL Server cap
+their source pool at `MaxOpenConns(1)` (`internal/engine/mysql.go`,
+`internal/engine/mssql.go`) while PostgreSQL does not, so only those three
+deadlocked — waiting for a connection the caller was itself holding, until the
+context deadline. Diagnosed by watching the MySQL process list during the hang:
+two idle connections, zero blocked queries, which ruled out a server-side lock
+and pointed at client-side pool starvation. Counting through the stable view is
+also the more truthful measurement: it counts the snapshot that was transferred.
+`TestStage4MySQLStableRunnerLiveTLS` went from a 20s deadline exceeded to 0.1s.
 
-### What to fix first
-
-The qualified-FK cluster is one root cause and looks tractable: when the
-referenced table is itself part of the migration, the planner should resolve the
-reference to the unqualified target table rather than refuse it. Refusal is only
-correct when the reference escapes the migrated set. Fixing it at the renderer
-would be wrong — the renderer cannot know the mapping; fix it in the
-source-to-SQLite projection.
-
-The three single-connection timeouts are a separate root cause and are the more
-serious of the two: they are Stage 4 routes on three engines, and a deadline
-exceeded under a one-connection budget suggests the stable-source path acquires
-more than one connection somewhere on those engines.
+**2. Intra-schema foreign keys were never unqualified for SQLite** (`20bcbb1`).
+The SQLite projections normalized `Match`, `OnUpdate`, and `OnDelete` but left
+`ReferencedSchema` set, and `renderSQLiteForeignKey` refuses any qualified
+reference. SQLite has one namespace, so a reference inside the migrated schema
+is expressible only unqualified — the SQLite database *is* that schema. The
+projections now clear the qualifier for same-schema references and still refuse
+cross-schema ones, which genuinely name a relation the migration does not carry.
+Fixed in the projection rather than the renderer: the renderer cannot know the
+mapping. This also restored the destructive-acknowledgement gate, which the
+schema error had been masking.
 
 ## Decisions waiting on John
 
