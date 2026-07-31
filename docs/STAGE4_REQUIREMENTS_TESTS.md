@@ -348,10 +348,10 @@ permanently at the first terminal table evidence.
 | Normative behavior | Current evidence | Remaining proof |
 |---|---|---|
 | Fresh, resume, and abandon use canonical target lease. | **Covered base:** lease identity tests and Stage 2 lifecycle CLI tests. | `TestStage4NetworkRunResumeAbandonShareCanonicalLeaseLive`. |
-| Random token, monotonic generation, atomic acquisition/takeover; live second owner fails and force cannot bypass. | **Covered base:** `TestSQLiteStoreRejectsSecondLiveTargetLease`, `TestReleasedLeaseRetainsMonotonicFencingGeneration`, force-resume tests. | Process-level `TestTargetLeaseTwoProcessRace` and `TestForceResumeCannotBypassLiveNetworkLease`. |
+| Random token, monotonic generation, atomic acquisition/takeover; live second owner fails and force cannot bypass. | **Covered:** `TestSQLiteStoreRejectsSecondLiveTargetLease`, `TestReleasedLeaseRetainsMonotonicFencingGeneration`, force-resume tests, and process-level `TestTargetLeaseTwoProcessRace`. | `TestForceResumeCannotBypassLiveNetworkLease` remains missing (network route). |
 | Heartbeat renewal fences every run/task/progress/completion mutation; stale owner is cancelled and cannot succeed. | **Covered base:** `TestFencedBackendsRejectEveryOldGenerationMutationAfterTakeover`, `TestTargetMutationFenceSerializesTakeoverAndRejectsOldOwner`. | `TestStage4OldNetworkOwnerCancelledAfterTakeoverLive`. |
 | Takeover only after TTL; legacy fresh un-fenced run rejects. | **Partial:** TTL takeover/generation is covered; explicit legacy-live rejection needs proof. | `TestLegacyFreshUnfencedRunRejectsTakeover`. |
-| Different canonical targets run concurrently. | **Missing explicit process fixture.** | `TestDifferentCanonicalTargetsRunConcurrently`. |
+| Different canonical targets run concurrently. | **Covered:** `TestDifferentCanonicalTargetsRunConcurrently` runs two processes against distinct canonical targets and requires both to succeed. | None. |
 
 ### 11.5 Outcome versus resumability
 
@@ -451,9 +451,9 @@ it cannot implement safely until separately admitted.
 | Unknown/required-write failures prevent success. | **Covered:** `TestStage4EveryRequiredWriteFailureReturnsStateExitSix`. |
 | Task creation fails before mutation. | **Covered base;** network live regression required. |
 | Periodic failure may be superseded only by audited final save. | **Missing:** two proposed periodic-checkpoint fixtures. |
-| Two processes racing one target produce one owner. | **Missing explicit process test:** `TestTargetLeaseTwoProcessRace`. |
+| Two processes racing one target produce one owner. | **Covered:** `TestTargetLeaseTwoProcessRace` holds the lease and proves a second real process cannot take an owned target, then that the target frees on release. |
 | Old generation cannot mutate or report success after takeover. | **Covered base:** fenced backend/target mutation tests; network live fixture required. |
-| Different targets run concurrently. | **Missing:** `TestDifferentCanonicalTargetsRunConcurrently`. |
+| Different targets run concurrently. | **Covered:** `TestDifferentCanonicalTargetsRunConcurrently`. |
 | Config drift/force rules hold. | **Covered base;** extend for every Stage 4 field. |
 | Completed skip requires target-count agreement. | **Covered base SQLite;** network matrix required. |
 | Topology change clears stale progress. | **Covered base;** network matrix required. |
@@ -598,7 +598,7 @@ due/candidate reporting, and estimate provenance.
 - `TestDeleteReconcileDryRunReportsDueCandidates` — reporting half of dry-run
 - `TestClickHouseIncrementalRejectedBeforeMutationLive`
 - `TestClickHouseDeleteReconcileRejectedBeforeMutationLive`
-- `TestTargetLeaseTwoProcessRace`, `TestDifferentCanonicalTargetsRunConcurrently`
+- ~~`TestTargetLeaseTwoProcessRace`, `TestDifferentCanonicalTargetsRunConcurrently`~~ — **closed 2026-07-31**
 - ~~`TestStage4EveryRequiredWriteFailureReturnsStateExitSix`~~ — **closed 2026-07-31**
 - periodic-checkpoint supersession pair (Section 11.3)
 - engine retry classifiers (Section 8.6) — six fixtures
