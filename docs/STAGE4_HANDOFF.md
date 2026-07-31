@@ -270,7 +270,12 @@ so it is reachable only on the date-based incremental route.
    `docs/STAGE4_REQUIREMENTS_TESTS.md` in any operation.
 2. Continue the requirements/test map; the aggregate composition slices are
    complete for the incremental, stable-network, and PostgreSQL delete routes.
-3. Rerun the PostgreSQL TLS live matrix when the approval quota permits it.
+3. Rerun the PostgreSQL TLS live matrix when the approval quota permits it
+   (retry date 2026-08-06). **Arm the exit gate**: set
+   `DMTX_STAGE4_LIVE_REQUIRED=1` so `TestStage4LiveMatrixEnvironmentRequired`
+   fails on any missing endpoint. Every live fixture skips on an unset DSN, so
+   an unarmed run against a half-provisioned environment reports success while
+   proving almost nothing.
 4. After the aggregate slices, continue the requirements/test map in
    `docs/STAGE4_REQUIREMENTS_TESTS.md`, especially deterministic tuning/dry-run,
    broader certified relational routes, schema/validation/spatial coverage, and

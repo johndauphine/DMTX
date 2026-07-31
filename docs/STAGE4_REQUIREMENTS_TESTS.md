@@ -536,7 +536,14 @@ The final Stage 4 gate must include all of the following:
 3. `go vet ./...`, command builds, cross-compilation checks already required
    by the repository, and `git diff --check`
 4. `TestStage4LiveMatrixEnvironmentRequired`, which must fail—not skip—when
-   the exit-gate flag is enabled and any pinned TLS endpoint is missing
+   the exit-gate flag is enabled and any pinned TLS endpoint is missing.
+   **Implemented 2026-07-31.** Arm it with `DMTX_STAGE4_LIVE_REQUIRED=1`; it
+   then fails naming every absent variable. `TestStage4LiveMatrixEnvironment`
+   `CoversEveryPinnedEndpoint` additionally proves the Stage 4 endpoint list
+   never narrows below Stage 3's, so the gate cannot silently shrink.
+   **Run the exit gate with this armed** — every live fixture in the repository
+   skips on an unset DSN, so an unarmed run against a half-provisioned
+   environment reports success while proving almost nothing.
 5. TLS live matrices for PostgreSQL 16, SQL Server 2022, Oracle MySQL 8.0,
    MariaDB 10.11, ClickHouse 24.8, and SQLite local routes
 6. `TestStage4CertifiedRelationalIncrementalRouteMatrixLive`
@@ -625,7 +632,8 @@ the zero-mutation guarantee is now asserted rather than assumed. Remaining:
   there is nothing to supersede. Resolve whether it drives a real periodic save
   or is removed as superseded by per-range acknowledgement
 - ~~engine retry classifiers (Section 8.6)~~ — **already covered**; verified 2026-07-31, all six engines in `TestClassifyEngineRetryMatrix`
-- `TestStage4LiveMatrixEnvironmentRequired`
+- ~~`TestStage4LiveMatrixEnvironmentRequired`~~ — **closed 2026-07-31**; arm with
+  `DMTX_STAGE4_LIVE_REQUIRED=1`, and it fails naming every absent endpoint
 
 ### F2. Inert configuration audit
 
