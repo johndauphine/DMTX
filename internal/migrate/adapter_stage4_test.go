@@ -183,7 +183,7 @@ func TestStage4AdapterFreshOrdersSchemaWorkMutationAndPublication(
 		tasks,
 		ranges,
 		state.TaskKey{
-			Type:   "table-copy",
+			Type:   stage4AdapterNetworkTaskType,
 			Schema: "public",
 			Table:  "items",
 		},
@@ -951,7 +951,7 @@ func TestStage4AdapterResumeRejectsCompletedCheckpointWithoutStructuredWork(
 	}
 }
 
-func TestStage4AdapterResumeRejectsCompletedRangeForIncompleteTable(
+func TestStage4AdapterResumeAdmitsCompletedRangeForIncompleteTable(
 	t *testing.T,
 ) {
 	events := make([]string, 0)
@@ -986,6 +986,7 @@ func TestStage4AdapterResumeRejectsCompletedRangeForIncompleteTable(
 		"target-password",
 	)
 	cfg.Migration.TargetMode = "upsert"
+	cfg.Migration.Partitions = 2
 	prepared, err := prepareStage4AdapterRun(
 		context.Background(),
 		cfg,
@@ -1016,8 +1017,22 @@ func TestStage4AdapterResumeRejectsCompletedRangeForIncompleteTable(
 	); err != nil {
 		t.Fatal(err)
 	}
+	if len(item.ranges) != 2 {
+		t.Fatalf("network ranges = %#v", item.ranges)
+	}
+	restores, err := prepared.network.loadRestores(
+		context.Background(),
+	)
+	if err != nil {
+		t.Fatalf("restore partial network work: %v", err)
+	}
+	if len(restores) != 2 ||
+		!restores[0].Complete ||
+		restores[1].Complete {
+		t.Fatalf("partial network restores = %#v", restores)
+	}
 	events = events[:0]
-	_, err = resumeWithAdapters(
+	result, err := resumeWithAdapters(
 		context.Background(),
 		cfg,
 		nil,
@@ -1026,26 +1041,16 @@ func TestStage4AdapterResumeRejectsCompletedRangeForIncompleteTable(
 		source,
 		target,
 	)
-	if err == nil ||
-		!strings.Contains(
-			err.Error(),
-			"range marks table items complete",
-		) {
-		t.Fatalf("completed range error = %v", err)
+	if err != nil {
+		t.Fatalf("resume partially completed network work: %v", err)
 	}
-	for _, forbidden := range []string{
-		"before_tables:items",
-		"target_prepare",
-		"target_write",
-		"target_finalize",
-	} {
-		if stage4AdapterEventIndex(events, forbidden) >= 0 {
-			t.Fatalf(
-				"completed range crossed %s: %v",
-				forbidden,
-				events,
-			)
-		}
+	if result != (Result{Tables: 1, Rows: 2, Validated: true}) {
+		t.Fatalf("partial network resume result = %#v", result)
+	}
+	if stage4AdapterEventIndex(events, "target_prepare") < 0 ||
+		stage4AdapterEventIndex(events, "target_write") <
+			stage4AdapterEventIndex(events, "target_prepare") {
+		t.Fatalf("partial network resume order = %v", events)
 	}
 }
 

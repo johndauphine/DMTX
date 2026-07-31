@@ -108,6 +108,71 @@ func (source *recordingAdapterSource) CountRows(
 	return len(source.payloads()), nil
 }
 
+func (source *recordingAdapterSource) PlanPagination(
+	_ context.Context,
+	table schema.Table,
+	requestedPartitions int,
+) (PaginationPlan, error) {
+	*source.events = append(*source.events, "source_pagination")
+	if requestedPartitions < 1 {
+		return PaginationPlan{}, fmt.Errorf(
+			"unexpected partition count %d",
+			requestedPartitions,
+		)
+	}
+	ranges := SplitIntegerRange(
+		1,
+		int64(len(source.payloads())),
+		requestedPartitions,
+	)
+	if len(ranges) == 0 {
+		ranges = []PaginationRange{{ID: 0, Empty: true}}
+	}
+	plan := PaginationPlan{
+		Strategy: PaginationIntegerKeyset,
+		Keys: []KeySpec{{
+			Name: "id",
+			Kind: KeyInteger,
+		}},
+		Ranges: ranges,
+	}
+	keys, err := adapterPaginationPrimaryKey(
+		"postgres",
+		table.Schema,
+		table,
+	)
+	if err != nil {
+		return PaginationPlan{}, err
+	}
+	evidence := make(
+		[]adapterPaginationKeyEvidence,
+		len(keys),
+	)
+	for index, key := range keys {
+		evidence[index] = adapterPaginationKeyEvidence{
+			Name:     key.Name,
+			Type:     key.Type,
+			Nullable: key.Nullable,
+			Position: key.PrimaryKeyPosition,
+			Declaration: cloneAdapterPaginationDeclaration(
+				key.DeclaredType,
+			),
+		}
+	}
+	topology, err := adapterPaginationTopologyHash(
+		"postgres",
+		table,
+		requestedPartitions,
+		evidence,
+		plan,
+	)
+	if err != nil {
+		return PaginationPlan{}, err
+	}
+	plan.TopologyHash = topology
+	return plan, nil
+}
+
 func (source *recordingAdapterSource) Close() error {
 	*source.events = append(*source.events, "source_close")
 	return nil

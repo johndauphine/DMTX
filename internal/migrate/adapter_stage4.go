@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	stage4AdapterCopyStrategy = "stage4_adapter_table_copy_v1"
-	stage4AdapterCopyRangeID  = "full-copy"
+	stage4AdapterNetworkTaskType = "network-table-copy"
+	stage4AdapterCopyStrategy    = "stage4_adapter_network_ranges_v1"
+	stage4AdapterCopyRangeID     = "range/0"
 )
 
 type stage4AdapterAdmission struct {
@@ -58,7 +59,8 @@ func resolveStage4AdapterAdmission(
 	if _, err := requireStage4TableSetObserver(observer); err != nil {
 		return stage4AdapterAdmission{}, err
 	}
-	if _, ok := observer.(adapterTargetMutationProtector); !ok {
+	protector, protected := observer.(adapterTargetMutationProtector)
+	if !protected || networkMutationProtectorIsNil(protector) {
 		return stage4AdapterAdmission{}, NewTransferError(
 			ErrorClassState,
 			fmt.Errorf(
@@ -138,11 +140,15 @@ type stage4AdapterPrepared struct {
 	targetTables []schema.Table
 	validation   ValidationCoreProbe
 	work         []stage4AdapterWork
+	network      *networkStateCoordinator
 }
 
 type stage4AdapterWork struct {
-	task     state.TaskKey
-	topology string
+	task       state.TaskKey
+	strategy   string
+	topology   string
+	ranges     []state.RangeState
+	pagination PaginationPlan
 }
 
 func migrateWithStage4Adapters(
@@ -712,6 +718,23 @@ func prepareStage4AdapterRun(
 	if err != nil {
 		return result, err
 	}
+	result.work, err = bindStage4AdapterPagination(
+		ctx,
+		source,
+		cfg.Migration.Partitions,
+		result.work,
+		plans,
+	)
+	if err != nil {
+		return result, err
+	}
+	result.network, err = newStage4AdapterNetworkCoordinator(
+		run,
+		result.work,
+	)
+	if err != nil {
+		return result, err
+	}
 	return result, nil
 }
 
@@ -1220,7 +1243,7 @@ func buildStage4AdapterWork(
 	seen := make(map[state.TaskKey]struct{}, len(plans))
 	for index, plan := range plans {
 		task := state.TaskKey{
-			Type:   "table-copy",
+			Type:   stage4AdapterNetworkTaskType,
 			Schema: plan.source.Schema,
 			Table:  plan.source.Name,
 		}
@@ -1301,6 +1324,7 @@ func buildStage4AdapterWork(
 		digest := sha256.Sum256(encoded)
 		result[index] = stage4AdapterWork{
 			task:     task,
+			strategy: stage4AdapterCopyStrategy,
 			topology: hex.EncodeToString(digest[:]),
 		}
 	}
@@ -1550,6 +1574,15 @@ func checkpointStage4AdapterWork(
 	observer TableObserver,
 	prepared stage4AdapterPrepared,
 ) error {
+	protector, protected := observer.(adapterTargetMutationProtector)
+	if !protected || networkMutationProtectorIsNil(protector) {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"Stage 4 network admission requires a lease-fenced target mutation protector",
+			),
+		)
+	}
 	setObserver, err := requireStage4TableSetObserver(observer)
 	if err != nil {
 		return err
@@ -1569,11 +1602,28 @@ func checkpointStage4AdapterWork(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return ensureStage4AdapterWork(
-		ctx,
-		prepared.run,
-		prepared.work,
-	)
+	if prepared.network == nil {
+		if len(prepared.work) == 0 {
+			return nil
+		}
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 network admission is unavailable"),
+		)
+	}
+	if err := prepared.network.ensurePlans(ctx); err != nil {
+		return fmt.Errorf(
+			"checkpoint Stage 4 network ranges before target preparation: %w",
+			err,
+		)
+	}
+	if _, err := prepared.network.loadRestores(ctx); err != nil {
+		return fmt.Errorf(
+			"verify Stage 4 network ranges before target preparation: %w",
+			err,
+		)
+	}
+	return nil
 }
 
 func requireStage4TableSetObserver(
@@ -1596,39 +1646,25 @@ func ensureStage4AdapterWork(
 	run Stage4RunContext,
 	work []stage4AdapterWork,
 ) error {
-	if err := ctx.Err(); err != nil {
+	if len(work) == 0 {
+		return ctx.Err()
+	}
+	coordinator, err := newStage4AdapterNetworkCoordinator(run, work)
+	if err != nil {
 		return err
 	}
-	now := time.Now().UTC()
-	for _, item := range work {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		task := state.WorkTask{
-			RunID:        run.RunID,
-			Key:          item.task,
-			Strategy:     stage4AdapterCopyStrategy,
-			TopologyHash: item.topology,
-			StartedAt:    now,
-		}
-		ranges := []state.RangeState{{
-			ID:           stage4AdapterCopyRangeID,
-			Strategy:     stage4AdapterCopyStrategy,
-			TopologyHash: item.topology,
-		}}
-		if _, err := run.Backend.EnsureWorkPlan(
-			task,
-			ranges,
-		); err != nil {
-			return NewTransferError(
-				ErrorClassState,
-				fmt.Errorf(
-					"checkpoint Stage 4 work for %s before target preparation: %w",
-					item.task.Table,
-					err,
-				),
-			)
-		}
+	if err := coordinator.ensurePlans(ctx); err != nil {
+		return fmt.Errorf(
+			"checkpoint Stage 4 network ranges before target preparation: %w",
+			err,
+		)
+	}
+	_, err = coordinator.loadRestores(ctx)
+	if err != nil {
+		return fmt.Errorf(
+			"verify Stage 4 network ranges before target preparation: %w",
+			err,
+		)
 	}
 	return nil
 }
@@ -1651,8 +1687,10 @@ func verifyStage4ResumeWorkEvidence(
 	for _, item := range work {
 		expected[item.task] = struct{}{}
 	}
-	for key, task := range inventory.tasks {
-		if task.Strategy != stage4AdapterCopyStrategy {
+	for key := range inventory.tasks {
+		if key.Type != stage4AdapterNetworkTaskType &&
+			key.Type != "table-copy" &&
+			key.Type != "analytical-table-copy" {
 			continue
 		}
 		if _, ok := expected[key]; !ok {
@@ -1666,8 +1704,10 @@ func verifyStage4ResumeWorkEvidence(
 		}
 	}
 	for key, ranges := range inventory.ranges {
-		for _, workRange := range ranges {
-			if workRange.Strategy != stage4AdapterCopyStrategy {
+		for range ranges {
+			if key.Type != stage4AdapterNetworkTaskType &&
+				key.Type != "table-copy" &&
+				key.Type != "analytical-table-copy" {
 				continue
 			}
 			if _, ok := expected[key]; !ok {
@@ -1683,11 +1723,9 @@ func verifyStage4ResumeWorkEvidence(
 	}
 	for _, item := range work {
 		_, checkpointComplete := validated[item.task.Table]
-		task, workRange, found, err := inventory.exact(
-			item.task,
-			stage4AdapterCopyRangeID,
-			stage4AdapterCopyStrategy,
-			item.topology,
+		task, _, found, err := exactStage4AdapterWork(
+			inventory,
+			item,
 			allowMissingIncomplete && !checkpointComplete,
 		)
 		if err != nil {
@@ -1705,16 +1743,6 @@ func verifyStage4ResumeWorkEvidence(
 				),
 			)
 		}
-		if workRange.Status == "completed" &&
-			!checkpointComplete {
-			return NewTransferError(
-				ErrorClassState,
-				fmt.Errorf(
-					"Stage 4 structured work range marks table %s complete but its ordinary checkpoint is not reusable",
-					item.task.Table,
-				),
-			)
-		}
 	}
 	return nil
 }
@@ -1725,12 +1753,10 @@ func completeStage4AdapterWork(
 	work []stage4AdapterWork,
 ) error {
 	for _, item := range work {
-		if err := completeStage4WorkTask(
+		if err := completeStage4AdapterWorkItem(
 			ctx,
 			run,
-			item.task,
-			stage4AdapterCopyRangeID,
-			item.topology,
+			item,
 		); err != nil {
 			return fmt.Errorf(
 				"complete Stage 4 work for %s: %w",
