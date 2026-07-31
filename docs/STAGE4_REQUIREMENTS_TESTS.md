@@ -121,35 +121,31 @@ S4.8 **partial**; S4.9 **blocked on the live matrix rerun**.
 
 ### 7.4 Schema drift and contract
 
-The committed Stage 3 baseline does not enforce this contract. Uncommitted S4.1
-configuration parsing and state-evidence primitives are in progress; their
-current unit names include `TestParseProductionSemanticsSurface`,
-`TestParseExpandsScalarAndEmptySchemaContracts`,
-`TestParseCanonicalizesDeprecatedProductionSettings`,
-`TestParseRejectsInvalidProductionSemantics`,
-`TestResumeCompatibilityHashCoversProductionDataSemantics`, and
-`TestSchemaEvolutionRenamePreservesHashWireShape`. They are not completion
-evidence until the slice compiles, is backend-conformant, and is composed into
-the migration lifecycle. Every behavior row below remains a Stage 4 gap.
+**Substantially corrected 2026-07-31.** The original text — "every behavior row
+below remains a Stage 4 gap" — is obsolete. `internal/migrate/schema_contract.go`
+implements the contract and `schema_contract_test.go` carries 25 fixtures. None
+of the proposed names below were used. Every row is covered non-live; the open
+item is the per-engine live matrix.
 
-| Normative behavior | Required missing fixtures |
-|---|---|
-| Compare every run/resume to the latest successful applicable filtered snapshot; omitted contract is report-only unless `fail_on_schema_drift` gates. | `TestSchemaContractUsesLatestSuccessfulFilteredSnapshot`, `TestResumeReevaluatesSchemaContract`, `TestOmittedSchemaContractReportsOnly`, `TestFailOnSchemaDriftStopsBeforeMutation`. |
-| Entity modes default correctly: scalar applies to tables/columns/data type; omitted entities under a present section default to `evolve`. | `TestSchemaContractEntityDefaultsAndScalarExpansion`. |
-| `evolve`: add eligible tables/nullable columns, relax nullability, widen safe types; rebuild uses current shape. | `TestSchemaContractEvolveSafeChanges`, `TestSchemaContractEvolveRejectsUnsafeChanges`, `TestSchemaContractRebuildUsesCurrentShape`. |
-| `freeze`: abort before transfer on entity drift. | `TestSchemaContractFreezeStopsBeforeTargetMutation`. |
-| `discard_row`: remove added or affected tables from transfer, validation, and successful snapshot. | `TestSchemaContractDiscardRowProjectsWholeRun`. |
-| `discard_value`: omit eligible columns, retain prior snapshot evidence for type drift, and prune dependent indexes/FKs/checks. | `TestSchemaContractDiscardValuePrunesDependentObjects`, `TestDiscardValueRetainsPriorSnapshotEvidence`. |
-| `report`: emit drift without target schema mutation. | `TestSchemaContractReportIsReadOnly`. |
-| Reject `tables: discard_value`; never discard PK, identity, or selected date column. | `TestSchemaContractRejectsTableDiscardValue`, `TestSchemaContractRejectsProtectedColumnDiscard`. |
-| Block identity/PK addition in upsert, nullability tightening, narrowing/lossy conversion, coupled default/PK drift, and unrenderable operations. | `TestSchemaContractUnsafeEvolutionMatrix`. |
-| Report dropped source objects but retain target objects; infer no destructive drop. | `TestSchemaContractSourceDropRetainsTarget`. |
-| Every decision has entity, mode, kind, object, previous/current evidence, action, and reason in stable order. | `TestSchemaContractDecisionFactsAreCompleteAndStable`. |
-| Reject simultaneous `schema_contract` and deprecated `schema_evolution`; preserve compatible old form when supported. | `TestSchemaContractRejectsMixedDeprecatedSurface`, `TestSchemaEvolutionCompatibilityHashWireShape`. |
+| Normative behavior | Current evidence | Remaining proof |
+|---|---|---|
+| Compare every run/resume to the latest successful applicable filtered snapshot; omitted contract is report-only unless `fail_on_schema_drift` gates. | **Covered:** `TestSchemaContractOmittedReportsUnlessHardGate`, `TestStage4SchemaGateSuccessfulBaselineCannotBeReplacedByRetainedTargetShape`, `TestStage4SchemaGateTopologyExcludesDiscoveryAndBindsConfiguration`. | Live matrix. |
+| Entity modes default correctly: scalar applies to tables/columns/data type; omitted entities under a present section default to `evolve`. | **Covered:** `TestParseExpandsScalarAndEmptySchemaContracts`. | None. |
+| `evolve`: add eligible tables/nullable columns, relax nullability, widen safe types; rebuild uses current shape. | **Covered:** `TestSchemaContractEvolveSafeUpsertChanges`, `TestSchemaContractEvolveSafeTypeWideningMatrix`, `TestSchemaContractRebuildUsesCurrentShapeSeparatelyFromUpsert`. | Live matrix. |
+| `freeze`: abort before transfer on entity drift. | **Covered:** `TestSchemaContractFreezeAndReportNeverProjectUpsertMutation`. | Live matrix. |
+| `discard_row`: remove added or affected tables from transfer, validation, and successful snapshot. | **Covered:** `TestSchemaContractDiscardRowProjectsWholeRun`, `TestSchemaContractDiscardRowDominatesDependentObjectEvolution`. | Live matrix. |
+| `discard_value`: omit eligible columns, retain prior snapshot evidence for type drift, and prune dependent indexes/FKs/checks. | **Covered:** `TestSchemaContractDiscardValuePrunesDependentObjectsAndRetainsTypeEvidence`, `TestSchemaContractDiscardValueOmitsEligibleAddedColumn`, `TestStage4SchemaGateTypeDiscardRetainsSuccessfulEvidenceWithoutRichProjection`, plus rebuild-side pruning in `TestSchemaContractRebuildDoesNotRestoreCheckAcrossDiscardedColumn`, `TestSchemaContractRebuildDoesNotRestoreInboundCompositeFKAcrossDiscard`, `TestSchemaContractRebuildPrunesDependenciesFromRestoredWholeTable`. | Live matrix. |
+| `report`: emit drift without target schema mutation. | **Covered:** `TestSchemaContractFreezeAndReportNeverProjectUpsertMutation`, `TestSchemaContractReportRebuildProjectionRetainsSourceDrops`. | Live matrix. |
+| Reject `tables: discard_value`; never discard PK, identity, or selected date column. | **Covered:** `TestSchemaContractRejectsTablesDiscardValueAndInvalidModes`, `TestSchemaContractRejectsProtectedColumnDiscard`. | None. |
+| Block identity/PK addition in upsert, nullability tightening, narrowing/lossy conversion, coupled default/PK drift, and unrenderable operations. | **Covered:** `TestSchemaContractEvolveRejectsUnsafeUpsertChanges`, `TestSchemaContractEvolveRejectsInconsistentTypeEvidence`, `TestStage4AdapterRejectsUpsertEvolutionDecisionBeforeTargetPlanning`. | Live matrix. |
+| Report dropped source objects but retain target objects; infer no destructive drop. | **Covered:** `TestSchemaContractSourceDropsRetainUpsertTarget`, `TestSchemaContractSourceColumnDropDoesNotBecomeDiscardRowOrValue`, `TestSchemaContractRebuildRetainsDropsWhileUsingCurrentNonDropShape`, `TestStage4SchemaGateRepresentsRetainedDropsAsTargetCatalogRequirement`. | Live matrix. |
+| Every decision has entity, mode, kind, object, previous/current evidence, action, and reason in stable order. | **Covered:** `TestSchemaContractDecisionFactsAreCompleteStableAndInputImmutable`, `TestStage4SchemaDecisionsPublishBeforeTargetPlanning`, `TestStage4SchemaDecisionSinkFailureStopsBeforePlanningAndMutation`, `TestStage4SchemaDriftRequiresDecisionSinkBeforeTargetPlanning`. Secret safety: `TestSchemaContractErrorDoesNotExposeEvidenceValues`. | None. |
+| Reject simultaneous `schema_contract` and deprecated `schema_evolution`; preserve compatible old form when supported. | **Covered:** the "conflicting schema names" case in `TestParseRejectsInvalidProductionSemantics`, `TestParseCanonicalizesDeprecatedProductionSettings`, `TestSchemaEvolutionRenamePreservesHashWireShape`. | None. |
 
-Required live proof is
-`TestStage4SchemaContractTargetMatrixLive`, with subtests for PostgreSQL,
-SQL Server, Oracle MySQL, MariaDB, SQLite, and ClickHouse rebuild.
+Required live proof is `TestStage4SchemaContractTargetMatrixLive`, with subtests
+for PostgreSQL, SQL Server, Oracle MySQL, MariaDB, SQLite, and ClickHouse
+rebuild. One composed route exists today:
+`TestStage4AdapterPostgresSchemaEvolutionComposedRouteLiveTLS`.
 
 ## Section 8 — Transfer semantics and safety
 
@@ -496,28 +492,39 @@ baseline until each supported cell is admitted.
 
 ## Acceptance 21.9 — Schema contract and validation
 
-All acceptance items are **missing or partial**:
+**Corrected 2026-07-31.** Every acceptance item here is covered non-live; the
+only open work is per-engine live proof. See Section 7.4 and Section 12 for the
+full fixture lists.
 
-- Schema add/drop/evolution/freeze/report/discard behavior:
-  `TestSchemaContractModeAcceptanceMatrix`.
-- Protected discarded columns and dependent-object pruning:
-  `TestSchemaContractDiscardValuePrunesDependentObjects`,
-  `TestSchemaContractRejectsProtectedColumnDiscard`.
-- JSON/audit evidence:
-  `TestSchemaContractDecisionFactsAreCompleteAndStable` (audit presentation
-  remains Stage 5).
-- Count timeout/mismatch policy:
-  `TestValidationTimeoutPolicyMatrix`,
-  `TestValidationEstimateMismatchPolicyMatrix`.
-- Upsert/reconciliation count policy:
-  `TestValidationCountPolicyByModeAndReconciliation`.
-- NULL parity:
-  `TestNullParityDetectsSystematicConversionLive`.
-- Canonical samples:
-  `TestValidationCanonicalValueMatrix` and
-  `TestStage4SampleValidationRouteMatrixLive`.
-- Explicit `full` rejection:
-  `TestValidationFullModeRejected`.
+- Schema add/drop/evolution/freeze/report/discard behavior: **covered** by the
+  25 fixtures in `schema_contract_test.go`.
+- Protected discarded columns and dependent-object pruning: **covered** by
+  `TestSchemaContractRejectsProtectedColumnDiscard`,
+  `TestSchemaContractDiscardValuePrunesDependentObjectsAndRetainsTypeEvidence`,
+  and the three rebuild-side pruning fixtures.
+- JSON/audit evidence: **covered** by
+  `TestSchemaContractDecisionFactsAreCompleteStableAndInputImmutable` and the
+  three `TestStage4SchemaDecision*` publication fixtures; audit presentation
+  remains Stage 5.
+- Count timeout/mismatch policy: **covered** by
+  `TestValidationCoreExactTimeoutAndEstimatePolicy`,
+  `TestValidationCoreDeepTimeoutsHonorLogOnlyPolicy`,
+  `TestValidationCoreDoesNotEstimateAfterNonTimeoutFailure`.
+- Upsert/reconciliation count policy: **covered** by
+  `TestValidationCoreCountTargetPolicies`,
+  `TestValidationCoreUsesPerTableReconciliationStrictness`.
+- NULL parity: **covered** non-live by
+  `TestValidationCoreNullParityDetectsSystematicConversion` and five upsert-scope
+  guards; the live sentinel remains open.
+- Canonical samples: **covered** by the twelve `TestCanonicalValidation*`
+  fixtures; `TestStage4SampleValidationRouteMatrixLive` remains open.
+- Explicit `full` rejection: **covered** by
+  `TestBuildValidationPlanIsInclusiveAndRejectsFull` and the config-level
+  "reserved full validation" case.
+
+Open: `TestStage4SchemaContractTargetMatrixLive`,
+`TestStage4ValidationRouteMatrixLive`,
+`TestStage4SampleValidationRouteMatrixLive`, and the NULL-parity live sentinel.
 
 ## Mandatory Stage 4 gates
 
@@ -580,11 +587,13 @@ MySQL, MariaDB, SQL Server, and SQLite each need their supported scope
 implemented and live-proven; every ClickHouse scope must reject. PostgreSQL is
 done and is the reference implementation.
 
-### D. Schema-contract modes
+### D. Schema-contract modes — logic done, live matrix open
 
-`freeze`, `report`, `discard_value` dependent-object pruning, the entity-default
-matrix, and the unsafe-evolution matrix have no fixtures. `evolve` and
-projection are proven for PostgreSQL only.
+Corrected 2026-07-31. Every mode is implemented and covered non-live by 25
+fixtures in `schema_contract_test.go`; the earlier claim that `freeze`,
+`report`, `discard_value` pruning, the entity-default matrix, and the
+unsafe-evolution matrix had no fixtures was wrong. What remains is
+`TestStage4SchemaContractTargetMatrixLive` — gated on block G.
 
 ### E. Dry-run (Section 7.2)
 
@@ -689,10 +698,10 @@ Reordered 2026-07-31. The two original top risks are closed.
    per-engine live matrix. The risk is inverted from what it looks like: the
    algorithms are done, so the remaining failure mode is an engine-specific
    driver or type behavior that only live proof surfaces.
-4. **Schema-contract modes are partially implemented.** `evolve` and projection
-   are proven for PostgreSQL; `freeze`, `report`, `discard_value` pruning, and
-   the entity-default matrix have no fixtures. Treating the contract as DDL-only
-   would create false success.
+4. **Schema-contract modes are implemented but proven on one engine.** All five
+   modes and their projection, pruning, and decision-fact contracts are covered
+   non-live; only the per-engine live matrix is open. Same inverted risk shape
+   as validation.
 5. **Strict consistency for MySQL, MariaDB, SQL Server, and SQLite is
    unimplemented.** Snapshot ownership, crash cleanup, and SQL Server snapshot
    reuse remain the highest-risk cells.
