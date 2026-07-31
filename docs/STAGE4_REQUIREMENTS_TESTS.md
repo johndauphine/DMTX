@@ -331,7 +331,7 @@ permanently at the first terminal table evidence.
 
 | Normative behavior | Current evidence | Remaining proof |
 |---|---|---|
-| Run stores IDs/times/status/resumability/phase, source/target identity, sanitized config/hash, origin/error, and lease key/token/generation. | **Partial:** `Run` stores only a subset; lease is guarded externally. | `TestStage4RunRecordRoundTripAndRedaction`. |
+| Run stores IDs/times/status/resumability/phase, source/target identity, sanitized config/hash, origin/error, and lease key/token/generation. | **Partial, advanced 2026-07-31.** `TestStage4RunRecordRoundTripAndRedaction` proves every stored identity and lease field survives a backend reopen on both backends, and that `status` and `history` never print the lease owner token while still emitting non-secret identity; `TestStage4PublicRunKeepsEveryNonSecretField` pins the redaction to exactly one field. `Run` still lacks a phase field and structured origin/error. | Add phase and origin/error, or record them as Stage 5. |
 | Tasks use structured type/schema/table/partition identity and store state, attempts/retries/times/scrubbed error. | **Covered base in `WorkTask`; legacy table `Task` remains scalar.** | `TestStage4UsesStructuredTaskIdentityEverywhere`. |
 | Human task keys cannot collide for punctuation/quoted identifiers. | **Covered:** `TestTaskKeyCanonicalizationHasNoDelimiterCollisions` now exists. | None. |
 | Progress stores table/range, rows done/total, safe typed watermark, range envelope, and timestamp. | **Covered base:** `TestRangeBackendConformance`. | Extend for Stage 4 timestamp/fence evidence in `TestStage4ProgressEnvelopeRoundTrip`. |
