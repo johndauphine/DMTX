@@ -581,7 +581,11 @@ started.
 Every certified-cell implementation needs its family. Missing, by name:
 
 - `TestStage4CertifiedRelationalIncrementalRouteMatrixLive`
-- `TestStage4CertifiedRelationalDeleteRouteMatrixLive`
+- ~~`TestStage4CertifiedRelationalDeleteRouteMatrixLive`~~ — **closed
+  2026-07-31**: enumerates all 36 source/target cells, proves the single
+  certified cell is admitted and the other 35 refuse as policy before mutation,
+  with `TestStage4CertifiedRelationalDeleteRejectsUncertifiedModes` pinning the
+  upsert-only and no-strict-epoch edges
 - `TestStage4SchemaContractTargetMatrixLive`
 - `TestStage4ValidationRouteMatrixLive`
 - `TestStage4CertifiedRelationalCrashResumeMatrixLive` (both state backends)
