@@ -99,11 +99,11 @@ func TestInspectPostgres16SourceSchemaLive(t *testing.T) {
 		t.Fatalf("plan source objects: %v", err)
 	}
 	for _, object := range objects {
-		if _, err := database.ExecContext(ctx, object.SQL); err != nil {
+		if _, err := database.ExecContext(ctx, object.SQL()); err != nil {
 			t.Fatalf(
 				"create source object %s on %s: %v",
-				object.Name,
-				object.Table,
+				object.Name(),
+				object.Table(),
 				err,
 			)
 		}

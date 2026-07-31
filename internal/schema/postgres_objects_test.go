@@ -9,6 +9,30 @@ import (
 	"unicode/utf8"
 )
 
+type postgresObjectStatementView struct {
+	Kind   PostgresObjectKind
+	Schema string
+	Table  string
+	Name   string
+	SQL    string
+}
+
+func viewPostgresObjectStatements(
+	statements []PostgresObjectStatement,
+) []postgresObjectStatementView {
+	views := make([]postgresObjectStatementView, len(statements))
+	for index, statement := range statements {
+		views[index] = postgresObjectStatementView{
+			Kind:   statement.Kind(),
+			Schema: statement.Schema(),
+			Table:  statement.Table(),
+			Name:   statement.Name(),
+			SQL:    statement.SQL(),
+		}
+	}
+	return views
+}
+
 func TestPlanPostgresDropRecreateObjectsExactDDLAndGlobalOrder(
 	t *testing.T,
 ) {
@@ -98,7 +122,7 @@ func TestPlanPostgresDropRecreateObjectsExactDDLAndGlobalOrder(
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []PostgresObjectStatement{
+	want := []postgresObjectStatementView{
 		{
 			Kind:   PostgresIndexObject,
 			Schema: `tenant "west"`,
@@ -148,7 +172,7 @@ func TestPlanPostgresDropRecreateObjectsExactDDLAndGlobalOrder(
 				`ON UPDATE CASCADE ON DELETE SET NULL;`,
 		},
 	}
-	if !reflect.DeepEqual(got, want) {
+	if !reflect.DeepEqual(viewPostgresObjectStatements(got), want) {
 		t.Fatalf("plan mismatch:\n got: %#v\nwant: %#v", got, want)
 	}
 
@@ -165,7 +189,7 @@ func TestPlanPostgresDropRecreateObjectsExactDDLAndGlobalOrder(
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(again, want) {
+		if !reflect.DeepEqual(viewPostgresObjectStatements(again), want) {
 			t.Fatalf("attempt %d was not deterministic: %#v", attempt, again)
 		}
 	}
@@ -201,7 +225,7 @@ func TestPlanPostgresObjectsQuotesEveryIdentifier(t *testing.T) {
 	const want = `CREATE INDEX "odd""index" ON ` +
 		`"odd""schema"."odd""table" ` +
 		`("odd""column" COLLATE "pg_catalog"."C" ASC NULLS FIRST);`
-	if len(got) != 1 || got[0].SQL != want {
+	if len(got) != 1 || got[0].SQL() != want {
 		t.Fatalf("got %#v, want %q", got, want)
 	}
 }
@@ -245,7 +269,7 @@ func TestPlanPostgresObjectsInfersReferencedPrimaryKeyOrder(
 		`FOREIGN KEY ("local_first", "local_second") ` +
 		`REFERENCES "public"."parent" ("first", "second") ` +
 		`MATCH SIMPLE ON UPDATE NO ACTION ON DELETE NO ACTION;`
-	if len(got) != 1 || got[0].SQL != want {
+	if len(got) != 1 || got[0].SQL() != want {
 		t.Fatalf("got %#v, want %q", got, want)
 	}
 }
@@ -293,12 +317,12 @@ func TestPlanPostgresObjectsPreservesForeignKeyConstraintName(
 	}
 	var found bool
 	for _, statement := range statements {
-		if statement.Kind != PostgresForeignKeyObject {
+		if statement.Kind() != PostgresForeignKeyObject {
 			continue
 		}
 		found = true
-		if statement.Name != "children_parent_contract" {
-			t.Fatalf("foreign-key name = %q", statement.Name)
+		if statement.Name() != "children_parent_contract" {
+			t.Fatalf("foreign-key name = %q", statement.Name())
 		}
 	}
 	if !found {
@@ -347,8 +371,8 @@ func TestPlanPostgresObjectsAcceptsKnownUniqueReferencedIndex(
 		t.Fatal(err)
 	}
 	if len(got) != 2 ||
-		got[0].Kind != PostgresIndexObject ||
-		got[1].Kind != PostgresForeignKeyObject {
+		got[0].Kind() != PostgresIndexObject ||
+		got[1].Kind() != PostgresForeignKeyObject {
 		t.Fatalf("unexpected plan: %#v", got)
 	}
 }
@@ -409,19 +433,23 @@ func TestPostgresObjectNamesAreBoundedAndCollisionSafe(t *testing.T) {
 	}
 	names := make(map[string]bool, len(first))
 	for _, statement := range first {
-		if len(statement.Name) > postgresIdentifierMaximumBytes {
-			t.Fatalf("name %q is %d bytes", statement.Name, len(statement.Name))
+		if len(statement.Name()) > postgresIdentifierMaximumBytes {
+			t.Fatalf(
+				"name %q is %d bytes",
+				statement.Name(),
+				len(statement.Name()),
+			)
 		}
-		if !utf8.ValidString(statement.Name) {
-			t.Fatalf("name is not UTF-8: %q", statement.Name)
+		if !utf8.ValidString(statement.Name()) {
+			t.Fatalf("name is not UTF-8: %q", statement.Name())
 		}
-		if names[statement.Name] {
-			t.Fatalf("duplicate relation name %q", statement.Name)
+		if names[statement.Name()] {
+			t.Fatalf("duplicate relation name %q", statement.Name())
 		}
-		if statement.Name == "shared" {
+		if statement.Name() == "shared" {
 			t.Fatalf("index name collided with table relation: %#v", first)
 		}
-		names[statement.Name] = true
+		names[statement.Name()] = true
 	}
 }
 
@@ -465,12 +493,12 @@ func TestPostgresObjectNameCollisionsIncludeConstraintsAndPrimaryKeys(
 		t.Fatalf("got %#v", got)
 	}
 	for _, statement := range got {
-		if statement.Kind == PostgresIndexObject &&
-			statement.Name == "parent_pkey" {
+		if statement.Kind() == PostgresIndexObject &&
+			statement.Name() == "parent_pkey" {
 			t.Fatalf("index collided with generated primary-key relation")
 		}
 	}
-	if got[1].Name == got[2].Name {
+	if got[1].Name() == got[2].Name() {
 		t.Fatalf("constraint names collided: %#v", got)
 	}
 }
@@ -985,10 +1013,10 @@ func TestPlanPostgresObjectsReservesIdentitySequenceName(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first) != 1 || first[0].Name == "accounts_id_seq" {
+	if len(first) != 1 || first[0].Name() == "accounts_id_seq" {
 		t.Fatalf("identity sequence name was not reserved: %#v", first)
 	}
-	if len(first[0].Name) > postgresIdentifierMaximumBytes ||
+	if len(first[0].Name()) > postgresIdentifierMaximumBytes ||
 		!reflect.DeepEqual(first, second) {
 		t.Fatalf("identity collision allocation is invalid: %#v", first)
 	}

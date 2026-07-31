@@ -19,7 +19,7 @@ func TestQualifiedForeignKeyPlannersSelectExactSchema(t *testing.T) {
 	}
 	if len(postgres) != 1 ||
 		!strings.Contains(
-			postgres[0].SQL,
+			postgres[0].SQL(),
 			`REFERENCES "identity"."accounts"`,
 		) {
 		t.Fatalf("PostgreSQL qualified plan = %#v", postgres)

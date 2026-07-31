@@ -135,14 +135,17 @@ func planPostgresRetainedIndexesAndForeignKeys(
 	indexNames := make(map[string][]string)
 	foreignKeyNames := make(map[string][]string)
 	for _, statement := range statements {
-		key := postgresRetainedTableKey(statement.Schema, statement.Table)
-		switch statement.Kind {
+		key := postgresRetainedTableKey(
+			statement.Schema(),
+			statement.Table(),
+		)
+		switch statement.Kind() {
 		case schema.PostgresIndexObject:
-			indexNames[key] = append(indexNames[key], statement.Name)
+			indexNames[key] = append(indexNames[key], statement.Name())
 		case schema.PostgresForeignKeyObject:
 			foreignKeyNames[key] = append(
 				foreignKeyNames[key],
-				statement.Name,
+				statement.Name(),
 			)
 		}
 	}

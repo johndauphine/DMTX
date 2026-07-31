@@ -77,6 +77,73 @@ func (adapter *postgresTargetAdapter) PlanTables(
 	sourceTables []schema.Table,
 	mode string,
 ) ([]schema.Table, error) {
+	targetTables, err := adapter.planTablesBeforeObjectNameMaterialization(
+		sourceEngine,
+		sourceTables,
+		mode,
+	)
+	if err != nil {
+		return nil, err
+	}
+	targetTables, err = schema.MaterializePostgresObjectNames(
+		targetTables,
+		schema.PostgresObjectPlanOptions{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"materialize PostgreSQL target object names: %w",
+			err,
+		)
+	}
+	return targetTables, nil
+}
+
+func (adapter *postgresTargetAdapter) PlanTablesAfterPrior(
+	sourceEngine string,
+	priorSourceTables []schema.Table,
+	priorTargetTables []schema.Table,
+	currentSourceTables []schema.Table,
+	mode string,
+) ([]schema.Table, error) {
+	priorTables, err := adapter.planTablesBeforeObjectNameMaterialization(
+		sourceEngine,
+		priorSourceTables,
+		mode,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"plan PostgreSQL prior target tables: %w",
+			err,
+		)
+	}
+	currentTables, err := adapter.planTablesBeforeObjectNameMaterialization(
+		sourceEngine,
+		currentSourceTables,
+		mode,
+	)
+	if err != nil {
+		return nil, err
+	}
+	currentTables, err = schema.MaterializePostgresObjectNamesAfterPrior(
+		currentTables,
+		priorTables,
+		priorTargetTables,
+		schema.PostgresObjectPlanOptions{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"materialize PostgreSQL target object names after prior projection: %w",
+			err,
+		)
+	}
+	return currentTables, nil
+}
+
+func (adapter *postgresTargetAdapter) planTablesBeforeObjectNameMaterialization(
+	sourceEngine string,
+	sourceTables []schema.Table,
+	mode string,
+) ([]schema.Table, error) {
 	mode, err := normalizeAdapterTargetMode(mode)
 	if err != nil {
 		return nil, err

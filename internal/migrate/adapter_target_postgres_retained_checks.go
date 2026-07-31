@@ -65,14 +65,14 @@ func planPostgresRetainedChecks(
 	}
 	names := make(map[string][]string, len(tables))
 	for _, statement := range statements {
-		if statement.Kind != schema.PostgresCheckObject {
+		if statement.Kind() != schema.PostgresCheckObject {
 			continue
 		}
 		key := postgresRetainedTableKey(
-			statement.Schema,
-			statement.Table,
+			statement.Schema(),
+			statement.Table(),
 		)
-		names[key] = append(names[key], statement.Name)
+		names[key] = append(names[key], statement.Name())
 	}
 
 	result := make(map[string][]postgresRetainedCheck, len(tables))

@@ -615,10 +615,10 @@ func createPostgresCommonFixture(
 		t.Fatalf("plan common-fixture objects: %v", err)
 	}
 	for _, object := range objects {
-		if _, err := database.ExecContext(ctx, object.SQL); err != nil {
+		if _, err := database.ExecContext(ctx, object.SQL()); err != nil {
 			t.Fatalf(
 				"create common-fixture object %s: %v",
-				object.Name,
+				object.Name(),
 				err,
 			)
 		}

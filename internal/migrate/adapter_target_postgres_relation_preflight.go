@@ -175,14 +175,14 @@ func planPostgresDropRecreateRelationNames(
 		}
 	}
 	for _, statement := range objectPlan {
-		if statement.Kind != schema.PostgresIndexObject {
+		if statement.Kind() != schema.PostgresIndexObject {
 			continue
 		}
 		if err := add(postgresPlannedRelationName{
-			namespace: statement.Schema,
-			name:      statement.Name,
+			namespace: statement.Schema(),
+			name:      statement.Name(),
 			kind:      "post-load index",
-			table:     statement.Table,
+			table:     statement.Table(),
 		}); err != nil {
 			return nil, err
 		}
