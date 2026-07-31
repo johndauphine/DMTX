@@ -580,7 +580,10 @@ started.
 
 Every certified-cell implementation needs its family. Missing, by name:
 
-- `TestStage4CertifiedRelationalIncrementalRouteMatrixLive`
+- ~~`TestStage4CertifiedRelationalIncrementalRouteMatrixLive`~~ — **closed
+  2026-07-31**: enumerates the 35 uncertified cells and proves each refuses as
+  policy without touching an endpoint; the certified cell's live behaviour is
+  proven by `TestStage4PostgresIncrementalCompositionLiveTLS`
 - ~~`TestStage4CertifiedRelationalDeleteRouteMatrixLive`~~ — **closed
   2026-07-31**: enumerates all 36 source/target cells, proves the single
   certified cell is admitted and the other 35 refuse as policy before mutation,
