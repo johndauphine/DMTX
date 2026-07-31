@@ -206,6 +206,60 @@ func (adapter *sqlServerTargetAdapter) WriteBatch(
 	)
 }
 
+// WriteStage4NetworkBatch preserves source normalization while requiring the
+// native writer to fence and re-prove replay isolation inside the exact page
+// transaction.
+func (adapter *sqlServerTargetAdapter) WriteStage4NetworkBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	writer, ok := adapter.batchWriter.(sqlServerStage4NetworkBatchWriter)
+	if !ok || isNilInterface(writer) {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"SQL Server Stage 4 network batch writer is not configured",
+				),
+			)
+	}
+	if adapter.sourceEngine == "sqlite" {
+		normalized, err := normalizeSQLiteSQLServerBatch(
+			table,
+			columns,
+			rows,
+		)
+		if err != nil {
+			return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, err
+		}
+		rows = normalized
+	}
+	if err := validateSQLServerTargetBatchValues(
+		table,
+		columns,
+		rows,
+	); err != nil {
+		return WriteReceipt{
+			Certainty:     CommitNotCommitted,
+			AttemptedRows: attempted,
+		}, err
+	}
+	return writer.WriteStage4NetworkBatch(
+		ctx,
+		table,
+		columns,
+		rows,
+	)
+}
+
 func (adapter *sqlServerTargetAdapter) CountRows(
 	ctx context.Context,
 	table schema.Table,

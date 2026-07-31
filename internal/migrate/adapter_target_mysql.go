@@ -274,6 +274,63 @@ func (adapter *mysqlTargetAdapter) WriteBatch(
 	)
 }
 
+// WriteStage4NetworkBatch is the target boundary for a replayable network
+// page. It preserves the ordinary source-value normalization but requires a
+// native writer that can bind its replay-isolation proof to the exact upsert
+// transaction.
+func (adapter *mysqlTargetAdapter) WriteStage4NetworkBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	writer, ok := adapter.batchWriter.(mysqlStage4NetworkBatchWriter)
+	if !ok || isNilInterface(writer) {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"MySQL Stage 4 network batch writer is not configured",
+				),
+			)
+	}
+	if adapter.normalizeSQLiteSourceValues {
+		normalized, err := normalizeSQLiteMySQLBatch(
+			table,
+			columns,
+			rows,
+		)
+		if err != nil {
+			return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, err
+		}
+		rows = normalized
+	}
+	if adapter.validateSQLServerSourceValues {
+		if err := validateMySQLTargetSQLServerBatchValues(
+			table,
+			columns,
+			rows,
+		); err != nil {
+			return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, err
+		}
+	}
+	return writer.WriteStage4NetworkBatch(
+		ctx,
+		table,
+		columns,
+		rows,
+	)
+}
+
 func (adapter *mysqlTargetAdapter) CountRows(
 	ctx context.Context,
 	table schema.Table,

@@ -186,6 +186,44 @@ func (adapter *postgresTargetAdapter) WriteBatch(
 	)
 }
 
+func (adapter *postgresTargetAdapter) WriteStage4NetworkBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	if adapter == nil {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"PostgreSQL Stage 4 network target adapter is not configured",
+				),
+			)
+	}
+	writer, ok := adapter.batchWriter.(postgresStage4NetworkBatchWriter)
+	if !ok {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"PostgreSQL Stage 4 network batch writer is not configured",
+				),
+			)
+	}
+	return writer.WriteStage4NetworkBatch(
+		ctx,
+		table,
+		columns,
+		rows,
+	)
+}
+
 func (adapter *postgresTargetAdapter) CountRows(
 	ctx context.Context,
 	table schema.Table,

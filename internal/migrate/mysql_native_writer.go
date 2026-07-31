@@ -3,14 +3,18 @@ package migrate
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/johndauphine/dmtx/internal/engine"
 	"github.com/johndauphine/dmtx/internal/schema"
 )
+
+const mysqlStage4NetworkCleanupTimeout = 5 * time.Second
 
 // mysqlBatchWriter is the target adapter's durable bounded-insert dependency.
 // Production construction always installs mysqlNativeWriter.
@@ -24,8 +28,23 @@ type mysqlBatchWriter interface {
 	) (WriteReceipt, error)
 }
 
+type mysqlStage4NetworkBatchWriter interface {
+	WriteStage4NetworkBatch(
+		context.Context,
+		schema.Table,
+		[]string,
+		[][]any,
+	) (WriteReceipt, error)
+}
+
 type mysqlTransactionProvider interface {
 	Begin(context.Context) (mysqlBatchTransaction, error)
+}
+
+type mysqlStage4NetworkTransactionProvider interface {
+	BeginStage4Network(
+		context.Context,
+	) (mysqlStage4NetworkBatchTransaction, error)
 }
 
 type mysqlBatchTransaction interface {
@@ -40,6 +59,24 @@ type mysqlBatchTransaction interface {
 	WarningCount(context.Context) (int64, error)
 	Commit() error
 	Rollback() error
+}
+
+// mysqlStage4NetworkBatchTransaction is the per-page transaction capability
+// required by crash-resumable network writes. The fence and catalog proof must
+// run on the same transaction that performs the upsert so target DDL cannot
+// invalidate admission between the proof and the page mutation.
+type mysqlStage4NetworkBatchTransaction interface {
+	mysqlBatchTransaction
+	AcquireStage4NetworkReplayFence(
+		context.Context,
+		schema.Table,
+	) error
+	PreflightStage4NetworkReplayIsolation(
+		context.Context,
+		schema.Table,
+		engine.MySQLServerFlavor,
+	) error
+	RollbackStage4Network(context.Context) error
 }
 
 type mysqlBatchStatement interface {
@@ -189,6 +226,109 @@ func (writer *mysqlNativeWriter) WriteBatch(
 	)
 }
 
+// WriteStage4NetworkBatch writes one replayable network page. It deliberately
+// bypasses LOAD DATA even for a newly-created target: only the strict,
+// primary-key-guarded upsert path has the idempotence and receipt semantics
+// required by durable range replay.
+func (writer *mysqlNativeWriter) WriteStage4NetworkBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	notCommitted := WriteReceipt{
+		Certainty:     CommitNotCommitted,
+		AttemptedRows: attempted,
+	}
+	if err := validateMySQLWriteShape(
+		table,
+		columns,
+		"upsert",
+	); err != nil {
+		return notCommitted, err
+	}
+	for index, row := range rows {
+		if len(row) != len(columns) {
+			return notCommitted, fmt.Errorf(
+				"write MySQL table %s: row %d has %d values for %d columns",
+				table.Name,
+				index,
+				len(row),
+				len(columns),
+			)
+		}
+	}
+	if len(rows) == 0 {
+		return WriteReceipt{Certainty: CommitDurable}, nil
+	}
+	if writer == nil || writer.transactions == nil {
+		return notCommitted, fmt.Errorf(
+			"write MySQL table %s: transaction provider is not configured",
+			table.Name,
+		)
+	}
+	writeStatement, err := mySQLNativeWriteStatementForFlavor(
+		table,
+		columns,
+		"upsert",
+		writer.flavor,
+	)
+	if err != nil {
+		return notCommitted, err
+	}
+
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.writeMySQLStrictBatchWithGuard(
+		ctx,
+		table,
+		"upsert",
+		rows,
+		writeStatement,
+		func(
+			ctx context.Context,
+			transaction mysqlBatchTransaction,
+		) error {
+			stage4Transaction, ok :=
+				transaction.(mysqlStage4NetworkBatchTransaction)
+			if !ok || isNilInterface(stage4Transaction) {
+				return NewTransferError(
+					ErrorClassState,
+					fmt.Errorf(
+						"write MySQL Stage 4 network table %s: transaction has no replay-isolation fence",
+						table.Name,
+					),
+				)
+			}
+			if err := stage4Transaction.
+				AcquireStage4NetworkReplayFence(
+					ctx,
+					table,
+				); err != nil {
+				return newMySQLSafeOperationError(
+					"acquire MySQL Stage 4 network replay fence for",
+					table.Name,
+					err,
+				)
+			}
+			if err := stage4Transaction.
+				PreflightStage4NetworkReplayIsolation(
+					ctx,
+					table,
+					writer.flavor,
+				); err != nil {
+				return fmt.Errorf(
+					"prove MySQL Stage 4 network replay isolation for table %s: %w",
+					table.Name,
+					err,
+				)
+			}
+			return nil
+		},
+	)
+}
+
 func (writer *mysqlNativeWriter) writeMySQLStrictBatch(
 	ctx context.Context,
 	table schema.Table,
@@ -196,12 +336,47 @@ func (writer *mysqlNativeWriter) writeMySQLStrictBatch(
 	rows [][]any,
 	writeStatement string,
 ) (WriteReceipt, error) {
+	return writer.writeMySQLStrictBatchWithGuard(
+		ctx,
+		table,
+		mode,
+		rows,
+		writeStatement,
+		nil,
+	)
+}
+
+func (writer *mysqlNativeWriter) writeMySQLStrictBatchWithGuard(
+	ctx context.Context,
+	table schema.Table,
+	mode string,
+	rows [][]any,
+	writeStatement string,
+	guard func(context.Context, mysqlBatchTransaction) error,
+) (receipt WriteReceipt, operationError error) {
 	attempted := int64(len(rows))
 	notCommitted := WriteReceipt{
 		Certainty:     CommitNotCommitted,
 		AttemptedRows: attempted,
 	}
-	transaction, err := writer.transactions.Begin(ctx)
+	var transaction mysqlBatchTransaction
+	var err error
+	if guard == nil {
+		transaction, err = writer.transactions.Begin(ctx)
+	} else {
+		stage4Provider, ok :=
+			writer.transactions.(mysqlStage4NetworkTransactionProvider)
+		if !ok || isNilInterface(stage4Provider) {
+			return notCommitted, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"write MySQL Stage 4 network table %s: transaction provider has no pinned replay transaction",
+					table.Name,
+				),
+			)
+		}
+		transaction, err = stage4Provider.BeginStage4Network(ctx)
+	}
 	if err != nil {
 		return notCommitted, newMySQLSafeOperationError(
 			"begin MySQL write for",
@@ -210,11 +385,61 @@ func (writer *mysqlNativeWriter) writeMySQLStrictBatch(
 		)
 	}
 	committed := false
+	writeMayHaveChangedTarget := false
 	defer func() {
-		if !committed {
+		if committed {
+			return
+		}
+		if guard == nil {
 			_ = transaction.Rollback()
+			return
+		}
+		stage4Transaction, ok :=
+			transaction.(mysqlStage4NetworkBatchTransaction)
+		if !ok || isNilInterface(stage4Transaction) {
+			operationError = errors.Join(
+				operationError,
+				NewTransferError(
+					ErrorClassState,
+					fmt.Errorf(
+						"clean up MySQL Stage 4 network table %s: transaction has no bounded rollback",
+						table.Name,
+					),
+				),
+			)
+			if writeMayHaveChangedTarget {
+				receipt.Certainty = CommitUnknown
+			}
+			return
+		}
+		cleanupContext, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			mysqlStage4NetworkCleanupTimeout,
+		)
+		defer cancel()
+		if rollbackErr := stage4Transaction.RollbackStage4Network(
+			cleanupContext,
+		); rollbackErr != nil &&
+			!errors.Is(rollbackErr, sql.ErrTxDone) {
+			if writeMayHaveChangedTarget {
+				receipt.Certainty = CommitUnknown
+			}
+			operationError = errors.Join(
+				operationError,
+				newMySQLSafeOperationError(
+					"roll back MySQL Stage 4 network write for",
+					table.Name,
+					rollbackErr,
+				),
+			)
 		}
 	}()
+
+	if guard != nil {
+		if err := guard(ctx, transaction); err != nil {
+			return notCommitted, err
+		}
+	}
 
 	statement, err := transaction.Prepare(
 		ctx,
@@ -235,6 +460,9 @@ func (writer *mysqlNativeWriter) writeMySQLStrictBatch(
 	}()
 
 	for _, row := range rows {
+		// The server can apply the DML and lose the response. From this point a
+		// failed rollback makes the target state unknown.
+		writeMayHaveChangedTarget = true
 		affected, err := statement.Exec(ctx, row)
 		if err != nil {
 			return notCommitted, newMySQLSafeOperationError(
@@ -535,8 +763,69 @@ func (provider mysqlSQLTransactionProvider) Begin(
 	return mysqlSQLBatchTransaction{transaction: transaction}, nil
 }
 
+func (provider mysqlSQLTransactionProvider) BeginStage4Network(
+	ctx context.Context,
+) (mysqlStage4NetworkBatchTransaction, error) {
+	if provider.database == nil {
+		return nil, fmt.Errorf("MySQL database is not configured")
+	}
+	connection, err := provider.database.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	transaction, err := connection.BeginTx(ctx, nil)
+	if err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	return &mysqlSQLStage4NetworkTransaction{
+		mysqlSQLBatchTransaction: mysqlSQLBatchTransaction{
+			transaction: transaction,
+		},
+		connection: connection,
+	}, nil
+}
+
 type mysqlSQLBatchTransaction struct {
 	transaction *sql.Tx
+}
+
+func (transaction mysqlSQLBatchTransaction) AcquireStage4NetworkReplayFence(
+	ctx context.Context,
+	table schema.Table,
+) error {
+	// A table reference inside an explicit MySQL-family transaction acquires a
+	// shared metadata lock that is retained through commit/rollback. Reading
+	// at most one constant avoids row materialization while preventing ALTER,
+	// DROP, RENAME, and foreign-key DDL from crossing the catalog proof.
+	rows, err := transaction.transaction.QueryContext(
+		ctx,
+		stage4MySQLNetworkReplayFenceStatement(table),
+	)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		// At most one constant row is returned; no target value is observed.
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	return rows.Close()
+}
+
+func (transaction mysqlSQLBatchTransaction) PreflightStage4NetworkReplayIsolation(
+	ctx context.Context,
+	table schema.Table,
+	flavor engine.MySQLServerFlavor,
+) error {
+	return preflightStage4MySQLNetworkReplayIsolation(
+		ctx,
+		transaction.transaction,
+		[]schema.Table{table},
+		flavor,
+	)
 }
 
 func (transaction mysqlSQLBatchTransaction) Prepare(
@@ -609,6 +898,69 @@ func (transaction mysqlSQLBatchTransaction) Commit() error {
 
 func (transaction mysqlSQLBatchTransaction) Rollback() error {
 	return transaction.transaction.Rollback()
+}
+
+type mysqlSQLStage4NetworkTransaction struct {
+	mysqlSQLBatchTransaction
+	connection *sql.Conn
+}
+
+func (transaction *mysqlSQLStage4NetworkTransaction) Commit() error {
+	commitErr := transaction.mysqlSQLBatchTransaction.Commit()
+	if commitErr != nil {
+		transaction.discard()
+	}
+	closeErr := transaction.connection.Close()
+	return errors.Join(commitErr, closeErr)
+}
+
+func (transaction *mysqlSQLStage4NetworkTransaction) RollbackStage4Network(
+	ctx context.Context,
+) error {
+	if ctx == nil {
+		return fmt.Errorf(
+			"MySQL Stage 4 rollback context is required",
+		)
+	}
+	type rollbackResult struct {
+		rollback error
+		close    error
+	}
+	result := make(chan rollbackResult, 1)
+	go func() {
+		rollbackErr :=
+			transaction.mysqlSQLBatchTransaction.Rollback()
+		if rollbackErr != nil &&
+			!errors.Is(rollbackErr, sql.ErrTxDone) {
+			transaction.discard()
+		}
+		result <- rollbackResult{
+			rollback: rollbackErr,
+			close:    transaction.connection.Close(),
+		}
+	}()
+	select {
+	case completed := <-result:
+		return errors.Join(completed.rollback, completed.close)
+	case <-ctx.Done():
+		// The pinned *sql.Conn remains unavailable to the pool. The cleanup
+		// goroutine will discard it on a rollback failure and close it only
+		// after rollback completes, so timeout never exposes a transaction
+		// that might still be active to a later caller.
+		return fmt.Errorf(
+			"MySQL Stage 4 rollback did not complete before cleanup deadline: %w",
+			ctx.Err(),
+		)
+	}
+}
+
+func (transaction *mysqlSQLStage4NetworkTransaction) discard() {
+	if transaction == nil || transaction.connection == nil {
+		return
+	}
+	_ = transaction.connection.Raw(func(any) error {
+		return driver.ErrBadConn
+	})
 }
 
 type mysqlSQLBatchStatement struct {

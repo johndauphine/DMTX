@@ -50,6 +50,54 @@ func preflightMySQLRetainedTables(
 	database *sql.DB,
 	targetTables []schema.Table,
 ) error {
+	if len(targetTables) != 0 {
+		flavor, err := engine.DetectMySQLServerFlavor(
+			ctx,
+			database,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"preflight MySQL upsert trigger visibility: %w",
+				err,
+			)
+		}
+		selected := make(
+			map[string]struct{},
+			len(targetTables),
+		)
+		namespace := targetTables[0].Schema
+		for _, table := range targetTables {
+			if table.Schema != namespace {
+				return fmt.Errorf(
+					"preflight MySQL upsert: all tables must use one target database",
+				)
+			}
+			selected[adapterSourceTableKey(
+				table.Schema,
+				table.Name,
+			)] = struct{}{}
+			if err := preflightStage4MySQLTriggerMetadataVisibility(
+				ctx,
+				database,
+				flavor,
+				table,
+			); err != nil {
+				return fmt.Errorf(
+					"preflight MySQL table %s trigger visibility: %w",
+					table.Name,
+					err,
+				)
+			}
+		}
+		if err := preflightMySQLSelectedTargetTriggers(
+			ctx,
+			database,
+			namespace,
+			selected,
+		); err != nil {
+			return err
+		}
+	}
 	for _, planned := range targetTables {
 		exists, err := mysqlTargetTableExists(
 			ctx,
@@ -678,7 +726,7 @@ func preflightMySQLSelectedTargetTriggers(
 			tableName,
 		)]; planned {
 			return fmt.Errorf(
-				"preflight MySQL table %s: target trigger %s prevents safe replacement",
+				"preflight MySQL table %s: target trigger %s prevents safe target writes",
 				tableName,
 				triggerName,
 			)

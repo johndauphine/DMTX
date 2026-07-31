@@ -831,6 +831,293 @@ func TestSQLServerNativeWriterCompositeUpsertLocksThenInserts(
 	)
 }
 
+func TestSQLServerNativeWriterStage4NetworkFencesAndProvesBeforeUpsert(
+	t *testing.T,
+) {
+	writer, _, _, transaction := newSQLServerNativeTestWriter()
+	transaction.match.execAffected = []int64{1}
+
+	receipt, err := writer.WriteStage4NetworkBatch(
+		context.Background(),
+		sqlServerNativeTestTable(),
+		[]string{"payload", "tenant_id", "id"},
+		[][]any{{"updated", int64(7), int64(1)}},
+	)
+	if err != nil {
+		t.Fatalf("WriteStage4NetworkBatch: %v", err)
+	}
+	assertSQLServerNativeReceipt(t, receipt, CommitDurable, 1, 1)
+	if transaction.bulk.doneCalls != 0 {
+		t.Fatalf(
+			"Stage 4 page used bulk copy: %#v",
+			transaction.bulk,
+		)
+	}
+	assertSQLServerEventBefore(
+		t,
+		transaction.events,
+		"tx exec session guard",
+		"acquire Stage 4 replay fence",
+	)
+	assertSQLServerEventBefore(
+		t,
+		transaction.events,
+		"acquire Stage 4 replay fence",
+		"prove Stage 4 replay isolation",
+	)
+	assertSQLServerEventBefore(
+		t,
+		transaction.events,
+		"prove Stage 4 replay isolation",
+		"prepare match",
+	)
+	assertSQLServerEventBefore(
+		t,
+		transaction.events,
+		"prove Stage 4 replay isolation",
+		"prepare insert",
+	)
+}
+
+func TestSQLServerNativeWriterStage4GuardFailuresRollBackBeforeWrite(
+	t *testing.T,
+) {
+	fenceFailure := errors.New("fence failed with secret driver text")
+	proofFailure := NewTransferError(
+		ErrorClassPolicy,
+		errors.New("unsafe incoming foreign key"),
+	)
+	for _, testCase := range []struct {
+		name      string
+		fenceErr  error
+		proofErr  error
+		want      string
+		wantCause error
+	}{
+		{
+			name:      "fence",
+			fenceErr:  fenceFailure,
+			want:      "acquire SQL Server Stage 4 network replay fence for event]data",
+			wantCause: fenceFailure,
+		},
+		{
+			name:      "proof",
+			proofErr:  proofFailure,
+			want:      "unsafe incoming foreign key",
+			wantCause: proofFailure,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			writer, _, _, transaction :=
+				newSQLServerNativeTestWriter()
+			transaction.stage4FenceErr = testCase.fenceErr
+			transaction.stage4ProofErr = testCase.proofErr
+
+			receipt, err := writer.WriteStage4NetworkBatch(
+				context.Background(),
+				sqlServerNativeTestTable(),
+				[]string{"payload", "tenant_id", "id"},
+				[][]any{{"safe", int64(7), int64(1)}},
+			)
+			if err == nil ||
+				!strings.Contains(err.Error(), testCase.want) ||
+				!errors.Is(err, testCase.wantCause) {
+				t.Fatalf("guard error = %v", err)
+			}
+			assertSQLServerNativeReceipt(
+				t,
+				receipt,
+				CommitNotCommitted,
+				1,
+				0,
+			)
+			if len(transaction.prepared) != 0 {
+				t.Fatalf(
+					"guard failure prepared writes: %#v",
+					transaction.prepared,
+				)
+			}
+			if transaction.commits != 0 ||
+				transaction.rollbacks != 1 {
+				t.Fatalf("transaction = %#v", transaction)
+			}
+		})
+	}
+}
+
+func TestSQLServerNativeWriterStage4RejectsBetweenPageRetainedShapeDriftBeforeDML(
+	t *testing.T,
+) {
+	writer, _, _, transaction := newSQLServerNativeTestWriter()
+	transaction.match.execAffected = []int64{1}
+	table := sqlServerNativeTestTable()
+	first, err := writer.WriteStage4NetworkBatch(
+		context.Background(),
+		table,
+		[]string{"payload", "tenant_id", "id"},
+		[][]any{{"first", int64(7), int64(1)}},
+	)
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	assertSQLServerNativeReceipt(t, first, CommitDurable, 1, 1)
+	preparedAfterFirst := len(transaction.prepared)
+	writesAfterFirst := len(transaction.match.rows)
+	commitsAfterFirst := transaction.commits
+
+	drift := NewTransferError(
+		ErrorClassPolicy,
+		errors.New("target-only identity column changed retained shape"),
+	)
+	transaction.stage4ProofErr = drift
+	second, err := writer.WriteStage4NetworkBatch(
+		context.Background(),
+		table,
+		[]string{"payload", "tenant_id", "id"},
+		[][]any{{"must-not-apply", int64(7), int64(2)}},
+	)
+	if !errors.Is(err, drift) {
+		t.Fatalf("between-page retained-shape error = %v", err)
+	}
+	assertSQLServerNativeReceipt(
+		t,
+		second,
+		CommitNotCommitted,
+		1,
+		0,
+	)
+	if len(transaction.prepared) != preparedAfterFirst ||
+		len(transaction.match.rows) != writesAfterFirst ||
+		transaction.commits != commitsAfterFirst {
+		t.Fatalf(
+			"rejected drift prepared/wrote/committed: prepared=%d/%d writes=%d/%d commits=%d/%d",
+			len(transaction.prepared),
+			preparedAfterFirst,
+			len(transaction.match.rows),
+			writesAfterFirst,
+			transaction.commits,
+			commitsAfterFirst,
+		)
+	}
+	if transaction.rollbacks != 1 {
+		t.Fatalf("rejected drift rollbacks = %d, want 1", transaction.rollbacks)
+	}
+}
+
+func TestSQLServerNativeWriterStage4CommitFailureIsUnknown(
+	t *testing.T,
+) {
+	writer, _, _, transaction := newSQLServerNativeTestWriter()
+	transaction.match.execAffected = []int64{1}
+	transaction.commitErr = errors.New("lost commit response")
+
+	receipt, err := writer.WriteStage4NetworkBatch(
+		context.Background(),
+		sqlServerNativeTestTable(),
+		[]string{"payload", "tenant_id", "id"},
+		[][]any{{"updated", int64(7), int64(1)}},
+	)
+	if err == nil {
+		t.Fatal("commit failure was accepted")
+	}
+	assertSQLServerNativeReceipt(t, receipt, CommitUnknown, 1, 0)
+	if transaction.rollbacks != 1 {
+		t.Fatalf("rollbacks = %d, want 1", transaction.rollbacks)
+	}
+}
+
+func TestSQLServerNativeWriterStage4RollbackFailurePreservesSafetyEvidence(
+	t *testing.T,
+) {
+	t.Run("proof failure remains not committed", func(t *testing.T) {
+		writer, _, _, transaction :=
+			newSQLServerNativeTestWriter()
+		proofFailure := NewTransferError(
+			ErrorClassPolicy,
+			errors.New("unsafe incoming foreign key"),
+		)
+		transaction.stage4ProofErr = proofFailure
+		transaction.rollbackErr = errors.New(
+			"rollback failed with secret connection detail",
+		)
+
+		receipt, err := writer.WriteStage4NetworkBatch(
+			context.Background(),
+			sqlServerNativeTestTable(),
+			[]string{"payload", "tenant_id", "id"},
+			[][]any{{"safe", int64(7), int64(1)}},
+		)
+		if !errors.Is(err, proofFailure) ||
+			!errors.Is(err, transaction.rollbackErr) ||
+			strings.Contains(err.Error(), "secret connection detail") {
+			t.Fatalf("joined cleanup error = %v", err)
+		}
+		assertSQLServerNativeReceipt(
+			t,
+			receipt,
+			CommitNotCommitted,
+			1,
+			0,
+		)
+		if !transaction.stage4ConnectionQuarantined {
+			t.Fatal("failed Stage 4 rollback was not quarantined")
+		}
+	})
+
+	t.Run("post-DML failure becomes unknown", func(t *testing.T) {
+		writer, _, _, transaction :=
+			newSQLServerNativeTestWriter()
+		transaction.match.execErr = errors.New("upsert failed")
+		transaction.rollbackErr = errors.New("rollback failed")
+
+		receipt, err := writer.WriteStage4NetworkBatch(
+			context.Background(),
+			sqlServerNativeTestTable(),
+			[]string{"payload", "tenant_id", "id"},
+			[][]any{{"safe", int64(7), int64(1)}},
+		)
+		if err == nil ||
+			!errors.Is(err, transaction.match.execErr) ||
+			!errors.Is(err, transaction.rollbackErr) {
+			t.Fatalf("post-DML cleanup error = %v", err)
+		}
+		assertSQLServerNativeReceipt(
+			t,
+			receipt,
+			CommitUnknown,
+			1,
+			0,
+		)
+	})
+}
+
+func TestSQLServerNativeWriterStage4RollbackIgnoresCanceledWriteContext(
+	t *testing.T,
+) {
+	writer, _, _, transaction := newSQLServerNativeTestWriter()
+	transaction.stage4ProofErr = errors.New("proof failed")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := writer.WriteStage4NetworkBatch(
+		ctx,
+		sqlServerNativeTestTable(),
+		[]string{"payload", "tenant_id", "id"},
+		[][]any{{"safe", int64(7), int64(1)}},
+	)
+	if err == nil {
+		t.Fatal("proof failure was accepted")
+	}
+	if transaction.stage4RollbackContextErr != nil ||
+		!transaction.stage4RollbackHasDeadline {
+		t.Fatalf(
+			"rollback context err=%v deadline=%t",
+			transaction.stage4RollbackContextErr,
+			transaction.stage4RollbackHasDeadline,
+		)
+	}
+}
+
 func TestSQLServerNativeWriterKeyOnlyUpsertProbesBeforeInsert(
 	t *testing.T,
 ) {
@@ -1271,17 +1558,23 @@ func (connection *sqlServerNativeTestConnection) Discard() {
 }
 
 type sqlServerNativeTestTransaction struct {
-	events      []string
-	prepared    []string
-	bulk        *sqlServerNativeTestStatement
-	insert      *sqlServerNativeTestStatement
-	match       *sqlServerNativeTestStatement
-	execErr     error
-	execErrors  map[string]error
-	commitErr   error
-	rollbackErr error
-	commits     int
-	rollbacks   int
+	events                      []string
+	prepared                    []string
+	bulk                        *sqlServerNativeTestStatement
+	insert                      *sqlServerNativeTestStatement
+	match                       *sqlServerNativeTestStatement
+	execErr                     error
+	execErrors                  map[string]error
+	commitErr                   error
+	rollbackErr                 error
+	commits                     int
+	rollbacks                   int
+	stage4FenceErr              error
+	stage4ProofErr              error
+	stage4Table                 schema.Table
+	stage4RollbackContextErr    error
+	stage4RollbackHasDeadline   bool
+	stage4ConnectionQuarantined bool
 }
 
 func (transaction *sqlServerNativeTestTransaction) Prepare(
@@ -1328,6 +1621,39 @@ func (transaction *sqlServerNativeTestTransaction) Exec(
 		return 0, transaction.execErr
 	}
 	return 0, nil
+}
+
+func (transaction *sqlServerNativeTestTransaction) AcquireStage4NetworkReplayFence(
+	_ context.Context,
+	table schema.Table,
+) error {
+	transaction.events = append(
+		transaction.events,
+		"acquire Stage 4 replay fence",
+	)
+	transaction.stage4Table = table
+	return transaction.stage4FenceErr
+}
+
+func (transaction *sqlServerNativeTestTransaction) PreflightStage4NetworkReplayIsolation(
+	_ context.Context,
+	table schema.Table,
+) error {
+	transaction.events = append(
+		transaction.events,
+		"prove Stage 4 replay isolation",
+	)
+	transaction.stage4Table = table
+	return transaction.stage4ProofErr
+}
+
+func (transaction *sqlServerNativeTestTransaction) RollbackStage4Network(
+	ctx context.Context,
+) error {
+	transaction.stage4RollbackContextErr = ctx.Err()
+	_, transaction.stage4RollbackHasDeadline = ctx.Deadline()
+	transaction.stage4ConnectionQuarantined = true
+	return transaction.Rollback()
 }
 
 func (transaction *sqlServerNativeTestTransaction) Commit() error {

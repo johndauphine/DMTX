@@ -39,6 +39,11 @@ type postgresCatalogTableShape struct {
 	rowSecurity  bool
 }
 
+type postgresUpsertCatalogQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 func (adapter *postgresTargetAdapter) PreflightTables(
 	ctx context.Context,
 	targetTables []schema.Table,
@@ -157,7 +162,7 @@ func preflightPostgresDropRecreateTable(
 
 func readPostgresUpsertCatalogShape(
 	ctx context.Context,
-	database *sql.DB,
+	database postgresUpsertCatalogQueryer,
 	table schema.Table,
 ) (postgresCatalogTableShape, bool, error) {
 	var result postgresCatalogTableShape

@@ -3,8 +3,10 @@ package migrate
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -19,6 +21,15 @@ type postgresBatchWriter interface {
 		schema.Table,
 		[]string,
 		string,
+		[][]any,
+	) (WriteReceipt, error)
+}
+
+type postgresStage4NetworkBatchWriter interface {
+	WriteStage4NetworkBatch(
+		context.Context,
+		schema.Table,
+		[]string,
 		[][]any,
 	) (WriteReceipt, error)
 }
@@ -71,6 +82,12 @@ type postgresNativeConnection interface {
 	Begin(context.Context) (postgresNativeTransaction, error)
 }
 
+type postgresNativeDiscardableConnection interface {
+	Discard()
+}
+
+const postgresStage4NetworkRollbackTimeout = 5 * time.Second
+
 // postgresNativeTransaction is deliberately narrower than pgx.Tx. It contains
 // only the native operations required for one durable PostgreSQL batch.
 type postgresNativeTransaction interface {
@@ -102,6 +119,44 @@ func (writer *postgresNativeWriter) WriteBatch(
 	mode string,
 	rows [][]any,
 ) (WriteReceipt, error) {
+	return writer.writeBatch(
+		ctx,
+		table,
+		columns,
+		mode,
+		rows,
+		false,
+	)
+}
+
+// WriteStage4NetworkBatch is the only PostgreSQL page-write path certified for
+// Stage 4 crash replay. It always uses idempotent upsert and proves that an
+// update cannot escape the page through an incoming foreign key while the same
+// transaction holds a DDL fence on the target table.
+func (writer *postgresNativeWriter) WriteStage4NetworkBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) (WriteReceipt, error) {
+	return writer.writeBatch(
+		ctx,
+		table,
+		columns,
+		"upsert",
+		rows,
+		true,
+	)
+}
+
+func (writer *postgresNativeWriter) writeBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	mode string,
+	rows [][]any,
+	stage4NetworkReplay bool,
+) (WriteReceipt, error) {
 	attempted := int64(len(rows))
 	notCommitted := WriteReceipt{
 		Certainty:     CommitNotCommitted,
@@ -114,6 +169,14 @@ func (writer *postgresNativeWriter) WriteBatch(
 		return WriteReceipt{
 			Certainty: CommitDurable,
 		}, nil
+	}
+	if stage4NetworkReplay && ctx == nil {
+		return notCommitted, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"PostgreSQL Stage 4 network write context is required",
+			),
+		)
 	}
 	if writer == nil || writer.connections == nil {
 		return notCommitted, fmt.Errorf(
@@ -137,6 +200,21 @@ func (writer *postgresNativeWriter) WriteBatch(
 			defer func() {
 				callbackError = operationError
 			}()
+			var discardable postgresNativeDiscardableConnection
+			if stage4NetworkReplay {
+				var discardableOK bool
+				discardable, discardableOK =
+					connection.(postgresNativeDiscardableConnection)
+				if !discardableOK {
+					return NewTransferError(
+						ErrorClassState,
+						fmt.Errorf(
+							"PostgreSQL Stage 4 network connection cannot discard an unclean transaction for table %s",
+							table.Name,
+						),
+					)
+				}
+			}
 			transaction, beginErr := connection.Begin(ctx)
 			if beginErr != nil {
 				return newPostgresSafeOperationError(
@@ -145,12 +223,59 @@ func (writer *postgresNativeWriter) WriteBatch(
 					beginErr,
 				)
 			}
+			if transaction == nil {
+				if discardable != nil {
+					discardable.Discard()
+				}
+				return NewTransferError(
+					ErrorClassState,
+					fmt.Errorf(
+						"PostgreSQL native transaction is not configured for table %s",
+						table.Name,
+					),
+				)
+			}
 			committed := false
 			defer func() {
 				if !committed {
-					_ = transaction.Rollback(ctx)
+					rollbackContext := ctx
+					cancelRollback := func() {}
+					if stage4NetworkReplay {
+						rollbackContext, cancelRollback =
+							context.WithTimeout(
+								context.WithoutCancel(ctx),
+								postgresStage4NetworkRollbackTimeout,
+							)
+					}
+					defer cancelRollback()
+					if rollbackErr := transaction.Rollback(
+						rollbackContext,
+					); rollbackErr != nil &&
+						!errors.Is(rollbackErr, pgx.ErrTxClosed) {
+						if stage4NetworkReplay {
+							discardable.Discard()
+							operationError = errors.Join(
+								operationError,
+								newPostgresSafeOperationError(
+									"rollback PostgreSQL native write for",
+									table.Name,
+									rollbackErr,
+								),
+							)
+						}
+					}
 				}
 			}()
+
+			if stage4NetworkReplay {
+				if isolationErr := fenceAndValidateStage4PostgresNetworkReplay(
+					ctx,
+					transaction,
+					table,
+				); isolationErr != nil {
+					return isolationErr
+				}
+			}
 
 			if mode == "drop_recreate" {
 				if copyErr := copyPostgresRows(
@@ -179,6 +304,16 @@ func (writer *postgresNativeWriter) WriteBatch(
 			if commitErr := transaction.Commit(ctx); commitErr != nil {
 				if !errors.Is(commitErr, pgx.ErrTxCommitRollback) {
 					receipt.Certainty = CommitUnknown
+					if stage4NetworkReplay {
+						// A failed COMMIT can mean the server committed but
+						// the acknowledgement was lost. pgx then commonly
+						// reports ErrTxClosed from the deferred rollback,
+						// which proves nothing about the physical session.
+						// Quarantine it immediately; only
+						// ErrTxCommitRollback proves the transaction rolled
+						// back instead of committing.
+						discardable.Discard()
+					}
 				}
 				return newPostgresSafeOperationError(
 					"commit PostgreSQL table",
@@ -206,6 +341,52 @@ func (writer *postgresNativeWriter) WriteBatch(
 		)
 	}
 	return receipt, nil
+}
+
+func fenceAndValidateStage4PostgresNetworkReplay(
+	ctx context.Context,
+	transaction postgresNativeTransaction,
+	table schema.Table,
+) error {
+	reader, ok := transaction.(stage4PostgresReplayCatalogReader)
+	if !ok {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"PostgreSQL native transaction does not provide the Stage 4 network replay catalog proof for table %s",
+				table.Name,
+			),
+		)
+	}
+	if _, err := transaction.Exec(
+		ctx,
+		"LOCK TABLE "+
+			postgresQualified(table.Schema, table.Name)+
+			" IN SHARE UPDATE EXCLUSIVE MODE",
+	); err != nil {
+		return newPostgresSafeOperationError(
+			"acquire PostgreSQL Stage 4 network replay DDL fence for",
+			table.Name,
+			err,
+		)
+	}
+	err := validateStage4PostgresNetworkReplayIsolation(
+		ctx,
+		reader,
+		[]schema.Table{table},
+	)
+	if err == nil {
+		return nil
+	}
+	var transferError *TransferError
+	if errors.As(err, &transferError) {
+		return err
+	}
+	return newPostgresSafeOperationError(
+		"prove PostgreSQL Stage 4 network replay isolation for",
+		table.Name,
+		err,
+	)
 }
 
 func copyPostgresRows(
@@ -314,21 +495,33 @@ func (provider postgresStdlibConnectionProvider) WithConnection(
 	}
 	defer connection.Close()
 
-	return connection.Raw(func(driverConnection any) error {
+	var operationError error
+	rawError := connection.Raw(func(driverConnection any) error {
 		stdlibConnection, ok := driverConnection.(*stdlib.Conn)
 		if !ok {
 			return fmt.Errorf(
 				"PostgreSQL native COPY requires the pgx stdlib driver",
 			)
 		}
-		return operation(postgresPGXConnection{
+		discard := false
+		operationError = operation(postgresPGXConnection{
 			connection: stdlibConnection.Conn(),
+			discard:    &discard,
 		})
+		if discard {
+			return driver.ErrBadConn
+		}
+		return operationError
 	})
+	if operationError != nil && errors.Is(rawError, driver.ErrBadConn) {
+		return operationError
+	}
+	return rawError
 }
 
 type postgresPGXConnection struct {
 	connection *pgx.Conn
+	discard    *bool
 }
 
 func (connection postgresPGXConnection) Begin(
@@ -341,8 +534,220 @@ func (connection postgresPGXConnection) Begin(
 	return postgresPGXTransaction{transaction: transaction}, nil
 }
 
+func (connection postgresPGXConnection) Discard() {
+	if connection.discard != nil {
+		*connection.discard = true
+	}
+}
+
 type postgresPGXTransaction struct {
 	transaction pgx.Tx
+}
+
+type postgresPGXReplayCatalogRows struct {
+	rows pgx.Rows
+}
+
+func (rows postgresPGXReplayCatalogRows) Next() bool {
+	return rows.rows.Next()
+}
+
+func (rows postgresPGXReplayCatalogRows) Scan(destinations ...any) error {
+	return rows.rows.Scan(destinations...)
+}
+
+func (rows postgresPGXReplayCatalogRows) Err() error {
+	return rows.rows.Err()
+}
+
+func (rows postgresPGXReplayCatalogRows) Close() error {
+	rows.rows.Close()
+	return nil
+}
+
+func (transaction postgresPGXTransaction) ReadStage4PostgresRetainedShape(
+	ctx context.Context,
+	table schema.Table,
+) (postgresCatalogTableShape, bool, error) {
+	var result postgresCatalogTableShape
+	err := transaction.transaction.QueryRow(
+		ctx,
+		`SELECT
+			relation.relkind::text,
+			relation.relpersistence::text,
+			relation.relrowsecurity OR relation.relforcerowsecurity
+		   FROM pg_catalog.pg_class AS relation
+		   JOIN pg_catalog.pg_namespace AS namespace
+		     ON namespace.oid = relation.relnamespace
+		  WHERE namespace.nspname = $1
+		    AND relation.relname = $2`,
+		table.Schema,
+		table.Name,
+	).Scan(
+		&result.relationKind,
+		&result.persistence,
+		&result.rowSecurity,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return postgresCatalogTableShape{}, false, nil
+	}
+	if err != nil {
+		return postgresCatalogTableShape{}, false, err
+	}
+	if result.relationKind != "r" {
+		return result, true, nil
+	}
+
+	rows, err := transaction.transaction.Query(
+		ctx,
+		`SELECT
+			attribute.attname,
+			column_type.typname,
+			attribute.atttypmod,
+			attribute.attnotnull,
+			attribute.attgenerated::text,
+			attribute.attidentity::text,
+			attribute.attcollation = column_type.typcollation
+		   FROM pg_catalog.pg_attribute AS attribute
+		   JOIN pg_catalog.pg_class AS relation
+		     ON relation.oid = attribute.attrelid
+		   JOIN pg_catalog.pg_namespace AS namespace
+		     ON namespace.oid = relation.relnamespace
+		   JOIN pg_catalog.pg_type AS column_type
+		     ON column_type.oid = attribute.atttypid
+		  WHERE namespace.nspname = $1
+		    AND relation.relname = $2
+		    AND relation.relkind = 'r'
+		    AND attribute.attnum > 0
+		    AND NOT attribute.attisdropped
+		  ORDER BY attribute.attnum`,
+		table.Schema,
+		table.Name,
+	)
+	if err != nil {
+		return postgresCatalogTableShape{}, false, err
+	}
+	for rows.Next() {
+		var (
+			column   postgresCatalogColumnShape
+			typeName string
+			typeMode int32
+		)
+		if err := rows.Scan(
+			&column.name,
+			&typeName,
+			&typeMode,
+			&column.notNull,
+			&column.generated,
+			&column.identity,
+			&column.defaultCollation,
+		); err != nil {
+			rows.Close()
+			return postgresCatalogTableShape{}, false, err
+		}
+		column.columnType = postgresCatalogTypeFromModifier(
+			typeName,
+			typeMode,
+		)
+		result.columns = append(result.columns, column)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return postgresCatalogTableShape{}, false, err
+	}
+	rows.Close()
+
+	keyRows, err := transaction.transaction.Query(
+		ctx,
+		`SELECT attribute.attname
+		   FROM pg_catalog.pg_index AS index
+		   JOIN pg_catalog.pg_class AS relation
+		     ON relation.oid = index.indrelid
+		   JOIN pg_catalog.pg_namespace AS namespace
+		     ON namespace.oid = relation.relnamespace
+		   CROSS JOIN LATERAL unnest(index.indkey)
+		     WITH ORDINALITY AS key_column(attnum, position)
+		   JOIN pg_catalog.pg_attribute AS attribute
+		     ON attribute.attrelid = relation.oid
+		    AND attribute.attnum = key_column.attnum
+		  WHERE namespace.nspname = $1
+		    AND relation.relname = $2
+		    AND index.indisprimary
+		  ORDER BY key_column.position`,
+		table.Schema,
+		table.Name,
+	)
+	if err != nil {
+		return postgresCatalogTableShape{}, false, err
+	}
+	for keyRows.Next() {
+		var name string
+		if err := keyRows.Scan(&name); err != nil {
+			keyRows.Close()
+			return postgresCatalogTableShape{}, false, err
+		}
+		result.primaryKey = append(result.primaryKey, name)
+	}
+	if err := keyRows.Err(); err != nil {
+		keyRows.Close()
+		return postgresCatalogTableShape{}, false, err
+	}
+	keyRows.Close()
+
+	if err := transaction.transaction.QueryRow(
+		ctx,
+		`SELECT COUNT(*)
+		   FROM pg_catalog.pg_trigger AS trigger
+		   JOIN pg_catalog.pg_class AS relation
+		     ON relation.oid = trigger.tgrelid
+		   JOIN pg_catalog.pg_namespace AS namespace
+		     ON namespace.oid = relation.relnamespace
+		  WHERE namespace.nspname = $1
+		    AND relation.relname = $2
+		    AND NOT trigger.tgisinternal`,
+		table.Schema,
+		table.Name,
+	).Scan(&result.userTriggers); err != nil {
+		return postgresCatalogTableShape{}, false, err
+	}
+	if err := transaction.transaction.QueryRow(
+		ctx,
+		`SELECT COUNT(*)
+		   FROM pg_catalog.pg_rewrite AS rewrite_rule
+		   JOIN pg_catalog.pg_class AS relation
+		     ON relation.oid = rewrite_rule.ev_class
+		   JOIN pg_catalog.pg_namespace AS namespace
+		     ON namespace.oid = relation.relnamespace
+		  WHERE namespace.nspname = $1
+		    AND relation.relname = $2`,
+		table.Schema,
+		table.Name,
+	).Scan(&result.userRules); err != nil {
+		return postgresCatalogTableShape{}, false, err
+	}
+	return result, true, nil
+}
+
+func (transaction postgresPGXTransaction) QueryStage4PostgresIncomingForeignKeys(
+	ctx context.Context,
+	namespace string,
+	table string,
+) (stage4PostgresReplayCatalogRows, error) {
+	rows, err := transaction.transaction.Query(
+		ctx,
+		stage4PostgresIncomingForeignKeysQuery,
+		namespace,
+		table,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if rows == nil {
+		return nil, fmt.Errorf(
+			"PostgreSQL replay catalog query returned no row iterator",
+		)
+	}
+	return postgresPGXReplayCatalogRows{rows: rows}, nil
 }
 
 func (transaction postgresPGXTransaction) CopyRows(

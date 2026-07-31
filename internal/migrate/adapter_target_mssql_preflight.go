@@ -113,7 +113,7 @@ func (adapter *sqlServerTargetAdapter) PreflightTables(
 				planned.Name,
 			)
 		}
-		actual, err := engine.InspectSQLServerTable(
+		actual, err := engine.InspectSQLServerTargetTableWithQueryer(
 			ctx,
 			adapter.database,
 			planned.Schema,

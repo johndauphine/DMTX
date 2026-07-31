@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -885,6 +886,381 @@ func TestMySQLNativeWriterKeepsUpsertOnGuardedInsertPath(t *testing.T) {
 	}
 }
 
+func TestMySQLNativeWriterStage4NetworkFencesAndProvesBeforeStrictUpsert(
+	t *testing.T,
+) {
+	for _, testCase := range []struct {
+		name   string
+		flavor engine.MySQLServerFlavor
+		alias  string
+	}{
+		{
+			name:   "Oracle MySQL 8",
+			flavor: engine.MySQLServerFlavorOracle80,
+			alias:  "AS `dmtx_new` ON DUPLICATE KEY UPDATE",
+		},
+		{
+			name:   "MariaDB 10.11",
+			flavor: engine.MySQLServerFlavorMariaDB1011,
+			alias:  "VALUES(`payload`)",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			writer, transaction :=
+				newMySQLNativeTestWriterForFlavor(testCase.flavor)
+			// A Stage 4 page must bypass both capability probing and
+			// LOAD DATA even when the writer has not chosen a bulk mode.
+			writer.localInfile = mysqlLocalInfileUnknown
+			transaction.statement.affected = []int64{1}
+			transaction.warnings = []int64{0}
+
+			receipt, err := writer.WriteStage4NetworkBatch(
+				context.Background(),
+				mysqlNativeTestTable(),
+				[]string{"id", "payload"},
+				[][]any{{int64(7), "safe"}},
+			)
+			if err != nil {
+				t.Fatalf("WriteStage4NetworkBatch: %v", err)
+			}
+			assertMySQLNativeReceipt(
+				t,
+				receipt,
+				CommitDurable,
+				1,
+				1,
+			)
+			wantEvents := []string{
+				"begin",
+				"acquire Stage 4 replay fence",
+				"prove Stage 4 replay isolation",
+				"prepare strict write",
+				"inspect warnings",
+				"commit",
+			}
+			if !reflect.DeepEqual(
+				transaction.stage4Events,
+				wantEvents,
+			) {
+				t.Fatalf(
+					"events = %#v, want %#v",
+					transaction.stage4Events,
+					wantEvents,
+				)
+			}
+			if transaction.stage4Flavor != testCase.flavor {
+				t.Fatalf(
+					"proof flavor = %q, want %q",
+					transaction.stage4Flavor,
+					testCase.flavor,
+				)
+			}
+			if transaction.localInfileChecks != 0 ||
+				len(transaction.bulkStatements) != 0 {
+				t.Fatalf(
+					"Stage 4 write used LOAD DATA path: checks=%d statements=%#v",
+					transaction.localInfileChecks,
+					transaction.bulkStatements,
+				)
+			}
+			if !strings.Contains(
+				transaction.statement.query,
+				testCase.alias,
+			) {
+				t.Fatalf(
+					"strict upsert %q lacks %q",
+					transaction.statement.query,
+					testCase.alias,
+				)
+			}
+		})
+	}
+}
+
+func TestMySQLNativeWriterStage4NetworkGuardFailuresRollBackBeforeWrite(
+	t *testing.T,
+) {
+	fenceFailure := errors.New("fence failed with sensitive driver text")
+	proofFailure := NewTransferError(
+		ErrorClassPolicy,
+		errors.New("unsafe incoming foreign key"),
+	)
+	for _, testCase := range []struct {
+		name       string
+		fenceErr   error
+		proofErr   error
+		want       string
+		wantCause  error
+		wantEvents []string
+	}{
+		{
+			name:      "fence",
+			fenceErr:  fenceFailure,
+			want:      "acquire MySQL Stage 4 network replay fence for events",
+			wantCause: fenceFailure,
+			wantEvents: []string{
+				"begin",
+				"acquire Stage 4 replay fence",
+				"rollback",
+			},
+		},
+		{
+			name:      "proof",
+			proofErr:  proofFailure,
+			want:      "unsafe incoming foreign key",
+			wantCause: proofFailure,
+			wantEvents: []string{
+				"begin",
+				"acquire Stage 4 replay fence",
+				"prove Stage 4 replay isolation",
+				"rollback",
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			writer, transaction := newMySQLNativeTestWriter()
+			transaction.stage4FenceErr = testCase.fenceErr
+			transaction.stage4ProofErr = testCase.proofErr
+
+			receipt, err := writer.WriteStage4NetworkBatch(
+				context.Background(),
+				mysqlNativeTestTable(),
+				[]string{"id", "payload"},
+				[][]any{{int64(7), "safe"}},
+			)
+			if err == nil ||
+				!strings.Contains(err.Error(), testCase.want) ||
+				!errors.Is(err, testCase.wantCause) {
+				t.Fatalf("guard error = %v", err)
+			}
+			assertMySQLNativeReceipt(
+				t,
+				receipt,
+				CommitNotCommitted,
+				1,
+				0,
+			)
+			if transaction.statement.query != "" {
+				t.Fatalf(
+					"guard failure prepared a write: %q",
+					transaction.statement.query,
+				)
+			}
+			if !reflect.DeepEqual(
+				transaction.stage4Events,
+				testCase.wantEvents,
+			) {
+				t.Fatalf(
+					"events = %#v, want %#v",
+					transaction.stage4Events,
+					testCase.wantEvents,
+				)
+			}
+		})
+	}
+}
+
+func TestMySQLNativeWriterStage4NetworkRejectsBetweenPageRetainedShapeDriftBeforeDML(
+	t *testing.T,
+) {
+	for _, testCase := range []struct {
+		name   string
+		flavor engine.MySQLServerFlavor
+		drift  string
+	}{
+		{
+			name:   "Oracle MySQL timestamp on update",
+			flavor: engine.MySQLServerFlavorOracle80,
+			drift:  "column extra includes ON UPDATE CURRENT_TIMESTAMP",
+		},
+		{
+			name:   "MariaDB system versioning",
+			flavor: engine.MySQLServerFlavorMariaDB1011,
+			drift:  "table options include SYSTEM VERSIONING",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			writer, transaction :=
+				newMySQLNativeTestWriterForFlavor(testCase.flavor)
+			transaction.statement.affected = []int64{1}
+			transaction.warnings = []int64{0}
+			table := mysqlNativeTestTable()
+
+			first, err := writer.WriteStage4NetworkBatch(
+				context.Background(),
+				table,
+				[]string{"id", "payload"},
+				[][]any{{int64(7), "first"}},
+			)
+			if err != nil {
+				t.Fatalf("first page: %v", err)
+			}
+			assertMySQLNativeReceipt(
+				t,
+				first,
+				CommitDurable,
+				1,
+				1,
+			)
+			writesAfterFirst := len(transaction.statement.rows)
+			commitsAfterFirst := transaction.commits
+
+			transaction.stage4ProofErr = NewTransferError(
+				ErrorClassPolicy,
+				errors.New(testCase.drift),
+			)
+			second, err := writer.WriteStage4NetworkBatch(
+				context.Background(),
+				table,
+				[]string{"id", "payload"},
+				[][]any{{int64(7), "must-not-apply"}},
+			)
+			if err == nil || !strings.Contains(
+				err.Error(),
+				testCase.drift,
+			) {
+				t.Fatalf("between-page drift error = %v", err)
+			}
+			assertMySQLNativeReceipt(
+				t,
+				second,
+				CommitNotCommitted,
+				1,
+				0,
+			)
+			if len(transaction.statement.rows) != writesAfterFirst ||
+				transaction.commits != commitsAfterFirst {
+				t.Fatalf(
+					"rejected drift wrote rows or committed: rows=%d/%d commits=%d/%d",
+					len(transaction.statement.rows),
+					writesAfterFirst,
+					transaction.commits,
+					commitsAfterFirst,
+				)
+			}
+			if transaction.rollbacks != 1 {
+				t.Fatalf(
+					"rejected drift rollbacks = %d, want 1",
+					transaction.rollbacks,
+				)
+			}
+		})
+	}
+}
+
+func TestMySQLNativeWriterStage4NetworkCommitFailureIsUnknown(
+	t *testing.T,
+) {
+	writer, transaction := newMySQLNativeTestWriter()
+	transaction.statement.affected = []int64{1}
+	transaction.warnings = []int64{0}
+	transaction.commitErr = errors.New("lost commit response")
+
+	receipt, err := writer.WriteStage4NetworkBatch(
+		context.Background(),
+		mysqlNativeTestTable(),
+		[]string{"id", "payload"},
+		[][]any{{int64(7), "safe"}},
+	)
+	if err == nil {
+		t.Fatal("commit failure was accepted")
+	}
+	assertMySQLNativeReceipt(t, receipt, CommitUnknown, 1, 0)
+	if transaction.rollbacks != 1 {
+		t.Fatalf("rollbacks = %d, want 1", transaction.rollbacks)
+	}
+}
+
+func TestMySQLNativeWriterStage4RollbackFailurePreservesSafetyEvidence(
+	t *testing.T,
+) {
+	t.Run("proof failure remains not committed", func(t *testing.T) {
+		writer, transaction := newMySQLNativeTestWriter()
+		proofFailure := NewTransferError(
+			ErrorClassPolicy,
+			errors.New("unsafe incoming foreign key"),
+		)
+		rollbackFailure := errors.New(
+			"rollback failed with secret connection detail",
+		)
+		transaction.stage4ProofErr = proofFailure
+		transaction.rollbackErr = rollbackFailure
+
+		receipt, err := writer.WriteStage4NetworkBatch(
+			context.Background(),
+			mysqlNativeTestTable(),
+			[]string{"id", "payload"},
+			[][]any{{int64(7), "safe"}},
+		)
+		if !errors.Is(err, proofFailure) ||
+			!errors.Is(err, rollbackFailure) ||
+			strings.Contains(err.Error(), "secret connection detail") {
+			t.Fatalf("joined cleanup error = %v", err)
+		}
+		assertMySQLNativeReceipt(
+			t,
+			receipt,
+			CommitNotCommitted,
+			1,
+			0,
+		)
+	})
+
+	t.Run("post-DML failure becomes unknown", func(t *testing.T) {
+		writer, transaction := newMySQLNativeTestWriter()
+		transaction.statement.affected = []int64{1}
+		transaction.warnings = []int64{1}
+		transaction.rollbackErr = errors.New("rollback failed")
+
+		receipt, err := writer.WriteStage4NetworkBatch(
+			context.Background(),
+			mysqlNativeTestTable(),
+			[]string{"id", "payload"},
+			[][]any{{int64(7), "unsafe conversion"}},
+		)
+		if err == nil || !strings.Contains(
+			err.Error(),
+			"conversion warnings",
+		) || !errors.Is(err, transaction.rollbackErr) {
+			t.Fatalf("post-DML cleanup error = %v", err)
+		}
+		assertMySQLNativeReceipt(
+			t,
+			receipt,
+			CommitUnknown,
+			1,
+			0,
+		)
+	})
+}
+
+func TestMySQLNativeWriterStage4RollbackIgnoresCanceledWriteContext(
+	t *testing.T,
+) {
+	writer, transaction := newMySQLNativeTestWriter()
+	transaction.stage4ProofErr = errors.New("proof failed")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := writer.WriteStage4NetworkBatch(
+		ctx,
+		mysqlNativeTestTable(),
+		[]string{"id", "payload"},
+		[][]any{{int64(7), "safe"}},
+	)
+	if err == nil {
+		t.Fatal("proof failure was accepted")
+	}
+	if transaction.stage4RollbackContextErr != nil ||
+		!transaction.stage4RollbackHasDeadline {
+		t.Fatalf(
+			"rollback context err=%v deadline=%t",
+			transaction.stage4RollbackContextErr,
+			transaction.stage4RollbackHasDeadline,
+		)
+	}
+}
+
 func mysqlNativeTestTable() schema.Table {
 	return schema.Table{
 		Schema: "target_db",
@@ -929,38 +1305,64 @@ type mysqlNativeTestProvider struct {
 func (provider *mysqlNativeTestProvider) Begin(
 	context.Context,
 ) (mysqlBatchTransaction, error) {
+	provider.transaction.stage4Events = append(
+		provider.transaction.stage4Events,
+		"begin",
+	)
+	provider.transaction.begins++
+	return provider.transaction, nil
+}
+
+func (provider *mysqlNativeTestProvider) BeginStage4Network(
+	context.Context,
+) (mysqlStage4NetworkBatchTransaction, error) {
+	provider.transaction.stage4Events = append(
+		provider.transaction.stage4Events,
+		"begin",
+	)
 	provider.transaction.begins++
 	return provider.transaction, nil
 }
 
 type mysqlNativeTestTransaction struct {
-	begins             int
-	commits            int
-	rollbacks          int
-	warningCalls       int
-	warnings           []int64
-	commitErr          error
-	statement          *mysqlNativeTestStatement
-	localInfileChecks  int
-	localInfileEnabled []bool
-	localInfileErrs    []error
-	bulkAffected       []int64
-	bulkErrs           []error
-	bulkStatements     []string
-	bulkPayloads       [][]byte
-	executeAffected    []int64
-	executeErrs        []error
-	executeStatements  []string
-	counts             []int64
-	countErrs          []error
-	countStatements    []string
-	rollbackErr        error
+	begins                    int
+	commits                   int
+	rollbacks                 int
+	warningCalls              int
+	warnings                  []int64
+	commitErr                 error
+	statement                 *mysqlNativeTestStatement
+	localInfileChecks         int
+	localInfileEnabled        []bool
+	localInfileErrs           []error
+	bulkAffected              []int64
+	bulkErrs                  []error
+	bulkStatements            []string
+	bulkPayloads              [][]byte
+	executeAffected           []int64
+	executeErrs               []error
+	executeStatements         []string
+	counts                    []int64
+	countErrs                 []error
+	countStatements           []string
+	rollbackErr               error
+	stage4Events              []string
+	stage4FenceErr            error
+	stage4ProofErr            error
+	stage4Flavor              engine.MySQLServerFlavor
+	stage4Table               schema.Table
+	stage4RollbackContextErr  error
+	stage4RollbackHasDeadline bool
 }
 
 func (transaction *mysqlNativeTestTransaction) Prepare(
 	_ context.Context,
 	statement string,
 ) (mysqlBatchStatement, error) {
+	transaction.stage4Events = append(
+		transaction.stage4Events,
+		"prepare strict write",
+	)
 	transaction.statement.query = statement
 	return transaction.statement, nil
 }
@@ -968,6 +1370,10 @@ func (transaction *mysqlNativeTestTransaction) Prepare(
 func (transaction *mysqlNativeTestTransaction) WarningCount(
 	context.Context,
 ) (int64, error) {
+	transaction.stage4Events = append(
+		transaction.stage4Events,
+		"inspect warnings",
+	)
 	index := transaction.warningCalls
 	transaction.warningCalls++
 	return transaction.warnings[index], nil
@@ -1058,13 +1464,55 @@ func (transaction *mysqlNativeTestTransaction) LoadLocalInfile(
 }
 
 func (transaction *mysqlNativeTestTransaction) Commit() error {
+	transaction.stage4Events = append(
+		transaction.stage4Events,
+		"commit",
+	)
 	transaction.commits++
 	return transaction.commitErr
 }
 
 func (transaction *mysqlNativeTestTransaction) Rollback() error {
+	transaction.stage4Events = append(
+		transaction.stage4Events,
+		"rollback",
+	)
 	transaction.rollbacks++
 	return transaction.rollbackErr
+}
+
+func (transaction *mysqlNativeTestTransaction) AcquireStage4NetworkReplayFence(
+	_ context.Context,
+	table schema.Table,
+) error {
+	transaction.stage4Events = append(
+		transaction.stage4Events,
+		"acquire Stage 4 replay fence",
+	)
+	transaction.stage4Table = table
+	return transaction.stage4FenceErr
+}
+
+func (transaction *mysqlNativeTestTransaction) PreflightStage4NetworkReplayIsolation(
+	_ context.Context,
+	table schema.Table,
+	flavor engine.MySQLServerFlavor,
+) error {
+	transaction.stage4Events = append(
+		transaction.stage4Events,
+		"prove Stage 4 replay isolation",
+	)
+	transaction.stage4Table = table
+	transaction.stage4Flavor = flavor
+	return transaction.stage4ProofErr
+}
+
+func (transaction *mysqlNativeTestTransaction) RollbackStage4Network(
+	ctx context.Context,
+) error {
+	transaction.stage4RollbackContextErr = ctx.Err()
+	_, transaction.stage4RollbackHasDeadline = ctx.Deadline()
+	return transaction.Rollback()
 }
 
 type mysqlNativeTestStatement struct {
