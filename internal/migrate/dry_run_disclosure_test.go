@@ -94,6 +94,21 @@ func TestStage4DryRunDisclosesTuningAndDeletePolicy(t *testing.T) {
 		t.Fatalf("row count provenance = %q", plan.Tables[0].RowsProvenance)
 	}
 
+	// The pagination strategy is the fact that tells an operator how the table
+	// will actually be read; a topology hash makes two dry runs comparable.
+	pagination := plan.Tables[0].Pagination
+	if pagination == nil {
+		t.Fatal("dry run disclosed no pagination strategy")
+	}
+	if pagination.Strategy == "" ||
+		pagination.TopologyHash == "" ||
+		pagination.Partitions < 1 {
+		t.Fatalf("pagination disclosure = %#v", pagination)
+	}
+	if len(pagination.Keys) == 0 || pagination.Keys[0] != "id" {
+		t.Fatalf("pagination keys = %#v", pagination.Keys)
+	}
+
 	if plan.Deletes == nil {
 		t.Fatal("dry run disclosed no delete policy")
 	}

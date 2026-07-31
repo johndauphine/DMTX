@@ -102,7 +102,7 @@ S4.8 **partial**; S4.9 **blocked on the live matrix rerun**.
 
 | Normative behavior | Current evidence | Remaining proof |
 |---|---|---|
-| Connect, run deterministic source and target preflight, discover/filter schema, report drift/policy, select pagination, and disclose tuning/provenance. | **Partial, advanced 2026-07-31.** Tuning disclosure now lands: `Plan.Tuning` reports connection limit, workers, readers, writers, queue depth, chunk rows, and memory budget, each with selection provenance, derived from the same resolver the migration uses. Proven by `TestStage4DryRunDisclosesTuningAndDeletePolicy` and `TestStage4DryRunTuningMatchesResolvedPlan`. Still absent: target preflight, schema drift reporting, and pagination selection. | S4.8: target preflight and drift/pagination disclosure, then `TestStage4DryRunNetworkRouteMatrixLive`. |
+| Connect, run deterministic source and target preflight, discover/filter schema, report drift/policy, select pagination, and disclose tuning/provenance. | **Partial, advanced 2026-07-31.** Tuning disclosure now lands: `Plan.Tuning` reports connection limit, workers, readers, writers, queue depth, chunk rows, and memory budget, each with selection provenance, derived from the same resolver the migration uses. Proven by `TestStage4DryRunDisclosesTuningAndDeletePolicy` and `TestStage4DryRunTuningMatchesResolvedPlan`. Pagination selection now lands too: `PlannedTable.Pagination` reports strategy, key columns, partition count, and topology hash, best-effort and omitted rather than guessed when it cannot be planned. Still absent: target preflight and schema drift reporting. | S4.8: target preflight and drift/pagination disclosure, then `TestStage4DryRunNetworkRouteMatrixLive`. |
 | Estimate rows/duration only when evidence exists and show delete due/candidate state. | **Partial, advanced 2026-07-31.** Row counts now carry `rows_provenance`, always `exact` because every source path issues `COUNT(*)`; the label exists so a future cheaper path cannot start reporting estimates through a field operators already read as exact. No duration estimate is emitted, deliberately — there is no throughput evidence to derive one from. `Plan.Deletes` discloses mode, schedule, interval, and primary-key requirement, and carries `due_state_known: false` so a caller cannot present policy as due-ness. Proven by `TestStage4DryRunDisclosesTuningAndDeletePolicy`. | Estimate provenance is closed. `TestDeleteReconcileDryRunReportsDueCandidates` stays blocked on the state-access decision: due-ness needs the durable last-success time, which a dry run must not read. |
 | Never mutate target data/schema, state progress, task success, watermarks, or deletes. | **Covered base for SQLite only:** `TestRunDryRunDiscoversSQLiteWithoutMutatingTargetOrState`. | S4.8: `TestStage4DryRunHasZeroMutationAcrossCertifiedRoutesLive`. |
 | AI advice is advisory and cannot replace deterministic facts. | **Stage 5 boundary.** | Stage 5 fixture: `TestAIAdviceCannotAlterDryRunFacts`. |
@@ -161,7 +161,7 @@ rebuild. One composed route exists today:
 
 | Normative behavior | Current evidence | Remaining proof |
 |---|---|---|
-| Report the selected strategy per table. | **Partial:** pagination plans carry strategy; no complete Stage 4 JSON/audit fact. | `TestPaginationDecisionFactIsStablePerTable`. |
+| Report the selected strategy per table. | **Covered:** planning stability by `TestPlanSQLitePaginationSelectsTupleAndStableTopology`; operator-visible disclosure by `PlannedTable.Pagination` in the dry-run plan, proven by `TestStage4DryRunDisclosesTuningAndDeletePolicy`. | Non-SQLite sources omit the field; extend with each engine dry-run path. |
 | Integer keyset uses exact bounds/order and covers signed 64-bit extremes. | **Covered base for SQLite:** `TestSplitIntegerRangeCoversSignedExtremesWithoutOverlap`, `TestSQLiteKeysetHandlesSignedIntegerExtremes`. | S4.2: `TestStage4IntegerKeysetSourceMatrixLive`. |
 | Tuple keyset is admitted only when bind/null/type/conversion/collation order equals `ORDER BY`; typed watermarks preserve values above `2^53`. | **Partial for SQLite/state:** `TestKeyValueRoundTripAboveTwoToTheFiftyThird`, `TestPlanSQLitePaginationSelectsTupleAndStableTopology`, `TestRangeBackendConformance`. | S4.2: `TestPostgresTupleKeysetOrderingLive`, `TestSQLServerTupleKeysetOrderingLive`, `TestMySQLTupleKeysetCollationLive`, `TestMariaDBTupleKeysetCollationLive`. |
 | Unsafe text collation, nullable tuple component, unsigned value, converter-touched key, and date/time key fall back to ROW_NUMBER unless equivalence is proven. | **Covered base only for representative SQLite unsafe tuples:** `TestSQLiteUnsafeTupleFallsBackToRowNumber`. | `TestStage4UnsafeTupleFallbackMatrix` plus engine live collation sentinels. |
@@ -609,7 +609,8 @@ the zero-mutation guarantee is now asserted rather than assumed. Remaining:
 
 - target preflight (dry-run currently never opens the target)
 - schema drift reporting
-- pagination selection disclosure
+- ~~pagination selection disclosure~~ — **closed 2026-07-31** for SQLite sources;
+  other engines omit the field rather than guess
 - ~~estimate provenance labelling~~ — **closed 2026-07-31**; `rows_provenance` is
   always `exact`, and no duration estimate is emitted for want of evidence
 - delete due/candidate state — **blocked on a decision**: due-ness needs the

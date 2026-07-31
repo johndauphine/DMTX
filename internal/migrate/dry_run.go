@@ -37,6 +37,20 @@ type PlannedTable struct {
 	Name           string             `json:"name"`
 	Rows           int                `json:"rows"`
 	RowsProvenance RowCountProvenance `json:"rows_provenance"`
+	Pagination     *PlannedPagination `json:"pagination,omitempty"`
+}
+
+// PlannedPagination reports the strategy a table would be read with. It is
+// omitted rather than guessed when the source engine has no dry-run planning
+// path, because a wrong strategy reads as a promise about how the migration will
+// behave. Ranges are deliberately excluded: the strategy, keys, and partition
+// count are the operator-relevant facts, and boundary lists are large and
+// change with the data.
+type PlannedPagination struct {
+	Strategy     string   `json:"strategy"`
+	Keys         []string `json:"keys,omitempty"`
+	Partitions   int      `json:"partitions"`
+	TopologyHash string   `json:"topology_hash"`
 }
 
 // PlannedSetting is one effective tuning value with the provenance that
@@ -183,10 +197,47 @@ func discoverDryRunPlan(ctx context.Context, cfg config.Config) (Plan, error) {
 			return Plan{}, fmt.Errorf("count source table %s: %w", name, err)
 		}
 		plan.Tables = append(plan.Tables, PlannedTable{
-			Name: name, Rows: rows, RowsProvenance: RowCountExact,
+			Name:           name,
+			Rows:           rows,
+			RowsProvenance: RowCountExact,
+			Pagination:     planSQLiteDryRunPagination(ctx, source, name, cfg),
 		})
 	}
 	return plan, nil
+}
+
+// planSQLiteDryRunPagination reports the strategy this table would be read with,
+// on a best-effort basis. A dry run must stay useful when pagination cannot be
+// planned — an unreadable table should not deny the operator the rest of the
+// plan — so every failure omits the disclosure instead of failing the run.
+func planSQLiteDryRunPagination(
+	ctx context.Context,
+	source *sql.DB,
+	name string,
+	cfg config.Config,
+) *PlannedPagination {
+	table, _, err := inspectTable(ctx, source, name)
+	if err != nil {
+		return nil
+	}
+	partitions := cfg.Migration.Partitions
+	if partitions <= 0 {
+		partitions = config.DefaultPartitions
+	}
+	plan, err := PlanSQLitePagination(ctx, source, table, partitions)
+	if err != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(plan.Keys))
+	for _, key := range plan.Keys {
+		keys = append(keys, key.Name)
+	}
+	return &PlannedPagination{
+		Strategy:     string(plan.Strategy),
+		Keys:         keys,
+		Partitions:   len(plan.Ranges),
+		TopologyHash: plan.TopologyHash,
+	}
 }
 
 func sqlServerDryRun(ctx context.Context, cfg config.Config) (Plan, error) {
