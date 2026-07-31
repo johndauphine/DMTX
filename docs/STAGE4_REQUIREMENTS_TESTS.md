@@ -295,7 +295,7 @@ Epoch and evidence primitives now covered by
 | PostgreSQL migration: one exported snapshot across tables/partitions for one process epoch. | **Covered:** `TestStage4StrictMigrationSnapshotOwnsEveryTableEvidence`, `TestStage4PostgresStrictMixedCompletedResumeLiveTLS`. |
 | SQL Server table: shared table view/lock; writes to that table wait. | `TestSQLServerStrictTableLockLive`. |
 | SQL Server migration: one supported database snapshot; writers do not block. | `TestSQLServerStrictMigrationDatabaseSnapshotLive`. |
-| MySQL/MariaDB table: parallel InnoDB repeatable-read sessions opened under brief `LOCK TABLES`; verify engine and privilege. | `TestMySQLStrictTableSnapshotLive`, `TestMariaDBStrictTableSnapshotLive`, `TestMySQLStrictRejectsEngineOrLockPrivilegeLive`. |
+| MySQL/MariaDB table: parallel InnoDB repeatable-read sessions opened under brief `LOCK TABLES`; verify engine and privilege. | **Implemented and live-proven 2026-07-31.** `MySQLStrictConsistencyOpener` in `strict_consistency_mysql.go` serves both engines: a separate lock-holder connection holds `LOCK TABLES ... READ` while each reader issues `START TRANSACTION WITH CONSISTENT SNAPSHOT`, then the lock is released. Agreement is created by timing because MySQL has no exportable snapshot handle. `TestMySQLStrictTableSnapshotLive` and `TestMariaDBStrictTableSnapshotLive` prove against real servers that a commit landing after the view opens both succeeds (the lock was released) and stays invisible (the snapshot holds). `TestMySQLStrictRejectsEngineOrLockPrivilegeLive` proves the InnoDB gate against a real MyISAM table — MyISAM accepts every statement in the protocol while providing no snapshot, so refusing it is the difference between strict consistency and the appearance of it. |
 | SQLite table: one serializable reader and no parallel source readers. | **Implemented 2026-07-31.** `SQLiteStrictConsistencyOpener` in `strict_consistency_sqlite.go`; proven by `TestSQLiteStrictTableSnapshot`, `TestSQLiteStrictRejectsParallelSourceReaders`, `TestSQLiteStrictRejectsUnsupportedRequests`, and `TestSQLiteStrictCloseIsIdempotentAndFinal`. Needs no live server, so it is fully proven now, including through the real coordinator and a real state backend: `TestSQLiteStrictComposesWithTheCoordinator` shows the same-view count reaching durable strict evidence, and `TestSQLiteStrictCoordinatorRejectsMigrationScope` shows the scope refusal arriving as a policy error before any session opens. **Contract note:** in default rollback-journal mode the read transaction blocks source writers with SQLITE_BUSY. The view is stable because writers wait. The opener deliberately does not switch the source to WAL — journal mode is a persistent property of the user database and strict consistency must not silently reconfigure the source. |
 | MySQL/SQLite migration and every ClickHouse strict scope reject before mutation. | **Covered.** `TestBuiltInRoutesRejectUncertifiedStrictConsistencyScopes` walks every certified adapter pair against both scopes through `ValidateMigration`, which runs before any connection is opened, so rejection necessarily precedes mutation; `TestStrictConsistencyPrecedesAdapterConstruction` pins the ordering. At the opener boundary `TestSQLiteStrictRejectsUnsupportedRequests` refuses SQLite migration scope directly. The proposed name `TestStrictConsistencyUnsupportedScopesBeforeMutation` was never used. |
 | Full-table strict count comes from the same view, is persisted, and controls validation; later live drift is informational. | `TestStrictSnapshotCountIsPersistedAndAuthoritativeLive`. |
@@ -596,16 +596,19 @@ value contracts are all implemented and covered non-live. What remains is
 `TestMariaDBValidationModesLive`, `TestStage4ValidationRouteMatrixLive`, and
 `TestValidationTimeoutFallbackEngineMatrixLive` — all gated on block G.
 
-### C. Strict consistency for the remaining engines
+### C. Strict consistency — SQL Server only
 
 **SQLite is done as of 2026-07-31** and was misclassified as live-gated: it is
 an embedded engine, so its whole contract is provable without a server. That
 correction matters for planning — do not assume a block is endpoint-blocked
 just because its neighbours are.
 
-MySQL, MariaDB, and SQL Server still need their supported scope implemented,
-and those genuinely do need live servers — for a specific reason worth stating,
-because it is not the same reason the other blocks are endpoint-gated.
+**MySQL and MariaDB are done as of 2026-07-31**, implemented and proven against
+the live servers. Only SQL Server remains.
+
+The note below explains why these could not be built earlier and why building
+them against fakes would have been wrong. It is retained because the reasoning
+still applies to SQL Server.
 
 SQLite could be finished locally because it is embedded: its tests open a real
 database, so the engine itself judges whether the stable view behaves. That is
