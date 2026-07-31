@@ -71,6 +71,248 @@ func TestPrepareStage4SchemaGateEstablishesBaselineOnBothBackends(t *testing.T) 
 	}
 }
 
+func TestPrepareStage4SchemaGateFirstUpsertEvolveAuthorizesExactCreates(
+	t *testing.T,
+) {
+	for name, factory := range stage4LifecycleBackendFactories() {
+		t.Run(name, func(t *testing.T) {
+			backend := factory(t)
+			started := time.Date(2026, 7, 30, 9, 15, 0, 0, time.UTC)
+			initializeStage4LifecycleRun(t, backend, "first-evolve", started)
+			tables := []schema.Table{
+				stage4LifecycleSimpleTable("z", "later"),
+				stage4LifecycleSimpleTable("a.b", "c"),
+			}
+			options := stage4LifecycleOptions(started)
+			options.TargetMode = "upsert"
+			options.Contract = &config.SchemaContract{
+				Tables:   config.SchemaContractEvolve,
+				Columns:  config.SchemaContractEvolve,
+				DataType: config.SchemaContractEvolve,
+			}
+
+			result, err := PrepareStage4SchemaGate(
+				stage4LifecycleRunContext(t, backend, "first-evolve", false),
+				tables,
+				options,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.Baseline ||
+				result.PreviousSnapshot.Version != schema.SchemaSnapshotVersion ||
+				len(result.PreviousSnapshot.Tables) != 0 {
+				t.Fatalf(
+					"first evolve baseline=%v previous=%#v",
+					result.Baseline,
+					result.PreviousSnapshot,
+				)
+			}
+
+			wantObjects := map[schema.SchemaDriftObject]bool{
+				{
+					Kind:   schema.SchemaDriftObjectTable,
+					Schema: "z",
+					Table:  "later",
+				}: false,
+				{
+					Kind:   schema.SchemaDriftObjectTable,
+					Schema: "a.b",
+					Table:  "c",
+				}: false,
+			}
+			if len(result.Plan.Decisions) != len(wantObjects) {
+				t.Fatalf("create decisions = %#v", result.Plan.Decisions)
+			}
+			for _, decision := range result.Plan.Decisions {
+				if decision.Entity != schema.SchemaContractTables ||
+					decision.Mode != config.SchemaContractEvolve ||
+					decision.ChangeKind != schema.SchemaDriftTableAdded ||
+					decision.Action != SchemaContractCreateTable ||
+					string(decision.Previous) != "null" ||
+					string(decision.Current) == "null" ||
+					decision.Reason == "" {
+					t.Fatalf("non-exact first-run create decision = %#v", decision)
+				}
+				seen, ok := wantObjects[decision.Object]
+				if !ok || seen {
+					t.Fatalf("unexpected or duplicate create object = %#v", decision.Object)
+				}
+				wantObjects[decision.Object] = true
+			}
+			for object, seen := range wantObjects {
+				if !seen {
+					t.Fatalf("missing create decision for %#v", object)
+				}
+			}
+			if equal, compareErr := schema.SchemaSnapshotsEqual(
+				result.Plan.UpsertSnapshot,
+				result.CurrentSnapshot,
+			); compareErr != nil || !equal {
+				t.Fatalf(
+					"first evolve upsert projection equal=%v err=%v",
+					equal,
+					compareErr,
+				)
+			}
+		})
+	}
+}
+
+func TestPrepareStage4SchemaGateFirstBaselineDoesNotImplicitlyAuthorizeCreates(
+	t *testing.T,
+) {
+	tests := []struct {
+		name     string
+		mode     string
+		contract *config.SchemaContract
+	}{
+		{name: "upsert absent contract", mode: "upsert"},
+		{
+			name: "upsert report contract",
+			mode: "upsert",
+			contract: &config.SchemaContract{
+				Tables:   config.SchemaContractReport,
+				Columns:  config.SchemaContractReport,
+				DataType: config.SchemaContractReport,
+			},
+		},
+		{
+			name: "upsert freeze contract",
+			mode: "upsert",
+			contract: &config.SchemaContract{
+				Tables:   config.SchemaContractFreeze,
+				Columns:  config.SchemaContractFreeze,
+				DataType: config.SchemaContractFreeze,
+			},
+		},
+		{
+			name: "drop recreate evolve contract",
+			mode: "drop_recreate",
+			contract: &config.SchemaContract{
+				Tables:   config.SchemaContractEvolve,
+				Columns:  config.SchemaContractEvolve,
+				DataType: config.SchemaContractEvolve,
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			backend := state.SQLiteStore{Path: filepath.Join(t.TempDir(), "state.db")}
+			started := time.Date(2026, 7, 30, 9, 30, 0, 0, time.UTC)
+			runID := strings.ReplaceAll(test.name, " ", "-")
+			initializeStage4LifecycleRun(t, backend, runID, started)
+			options := stage4LifecycleOptions(started)
+			options.TargetMode = test.mode
+			options.Contract = test.contract
+
+			result, err := PrepareStage4SchemaGate(
+				stage4LifecycleRunContext(t, backend, runID, false),
+				[]schema.Table{stage4LifecycleSimpleTable("public", "items")},
+				options,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.Baseline || len(result.Plan.Decisions) != 0 {
+				t.Fatalf(
+					"baseline=%v decisions=%#v",
+					result.Baseline,
+					result.Plan.Decisions,
+				)
+			}
+			if equal, compareErr := schema.SchemaSnapshotsEqual(
+				result.PreviousSnapshot,
+				result.CurrentSnapshot,
+			); compareErr != nil || !equal {
+				t.Fatalf(
+					"non-authorizing baseline equal=%v err=%v",
+					equal,
+					compareErr,
+				)
+			}
+		})
+	}
+}
+
+func TestPrepareStage4SchemaGateFirstUpsertEvolveResumeUsesStagedEvidence(
+	t *testing.T,
+) {
+	for name, factory := range stage4LifecycleBackendFactories() {
+		t.Run(name, func(t *testing.T) {
+			backend := factory(t)
+			started := time.Date(2026, 7, 30, 9, 45, 0, 0, time.UTC)
+			initializeStage4LifecycleRun(t, backend, "first-evolve-resume", started)
+			run := stage4LifecycleRunContext(
+				t,
+				backend,
+				"first-evolve-resume",
+				false,
+			)
+			options := stage4LifecycleOptions(started)
+			options.TargetMode = "upsert"
+			options.Contract = &config.SchemaContract{
+				Tables:   config.SchemaContractEvolve,
+				Columns:  config.SchemaContractEvolve,
+				DataType: config.SchemaContractEvolve,
+			}
+			tables := []schema.Table{
+				stage4LifecycleSimpleTable("public", "items"),
+			}
+
+			first, err := PrepareStage4SchemaGate(run, tables, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := backend.(state.Stage4Backend).SaveSchemaSnapshot(
+				first.PendingSnapshot,
+			); err != nil {
+				t.Fatal(err)
+			}
+
+			run.Resume = true
+			resumeOptions := options
+			resumeOptions.CapturedAt = started.Add(time.Hour)
+			resumed, err := PrepareStage4SchemaGate(run, tables, resumeOptions)
+			if err != nil {
+				t.Fatalf("resume first evolve baseline: %v", err)
+			}
+			if !resumed.Baseline ||
+				len(resumed.PreviousSnapshot.Tables) != 0 ||
+				!reflect.DeepEqual(resumed.Plan.Decisions, first.Plan.Decisions) ||
+				!reflect.DeepEqual(resumed.PendingSnapshot, first.PendingSnapshot) {
+				t.Fatalf(
+					"resumed baseline=%v previous=%#v decisions=%#v pending=%#v; "+
+						"want decisions=%#v pending=%#v",
+					resumed.Baseline,
+					resumed.PreviousSnapshot,
+					resumed.Plan.Decisions,
+					resumed.PendingSnapshot,
+					first.Plan.Decisions,
+					first.PendingSnapshot,
+				)
+			}
+
+			changed := append(
+				cloneStage4LifecycleTables(tables),
+				stage4LifecycleSimpleTable("public", "new_items"),
+			)
+			if _, err := PrepareStage4SchemaGate(
+				run,
+				changed,
+				resumeOptions,
+			); err == nil ||
+				!strings.Contains(
+					err.Error(),
+					"same-run successful schema projection differs",
+				) {
+				t.Fatalf("changed first-evolve resume error = %v", err)
+			}
+		})
+	}
+}
+
 func TestPrepareStage4SchemaGateUsesLatestSuccessfulSnapshotAndPlansDrift(
 	t *testing.T,
 ) {
@@ -916,6 +1158,145 @@ func TestStage4SchemaGateRepresentsRetainedDropsAsTargetCatalogRequirement(
 	if len(required.Columns) != 2 ||
 		required.Columns[1].Name != "retained_target_only" {
 		t.Fatalf("required rebuild snapshot = %#v", required)
+	}
+}
+
+func TestStage4SchemaGateSuccessfulBaselineCannotBeReplacedByRetainedTargetShape(
+	t *testing.T,
+) {
+	for name, factory := range stage4LifecycleBackendFactories() {
+		t.Run(name, func(t *testing.T) {
+			backend := factory(t)
+			started := time.Date(2026, 7, 30, 15, 30, 0, 0, time.UTC)
+			contract := &config.SchemaContract{
+				Tables:   config.SchemaContractFreeze,
+				Columns:  config.SchemaContractDiscardRow,
+				DataType: config.SchemaContractFreeze,
+			}
+			options := stage4LifecycleOptions(started)
+			options.TargetMode = "upsert"
+			options.Contract = contract
+
+			firstTables := []schema.Table{
+				stage4LifecycleSimpleTable("public", "items"),
+			}
+			firstTables[0].Columns = append(
+				firstTables[0].Columns,
+				schema.Column{
+					Name: "value", Type: "text",
+				},
+			)
+			initializeStage4LifecycleRun(t, backend, "policy-first", started)
+			first, err := PrepareStage4SchemaGate(
+				stage4LifecycleRunContext(t, backend, "policy-first", false),
+				firstTables,
+				options,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := backend.(state.Stage4Backend).SaveSchemaSnapshot(
+				first.PendingSnapshot,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if err := backend.Append(state.Run{
+				ID: "policy-first", Source: "source", Target: "target",
+				Outcome: state.Success, Reason: "complete", StartedAt: started,
+				EndedAt: started.Add(time.Minute),
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			changedTables := cloneStage4LifecycleTables(firstTables)
+			changedTables[0].Columns[1].Nullable = true
+			secondStarted := started.Add(2 * time.Minute)
+			initializeStage4LifecycleRun(
+				t,
+				backend,
+				"policy-discard",
+				secondStarted,
+			)
+			options.CapturedAt = secondStarted
+			second, err := PrepareStage4SchemaGate(
+				stage4LifecycleRunContext(t, backend, "policy-discard", false),
+				changedTables,
+				options,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(second.Plan.SuccessfulSnapshot.Tables) != 0 ||
+				len(second.Plan.UpsertSnapshot.Tables) != 1 {
+				t.Fatalf(
+					"second-run successful=%#v upsert=%#v",
+					second.Plan.SuccessfulSnapshot,
+					second.Plan.UpsertSnapshot,
+				)
+			}
+			pending, err := schema.ParseSchemaSnapshot(
+				[]byte(second.PendingSnapshot.CanonicalJSON),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if equal, compareErr := schema.SchemaSnapshotsEqual(
+				pending,
+				second.Plan.SuccessfulSnapshot,
+			); compareErr != nil || !equal {
+				t.Fatalf(
+					"durable successful source baseline equal=%v err=%v",
+					equal,
+					compareErr,
+				)
+			}
+			if equal, compareErr := schema.SchemaSnapshotsEqual(
+				pending,
+				second.Plan.UpsertSnapshot,
+			); compareErr != nil || equal {
+				t.Fatalf(
+					"retained target shape replaced successful baseline equal=%v err=%v",
+					equal,
+					compareErr,
+				)
+			}
+			if err := backend.(state.Stage4Backend).SaveSchemaSnapshot(
+				second.PendingSnapshot,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if err := backend.Append(state.Run{
+				ID: "policy-discard", Source: "source", Target: "target",
+				Outcome: state.Success, Reason: "complete",
+				StartedAt: secondStarted,
+				EndedAt:   secondStarted.Add(time.Minute),
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			thirdStarted := started.Add(4 * time.Minute)
+			initializeStage4LifecycleRun(
+				t,
+				backend,
+				"policy-reverted",
+				thirdStarted,
+			)
+			options.CapturedAt = thirdStarted
+			third, thirdErr := PrepareStage4SchemaGate(
+				stage4LifecycleRunContext(t, backend, "policy-reverted", false),
+				firstTables,
+				options,
+			)
+			if thirdErr == nil ||
+				!strings.Contains(thirdErr.Error(), "freeze") ||
+				!strings.Contains(thirdErr.Error(), "table_added") {
+				t.Fatalf(
+					"reverted source bypassed table freeze: plan=%#v error=%v",
+					third.Plan,
+					thirdErr,
+				)
+			}
+		})
 	}
 }
 

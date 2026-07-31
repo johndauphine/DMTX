@@ -313,6 +313,22 @@ func PrepareStage4SchemaGate(
 		if err != nil {
 			return result, fmt.Errorf("verify latest successful aggregate schema snapshot: %w", err)
 		}
+	} else if normalizedMode == "upsert" &&
+		options.Contract != nil &&
+		options.Contract.Tables == config.SchemaContractEvolve {
+		// An explicit tables:evolve policy is the authority to create tables
+		// that are absent from a first-run upsert target. Compare the first
+		// successful source discovery with an empty durable prior so every
+		// source table receives an auditable create_table decision. All other
+		// policies retain the historical current=current baseline and therefore
+		// cannot silently authorize target mutation.
+		previous, err = schema.NewSchemaSnapshot(nil)
+		if err != nil {
+			return result, fmt.Errorf(
+				"build empty first-run upsert schema baseline: %w",
+				err,
+			)
+		}
 	}
 	result.PreviousSnapshot = previous
 
