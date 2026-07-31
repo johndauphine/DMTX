@@ -268,20 +268,23 @@ type boundTargetSchemaEvolutionDecision struct {
 // audit-backed transition. Callers cannot substitute the live target catalog
 // for durable prior intent or hand-build target identities.
 type TargetSchemaEvolutionRequest struct {
-	target          schema.Dialect
-	sourceEngine    string
-	targetEngine    string
-	targetMode      string
-	sourcePrior     string
-	sourceCurrent   string
-	projectionPrior string
-	projectionNext  string
-	mappings        []Stage4TargetSchemaObjectMapping
-	decisions       []boundTargetSchemaEvolutionDecision
-	priorTables     []schema.Table
-	currentTables   []schema.Table
-	createPlanner   TargetSchemaEvolutionCreatePlanner
-	authorityDigest string
+	target                      schema.Dialect
+	sourceEngine                string
+	targetEngine                string
+	targetMode                  string
+	sourcePrior                 string
+	sourceCurrent               string
+	projectionPrior             string
+	projectionNext              string
+	targetAuthorityTopology     string
+	targetAuthorityCatalog      string
+	targetAuthorityReservations []TargetSchemaEvolutionNameReservation
+	mappings                    []Stage4TargetSchemaObjectMapping
+	decisions                   []boundTargetSchemaEvolutionDecision
+	priorTables                 []schema.Table
+	currentTables               []schema.Table
+	createPlanner               TargetSchemaEvolutionCreatePlanner
+	authorityDigest             string
 }
 
 // NewTargetSchemaEvolutionRequest is the only production constructor for an
@@ -294,18 +297,21 @@ func NewTargetSchemaEvolutionRequest(
 	createPlanner TargetSchemaEvolutionCreatePlanner,
 ) (TargetSchemaEvolutionRequest, error) {
 	request := TargetSchemaEvolutionRequest{
-		target:          target,
-		sourceEngine:    projection.SourceEngine(),
-		targetEngine:    projection.TargetEngine(),
-		targetMode:      projection.TargetMode(),
-		sourcePrior:     projection.SourcePriorDigest(),
-		sourceCurrent:   projection.SourceCurrentDigest(),
-		projectionPrior: projection.PriorDigest(),
-		projectionNext:  projection.CurrentDigest(),
-		mappings:        projection.ObjectMappings(),
-		priorTables:     projection.PriorTables(),
-		currentTables:   projection.CurrentTables(),
-		createPlanner:   createPlanner,
+		target:                      target,
+		sourceEngine:                projection.SourceEngine(),
+		targetEngine:                projection.TargetEngine(),
+		targetMode:                  projection.TargetMode(),
+		sourcePrior:                 projection.SourcePriorDigest(),
+		sourceCurrent:               projection.SourceCurrentDigest(),
+		projectionPrior:             projection.PriorDigest(),
+		projectionNext:              projection.CurrentDigest(),
+		targetAuthorityTopology:     projection.TargetAuthorityTopologyHash(),
+		targetAuthorityCatalog:      projection.TargetAuthorityCatalogDigest(),
+		targetAuthorityReservations: projection.TargetAuthorityReservations(),
+		mappings:                    projection.ObjectMappings(),
+		priorTables:                 projection.PriorTables(),
+		currentTables:               projection.CurrentTables(),
+		createPlanner:               createPlanner,
 	}
 	if err := validateTargetSchemaEvolutionProjectionAuthority(
 		request,
@@ -508,6 +514,19 @@ func BuildTargetSchemaEvolutionPlan(
 			"preflight",
 			"target catalog is not complete and structurally valid",
 			err,
+		)
+	}
+	if !reflect.DeepEqual(
+		canonicalTargetSchemaEvolutionReservations(catalog.reservations),
+		canonicalTargetSchemaEvolutionReservations(
+			request.targetAuthorityReservations,
+		),
+	) {
+		return TargetSchemaEvolutionPlan{}, targetSchemaEvolutionError(
+			TargetSchemaEvolutionCatalogDrift,
+			"preflight",
+			"target catalog reservations differ from durable target-shape authority",
+			nil,
 		)
 	}
 	if err := prepareTargetSchemaEvolutionCreateBundle(
@@ -800,7 +819,7 @@ func prepareTargetSchemaEvolutionDefinition(
 	if err := validateTargetSchemaEvolutionColumnOrder(definition); err != nil {
 		return targetSchemaEvolutionDefinition{}, err
 	}
-	if err := validateTargetSchemaEvolutionManagedSets(definition); err != nil {
+	if err := validateTargetSchemaEvolutionManagedSets(&definition); err != nil {
 		return targetSchemaEvolutionDefinition{}, err
 	}
 	return definition, nil
@@ -1237,25 +1256,81 @@ func validateTargetSchemaEvolutionDecision(
 }
 
 func validateTargetSchemaEvolutionManagedSets(
-	definition targetSchemaEvolutionDefinition,
+	definition *targetSchemaEvolutionDefinition,
 ) error {
 	create := make(map[targetSchemaEvolutionTableKey]struct{})
+	pendingCreateObjects := make(
+		[]schema.SchemaDriftObject,
+		0,
+		len(definition.createObjects),
+	)
+	pendingCreateTables := make(
+		[]schema.Table,
+		0,
+		len(definition.createTables),
+	)
 	for _, object := range definition.createObjects {
 		key := targetSchemaEvolutionTableKey{
 			schema: object.Schema,
 			table:  object.Table,
 		}
-		if _, exists := definition.priorIndex[key]; exists {
+		if prior, exists := definition.priorIndex[key]; exists {
+			current, currentExists := definition.currentIndex[key]
+			if !currentExists {
+				return targetSchemaEvolutionError(
+					TargetSchemaEvolutionInvalidPlan,
+					"preflight",
+					"create_table authority has no current table "+
+						targetSchemaEvolutionObjectName(object),
+					nil,
+				)
+			}
+			equal, err := equalCanonicalTargetSchemaEvolutionCatalog(
+				[]schema.Table{prior},
+				[]schema.Table{current},
+			)
+			if err != nil {
+				return targetSchemaEvolutionError(
+					TargetSchemaEvolutionInvalidPlan,
+					"preflight",
+					"compare already-satisfied create_table authority for "+
+						targetSchemaEvolutionObjectName(object),
+					err,
+				)
+			}
+			if !equal {
+				return targetSchemaEvolutionError(
+					TargetSchemaEvolutionInvalidPlan,
+					"preflight",
+					"create_table prior projection contains an incompatible table "+
+						targetSchemaEvolutionObjectName(object),
+					nil,
+				)
+			}
+			// The immutable target-shape authority proves this table already
+			// satisfies the complete source-backed desired shape. Preserve the
+			// audit decision but emit no DDL operation.
+			continue
+		}
+		create[key] = struct{}{}
+		pendingCreateObjects = append(pendingCreateObjects, object)
+		current, exists := definition.currentIndex[key]
+		if !exists {
 			return targetSchemaEvolutionError(
 				TargetSchemaEvolutionInvalidPlan,
 				"preflight",
-				"create_table prior projection already contains "+
+				"create_table decision has no target-ready current table "+
 					targetSchemaEvolutionObjectName(object),
 				nil,
 			)
 		}
-		create[key] = struct{}{}
+		pendingCreateTables = append(
+			pendingCreateTables,
+			cloneStage4RichTable(current),
+		)
 	}
+	definition.createObjects = pendingCreateObjects
+	definition.createTables = pendingCreateTables
 	for _, specification := range definition.specifications {
 		key := targetSchemaEvolutionTableKey{
 			schema: specification.object.Schema,
@@ -2335,6 +2410,20 @@ func validateTargetSchemaEvolutionProjectionAuthority(
 			"projection has missing or unstable durable source endpoint digests",
 		)
 	}
+	if request.targetAuthorityTopology == "" ||
+		request.targetAuthorityCatalog == "" ||
+		request.targetAuthorityTopology !=
+			projection.TargetAuthorityTopologyHash() ||
+		request.targetAuthorityCatalog !=
+			projection.TargetAuthorityCatalogDigest() ||
+		!reflect.DeepEqual(
+			request.targetAuthorityReservations,
+			projection.TargetAuthorityReservations(),
+		) {
+		return fmt.Errorf(
+			"projection has missing or unstable durable target catalog authority",
+		)
+	}
 	priorDigest, err := digestTargetSchemaEvolutionCatalog(
 		request.priorTables,
 	)
@@ -2353,6 +2442,28 @@ func validateTargetSchemaEvolutionProjectionAuthority(
 		request.projectionNext != currentDigest {
 		return fmt.Errorf(
 			"projection digests do not match its target-ready endpoint tables",
+		)
+	}
+	priorSnapshot, err := schema.NewSchemaSnapshot(request.priorTables)
+	if err != nil {
+		return fmt.Errorf(
+			"snapshot target-ready prior catalog authority: %w",
+			err,
+		)
+	}
+	priorCatalogDigest, err := stage4TargetShapeCatalogDigest(
+		priorSnapshot,
+		request.targetAuthorityReservations,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"digest target-ready prior catalog authority: %w",
+			err,
+		)
+	}
+	if priorCatalogDigest != request.targetAuthorityCatalog {
+		return fmt.Errorf(
+			"projection target catalog authority does not match prior tables and reservations",
 		)
 	}
 	if !reflect.DeepEqual(
@@ -2410,14 +2521,6 @@ func validateTargetSchemaEvolutionProjectionAuthority(
 			}
 		}
 	}
-	for target := range requiredTargets {
-		if _, found := seenTarget[target]; !found {
-			return fmt.Errorf(
-				"projection has no source authority for target object %s",
-				stage4TargetSchemaObjectIdentityString(target),
-			)
-		}
-	}
 	for target := range seenTarget {
 		if _, found := requiredTargets[target]; !found {
 			return fmt.Errorf(
@@ -2472,27 +2575,35 @@ func digestTargetSchemaEvolutionAuthority(
 		Target   schema.SchemaDriftObject `json:"target"`
 	}
 	value := struct {
-		Target              schema.Dialect                    `json:"target"`
-		SourceEngine        string                            `json:"source_engine"`
-		TargetEngine        string                            `json:"target_engine"`
-		TargetMode          string                            `json:"target_mode"`
-		SourcePrior         string                            `json:"source_prior"`
-		SourceCurrent       string                            `json:"source_current"`
-		ProjectionPrior     string                            `json:"projection_prior"`
-		ProjectionNext      string                            `json:"projection_next"`
-		Mappings            []Stage4TargetSchemaObjectMapping `json:"mappings"`
-		Decisions           []digestDecision                  `json:"decisions"`
-		PriorTablesDigest   string                            `json:"prior_tables_digest"`
-		CurrentTablesDigest string                            `json:"current_tables_digest"`
+		Target                      schema.Dialect                         `json:"target"`
+		SourceEngine                string                                 `json:"source_engine"`
+		TargetEngine                string                                 `json:"target_engine"`
+		TargetMode                  string                                 `json:"target_mode"`
+		SourcePrior                 string                                 `json:"source_prior"`
+		SourceCurrent               string                                 `json:"source_current"`
+		ProjectionPrior             string                                 `json:"projection_prior"`
+		ProjectionNext              string                                 `json:"projection_next"`
+		TargetAuthorityTopology     string                                 `json:"target_authority_topology"`
+		TargetAuthorityCatalog      string                                 `json:"target_authority_catalog"`
+		TargetAuthorityReservations []TargetSchemaEvolutionNameReservation `json:"target_authority_reservations"`
+		Mappings                    []Stage4TargetSchemaObjectMapping      `json:"mappings"`
+		Decisions                   []digestDecision                       `json:"decisions"`
+		PriorTablesDigest           string                                 `json:"prior_tables_digest"`
+		CurrentTablesDigest         string                                 `json:"current_tables_digest"`
 	}{
-		Target:              request.target,
-		SourceEngine:        request.sourceEngine,
-		TargetEngine:        request.targetEngine,
-		TargetMode:          request.targetMode,
-		SourcePrior:         request.sourcePrior,
-		SourceCurrent:       request.sourceCurrent,
-		ProjectionPrior:     request.projectionPrior,
-		ProjectionNext:      request.projectionNext,
+		Target:                  request.target,
+		SourceEngine:            request.sourceEngine,
+		TargetEngine:            request.targetEngine,
+		TargetMode:              request.targetMode,
+		SourcePrior:             request.sourcePrior,
+		SourceCurrent:           request.sourceCurrent,
+		ProjectionPrior:         request.projectionPrior,
+		ProjectionNext:          request.projectionNext,
+		TargetAuthorityTopology: request.targetAuthorityTopology,
+		TargetAuthorityCatalog:  request.targetAuthorityCatalog,
+		TargetAuthorityReservations: canonicalTargetSchemaEvolutionReservations(
+			request.targetAuthorityReservations,
+		),
 		Mappings:            mappings,
 		Decisions:           make([]digestDecision, len(decisions)),
 		PriorTablesDigest:   priorTablesDigest,

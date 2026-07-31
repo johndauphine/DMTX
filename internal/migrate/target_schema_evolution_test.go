@@ -668,13 +668,22 @@ func TestTargetSchemaEvolutionBindsSourceDecisionsToTargetNamespace(
 		"upsert",
 		false,
 	)
-	projection, err := BuildStage4TargetSchemaEvolutionProjection(
+	projectionTarget := &stage4TargetSchemaProjectionTestTarget{
+		engine:       "postgres",
+		targetSchema: "tenant",
+	}
+	authority := stage4TargetSchemaProjectionAuthority(
+		t,
 		gate,
 		"mssql",
-		&stage4TargetSchemaProjectionTestTarget{
-			engine:       "postgres",
-			targetSchema: "tenant",
-		},
+		projectionTarget,
+		"upsert",
+	)
+	projection, err := BuildStage4TargetSchemaEvolutionProjection(
+		gate,
+		authority,
+		"mssql",
+		projectionTarget,
 		"upsert",
 	)
 	if err != nil {
@@ -772,6 +781,11 @@ func TestTargetSchemaEvolutionFreezesGlobalNameReservations(
 		baseCatalog.tables,
 		[]TargetSchemaEvolutionNameReservation{reservation},
 	)
+	targetSchemaEvolutionBindAuthorityReservations(
+		t,
+		&request,
+		catalog.reservations,
+	)
 	guard := &targetSchemaEvolutionGuardCreatePlanner{
 		rejectReservation: "events_account_idx",
 	}
@@ -802,6 +816,11 @@ func TestTargetSchemaEvolutionFreezesGlobalNameReservations(
 			Name:      "unrelated_sequence",
 		}},
 	)
+	targetSchemaEvolutionBindAuthorityReservations(
+		t,
+		&request,
+		catalog.reservations,
+	)
 	plan, err := BuildTargetSchemaEvolutionPlan(request, catalog)
 	if err != nil {
 		t.Fatal(err)
@@ -824,6 +843,31 @@ func TestTargetSchemaEvolutionFreezesGlobalNameReservations(
 	if !reflect.DeepEqual(session.calls, []string{"read"}) {
 		t.Fatalf("changed reservations reached mutation: %#v", session.calls)
 	}
+}
+
+func targetSchemaEvolutionBindAuthorityReservations(
+	t *testing.T,
+	request *TargetSchemaEvolutionRequest,
+	reservations []TargetSchemaEvolutionNameReservation,
+) {
+	t.Helper()
+	request.targetAuthorityReservations =
+		canonicalTargetSchemaEvolutionReservations(reservations)
+	snapshot, err := schema.NewSchemaSnapshot(request.priorTables)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.targetAuthorityCatalog, err = stage4TargetShapeCatalogDigest(
+		snapshot,
+		request.targetAuthorityReservations,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.authorityDigest = targetSchemaEvolutionTestAuthorityDigest(
+		t,
+		*request,
+	)
 }
 
 func TestTargetSchemaEvolutionRejectsUnsafeOrNondeterministicCreateBoundaries(
@@ -1444,6 +1488,17 @@ func targetSchemaEvolutionFixtureProjection(
 	if err != nil {
 		t.Fatal(err)
 	}
+	priorSnapshot, err := schema.NewSchemaSnapshot(prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalogDigest, err := stage4TargetShapeCatalogDigest(
+		priorSnapshot,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	byObject := make(map[Stage4SchemaObjectIdentity]struct{})
 	for _, tables := range [][]schema.Table{prior, current} {
 		for _, table := range tables {
@@ -1476,17 +1531,20 @@ func targetSchemaEvolutionFixtureProjection(
 			stage4TargetSchemaObjectIdentityKey(mappings[right].Source)
 	})
 	return Stage4TargetSchemaEvolutionProjection{
-		sourceEngine:        "mssql",
-		targetEngine:        "postgres",
-		targetMode:          "upsert",
-		sourcePriorDigest:   priorDigest,
-		sourceCurrentDigest: currentDigest,
-		priorDigest:         priorDigest,
-		currentDigest:       currentDigest,
-		decisions:           cloneStage4TargetSchemaProjectionDecisions(decisions),
-		priorTables:         cloneTargetSchemaEvolutionTables(prior),
-		currentTables:       cloneTargetSchemaEvolutionTables(current),
-		objectMappings:      mappings,
+		sourceEngine:                 "mssql",
+		targetEngine:                 "postgres",
+		targetMode:                   "upsert",
+		sourcePriorDigest:            priorDigest,
+		sourceCurrentDigest:          currentDigest,
+		targetAuthorityTopologyHash:  "target-evolution-fixture-topology",
+		targetAuthorityPriorDigest:   priorDigest,
+		targetAuthorityCatalogDigest: catalogDigest,
+		priorDigest:                  priorDigest,
+		currentDigest:                currentDigest,
+		decisions:                    cloneStage4TargetSchemaProjectionDecisions(decisions),
+		priorTables:                  cloneTargetSchemaEvolutionTables(prior),
+		currentTables:                cloneTargetSchemaEvolutionTables(current),
+		objectMappings:               mappings,
 	}
 }
 

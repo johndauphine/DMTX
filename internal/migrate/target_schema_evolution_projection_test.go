@@ -7,9 +7,11 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/schema"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 func TestStage4TargetSchemaEvolutionProjectionPlansExactSafeUpsertEndpoints(
@@ -30,9 +32,13 @@ func TestStage4TargetSchemaEvolutionProjectionPlansExactSafeUpsertEndpoints(
 		engine:       "postgres",
 		targetSchema: "warehouse",
 	}
+	authority := stage4TargetSchemaProjectionAuthority(
+		t, gate, "mssql", target, "upsert",
+	)
 
 	projection, err := BuildStage4TargetSchemaEvolutionProjection(
 		gate,
+		authority,
 		"mssql",
 		target,
 		"upsert",
@@ -162,6 +168,7 @@ func TestStage4TargetSchemaEvolutionProjectionPlansExactSafeUpsertEndpoints(
 
 	repeated, err := BuildStage4TargetSchemaEvolutionProjection(
 		gate,
+		authority,
 		"mssql",
 		target,
 		"upsert",
@@ -212,9 +219,13 @@ func TestStage4TargetSchemaEvolutionProjectionPreservesPostgresRetainedObjectNam
 	)
 	before := stage4TargetSchemaProjectionCloneGate(t, gate)
 	target := &postgresTargetAdapter{namespace: "tenant"}
+	authority := stage4TargetSchemaProjectionAuthority(
+		t, gate, "postgres", target, "upsert",
+	)
 
 	projection, err := BuildStage4TargetSchemaEvolutionProjection(
 		gate,
+		authority,
 		"postgres",
 		target,
 		"upsert",
@@ -267,6 +278,7 @@ func TestStage4TargetSchemaEvolutionProjectionPreservesPostgresRetainedObjectNam
 
 	repeated, err := BuildStage4TargetSchemaEvolutionProjection(
 		gate,
+		authority,
 		"postgres",
 		target,
 		"upsert",
@@ -330,19 +342,31 @@ func TestStage4TargetSchemaEvolutionProjectionRejectsRetainedRebuildSubobjectsWi
 		engine:       "mssql",
 		targetSchema: "dbo",
 	}
+	authority := stage4TargetSchemaProjectionAuthority(
+		t, gate, "postgres", target, "drop_recreate",
+	)
 
-	_, err := BuildStage4TargetSchemaEvolutionProjection(
+	projection, err := BuildStage4TargetSchemaEvolutionProjection(
 		gate,
+		authority,
 		"postgres",
 		target,
 		"drop_recreate",
 	)
-	if err == nil ||
-		!strings.Contains(
-			err.Error(),
-			"no separate immutable target-shape evidence",
-		) {
-		t.Fatalf("retained rebuild subobject error = %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := stage4TargetSchemaProjectionFindTable(
+		t,
+		projection.CurrentTables(),
+		"accounts",
+	)
+	if stage4TargetSchemaProjectionFindColumn(
+		t,
+		accounts,
+		"legacy_code",
+	).Name != "legacy_code" {
+		t.Fatal("durable target authority lost retained rebuild column")
 	}
 }
 
@@ -365,13 +389,18 @@ func TestStage4TargetSchemaEvolutionProjectionKeepsWholePriorOnlyTargetTable(
 		"drop_recreate",
 		false,
 	)
+	target := &stage4TargetSchemaProjectionTestTarget{
+		engine:       "mssql",
+		targetSchema: "dbo",
+	}
+	authority := stage4TargetSchemaProjectionAuthority(
+		t, gate, "postgres", target, "drop_recreate",
+	)
 	projection, err := BuildStage4TargetSchemaEvolutionProjection(
 		gate,
+		authority,
 		"postgres",
-		&stage4TargetSchemaProjectionTestTarget{
-			engine:       "mssql",
-			targetSchema: "dbo",
-		},
+		target,
 		"drop_recreate",
 	)
 	if err != nil {
@@ -402,8 +431,12 @@ func TestStage4TargetSchemaEvolutionProjectionAcceptsExplicitFirstRunCreates(
 		engine:       "mysql",
 		targetSchema: "destination",
 	}
+	authority := stage4TargetSchemaProjectionAuthority(
+		t, gate, "sqlite", target, "upsert",
+	)
 	projection, err := BuildStage4TargetSchemaEvolutionProjection(
 		gate,
+		authority,
 		"sqlite",
 		target,
 		"upsert",
@@ -418,6 +451,120 @@ func TestStage4TargetSchemaEvolutionProjectionAcceptsExplicitFirstRunCreates(
 			len(projection.PriorTables()),
 			len(projection.CurrentTables()),
 		)
+	}
+}
+
+func TestStage4TargetSchemaEvolutionProjectionAuthenticatesCompatibleExistingCreate(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	current := []schema.Table{{
+		Schema: "source",
+		Name:   "accounts",
+		Columns: []schema.Column{
+			stage4TargetSchemaProjectionPrimaryColumn("id", "bigint"),
+			{Name: "label", Type: "text", Nullable: true},
+		},
+	}}
+	gate := stage4TargetSchemaProjectionGate(
+		t,
+		nil,
+		current,
+		"upsert",
+		true,
+	)
+	target := &stage4TargetSchemaProjectionTestTarget{
+		engine:       "postgres",
+		targetSchema: "tenant",
+	}
+	planned, err := target.PlanTables("sqlite", current, "upsert")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compatible := cloneStage4TargetSchemaProjectionTables(planned)
+	compatible[0].Columns = append(
+		compatible[0].Columns,
+		schema.Column{
+			Name: "operator_only", Type: "text", Nullable: true,
+		},
+	)
+	catalog, err := NewTargetSchemaEvolutionCatalog(compatible, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := stage4TargetSchemaProjectionAuthorityFromCatalog(
+		t,
+		gate,
+		"sqlite",
+		"postgres",
+		"upsert",
+		catalog,
+	)
+	projection, err := BuildStage4TargetSchemaEvolutionProjection(
+		gate,
+		authority,
+		"sqlite",
+		target,
+		"upsert",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(projection.PriorTables(), projection.CurrentTables()) {
+		t.Fatalf(
+			"compatible existing create was not an authenticated no-op: prior=%#v current=%#v",
+			projection.PriorTables(),
+			projection.CurrentTables(),
+		)
+	}
+	request, err := NewTargetSchemaEvolutionRequest(
+		schema.Postgres,
+		projection,
+		targetSchemaEvolutionFixtureCreatePlanner{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildTargetSchemaEvolutionPlan(request, catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Complete() || plan.OperationCount() != 0 {
+		t.Fatalf(
+			"compatible existing create plan complete=%t operations=%d",
+			plan.Complete(),
+			plan.OperationCount(),
+		)
+	}
+
+	incompatible := cloneStage4TargetSchemaProjectionTables(compatible)
+	incompatible[0].Columns[0].Type = "text"
+	incompatibleCatalog, err := NewTargetSchemaEvolutionCatalog(
+		incompatible,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incompatibleAuthority :=
+		stage4TargetSchemaProjectionAuthorityFromCatalog(
+			t,
+			gate,
+			"sqlite",
+			"postgres",
+			"upsert",
+			incompatibleCatalog,
+		)
+	if _, err := BuildStage4TargetSchemaEvolutionProjection(
+		gate,
+		incompatibleAuthority,
+		"sqlite",
+		target,
+		"upsert",
+	); err == nil ||
+		!strings.Contains(err.Error(), "collides with incompatible") {
+		t.Fatalf("incompatible existing create error = %v", err)
 	}
 }
 
@@ -448,21 +595,34 @@ func TestStage4TargetSchemaEvolutionProjectionRejectsRetainedUpsertSubobjectsWit
 		"upsert",
 		false,
 	)
-	_, err := BuildStage4TargetSchemaEvolutionProjection(
+	target := &stage4TargetSchemaProjectionTestTarget{
+		engine:       "postgres",
+		targetSchema: "public",
+	}
+	authority := stage4TargetSchemaProjectionAuthority(
+		t, gate, "postgres", target, "upsert",
+	)
+	projection, err := BuildStage4TargetSchemaEvolutionProjection(
 		gate,
+		authority,
 		"postgres",
-		&stage4TargetSchemaProjectionTestTarget{
-			engine:       "postgres",
-			targetSchema: "public",
-		},
+		target,
 		"upsert",
 	)
-	if err == nil ||
-		!strings.Contains(
-			err.Error(),
-			"no separate immutable target-shape evidence",
-		) {
-		t.Fatalf("retained upsert subobject error = %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := stage4TargetSchemaProjectionFindTable(
+		t,
+		projection.CurrentTables(),
+		"accounts",
+	)
+	if stage4TargetSchemaProjectionFindColumn(
+		t,
+		accounts,
+		"legacy_code",
+	).Name != "legacy_code" {
+		t.Fatal("durable target authority lost retained upsert column")
 	}
 }
 
@@ -600,9 +760,45 @@ func TestStage4TargetSchemaEvolutionProjectionFailsClosedBeforeTargetIO(
 				engine:       "postgres",
 				targetSchema: "warehouse",
 			}
+			authority := stage4TargetSchemaProjectionAuthority(
+				t,
+				gate,
+				"mssql",
+				&stage4TargetSchemaProjectionTestTarget{
+					engine:       "postgres",
+					targetSchema: "warehouse",
+				},
+				"upsert",
+			)
 			test.mutate(&gate, target)
+			if test.name == "materialize malformed default" {
+				var digestErr error
+				authority.sourcePriorDigest, digestErr =
+					gate.PreviousSnapshot.Digest()
+				if digestErr != nil {
+					t.Fatal(digestErr)
+				}
+				authority.sourceCurrentDigest, digestErr =
+					gate.CurrentSnapshot.Digest()
+				if digestErr != nil {
+					t.Fatal(digestErr)
+				}
+				authority.sourceSuccessDigest, digestErr =
+					gate.Plan.SuccessfulSnapshot.Digest()
+				if digestErr != nil {
+					t.Fatal(digestErr)
+				}
+				authority.decisionDigest, digestErr =
+					stage4TargetShapeDecisionDigest(
+						gate.Plan.Decisions,
+					)
+				if digestErr != nil {
+					t.Fatal(digestErr)
+				}
+			}
 			_, err := BuildStage4TargetSchemaEvolutionProjection(
 				gate,
+				authority,
 				"mssql",
 				target,
 				"upsert",
@@ -654,8 +850,12 @@ func TestStage4TargetSchemaEvolutionProjectionRejectsCrossEndpointAliasReplaceme
 		engine:       "mysql",
 		targetSchema: "one_database",
 	}
+	authority := stage4TargetSchemaProjectionAuthority(
+		t, gate, "postgres", target, "upsert",
+	)
 	_, err := BuildStage4TargetSchemaEvolutionProjection(
 		gate,
+		authority,
 		"postgres",
 		target,
 		"upsert",
@@ -763,12 +963,111 @@ func stage4TargetSchemaProjectionGate(
 		t.Fatal(err)
 	}
 	return Stage4SchemaGateResult{
+		Task:                         stage4SchemaGateTask,
+		TopologyHash:                 "projection-fixture-topology",
 		Baseline:                     baseline,
 		PreviousSnapshot:             previous,
 		CurrentSnapshot:              current,
 		Plan:                         plan,
 		RebuildCurrentSnapshot:       plan.TransferSnapshot,
 		RebuildRequiresTargetCatalog: !equal,
+	}
+}
+
+func stage4TargetSchemaProjectionAuthority(
+	t *testing.T,
+	gate Stage4SchemaGateResult,
+	sourceEngine string,
+	target Stage4TargetSchemaPlanner,
+	targetMode string,
+) Stage4TargetShapeAuthority {
+	t.Helper()
+	priorSource, err := schema.MaterializeSchemaSnapshot(
+		gate.PreviousSnapshot,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorTarget, err := target.PlanTables(
+		sourceEngine,
+		priorSource,
+		targetMode,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recorder, ok := target.(*stage4TargetSchemaProjectionTestTarget); ok {
+		recorder.planCalls = 0
+		recorder.sourceEngines = nil
+		recorder.targetModes = nil
+	}
+	catalog, err := NewTargetSchemaEvolutionCatalog(priorTarget, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stage4TargetSchemaProjectionAuthorityFromCatalog(
+		t,
+		gate,
+		sourceEngine,
+		target.Engine(),
+		targetMode,
+		catalog,
+	)
+}
+
+func stage4TargetSchemaProjectionAuthorityFromCatalog(
+	t *testing.T,
+	gate Stage4SchemaGateResult,
+	sourceEngine string,
+	targetEngine string,
+	targetMode string,
+	catalog TargetSchemaEvolutionCatalog,
+) Stage4TargetShapeAuthority {
+	t.Helper()
+	seed, err := NewStage4TargetShapeSeed(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourcePriorDigest, err := gate.PreviousSnapshot.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceCurrentDigest, err := gate.CurrentSnapshot.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceSuccessDigest, err := gate.Plan.SuccessfulSnapshot.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decisionDigest, err := stage4TargetShapeDecisionDigest(
+		gate.Plan.Decisions,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorDigest, err := seed.snapshot.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Stage4TargetShapeAuthority{
+		runID:               "projection-fixture",
+		task:                stage4TargetShapeTask,
+		topologyHash:        "projection-fixture-topology",
+		sourceEngine:        sourceEngine,
+		targetEngine:        targetEngine,
+		targetMode:          targetMode,
+		sourcePriorDigest:   sourcePriorDigest,
+		sourceCurrentDigest: sourceCurrentDigest,
+		sourceSuccessDigest: sourceSuccessDigest,
+		decisionDigest:      decisionDigest,
+		priorEvidenceDigest: priorDigest,
+		priorCatalogDigest:  seed.catalogDigest,
+		priorSnapshot:       cloneSchemaSnapshot(seed.snapshot),
+		priorReservations: cloneTargetSchemaEvolutionReservations(
+			seed.reservations,
+		),
+		capturedAt: time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC),
 	}
 }
 
@@ -806,6 +1105,8 @@ func jsonMarshalStage4TargetSchemaProjectionGate(
 	gate Stage4SchemaGateResult,
 ) ([]byte, error) {
 	type cloneWire struct {
+		Task                         state.TaskKey
+		TopologyHash                 string
 		Baseline                     bool
 		PreviousSnapshot             schema.SchemaSnapshot
 		CurrentSnapshot              schema.SchemaSnapshot
@@ -814,6 +1115,8 @@ func jsonMarshalStage4TargetSchemaProjectionGate(
 		RebuildRequiresTargetCatalog bool
 	}
 	return json.Marshal(cloneWire{
+		Task:                         gate.Task,
+		TopologyHash:                 gate.TopologyHash,
 		Baseline:                     gate.Baseline,
 		PreviousSnapshot:             gate.PreviousSnapshot,
 		CurrentSnapshot:              gate.CurrentSnapshot,
@@ -827,6 +1130,8 @@ func jsonUnmarshalStage4TargetSchemaProjectionGate(
 	encoded []byte,
 ) (Stage4SchemaGateResult, error) {
 	var wire struct {
+		Task                         state.TaskKey
+		TopologyHash                 string
 		Baseline                     bool
 		PreviousSnapshot             schema.SchemaSnapshot
 		CurrentSnapshot              schema.SchemaSnapshot
@@ -838,6 +1143,8 @@ func jsonUnmarshalStage4TargetSchemaProjectionGate(
 		return Stage4SchemaGateResult{}, err
 	}
 	return Stage4SchemaGateResult{
+		Task:                         wire.Task,
+		TopologyHash:                 wire.TopologyHash,
 		Baseline:                     wire.Baseline,
 		PreviousSnapshot:             wire.PreviousSnapshot,
 		CurrentSnapshot:              wire.CurrentSnapshot,

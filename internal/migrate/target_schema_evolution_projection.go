@@ -55,17 +55,21 @@ type Stage4TargetSchemaObjectMapping struct {
 // one authorized schema transition. Accessors return deep copies so callers
 // cannot change the evidence after its deterministic digests are established.
 type Stage4TargetSchemaEvolutionProjection struct {
-	sourceEngine        string
-	targetEngine        string
-	targetMode          string
-	sourcePriorDigest   string
-	sourceCurrentDigest string
-	priorDigest         string
-	currentDigest       string
-	decisions           []SchemaContractDecision
-	priorTables         []schema.Table
-	currentTables       []schema.Table
-	objectMappings      []Stage4TargetSchemaObjectMapping
+	sourceEngine                 string
+	targetEngine                 string
+	targetMode                   string
+	sourcePriorDigest            string
+	sourceCurrentDigest          string
+	targetAuthorityTopologyHash  string
+	targetAuthorityPriorDigest   string
+	targetAuthorityCatalogDigest string
+	targetAuthorityReservations  []TargetSchemaEvolutionNameReservation
+	priorDigest                  string
+	currentDigest                string
+	decisions                    []SchemaContractDecision
+	priorTables                  []schema.Table
+	currentTables                []schema.Table
+	objectMappings               []Stage4TargetSchemaObjectMapping
 }
 
 func (projection Stage4TargetSchemaEvolutionProjection) SourceEngine() string {
@@ -86,6 +90,24 @@ func (projection Stage4TargetSchemaEvolutionProjection) SourcePriorDigest() stri
 
 func (projection Stage4TargetSchemaEvolutionProjection) SourceCurrentDigest() string {
 	return projection.sourceCurrentDigest
+}
+
+func (projection Stage4TargetSchemaEvolutionProjection) TargetAuthorityTopologyHash() string {
+	return projection.targetAuthorityTopologyHash
+}
+
+func (projection Stage4TargetSchemaEvolutionProjection) TargetAuthorityPriorDigest() string {
+	return projection.targetAuthorityPriorDigest
+}
+
+func (projection Stage4TargetSchemaEvolutionProjection) TargetAuthorityCatalogDigest() string {
+	return projection.targetAuthorityCatalogDigest
+}
+
+func (projection Stage4TargetSchemaEvolutionProjection) TargetAuthorityReservations() []TargetSchemaEvolutionNameReservation {
+	return cloneTargetSchemaEvolutionReservations(
+		projection.targetAuthorityReservations,
+	)
 }
 
 func (projection Stage4TargetSchemaEvolutionProjection) PriorDigest() string {
@@ -147,6 +169,7 @@ func (projection Stage4TargetSchemaEvolutionProjection) TargetObject(
 // same target PlanTables path. It performs no adapter I/O or mutation.
 func BuildStage4TargetSchemaEvolutionProjection(
 	gate Stage4SchemaGateResult,
+	authority Stage4TargetShapeAuthority,
 	sourceEngine string,
 	target Stage4TargetSchemaPlanner,
 	targetMode string,
@@ -177,6 +200,26 @@ func BuildStage4TargetSchemaEvolutionProjection(
 		targetEngine != strings.TrimSpace(targetEngine) {
 		return result, fmt.Errorf(
 			"project Stage 4 target schema evolution: canonical target engine is required",
+		)
+	}
+	if authority.task != stage4TargetShapeTask ||
+		authority.topologyHash == "" ||
+		authority.priorEvidenceDigest == "" {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: prepared durable target-shape authority is required",
+		)
+	}
+	if gate.TopologyHash == "" ||
+		gate.TopologyHash != authority.topologyHash {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: source gate and target-shape authority topology differ",
+		)
+	}
+	if authority.sourceEngine != sourceEngine ||
+		authority.targetEngine != targetEngine ||
+		authority.targetMode != targetMode {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: target-shape authority route or mode differs",
 		)
 	}
 
@@ -251,6 +294,70 @@ func BuildStage4TargetSchemaEvolutionProjection(
 			err,
 		)
 	}
+	if authority.sourcePriorDigest != sourcePriorDigest ||
+		authority.sourceCurrentDigest != sourceCurrentDigest {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: target-shape authority source endpoint digest differs",
+		)
+	}
+	sourceSuccess, err := canonicalStage4TargetSchemaProjectionSnapshot(
+		"target-authority source success",
+		gate.Plan.SuccessfulSnapshot,
+	)
+	if err != nil {
+		return result, err
+	}
+	sourceSuccessDigest, err := sourceSuccess.Digest()
+	if err != nil {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: digest source successful projection: %w",
+			err,
+		)
+	}
+	if authority.sourceSuccessDigest != sourceSuccessDigest {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: target-shape authority successful source digest differs",
+		)
+	}
+	decisionDigest, err := stage4TargetShapeDecisionDigest(gate.Plan.Decisions)
+	if err != nil {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: %w",
+			err,
+		)
+	}
+	if authority.decisionDigest != decisionDigest {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: target-shape authority decision digest differs",
+		)
+	}
+	authorityPriorDigest, err := authority.priorSnapshot.Digest()
+	if err != nil {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: digest durable target-shape authority: %w",
+			err,
+		)
+	}
+	if authorityPriorDigest != authority.priorEvidenceDigest {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: durable target-shape authority was mutated",
+		)
+	}
+	authorityCatalogDigest, err := stage4TargetShapeCatalogDigest(
+		authority.priorSnapshot,
+		authority.priorReservations,
+	)
+	if err != nil {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: digest durable target catalog authority: %w",
+			err,
+		)
+	}
+	if authorityCatalogDigest != authority.priorCatalogDigest {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: durable target catalog authority was mutated",
+		)
+	}
 
 	priorSource, err := schema.MaterializeSchemaSnapshot(previous)
 	if err != nil {
@@ -267,8 +374,20 @@ func BuildStage4TargetSchemaEvolutionProjection(
 			err,
 		)
 	}
+	durableTargetPrior, err := schema.MaterializeSchemaSnapshot(
+		authority.priorSnapshot,
+	)
+	if err != nil {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: materialize durable target-shape prior: %w",
+			err,
+		)
+	}
+	durableTargetPrior = cloneStage4TargetSchemaProjectionTables(
+		durableTargetPrior,
+	)
 
-	priorTables, priorDigest, priorMappings, err :=
+	projectedPriorTables, _, priorMappings, err :=
 		planStage4TargetSchemaProjectionEndpoint(
 			"prior",
 			sourceEngine,
@@ -282,7 +401,16 @@ func BuildStage4TargetSchemaEvolutionProjection(
 	if err != nil {
 		return result, err
 	}
-	currentTables, currentDigest, currentMappings, err :=
+	if err := validateStage4SourceBackedTargetPrior(
+		projectedPriorTables,
+		durableTargetPrior,
+	); err != nil {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: %w",
+			err,
+		)
+	}
+	plannedCurrentTables, _, currentMappings, err :=
 		planStage4TargetSchemaProjectionEndpoint(
 			"current",
 			sourceEngine,
@@ -291,11 +419,37 @@ func BuildStage4TargetSchemaEvolutionProjection(
 			targetMode,
 			currentSource,
 			priorSource,
-			priorTables,
+			durableTargetPrior,
 		)
 	if err != nil {
 		return result, err
 	}
+	currentTables, err := mergeStage4TargetShapeAuthority(
+		durableTargetPrior,
+		projectedPriorTables,
+		plannedCurrentTables,
+	)
+	if err != nil {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: %w",
+			err,
+		)
+	}
+	currentSnapshot, err := schema.NewSchemaSnapshot(currentTables)
+	if err != nil {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: snapshot authority-backed current target tables: %w",
+			err,
+		)
+	}
+	currentDigest, err := currentSnapshot.Digest()
+	if err != nil {
+		return result, fmt.Errorf(
+			"project Stage 4 target schema evolution: digest authority-backed current target tables: %w",
+			err,
+		)
+	}
+	priorDigest := authorityPriorDigest
 	if target.Engine() != targetEngine {
 		return result, fmt.Errorf(
 			"project Stage 4 target schema evolution: target planner engine changed from %q to %q",
@@ -326,16 +480,22 @@ func BuildStage4TargetSchemaEvolutionProjection(
 	}
 
 	result = Stage4TargetSchemaEvolutionProjection{
-		sourceEngine:        sourceEngine,
-		targetEngine:        targetEngine,
-		targetMode:          targetMode,
-		sourcePriorDigest:   sourcePriorDigest,
-		sourceCurrentDigest: sourceCurrentDigest,
-		priorDigest:         priorDigest,
-		currentDigest:       currentDigest,
-		decisions:           cloneStage4TargetSchemaProjectionDecisions(gate.Plan.Decisions),
-		priorTables:         cloneStage4TargetSchemaProjectionTables(priorTables),
-		currentTables:       cloneStage4TargetSchemaProjectionTables(currentTables),
+		sourceEngine:                 sourceEngine,
+		targetEngine:                 targetEngine,
+		targetMode:                   targetMode,
+		sourcePriorDigest:            sourcePriorDigest,
+		sourceCurrentDigest:          sourceCurrentDigest,
+		targetAuthorityTopologyHash:  authority.topologyHash,
+		targetAuthorityPriorDigest:   authority.priorEvidenceDigest,
+		targetAuthorityCatalogDigest: authority.priorCatalogDigest,
+		targetAuthorityReservations: cloneTargetSchemaEvolutionReservations(
+			authority.priorReservations,
+		),
+		priorDigest:   priorDigest,
+		currentDigest: currentDigest,
+		decisions:     cloneStage4TargetSchemaProjectionDecisions(gate.Plan.Decisions),
+		priorTables:   cloneStage4TargetSchemaProjectionTables(durableTargetPrior),
+		currentTables: cloneStage4TargetSchemaProjectionTables(currentTables),
 		objectMappings: append(
 			[]Stage4TargetSchemaObjectMapping(nil),
 			objectMappings...,
@@ -455,19 +615,6 @@ func validateStage4TargetSchemaProjectionGate(
 	if err != nil {
 		return fmt.Errorf("compare current and desired gate snapshots: %w", err)
 	}
-	successful, normalizeErr := canonicalStage4TargetSchemaProjectionSnapshot(
-		"successful",
-		gate.Plan.SuccessfulSnapshot,
-	)
-	if normalizeErr != nil {
-		return normalizeErr
-	}
-	if err := rejectStage4RetainedSubobjectProjection(
-		successful,
-		desired,
-	); err != nil {
-		return err
-	}
 	if gate.Baseline {
 		if gate.RebuildRequiresTargetCatalog {
 			return fmt.Errorf(
@@ -576,35 +723,6 @@ func validateStage4TargetSchemaProjectionGate(
 	if gate.RebuildRequiresTargetCatalog == equal {
 		return fmt.Errorf(
 			"retained prior-only reconstruction flag is inconsistent with rebuild snapshots",
-		)
-	}
-	return nil
-}
-
-// rejectStage4RetainedSubobjectProjection prevents one successful source
-// snapshot from being mistaken for durable target-shape authority. Retaining a
-// whole prior-only table is independently representable as a target-only
-// catalog object on later runs. Retaining columns, indexes, CHECKs, or foreign
-// keys inside a still-managed table is not: the successful source baseline
-// forgets that subobject, so a later exact target projection cannot reconstruct
-// it without separate immutable target-shape evidence.
-func rejectStage4RetainedSubobjectProjection(
-	successful schema.SchemaSnapshot,
-	desired schema.SchemaSnapshot,
-) error {
-	successfulTables := stage4TargetSchemaProjectionSnapshotTables(successful)
-	for _, desiredTable := range desired.Tables {
-		identity := stage4TargetSchemaProjectionTableIdentity{
-			schema: desiredTable.Schema,
-			table:  desiredTable.Name,
-		}
-		successfulTable, managed := successfulTables[identity]
-		if !managed || reflect.DeepEqual(successfulTable, desiredTable) {
-			continue
-		}
-		return fmt.Errorf(
-			"target table %s retains prior-only subobjects but the schema gate has no separate immutable target-shape evidence; retained columns, indexes, CHECKs, and foreign keys must fail closed before target evolution",
-			stage4TargetSchemaProjectionIdentityString(identity),
 		)
 	}
 	return nil
@@ -855,6 +973,318 @@ func stage4TargetSchemaProjectionUnsupportedPriorObject(
 		object,
 		stage4TargetSchemaProjectionIdentityString(identity),
 	)
+}
+
+func validateStage4SourceBackedTargetPrior(
+	sourceBacked []schema.Table,
+	authority []schema.Table,
+) error {
+	authorityByIdentity := make(
+		map[stage4TargetSchemaProjectionTableIdentity]schema.Table,
+		len(authority),
+	)
+	for _, table := range authority {
+		identity := stage4TargetSchemaProjectionTableIdentity{
+			schema: table.Schema,
+			table:  table.Name,
+		}
+		authorityByIdentity[identity] = cloneStage4RichTable(table)
+	}
+	for _, expected := range sourceBacked {
+		identity := stage4TargetSchemaProjectionTableIdentity{
+			schema: expected.Schema,
+			table:  expected.Name,
+		}
+		actual, found := authorityByIdentity[identity]
+		if !found {
+			return fmt.Errorf(
+				"durable target-shape authority is missing source-backed prior table %s",
+				stage4TargetSchemaProjectionIdentityString(identity),
+			)
+		}
+		contains, err := stage4TargetAuthorityTableContains(actual, expected)
+		if err != nil {
+			return err
+		}
+		if !contains {
+			return fmt.Errorf(
+				"durable target-shape authority does not contain the exact source-backed prior shape for table %s",
+				stage4TargetSchemaProjectionIdentityString(identity),
+			)
+		}
+	}
+	return nil
+}
+
+// mergeStage4TargetShapeAuthority overlays only source-backed desired objects
+// onto the durable target prior. Objects absent from the current filtered
+// source projection remain target-owned and are retained. A table-level create
+// colliding with an existing target table is admitted only as an authenticated
+// no-op when that table already contains the complete desired source-backed
+// shape; incompatible collisions fail before any adapter mutation.
+func mergeStage4TargetShapeAuthority(
+	authority []schema.Table,
+	sourceBackedPrior []schema.Table,
+	sourceBackedCurrent []schema.Table,
+) ([]schema.Table, error) {
+	result := cloneStage4TargetSchemaProjectionTables(authority)
+	resultIndex := make(
+		map[stage4TargetSchemaProjectionTableIdentity]int,
+		len(result),
+	)
+	for index, table := range result {
+		resultIndex[stage4TargetSchemaProjectionTableIdentity{
+			schema: table.Schema,
+			table:  table.Name,
+		}] = index
+	}
+	managed := make(
+		map[stage4TargetSchemaProjectionTableIdentity]struct{},
+		len(sourceBackedPrior),
+	)
+	for _, table := range sourceBackedPrior {
+		managed[stage4TargetSchemaProjectionTableIdentity{
+			schema: table.Schema,
+			table:  table.Name,
+		}] = struct{}{}
+	}
+	for _, desired := range sourceBackedCurrent {
+		identity := stage4TargetSchemaProjectionTableIdentity{
+			schema: desired.Schema,
+			table:  desired.Name,
+		}
+		index, exists := resultIndex[identity]
+		if !exists {
+			resultIndex[identity] = len(result)
+			result = append(result, cloneStage4RichTable(desired))
+			continue
+		}
+		if _, sourceOwned := managed[identity]; !sourceOwned {
+			contains, err := stage4TargetAuthorityTableContains(
+				result[index],
+				desired,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if !contains {
+				return nil, fmt.Errorf(
+					"source table create collides with incompatible existing target-authority table %s",
+					stage4TargetSchemaProjectionIdentityString(identity),
+				)
+			}
+			continue
+		}
+		result[index] = mergeStage4TargetAuthorityTable(
+			result[index],
+			desired,
+		)
+	}
+	snapshot, err := schema.NewSchemaSnapshot(result)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"validate authority-backed target shape: %w",
+			err,
+		)
+	}
+	normalized, err := schema.MaterializeSchemaSnapshot(snapshot)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"materialize normalized authority-backed target shape: %w",
+			err,
+		)
+	}
+	return cloneStage4TargetSchemaProjectionTables(normalized), nil
+}
+
+func stage4TargetAuthorityTableContains(
+	authority schema.Table,
+	desired schema.Table,
+) (bool, error) {
+	authoritySnapshot, err := schema.NewSchemaSnapshot([]schema.Table{authority})
+	if err != nil {
+		return false, fmt.Errorf(
+			"snapshot target-authority table %s.%s: %w",
+			authority.Schema,
+			authority.Name,
+			err,
+		)
+	}
+	desiredSnapshot, err := schema.NewSchemaSnapshot([]schema.Table{desired})
+	if err != nil {
+		return false, fmt.Errorf(
+			"snapshot desired target table %s.%s: %w",
+			desired.Schema,
+			desired.Name,
+			err,
+		)
+	}
+	actual := authoritySnapshot.Tables[0]
+	expected := desiredSnapshot.Tables[0]
+	if actual.Schema != expected.Schema ||
+		actual.Name != expected.Name ||
+		actual.MySQLCollation != expected.MySQLCollation ||
+		!reflect.DeepEqual(actual.ClickHouseOrderBy, expected.ClickHouseOrderBy) ||
+		!reflect.DeepEqual(actual.Identity, expected.Identity) ||
+		actual.SQLiteWithoutRowID != expected.SQLiteWithoutRowID ||
+		actual.SQLiteStrict != expected.SQLiteStrict {
+		return false, nil
+	}
+	for _, column := range expected.Columns {
+		found := false
+		for _, candidate := range actual.Columns {
+			if candidate.Name == column.Name &&
+				reflect.DeepEqual(candidate, column) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false, nil
+		}
+	}
+	for _, index := range expected.Indexes {
+		if !stage4TargetSchemaProjectionContains(actual.Indexes, index) {
+			return false, nil
+		}
+	}
+	for _, foreignKey := range expected.ForeignKeys {
+		if !stage4TargetSchemaProjectionContains(
+			actual.ForeignKeys,
+			foreignKey,
+		) {
+			return false, nil
+		}
+	}
+	for _, check := range expected.Checks {
+		if !stage4TargetSchemaProjectionContains(actual.Checks, check) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func mergeStage4TargetAuthorityTable(
+	prior schema.Table,
+	desired schema.Table,
+) schema.Table {
+	result := cloneStage4RichTable(prior)
+	for _, column := range desired.Columns {
+		replaced := false
+		for index := range result.Columns {
+			if result.Columns[index].Name == column.Name {
+				result.Columns[index] = cloneStage4RichColumn(column)
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			result.Columns = append(
+				result.Columns,
+				cloneStage4RichColumn(column),
+			)
+		}
+	}
+	if desired.Identity != nil {
+		result.Identity = cloneStage4RichIdentity(desired.Identity)
+	}
+	if desired.MySQLCollation != "" {
+		result.MySQLCollation = desired.MySQLCollation
+	}
+	if desired.ClickHouseOrderBy != nil {
+		result.ClickHouseOrderBy = append(
+			[]string(nil),
+			desired.ClickHouseOrderBy...,
+		)
+	}
+	result.SQLiteWithoutRowID = result.SQLiteWithoutRowID ||
+		desired.SQLiteWithoutRowID
+	result.SQLiteStrict = result.SQLiteStrict || desired.SQLiteStrict
+	result.Indexes = mergeStage4TargetAuthorityIndexes(
+		result.Indexes,
+		desired.Indexes,
+	)
+	result.ForeignKeys = mergeStage4TargetAuthorityForeignKeys(
+		result.ForeignKeys,
+		desired.ForeignKeys,
+	)
+	result.Checks = mergeStage4TargetAuthorityChecks(
+		result.Checks,
+		desired.Checks,
+	)
+	return result
+}
+
+func mergeStage4TargetAuthorityIndexes(
+	prior []schema.Index,
+	desired []schema.Index,
+) []schema.Index {
+	result := make([]schema.Index, len(prior))
+	for index, value := range prior {
+		result[index] = cloneStage4RichIndex(value)
+	}
+	for _, value := range desired {
+		replaced := false
+		for index := range result {
+			if result[index].Name == value.Name {
+				result[index] = cloneStage4RichIndex(value)
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			result = append(result, cloneStage4RichIndex(value))
+		}
+	}
+	return result
+}
+
+func mergeStage4TargetAuthorityForeignKeys(
+	prior []schema.ForeignKey,
+	desired []schema.ForeignKey,
+) []schema.ForeignKey {
+	result := make([]schema.ForeignKey, len(prior))
+	for index, value := range prior {
+		result[index] = cloneStage4RichForeignKey(value)
+	}
+	for _, value := range desired {
+		replaced := false
+		for index := range result {
+			if result[index].Name == value.Name {
+				result[index] = cloneStage4RichForeignKey(value)
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			result = append(
+				result,
+				cloneStage4RichForeignKey(value),
+			)
+		}
+	}
+	return result
+}
+
+func mergeStage4TargetAuthorityChecks(
+	prior []schema.CheckConstraint,
+	desired []schema.CheckConstraint,
+) []schema.CheckConstraint {
+	result := append([]schema.CheckConstraint(nil), prior...)
+	for _, value := range desired {
+		replaced := false
+		for index := range result {
+			if result[index].Name == value.Name {
+				result[index] = value
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 func planStage4TargetSchemaProjectionEndpoint(

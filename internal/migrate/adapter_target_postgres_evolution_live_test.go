@@ -473,8 +473,21 @@ func TestPostgresTargetEvolutionRealPlannerLive(t *testing.T) {
 		database:  database,
 		namespace: namespace,
 	}
+	initialCatalog, err := adapter.ReadTargetSchemaEvolutionCatalog(ctx)
+	if err != nil {
+		t.Fatalf("read initial PostgreSQL target authority: %v", err)
+	}
+	authority := stage4TargetSchemaProjectionAuthorityFromCatalog(
+		t,
+		gate,
+		"postgres",
+		"postgres",
+		"upsert",
+		initialCatalog,
+	)
 	projection, err := BuildStage4TargetSchemaEvolutionProjection(
 		gate,
+		authority,
 		"postgres",
 		adapter,
 		"upsert",
@@ -694,8 +707,17 @@ func TestPostgresTargetEvolutionRealPlannerLive(t *testing.T) {
 		"upsert",
 		false,
 	)
+	nextAuthority := stage4TargetSchemaProjectionAuthorityFromCatalog(
+		t,
+		nextGate,
+		"postgres",
+		"postgres",
+		"upsert",
+		actual,
+	)
 	nextProjection, err := BuildStage4TargetSchemaEvolutionProjection(
 		nextGate,
+		nextAuthority,
 		"postgres",
 		adapter,
 		"upsert",
