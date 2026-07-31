@@ -2416,13 +2416,6 @@ func stage4AdapterValidationProbe(
 	providerSources ...sourceAdapter,
 ) (ValidationCoreProbe, error) {
 	mode := cfg.Migration.Validation.Mode
-	if mode == "" || mode == config.ValidationCountOnly {
-		return &stage4AdapterCountProbe{
-			source: source,
-			target: target,
-			plans:  stage4AdapterPlansBySource(plans),
-		}, nil
-	}
 	providerSource := source
 	if len(providerSources) > 1 {
 		return nil, NewTransferError(
@@ -2434,6 +2427,20 @@ func stage4AdapterValidationProbe(
 	}
 	if len(providerSources) == 1 {
 		providerSource = providerSources[0]
+	}
+	// Count through the supplied provider, not the pool adapter. A stable
+	// network table validates while its source view still holds a pinned
+	// connection, and MySQL, MariaDB, and SQL Server cap that pool at one
+	// connection, so counting through the pool waits forever for a connection
+	// the caller itself is holding. Counting through the stable view is also
+	// the more truthful measurement: it counts the same snapshot that was
+	// transferred rather than whatever the source looks like afterwards.
+	if mode == "" || mode == config.ValidationCountOnly {
+		return &stage4AdapterCountProbe{
+			source: providerSource,
+			target: target,
+			plans:  stage4AdapterPlansBySource(plans),
+		}, nil
 	}
 	provider := stage4ValidationProvider(
 		observer,
