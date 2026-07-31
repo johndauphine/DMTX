@@ -22,14 +22,18 @@ type Stage4TargetSchemaPlanner interface {
 // targets whose engine-wide object-name scopes require retained target names
 // to be reserved before names are allocated to newly added objects.
 //
-// priorSourceTables and priorTargetTables are the exact inputs and result from
-// the already-validated prior projection. Implementations must not mutate any
+// priorSourceTables is the exact prior source projection. priorTargetTables is
+// the authenticated full target authority: it includes the source-backed prior
+// result plus target-only objects whose names must remain reserved before new
+// names are allocated. priorTargetReservations contains every authenticated
+// engine-wide name outside that table catalog. Implementations must not mutate
 // caller-owned metadata.
 type Stage4PriorAwareTargetSchemaPlanner interface {
 	PlanTablesAfterPrior(
 		sourceEngine string,
 		priorSourceTables []schema.Table,
 		priorTargetTables []schema.Table,
+		priorTargetReservations []TargetSchemaEvolutionNameReservation,
 		currentSourceTables []schema.Table,
 		mode string,
 	) ([]schema.Table, error)
@@ -395,8 +399,9 @@ func BuildStage4TargetSchemaEvolutionProjection(
 			targetEngine,
 			targetMode,
 			priorSource,
-			nil,
-			nil,
+			priorSource,
+			durableTargetPrior,
+			authority.priorReservations,
 		)
 	if err != nil {
 		return result, err
@@ -420,6 +425,7 @@ func BuildStage4TargetSchemaEvolutionProjection(
 			currentSource,
 			priorSource,
 			durableTargetPrior,
+			authority.priorReservations,
 		)
 	if err != nil {
 		return result, err
@@ -1296,6 +1302,7 @@ func planStage4TargetSchemaProjectionEndpoint(
 	sourceTables []schema.Table,
 	priorSourceTables []schema.Table,
 	priorTargetTables []schema.Table,
+	priorTargetReservations []TargetSchemaEvolutionNameReservation,
 ) (
 	[]schema.Table,
 	string,
@@ -1306,7 +1313,7 @@ func planStage4TargetSchemaProjectionEndpoint(
 	baseline := cloneStage4TargetSchemaProjectionTables(sourceTables)
 	plan := func(input []schema.Table) ([]schema.Table, error) {
 		priorAware, ok := target.(Stage4PriorAwareTargetSchemaPlanner)
-		if label != "current" || !ok {
+		if !ok {
 			return target.PlanTables(sourceEngine, input, targetMode)
 		}
 		priorSourceInput := cloneStage4TargetSchemaProjectionTables(
@@ -1321,10 +1328,17 @@ func planStage4TargetSchemaProjectionEndpoint(
 		priorTargetBefore := cloneStage4TargetSchemaProjectionTables(
 			priorTargetInput,
 		)
+		priorReservationInput := cloneTargetSchemaEvolutionReservations(
+			priorTargetReservations,
+		)
+		priorReservationBefore := cloneTargetSchemaEvolutionReservations(
+			priorReservationInput,
+		)
 		planned, err := priorAware.PlanTablesAfterPrior(
 			sourceEngine,
 			priorSourceInput,
 			priorTargetInput,
+			priorReservationInput,
 			input,
 			targetMode,
 		)
@@ -1338,6 +1352,16 @@ func planStage4TargetSchemaProjectionEndpoint(
 		if !reflect.DeepEqual(priorTargetInput, priorTargetBefore) {
 			return nil, fmt.Errorf(
 				"target planner %s mutated prior target projection evidence while planning %s snapshot",
+				targetEngine,
+				label,
+			)
+		}
+		if !reflect.DeepEqual(
+			priorReservationInput,
+			priorReservationBefore,
+		) {
+			return nil, fmt.Errorf(
+				"target planner %s mutated prior target name reservation evidence while planning %s snapshot",
 				targetEngine,
 				label,
 			)

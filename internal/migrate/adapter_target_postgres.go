@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/engine"
@@ -102,6 +103,7 @@ func (adapter *postgresTargetAdapter) PlanTablesAfterPrior(
 	sourceEngine string,
 	priorSourceTables []schema.Table,
 	priorTargetTables []schema.Table,
+	priorTargetReservations []TargetSchemaEvolutionNameReservation,
 	currentSourceTables []schema.Table,
 	mode string,
 ) ([]schema.Table, error) {
@@ -116,6 +118,36 @@ func (adapter *postgresTargetAdapter) PlanTablesAfterPrior(
 			err,
 		)
 	}
+	reservations := make(
+		[]schema.PostgresObjectNameReservation,
+		len(priorTargetReservations),
+	)
+	for index, reservation := range priorTargetReservations {
+		if reservation.Scope != "relation" {
+			return nil, fmt.Errorf(
+				"PostgreSQL target authority contains unsupported name reservation scope %q",
+				reservation.Scope,
+			)
+		}
+		if reservation.Namespace != adapter.namespace {
+			return nil, fmt.Errorf(
+				"PostgreSQL target relation reservation namespace %q differs from configured target namespace %q",
+				reservation.Namespace,
+				adapter.namespace,
+			)
+		}
+		if strings.TrimSpace(reservation.Name) == "" ||
+			reservation.Name != strings.TrimSpace(reservation.Name) {
+			return nil, fmt.Errorf(
+				"PostgreSQL target relation reservation %d has a non-canonical name",
+				index,
+			)
+		}
+		reservations[index] = schema.PostgresObjectNameReservation{
+			Namespace: reservation.Namespace,
+			Name:      reservation.Name,
+		}
+	}
 	currentTables, err := adapter.planTablesBeforeObjectNameMaterialization(
 		sourceEngine,
 		currentSourceTables,
@@ -124,12 +156,14 @@ func (adapter *postgresTargetAdapter) PlanTablesAfterPrior(
 	if err != nil {
 		return nil, err
 	}
-	currentTables, err = schema.MaterializePostgresObjectNamesAfterPrior(
-		currentTables,
-		priorTables,
-		priorTargetTables,
-		schema.PostgresObjectPlanOptions{},
-	)
+	currentTables, err =
+		schema.MaterializePostgresObjectNamesAfterPriorAuthority(
+			currentTables,
+			priorTables,
+			priorTargetTables,
+			reservations,
+			schema.PostgresObjectPlanOptions{},
+		)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"materialize PostgreSQL target object names after prior projection: %w",

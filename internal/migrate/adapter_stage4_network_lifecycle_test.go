@@ -217,14 +217,17 @@ func TestStage4AdapterNetworkFreshCheckpointsEveryTableBeforeAnyWrite(
 	for _, name := range []string{"items", "widgets"} {
 		before := stage4AdapterEventIndex(events, "before:"+name)
 		after := stage4AdapterEventIndex(events, "after:"+name)
-		closeIndex := stage4AdapterEventIndex(
-			events,
-			"source_stable_close:"+name,
-		)
+		closeIndex := -1
+		for index := after + 1; index < len(events); index++ {
+			if events[index] == "source_stable_close:"+name {
+				closeIndex = index
+				break
+			}
+		}
 		if before <= previousClose || after <= before ||
 			closeIndex <= after {
 			t.Fatalf(
-				"table %s did not own one complete stable lifecycle: %v",
+				"table %s did not own one complete execution stable lifecycle after its durable planning prepass: %v",
 				name,
 				events,
 			)
@@ -1390,9 +1393,17 @@ func TestStage4AdapterNetworkCloseFailureDefersGlobalPublicationAndResumes(
 ) {
 	events := make([]string, 0)
 	source := &recordingAdapterSource{
-		events:         &events,
-		table:          stage4AdapterTestTable(),
-		stableCloseErr: errors.New("forced stable close failure"),
+		events: &events,
+		table:  stage4AdapterTestTable(),
+	}
+	stableOpens := 0
+	source.beforeStableOpen = func(source *recordingAdapterSource) {
+		stableOpens++
+		source.stableCloseErr = nil
+		if stableOpens > 1 {
+			source.stableCloseErr =
+				errors.New("forced stable close failure")
+		}
 	}
 	target := &recordingAdapterTarget{events: &events}
 	backend := state.YAMLStore{
@@ -1454,6 +1465,7 @@ func TestStage4AdapterNetworkCloseFailureDefersGlobalPublicationAndResumes(
 		)
 	}
 
+	source.beforeStableOpen = nil
 	source.stableCloseErr = nil
 	events = events[:0]
 	resumeObserver := stage4AdapterObserver{

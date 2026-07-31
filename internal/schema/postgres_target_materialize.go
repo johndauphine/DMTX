@@ -3,7 +3,16 @@ package schema
 import (
 	"reflect"
 	"strconv"
+	"strings"
 )
+
+// PostgresObjectNameReservation records one authenticated PostgreSQL relation
+// name which is outside the logical table catalog but still participates in
+// the namespace-wide relation collision domain.
+type PostgresObjectNameReservation struct {
+	Namespace string
+	Name      string
+}
 
 // MaterializePostgresObjectNames returns a deep copy of tables with every
 // deterministic PostgreSQL index, CHECK, and foreign-key name written into its
@@ -113,6 +122,51 @@ func MaterializePostgresObjectNamesAfterPrior(
 			"prior target evidence does not match its exact source projection",
 		)
 	}
+	return materializePostgresObjectNamesAfterPriorAuthority(
+		tables,
+		priorTables,
+		priorMaterialized,
+		nil,
+		options,
+	)
+}
+
+// MaterializePostgresObjectNamesAfterPriorAuthority preserves source-backed
+// prior names while reserving every relation and constraint name from the
+// authenticated full target authority. This lets a new source object allocate
+// deterministically around target-only objects which remain present after the
+// projection.
+func MaterializePostgresObjectNamesAfterPriorAuthority(
+	tables []Table,
+	priorTables []Table,
+	authority []Table,
+	reservations []PostgresObjectNameReservation,
+	options PostgresObjectPlanOptions,
+) ([]Table, error) {
+	return materializePostgresObjectNamesAfterPriorAuthority(
+		tables,
+		priorTables,
+		authority,
+		reservations,
+		options,
+	)
+}
+
+func materializePostgresObjectNamesAfterPriorAuthority(
+	tables []Table,
+	priorTables []Table,
+	authority []Table,
+	reservations []PostgresObjectNameReservation,
+	options PostgresObjectPlanOptions,
+) ([]Table, error) {
+	priorNames, err := authenticatePostgresPriorObjectNames(
+		priorTables,
+		authority,
+		options,
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	planned, err := planPostgresObjectTables(
 		tables,
@@ -139,31 +193,60 @@ func MaterializePostgresObjectNamesAfterPrior(
 		currentKeys[postgresObjectRetentionKey(spec)] = struct{}{}
 	}
 
-	priorPlanned, err := planPostgresObjectTables(
-		priorTables,
+	authorityPlanned, err := planPostgresObjectTables(
+		authority,
 		options.MapNamespace,
 	)
 	if err != nil {
 		return nil, err
 	}
-	priorIndexes, priorChecks, priorForeignKeys, err :=
-		collectPostgresObjectSpecs(priorPlanned)
+	authorityIndexes, authorityChecks, authorityForeignKeys, err :=
+		collectPostgresObjectSpecs(authorityPlanned)
 	if err != nil {
 		return nil, err
 	}
-	priorNames, err := plannedPostgresObjectNames(
-		priorPlanned,
-		priorIndexes,
-		priorChecks,
-		priorForeignKeys,
+	rigidTables := append(
+		[]postgresObjectTable(nil),
+		authorityPlanned...,
 	)
+	authorityTableKeys := make(map[string]struct{}, len(authorityPlanned))
+	for _, table := range authorityPlanned {
+		authorityTableKeys[postgresTargetTableKey(
+			table.targetSchema,
+			table.source.Name,
+		)] = struct{}{}
+	}
+	for _, table := range planned {
+		key := postgresTargetTableKey(
+			table.targetSchema,
+			table.source.Name,
+		)
+		if _, exists := authorityTableKeys[key]; exists {
+			continue
+		}
+		rigidTables = append(rigidTables, table)
+	}
+	relationNames, constraintNames, relationOwners, constraintOwners, err :=
+		reserveStrictPostgresRigidNames(rigidTables)
 	if err != nil {
 		return nil, err
 	}
-
-	relationNames, constraintNames, relationOwners, constraintOwners, err :=
-		reserveStrictPostgresRigidNames(planned)
-	if err != nil {
+	if err := reservePostgresAuthorityObjectNames(
+		authorityIndexes,
+		authorityChecks,
+		authorityForeignKeys,
+		relationNames,
+		constraintNames,
+		relationOwners,
+		constraintOwners,
+	); err != nil {
+		return nil, err
+	}
+	if err := reservePostgresAuthorityRelationNames(
+		reservations,
+		relationNames,
+		relationOwners,
+	); err != nil {
 		return nil, err
 	}
 	retainedNames := make(
@@ -192,16 +275,18 @@ func MaterializePostgresObjectNamesAfterPrior(
 			)
 			class = "constraint"
 		}
-		if err := reserveStrictPostgresName(
-			allocator,
-			owners,
-			scope,
-			prior.name,
-			"retained "+postgresObjectKindDescription(prior.key.kind)+
-				" on "+prior.key.schema+"."+prior.key.table,
-			class,
-		); err != nil {
-			return nil, err
+		if !allocator.contains(scope, prior.name) {
+			if err := reserveStrictPostgresName(
+				allocator,
+				owners,
+				scope,
+				prior.name,
+				"retained "+postgresObjectKindDescription(prior.key.kind)+
+					" on "+prior.key.schema+"."+prior.key.table,
+				class,
+			); err != nil {
+				return nil, err
+			}
 		}
 		retainedNames[prior.key] = prior.name
 	}
@@ -256,6 +341,333 @@ func MaterializePostgresObjectNamesAfterPrior(
 		return nil, err
 	}
 	return materialized, nil
+}
+
+func authenticatePostgresPriorObjectNames(
+	prior []Table,
+	authority []Table,
+	options PostgresObjectPlanOptions,
+) ([]postgresPlannedObjectName, error) {
+	priorPlanned, err := planPostgresObjectTables(
+		prior,
+		options.MapNamespace,
+	)
+	if err != nil {
+		return nil, err
+	}
+	authorityPlanned, err := planPostgresObjectTables(
+		authority,
+		options.MapNamespace,
+	)
+	if err != nil {
+		return nil, err
+	}
+	authorityByTable := make(
+		map[string]Table,
+		len(authorityPlanned),
+	)
+	for _, table := range authorityPlanned {
+		authorityByTable[postgresTargetTableKey(
+			table.targetSchema,
+			table.source.Name,
+		)] = table.source
+	}
+	for _, expected := range priorPlanned {
+		key := postgresTargetTableKey(
+			expected.targetSchema,
+			expected.source.Name,
+		)
+		actual, found := authorityByTable[key]
+		if !found ||
+			expected.source.MySQLCollation != actual.MySQLCollation ||
+			!reflect.DeepEqual(
+				expected.source.ClickHouseOrderBy,
+				actual.ClickHouseOrderBy,
+			) ||
+			!reflect.DeepEqual(expected.source.Identity, actual.Identity) ||
+			expected.source.SQLiteWithoutRowID != actual.SQLiteWithoutRowID ||
+			expected.source.SQLiteStrict != actual.SQLiteStrict ||
+			!postgresMaterializedValuesContained(
+				expected.source.Columns,
+				actual.Columns,
+			) {
+			return nil, postgresObjectPolicy(
+				"materialize PostgreSQL object names after prior",
+				"full target authority does not contain the exact source-backed prior table "+key,
+			)
+		}
+	}
+
+	priorIndexes, priorChecks, priorForeignKeys, err :=
+		collectPostgresObjectSpecs(priorPlanned)
+	if err != nil {
+		return nil, err
+	}
+	authorityIndexes, authorityChecks, authorityForeignKeys, err :=
+		collectPostgresObjectSpecs(authorityPlanned)
+	if err != nil {
+		return nil, err
+	}
+	var result []postgresPlannedObjectName
+	for _, pair := range []struct {
+		expected []postgresObjectSpec
+		actual   []postgresObjectSpec
+	}{
+		{expected: priorIndexes, actual: authorityIndexes},
+		{expected: priorChecks, actual: authorityChecks},
+		{expected: priorForeignKeys, actual: authorityForeignKeys},
+	} {
+		names, err := authenticatePostgresPriorObjectGroup(
+			pair.expected,
+			pair.actual,
+		)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, names...)
+	}
+	return result, nil
+}
+
+func authenticatePostgresPriorObjectGroup(
+	expected []postgresObjectSpec,
+	actual []postgresObjectSpec,
+) ([]postgresPlannedObjectName, error) {
+	used := make([]bool, len(actual))
+	result := make([]postgresPlannedObjectName, 0, len(expected))
+	for _, wanted := range expected {
+		match := -1
+		for index, candidate := range actual {
+			if used[index] ||
+				!postgresObjectSpecsStructurallyEqual(wanted, candidate) {
+				continue
+			}
+			if match >= 0 {
+				return nil, postgresObjectPolicy(
+					"materialize PostgreSQL object names after prior",
+					"full target authority ambiguously represents a source-backed prior "+
+						postgresObjectKindDescription(wanted.kind),
+				)
+			}
+			match = index
+		}
+		if match < 0 {
+			return nil, postgresObjectPolicy(
+				"materialize PostgreSQL object names after prior",
+				"full target authority is missing a source-backed prior "+
+					postgresObjectKindDescription(wanted.kind),
+			)
+		}
+		name := postgresObjectSpecExactName(actual[match])
+		if err := validatePostgresObjectIdentifier(
+			postgresObjectKindDescription(wanted.kind),
+			name,
+		); err != nil {
+			return nil, err
+		}
+		used[match] = true
+		result = append(result, postgresPlannedObjectName{
+			key:  postgresObjectRetentionKey(wanted),
+			name: name,
+		})
+	}
+	return result, nil
+}
+
+func postgresObjectSpecsStructurallyEqual(
+	left postgresObjectSpec,
+	right postgresObjectSpec,
+) bool {
+	if left.kind != right.kind ||
+		left.table.targetSchema != right.table.targetSchema ||
+		left.table.source.Name != right.table.source.Name {
+		return false
+	}
+	switch left.kind {
+	case PostgresIndexObject:
+		leftValue := left.index
+		rightValue := right.index
+		leftValue.Name = ""
+		rightValue.Name = ""
+		return reflect.DeepEqual(leftValue, rightValue)
+	case PostgresCheckObject:
+		leftValue := left.check
+		rightValue := right.check
+		leftValue.Name = ""
+		rightValue.Name = ""
+		return reflect.DeepEqual(leftValue, rightValue)
+	case PostgresForeignKeyObject:
+		leftValue := left.foreignKey
+		rightValue := right.foreignKey
+		leftValue.Name = ""
+		rightValue.Name = ""
+		return reflect.DeepEqual(leftValue, rightValue)
+	default:
+		return false
+	}
+}
+
+func postgresObjectSpecExactName(spec postgresObjectSpec) string {
+	switch spec.kind {
+	case PostgresIndexObject:
+		return spec.index.Name
+	case PostgresCheckObject:
+		return spec.check.Name
+	case PostgresForeignKeyObject:
+		return spec.foreignKey.Name
+	default:
+		return ""
+	}
+}
+
+func postgresMaterializedValuesContained[T any](
+	expected []T,
+	actual []T,
+) bool {
+	for _, wanted := range expected {
+		found := false
+		for _, candidate := range actual {
+			if reflect.DeepEqual(wanted, candidate) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func reservePostgresAuthorityObjectNames(
+	indexes []postgresObjectSpec,
+	checks []postgresObjectSpec,
+	foreignKeys []postgresObjectSpec,
+	relations *postgresNameAllocator,
+	constraints *postgresNameAllocator,
+	relationOwners map[string]string,
+	constraintOwners map[string]string,
+) error {
+	for _, spec := range indexes {
+		name := spec.index.Name
+		if name == "" {
+			return postgresObjectPolicy(
+				"materialize PostgreSQL object names after prior",
+				"full target authority contains an unnamed index",
+			)
+		}
+		if err := validatePostgresObjectIdentifier("index", name); err != nil {
+			return err
+		}
+		if err := reserveStrictPostgresName(
+			relations,
+			relationOwners,
+			spec.table.targetSchema,
+			name,
+			"target-authority index on "+
+				spec.table.targetSchema+"."+spec.table.source.Name,
+			"relation",
+		); err != nil {
+			return err
+		}
+	}
+	for _, group := range [][]postgresObjectSpec{
+		checks,
+		foreignKeys,
+	} {
+		for _, spec := range group {
+			name := spec.check.Name
+			if spec.kind == PostgresForeignKeyObject {
+				name = spec.foreignKey.Name
+			}
+			if name == "" {
+				return postgresObjectPolicy(
+					"materialize PostgreSQL object names after prior",
+					"full target authority contains an unnamed constraint",
+				)
+			}
+			if err := validatePostgresObjectIdentifier(
+				"constraint",
+				name,
+			); err != nil {
+				return err
+			}
+			if err := reserveStrictPostgresName(
+				constraints,
+				constraintOwners,
+				postgresTargetTableKey(
+					spec.table.targetSchema,
+					spec.table.source.Name,
+				),
+				name,
+				"target-authority "+
+					postgresObjectKindDescription(spec.kind)+
+					" on "+spec.table.targetSchema+"."+
+					spec.table.source.Name,
+				"constraint",
+			); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func reservePostgresAuthorityRelationNames(
+	reservations []PostgresObjectNameReservation,
+	relations *postgresNameAllocator,
+	relationOwners map[string]string,
+) error {
+	seen := make(map[string]struct{}, len(reservations))
+	for index, reservation := range reservations {
+		if strings.TrimSpace(reservation.Namespace) == "" ||
+			reservation.Namespace != strings.TrimSpace(
+				reservation.Namespace,
+			) ||
+			strings.TrimSpace(reservation.Name) == "" ||
+			reservation.Name != strings.TrimSpace(reservation.Name) {
+			return postgresObjectPolicy(
+				"materialize PostgreSQL object names after prior",
+				"target-authority relation reservation "+
+					strconv.Itoa(index)+" is non-canonical",
+			)
+		}
+		if err := validatePostgresObjectIdentifier(
+			"reservation namespace",
+			reservation.Namespace,
+		); err != nil {
+			return err
+		}
+		if err := validatePostgresObjectIdentifier(
+			"reserved relation",
+			reservation.Name,
+		); err != nil {
+			return err
+		}
+		key := postgresTargetTableKey(
+			reservation.Namespace,
+			reservation.Name,
+		)
+		if _, duplicate := seen[key]; duplicate {
+			return postgresObjectPolicy(
+				"materialize PostgreSQL object names after prior",
+				"duplicate target-authority relation reservation "+
+					reservation.Namespace+"."+reservation.Name,
+			)
+		}
+		seen[key] = struct{}{}
+		if err := reserveStrictPostgresName(
+			relations,
+			relationOwners,
+			reservation.Namespace,
+			reservation.Name,
+			"target-authority unmodeled relation reservation",
+			"relation",
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type postgresRetainedObjectKey struct {

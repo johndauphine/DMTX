@@ -27,14 +27,79 @@ type stage4AdapterUnprotectedObserver struct {
 
 type stage4AdapterValidationProviderObserver struct {
 	stage4AdapterObserver
+	equalityProofEnabled bool
+	equalityProof        string
+	equalityProofErr     error
+	equalityProofCalls   *[]schema.Table
+	returnTypedNilProbe  bool
 }
 
-func (stage4AdapterValidationProviderObserver) Stage4ValidationProbe(
+func (observer stage4AdapterValidationProviderObserver) Stage4ValidationProbe(
+	source sourceAdapter,
+	target targetAdapter,
+	plans []adapterTablePlan,
+) (ValidationCoreProbe, error) {
+	if observer.returnTypedNilProbe {
+		return (*stage4AdapterValidationEqualityProofTestProbe)(nil), nil
+	}
+	countProbe := &stage4AdapterCountProbe{
+		source: source,
+		target: target,
+		plans:  stage4AdapterPlansBySource(plans),
+	}
+	if !observer.equalityProofEnabled {
+		return countProbe, nil
+	}
+	return &stage4AdapterValidationEqualityProofTestProbe{
+		stage4AdapterCountProbe: countProbe,
+		proof:                   observer.equalityProof,
+		err:                     observer.equalityProofErr,
+		calls:                   observer.equalityProofCalls,
+	}, nil
+}
+
+type stage4AdapterValidationEqualityProofTestProbe struct {
+	*stage4AdapterCountProbe
+	proof string
+	err   error
+	calls *[]schema.Table
+}
+
+type stage4AdapterTypedNilValidationProvider struct{}
+
+func (*stage4AdapterTypedNilValidationProvider) BeforeTable(
+	context.Context,
+	string,
+) error {
+	return nil
+}
+
+func (*stage4AdapterTypedNilValidationProvider) AfterTable(
+	context.Context,
+	string,
+	int,
+) error {
+	return nil
+}
+
+func (*stage4AdapterTypedNilValidationProvider) Stage4ValidationProbe(
 	sourceAdapter,
 	targetAdapter,
 	[]adapterTablePlan,
 ) (ValidationCoreProbe, error) {
-	return nil, errors.New("validation provider must not be constructed")
+	panic("typed-nil validation provider must not be invoked")
+}
+
+func (probe *stage4AdapterValidationEqualityProofTestProbe) Stage4ValidationPrimaryKeyEqualityProof(
+	table schema.Table,
+) (string, error) {
+	if probe.calls != nil {
+		*probe.calls = append(
+			*probe.calls,
+			cloneStage4RichTable(table),
+		)
+	}
+	return probe.proof, probe.err
 }
 
 func (observer stage4AdapterUnprotectedObserver) Stage4RunContext() (
@@ -668,12 +733,234 @@ func TestStage4AdapterUpsertDeepValidationRequiresEqualityProofSeam(
 		) {
 		t.Fatalf("deep upsert validation error = %v", err)
 	}
-	if stage4AdapterEventIndex(events, "target_plan") >= 0 ||
-		stage4AdapterEventsContain(events, "before") {
+	if stage4AdapterEventsContain(events, "before") ||
+		stage4AdapterEventIndex(events, "target_prepare") >= 0 ||
+		stage4AdapterEventIndex(events, "target_write") >= 0 ||
+		stage4AdapterEventIndex(events, "target_finalize") >= 0 {
 		t.Fatalf(
 			"deep upsert validation crossed admission: %v",
 			events,
 		)
+	}
+}
+
+func TestStage4AdapterUpsertDeepValidationBindsEqualityProofBeforeTargetMutation(
+	t *testing.T,
+) {
+	events := make([]string, 0)
+	source := &recordingAdapterSource{
+		events: &events,
+		table:  stage4AdapterTestTable(),
+	}
+	target := &recordingAdapterTarget{events: &events}
+	backend := state.YAMLStore{
+		Path: filepath.Join(t.TempDir(), "state.yaml"),
+	}
+	runID := "stage4-upsert-deep-validation-proof-bound"
+	initializeStage4LifecycleRun(
+		t,
+		backend,
+		runID,
+		time.Now().Add(-time.Minute),
+	)
+	cfg := stage4AdapterTestConfig(
+		t,
+		"source-password",
+		"target-password",
+	)
+	cfg.Migration.TargetMode = "upsert"
+	cfg.Migration.Validation.Mode = config.ValidationNullParity
+	proof := strings.Repeat("a", 64)
+	calls := make([]schema.Table, 0)
+	observer := stage4AdapterValidationProviderObserver{
+		stage4AdapterObserver: stage4AdapterObserver{
+			recordingTableObserver: recordingTableObserver{
+				events: &events,
+			},
+			run: stage4LifecycleRunContext(
+				t,
+				backend,
+				runID,
+				false,
+			),
+		},
+		equalityProofEnabled: true,
+		equalityProof:        proof,
+		equalityProofCalls:   &calls,
+	}
+	prepared, err := prepareStage4AdapterRun(
+		context.Background(),
+		cfg,
+		observer,
+		source,
+		target,
+		"upsert",
+		observer.run,
+	)
+	if err != nil {
+		t.Fatalf("prepare Stage 4 adapter run: %v", err)
+	}
+	if len(calls) != 1 ||
+		calls[0].Schema != "public" ||
+		calls[0].Name != "items" {
+		t.Fatalf("equality proof calls = %#v", calls)
+	}
+	specs, err := stage4AdapterValidationTableSpecs(prepared)
+	if err != nil {
+		t.Fatalf("build validation specs: %v", err)
+	}
+	if len(specs) != 1 ||
+		specs[0].PrimaryKeyEqualityProof != proof {
+		t.Fatalf("validation specs = %#v", specs)
+	}
+	if stage4AdapterEventsContain(events, "before") ||
+		stage4AdapterEventIndex(events, "target_prepare") >= 0 ||
+		stage4AdapterEventIndex(events, "target_write") >= 0 ||
+		stage4AdapterEventIndex(events, "target_finalize") >= 0 {
+		t.Fatalf(
+			"equality proof preparation crossed target mutation: %v",
+			events,
+		)
+	}
+}
+
+func TestStage4AdapterUpsertDeepValidationRejectsInvalidEqualityProofProviders(
+	t *testing.T,
+) {
+	table := stage4AdapterTestTable()
+	countProbe := &stage4AdapterCountProbe{}
+	var typedNil *stage4AdapterValidationEqualityProofTestProbe
+	tests := []struct {
+		name  string
+		probe ValidationCoreProbe
+		want  string
+	}{
+		{
+			name:  "missing provider",
+			probe: countProbe,
+			want:  "equality proof seam",
+		},
+		{
+			name:  "typed nil provider",
+			probe: typedNil,
+			want:  "equality proof seam",
+		},
+		{
+			name: "invalid digest",
+			probe: &stage4AdapterValidationEqualityProofTestProbe{
+				stage4AdapterCountProbe: countProbe,
+				proof:                   "not-a-digest",
+			},
+			want: "canonical SHA-256 digest",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := prepareStage4AdapterValidationPrimaryKeyEqualityProofs(
+				config.ValidationNullParity,
+				"upsert",
+				test.probe,
+				[]schema.Table{table},
+			)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("proof admission error = %v", err)
+			}
+		})
+	}
+}
+
+func TestStage4AdapterDeepValidationRejectsTypedNilProbeBeforeTargetMutation(
+	t *testing.T,
+) {
+	for _, targetMode := range []string{"drop_recreate", "upsert"} {
+		t.Run(targetMode, func(t *testing.T) {
+			events := make([]string, 0)
+			source := &recordingAdapterSource{
+				events: &events,
+				table:  stage4AdapterTestTable(),
+			}
+			target := &recordingAdapterTarget{events: &events}
+			backend := state.YAMLStore{
+				Path: filepath.Join(t.TempDir(), "state.yaml"),
+			}
+			runID := "stage4-typed-nil-validation-" + targetMode
+			initializeStage4LifecycleRun(
+				t,
+				backend,
+				runID,
+				time.Now().Add(-time.Minute),
+			)
+			cfg := stage4AdapterTestConfig(
+				t,
+				"source-password",
+				"target-password",
+			)
+			cfg.Migration.TargetMode = targetMode
+			cfg.Migration.Validation.Mode =
+				config.ValidationNullParity
+			observer := stage4AdapterValidationProviderObserver{
+				stage4AdapterObserver: stage4AdapterObserver{
+					recordingTableObserver: recordingTableObserver{
+						events: &events,
+					},
+					run: stage4LifecycleRunContext(
+						t,
+						backend,
+						runID,
+						false,
+					),
+				},
+				returnTypedNilProbe: true,
+			}
+			_, err := migrateWithAdapters(
+				context.Background(),
+				cfg,
+				observer,
+				source,
+				target,
+			)
+			if err == nil ||
+				!strings.Contains(
+					err.Error(),
+					"returned no probe",
+				) {
+				t.Fatalf(
+					"typed-nil %s validation error = %v",
+					targetMode,
+					err,
+				)
+			}
+			if stage4AdapterEventsContain(events, "before") ||
+				stage4AdapterEventIndex(
+					events,
+					"target_prepare",
+				) >= 0 ||
+				stage4AdapterEventIndex(
+					events,
+					"target_write",
+				) >= 0 ||
+				stage4AdapterEventIndex(
+					events,
+					"target_finalize",
+				) >= 0 {
+				t.Fatalf(
+					"typed-nil %s probe crossed target mutation: %v",
+					targetMode,
+					events,
+				)
+			}
+		})
+	}
+}
+
+func TestStage4ValidationProviderSkipsTypedNilProvider(t *testing.T) {
+	var typedNil *stage4AdapterTypedNilValidationProvider
+	if provider := stage4ValidationProvider(
+		typedNil,
+		&recordingAdapterSource{},
+		&recordingAdapterTarget{},
+	); provider != nil {
+		t.Fatalf("typed-nil validation provider = %#v", provider)
 	}
 }
 
@@ -754,7 +1041,7 @@ func TestStage4AdapterCredentialChangesDoNotChangeWorkTopology(
 	}
 }
 
-func TestStage4AdapterResumePublishesAfterPostFinalizeSaveFailure(
+func TestStage4AdapterSnapshotSaveFailurePrecedesEveryTargetMutation(
 	t *testing.T,
 ) {
 	events := make([]string, 0)
@@ -803,15 +1090,24 @@ func TestStage4AdapterResumePublishesAfterPostFinalizeSaveFailure(
 		!strings.Contains(err.Error(), "save validated Stage 4 schema") {
 		t.Fatalf("save failure error = %v", err)
 	}
-	if result != (Result{Tables: 1, Rows: 2}) {
-		t.Fatalf("result before publication = %#v", result)
+	if result != (Result{}) {
+		t.Fatalf("result before schema staging = %#v", result)
 	}
-	if stage4AdapterEventIndex(events, "target_finalize") < 0 ||
-		stage4AdapterEventIndex(events, "source_count") <
-			stage4AdapterEventIndex(events, "target_finalize") ||
-		stage4AdapterEventIndex(events, "after:items") <
-			stage4AdapterEventIndex(events, "source_count") {
-		t.Fatalf("failure order = %v", events)
+	for _, forbidden := range []string{
+		"target_prepare",
+		"target_write",
+		"target_finalize",
+		"source_count",
+		"target_count",
+		"after:items",
+	} {
+		if stage4AdapterEventIndex(events, forbidden) >= 0 {
+			t.Fatalf(
+				"schema staging failure crossed %s: %v",
+				forbidden,
+				events,
+			)
+		}
 	}
 	if _, found, loadErr := raw.LoadSchemaSnapshot(
 		runID,
@@ -823,71 +1119,6 @@ func TestStage4AdapterResumePublishesAfterPostFinalizeSaveFailure(
 			loadErr,
 		)
 	}
-
-	backend.fail = false
-	resumeStart := len(events)
-	resumeRun := stage4LifecycleRunContext(
-		t,
-		backend,
-		runID,
-		true,
-	)
-	resumeObserver := stage4AdapterObserver{
-		recordingTableObserver: recordingTableObserver{events: &events},
-		run:                    resumeRun,
-	}
-	result, err = resumeWithAdapters(
-		context.Background(),
-		cfg,
-		CompletedTableCheckpoints{
-			"items": {Rows: 2},
-		},
-		resumeObserver,
-		resumeObserver,
-		source,
-		target,
-	)
-	if err != nil {
-		t.Fatalf("resumeWithAdapters: %v", err)
-	}
-	if result != (Result{Tables: 1, Rows: 2, Validated: true}) {
-		t.Fatalf("resume result = %#v", result)
-	}
-	resumeEvents := events[resumeStart:]
-	for _, forbidden := range []string{
-		"target_prepare",
-		"target_write",
-		"target_finalize",
-	} {
-		if stage4AdapterEventIndex(resumeEvents, forbidden) >= 0 {
-			t.Fatalf(
-				"all-complete resume mutated through %s: %v",
-				forbidden,
-				resumeEvents,
-			)
-		}
-	}
-	if _, found, loadErr := raw.LoadSchemaSnapshot(
-		runID,
-		stage4SchemaGateTask,
-	); loadErr != nil || !found {
-		t.Fatalf(
-			"resume publication found=%v err=%v",
-			found,
-			loadErr,
-		)
-	}
-	tasks, ranges, listErr := raw.ListWork(runID)
-	if listErr != nil {
-		t.Fatal(listErr)
-	}
-	assertStage4AdapterWorkCompleted(
-		t,
-		tasks,
-		ranges,
-		stage4SchemaGateTask,
-		stage4SchemaGateRangeID,
-	)
 }
 
 func TestStage4AdapterResumeRejectsCompletedCheckpointWithoutStructuredWork(
@@ -1563,14 +1794,24 @@ func TestStage4AdapterRejectsCompletedSchemaSentinelWithoutSnapshot(
 		"source-password",
 		"target-password",
 	)
-	prepared, err := prepareStage4AdapterRun(
-		context.Background(),
-		cfg,
-		observer,
-		source,
-		target,
-		"drop_recreate",
+	configDigest, err := config.Hash(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, err := PrepareStage4SchemaGate(
 		run,
+		[]schema.Table{stage4AdapterTestTable()},
+		Stage4SchemaGateOptions{
+			SourceEngine:       source.Engine(),
+			TargetEngine:       target.Engine(),
+			TargetMode:         "drop_recreate",
+			IncludeTables:      cfg.Migration.IncludeTables,
+			ExcludeTables:      cfg.Migration.ExcludeTables,
+			ConfigIdentity:     configDigest,
+			Contract:           cfg.Migration.SchemaContract,
+			FailOnSchemaDrift:  cfg.Migration.FailOnSchemaDrift,
+			DateUpdatedColumns: cfg.Migration.DateUpdatedColumns,
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1578,9 +1819,9 @@ func TestStage4AdapterRejectsCompletedSchemaSentinelWithoutSnapshot(
 	if err := completeStage4WorkTask(
 		context.Background(),
 		run,
-		prepared.gate.Task,
+		gate.Task,
 		stage4SchemaGateRangeID,
-		prepared.gate.TopologyHash,
+		gate.TopologyHash,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1680,13 +1921,15 @@ func TestStage4AdapterValidationFailureNeverPublishesSchemaOrCompletion(
 			events,
 		)
 	}
-	if _, found, loadErr := backend.LoadSchemaSnapshot(
+	snapshot, found, loadErr := backend.LoadSchemaSnapshot(
 		runID,
 		stage4SchemaGateTask,
-	); loadErr != nil || found {
+	)
+	if loadErr != nil || !found || snapshot.Digest == "" {
 		t.Fatalf(
-			"failed validation published schema found=%v err=%v",
+			"failed validation did not retain its staged immutable schema found=%v snapshot=%#v err=%v",
 			found,
+			snapshot,
 			loadErr,
 		)
 	}
@@ -1777,13 +2020,15 @@ func TestStage4AdapterCancellationAfterFinalizeCannotPublishCompletion(
 			)
 		}
 	}
-	if _, found, loadErr := backend.LoadSchemaSnapshot(
+	snapshot, found, loadErr := backend.LoadSchemaSnapshot(
 		runID,
 		stage4SchemaGateTask,
-	); loadErr != nil || found {
+	)
+	if loadErr != nil || !found || snapshot.Digest == "" {
 		t.Fatalf(
-			"canceled run published schema found=%v err=%v",
+			"canceled run did not retain its staged immutable schema found=%v snapshot=%#v err=%v",
 			found,
+			snapshot,
 			loadErr,
 		)
 	}

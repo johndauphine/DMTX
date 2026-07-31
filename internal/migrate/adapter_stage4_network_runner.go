@@ -178,6 +178,17 @@ func admitStage4AdapterNetworkTransfer(
 		targetTables[index] =
 			cloneStage4RichTable(prepared.plans[index].target)
 	}
+	if prepared.evolution != nil {
+		existingTargetTables, existingErr :=
+			stage4AdapterExistingEvolutionTargetTables(
+				prepared.evolution,
+				targetTables,
+			)
+		if existingErr != nil {
+			return nil, existingErr
+		}
+		targetTables = existingTargetTables
+	}
 	if err := preflightStage4NetworkReplayIsolation(
 		ctx,
 		upsertTarget,
@@ -242,6 +253,13 @@ func admitStage4AdapterNetworkTransfer(
 		false,
 	)
 	if err != nil {
+		return nil, err
+	}
+	if err := bindStage4AdapterNetworkRangeTargetAuthority(
+		ranges,
+		prepared.evolution,
+		prepared.targetTables,
+	); err != nil {
 		return nil, err
 	}
 	reader, err := requireAdapterNetworkRangePageSource(source)
@@ -808,6 +826,13 @@ func (execution *stage4AdapterNetworkExecution) openTable(
 	if err != nil {
 		return nil, err
 	}
+	if err := bindStage4AdapterNetworkRangeTargetAuthority(
+		ranges,
+		execution.prepared.evolution,
+		[]schema.Table{plan.target},
+	); err != nil {
+		return nil, err
+	}
 	if len(ranges) == 0 ||
 		uint64(len(ranges)) >
 			maximumRuntimeTuningRanges-globalOffset {
@@ -1202,6 +1227,54 @@ func (execution *stage4AdapterNetworkTableExecution) run(
 		)
 	}
 	return totals[0], nil
+}
+
+func bindStage4AdapterNetworkRangeTargetAuthority(
+	ranges []stage4AdapterNetworkRange,
+	evolution *stage4AdapterTargetSchemaEvolution,
+	transfer []schema.Table,
+) error {
+	if evolution == nil {
+		return nil
+	}
+	current, err := stage4AdapterCurrentEvolutionTargetTables(
+		evolution,
+		transfer,
+	)
+	if err != nil {
+		return err
+	}
+	byIdentity := make(
+		map[targetSchemaEvolutionTableKey]schema.Table,
+		len(current),
+	)
+	for _, table := range current {
+		key := targetSchemaEvolutionTableKey{
+			schema: table.Schema,
+			table:  table.Name,
+		}
+		byIdentity[key] = cloneStage4RichTable(table)
+	}
+	for index := range ranges {
+		key := targetSchemaEvolutionTableKey{
+			schema: ranges[index].plan.target.Schema,
+			table:  ranges[index].plan.target.Name,
+		}
+		authenticated, found := byIdentity[key]
+		if !found {
+			return NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"Stage 4 network range target %s.%s is missing from the authenticated current target shape",
+					key.schema,
+					key.table,
+				),
+			)
+		}
+		ranges[index].plan.target =
+			cloneStage4RichTable(authenticated)
+	}
+	return nil
 }
 
 func (execution *stage4AdapterNetworkTableExecution) Close() error {
@@ -2021,6 +2094,15 @@ func cloneStage4AdapterNetworkPrepared(
 	)
 	for key, table := range value.sourceCatalog {
 		result.sourceCatalog[key] = cloneStage4RichTable(table)
+	}
+	if value.validationPrimaryKeyEqualityProofs != nil {
+		result.validationPrimaryKeyEqualityProofs = make(
+			map[stage4RichTableKey]string,
+			len(value.validationPrimaryKeyEqualityProofs),
+		)
+		for key, proof := range value.validationPrimaryKeyEqualityProofs {
+			result.validationPrimaryKeyEqualityProofs[key] = proof
+		}
 	}
 	return result
 }

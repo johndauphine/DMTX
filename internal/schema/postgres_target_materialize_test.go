@@ -264,6 +264,238 @@ func TestMaterializePostgresObjectNamesAfterPriorRejectsRigidNameCollisions(
 	}
 }
 
+func TestMaterializePostgresObjectNamesAfterPriorAuthorityReservesTargetOnlyNames(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	retainedCheck, err := ParseSQLiteCheckExpression(`legacy_code <> ''`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addedCheck, err := ParseSQLiteCheckExpression(`fresh_code <> ''`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := Column{
+		Name:               "id",
+		Type:               "bigint",
+		PrimaryKey:         true,
+		PrimaryKeyPosition: 1,
+	}
+	prior := []Table{{
+		Schema:  "tenant",
+		Name:    "items",
+		Columns: []Column{primary},
+	}}
+	priorMaterialized, err := MaterializePostgresObjectNames(
+		prior,
+		PostgresObjectPlanOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := []Table{{
+		Schema: "tenant",
+		Name:   "items",
+		Columns: []Column{
+			primary,
+			{Name: "legacy_code", Type: "text", Nullable: true},
+			{Name: "legacy_parent", Type: "bigint", Nullable: true},
+		},
+		Indexes: []Index{{
+			Name:    "shared_target_index",
+			Columns: []IndexColumn{{Name: "legacy_code"}},
+		}},
+		Checks: []CheckConstraint{{
+			Name:       "shared_target_check",
+			Expression: retainedCheck,
+		}},
+		ForeignKeys: []ForeignKey{{
+			Name:              "shared_target_fk",
+			Columns:           []string{"legacy_parent"},
+			ReferencedSchema:  "tenant",
+			ReferencedTable:   "items",
+			ReferencedColumns: []string{"id"},
+			OnUpdate:          "NO ACTION",
+			OnDelete:          "SET NULL",
+			Match:             "SIMPLE",
+		}},
+	}}
+	current := []Table{{
+		Schema: "tenant",
+		Name:   "items",
+		Columns: []Column{
+			primary,
+			{Name: "fresh_code", Type: "text", Nullable: true},
+			{Name: "fresh_parent", Type: "bigint", Nullable: true},
+			{Name: "fresh_reserved", Type: "bigint", Nullable: true},
+		},
+		Indexes: []Index{
+			{
+				Name:    "shared_target_index",
+				Columns: []IndexColumn{{Name: "fresh_code"}},
+			},
+			{
+				Name:    "unmodeled_relation",
+				Columns: []IndexColumn{{Name: "fresh_reserved"}},
+			},
+		},
+		Checks: []CheckConstraint{{
+			Name:       "shared_target_check",
+			Expression: addedCheck,
+		}},
+		ForeignKeys: []ForeignKey{{
+			Name:              "shared_target_fk",
+			Columns:           []string{"fresh_parent"},
+			ReferencedSchema:  "tenant",
+			ReferencedTable:   "items",
+			ReferencedColumns: []string{"id"},
+			OnUpdate:          "NO ACTION",
+			OnDelete:          "SET NULL",
+			Match:             "SIMPLE",
+		}},
+	}}
+	beforePrior := clonePostgresMaterializeTestTables(prior)
+	beforePriorMaterialized := clonePostgresMaterializeTestTables(
+		priorMaterialized,
+	)
+	beforeAuthority := clonePostgresMaterializeTestTables(authority)
+	beforeCurrent := clonePostgresMaterializeTestTables(current)
+	reservations := []PostgresObjectNameReservation{{
+		Namespace: "tenant",
+		Name:      "unmodeled_relation",
+	}}
+	beforeReservations := append(
+		[]PostgresObjectNameReservation(nil),
+		reservations...,
+	)
+
+	first, err := MaterializePostgresObjectNamesAfterPriorAuthority(
+		current,
+		prior,
+		authority,
+		reservations,
+		PostgresObjectPlanOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := MaterializePostgresObjectNamesAfterPriorAuthority(
+		current,
+		prior,
+		authority,
+		reservations,
+		PostgresObjectPlanOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Fatal("authority-aware PostgreSQL name allocation is nondeterministic")
+	}
+	if len(first) != 1 ||
+		len(first[0].Indexes) != 2 ||
+		len(first[0].Checks) != 1 ||
+		len(first[0].ForeignKeys) != 1 {
+		t.Fatalf("materialized current objects = %#v", first)
+	}
+	for name, retained := range map[string]string{
+		first[0].Indexes[0].Name:     "shared_target_index",
+		first[0].Checks[0].Name:      "shared_target_check",
+		first[0].ForeignKeys[0].Name: "shared_target_fk",
+	} {
+		if name == "" || name == retained {
+			t.Fatalf(
+				"new PostgreSQL object name %q did not allocate around retained %q",
+				name,
+				retained,
+			)
+		}
+	}
+	if first[0].Indexes[1].Name == "" ||
+		first[0].Indexes[1].Name == reservations[0].Name {
+		t.Fatalf(
+			"new PostgreSQL index name %q did not allocate around unmodeled relation reservation %q",
+			first[0].Indexes[1].Name,
+			reservations[0].Name,
+		)
+	}
+	if !reflect.DeepEqual(prior, beforePrior) ||
+		!reflect.DeepEqual(
+			priorMaterialized,
+			beforePriorMaterialized,
+		) ||
+		!reflect.DeepEqual(authority, beforeAuthority) ||
+		!reflect.DeepEqual(current, beforeCurrent) ||
+		!reflect.DeepEqual(reservations, beforeReservations) {
+		t.Fatal("authority-aware materialization mutated its inputs")
+	}
+}
+
+func TestMaterializePostgresObjectNamesAfterPriorAuthorityPreservesNameAllocatedAroundReservation(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	prior := []Table{{
+		Schema: "tenant",
+		Name:   "items",
+		Columns: []Column{
+			{
+				Name:               "id",
+				Type:               "bigint",
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 1,
+			},
+			{Name: "code", Type: "text", Nullable: true},
+		},
+		Indexes: []Index{{
+			Name:    "reserved_relation",
+			Columns: []IndexColumn{{Name: "code"}},
+		}},
+	}}
+	authority := clonePostgresMaterializeTestTables(prior)
+	authority[0].Indexes[0].Name =
+		"reserved_relation_7b60b423c9e1"
+	reservations := []PostgresObjectNameReservation{{
+		Namespace: "tenant",
+		Name:      "reserved_relation",
+	}}
+
+	first, err := MaterializePostgresObjectNamesAfterPriorAuthority(
+		prior,
+		prior,
+		authority,
+		reservations,
+		PostgresObjectPlanOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := MaterializePostgresObjectNamesAfterPriorAuthority(
+		prior,
+		prior,
+		authority,
+		reservations,
+		PostgresObjectPlanOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Fatal("reservation-aware prior materialization is nondeterministic")
+	}
+	if len(first) != 1 || len(first[0].Indexes) != 1 ||
+		first[0].Indexes[0].Name != authority[0].Indexes[0].Name {
+		t.Fatalf(
+			"authenticated prior index = %#v, want exact authority name %q",
+			first,
+			authority[0].Indexes[0].Name,
+		)
+	}
+}
+
 func clonePostgresMaterializeTestTables(tables []Table) []Table {
 	result := make([]Table, len(tables))
 	for index, table := range tables {

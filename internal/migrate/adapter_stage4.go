@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"sync"
 	"time"
 
@@ -132,18 +133,47 @@ type adapterStage4ValidationProbeProvider interface {
 	) (ValidationCoreProbe, error)
 }
 
+// adapterTargetSchemaEvolutionCapability is the complete, optional production
+// seam for applying schema-contract evolution to a live target. Projection
+// remains pure through targetAdapter.PlanTables; these methods own only the
+// target dialect, exact catalog preflight, and the lease-fenced mutation.
+type adapterTargetSchemaEvolutionCapability interface {
+	TargetSchemaEvolutionDialect() schema.Dialect
+	TargetSchemaEvolutionCreatePlanner() TargetSchemaEvolutionCreatePlanner
+	ReadTargetSchemaEvolutionCatalog(
+		context.Context,
+	) (TargetSchemaEvolutionCatalog, error)
+	PreflightTargetSchemaEvolution(
+		context.Context,
+		TargetSchemaEvolutionRequest,
+	) (TargetSchemaEvolutionPlan, error)
+	ApplyTargetSchemaEvolutionPlan(
+		context.Context,
+		TargetSchemaEvolutionPlan,
+	) error
+}
+
+// PostgreSQL is the first production target with an exact evolution
+// implementation. Keeping dialect admission on the composed-route capability
+// prevents the runner from inferring executable SQL from an engine label.
+func (*postgresTargetAdapter) TargetSchemaEvolutionDialect() schema.Dialect {
+	return schema.Postgres
+}
+
 type stage4AdapterPrepared struct {
-	run           Stage4RunContext
-	gate          Stage4SchemaGateResult
-	configDigest  string
-	mode          string
-	plans         []adapterTablePlan
-	names         []string
-	targetTables  []schema.Table
-	validation    ValidationCoreProbe
-	sourceCatalog map[stage4RichTableKey]schema.Table
-	work          []stage4AdapterWork
-	network       *networkStateCoordinator
+	run                                Stage4RunContext
+	gate                               Stage4SchemaGateResult
+	configDigest                       string
+	mode                               string
+	plans                              []adapterTablePlan
+	names                              []string
+	targetTables                       []schema.Table
+	validation                         ValidationCoreProbe
+	validationPrimaryKeyEqualityProofs map[stage4RichTableKey]string
+	sourceCatalog                      map[stage4RichTableKey]schema.Table
+	work                               []stage4AdapterWork
+	network                            *networkStateCoordinator
+	evolution                          *stage4AdapterTargetSchemaEvolution
 }
 
 type stage4AdapterWork struct {
@@ -194,10 +224,28 @@ func migrateWithStage4Adapters(
 		}
 	}
 	if networkExecution != nil {
-		if err := checkpointStage4AdapterTableSet(
+		if err := checkpointStage4AdapterStableNetworkWork(
 			ctx,
 			observer,
-			prepared.names,
+			networkExecution,
+			false,
+			nil,
+		); err != nil {
+			return Result{}, err
+		}
+		if err := applyStage4AdapterTargetSchema(
+			ctx,
+			observer,
+			prepared.run,
+			prepared.gate,
+			prepared.evolution,
+		); err != nil {
+			return Result{}, err
+		}
+		if err := preflightStage4AdapterDesiredTargetAfterEvolution(
+			ctx,
+			target,
+			prepared,
 		); err != nil {
 			return Result{}, err
 		}
@@ -214,10 +262,11 @@ func migrateWithStage4Adapters(
 		if err != nil {
 			return result, err
 		}
-		if err := publishStage4SchemaGate(
+		if err := completeStage4SchemaGateSentinels(
 			ctx,
 			prepared.run,
 			prepared.gate,
+			prepared.evolution,
 		); err != nil {
 			return result, err
 		}
@@ -227,6 +276,22 @@ func migrateWithStage4Adapters(
 	if err := checkpointStage4AdapterWork(
 		ctx,
 		observer,
+		prepared,
+	); err != nil {
+		return Result{}, err
+	}
+	if err := applyStage4AdapterTargetSchema(
+		ctx,
+		observer,
+		prepared.run,
+		prepared.gate,
+		prepared.evolution,
+	); err != nil {
+		return Result{}, err
+	}
+	if err := preflightStage4AdapterDesiredTargetAfterEvolution(
+		ctx,
+		target,
 		prepared,
 	); err != nil {
 		return Result{}, err
@@ -377,10 +442,11 @@ func migrateWithStage4Adapters(
 	); err != nil {
 		return result, err
 	}
-	if err := publishStage4SchemaGate(
+	if err := completeStage4SchemaGateSentinels(
 		ctx,
 		prepared.run,
 		prepared.gate,
+		prepared.evolution,
 	); err != nil {
 		return result, err
 	}
@@ -408,6 +474,69 @@ func checkpointStage4AdapterTableSet(
 			ErrorClassState,
 			fmt.Errorf("checkpoint Stage 4 table set: %w", err),
 		)
+	}
+	return ctx.Err()
+}
+
+// checkpointStage4AdapterStableNetworkWork materializes and checkpoints every
+// table's exact stable pagination plan before schema DDL is permitted. The
+// stable sessions are intentionally closed after checkpointing; execution
+// reopens each table and requires the newly observed plan to match the durable
+// one before preparing or writing that table.
+func checkpointStage4AdapterStableNetworkWork(
+	ctx context.Context,
+	observer TableObserver,
+	execution *stage4AdapterNetworkExecution,
+	resume bool,
+	completed map[string]int,
+) (resultErr error) {
+	if execution == nil || !execution.deferred {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"Stage 4 stable network work checkpoint requires a deferred execution",
+			),
+		)
+	}
+	if err := checkpointStage4AdapterTableSet(
+		ctx,
+		observer,
+		execution.prepared.names,
+	); err != nil {
+		return err
+	}
+	defer func() {
+		execution.mu.Lock()
+		execution.nextGlobalRange = 0
+		execution.mu.Unlock()
+	}()
+	for planIndex, plan := range execution.prepared.plans {
+		if rows, complete := completed[plan.source.Name]; complete {
+			if _, err := execution.validateCompletedTable(
+				ctx,
+				planIndex,
+				rows,
+				false,
+			); err != nil {
+				return err
+			}
+			continue
+		}
+		tableExecution, err := execution.openTable(
+			ctx,
+			planIndex,
+			resume,
+		)
+		if err != nil {
+			return err
+		}
+		if closeErr := tableExecution.Close(); closeErr != nil {
+			return fmt.Errorf(
+				"close Stage 4 stable source after checkpointing %s: %w",
+				plan.source.Name,
+				closeErr,
+			)
+		}
 	}
 	return ctx.Err()
 }
@@ -551,8 +680,8 @@ func runStage4AdapterStableNetworkTable(
 		ctx,
 		cfg,
 		observer,
-		execution.source,
 		execution.parent.source,
+		execution.source,
 		target,
 		prepared,
 		planIndex,
@@ -683,10 +812,28 @@ func resumeWithStage4Adapters(
 	); err != nil {
 		return resultForValidatedAdapterCheckpoints(validated), err
 	}
-	if err := checkpointStage4AdapterTableSet(
+	if err := checkpointStage4AdapterStableNetworkWork(
 		ctx,
 		observer,
-		prepared.names,
+		networkExecution,
+		true,
+		validated,
+	); err != nil {
+		return resultForValidatedAdapterCheckpoints(validated), err
+	}
+	if err := applyStage4AdapterTargetSchema(
+		ctx,
+		observer,
+		prepared.run,
+		prepared.gate,
+		prepared.evolution,
+	); err != nil {
+		return resultForValidatedAdapterCheckpoints(validated), err
+	}
+	if err := preflightStage4AdapterDesiredTargetAfterEvolution(
+		ctx,
+		target,
+		prepared,
 	); err != nil {
 		return resultForValidatedAdapterCheckpoints(validated), err
 	}
@@ -703,10 +850,11 @@ func resumeWithStage4Adapters(
 	if err != nil {
 		return result, err
 	}
-	if err := publishStage4SchemaGate(
+	if err := completeStage4SchemaGateSentinels(
 		ctx,
 		prepared.run,
 		prepared.gate,
+		prepared.evolution,
 	); err != nil {
 		return result, err
 	}
@@ -843,20 +991,21 @@ func prepareStage4AdapterRun(
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
+	gateOptions := Stage4SchemaGateOptions{
+		SourceEngine:       source.Engine(),
+		TargetEngine:       target.Engine(),
+		TargetMode:         mode,
+		IncludeTables:      cfg.Migration.IncludeTables,
+		ExcludeTables:      cfg.Migration.ExcludeTables,
+		ConfigIdentity:     configDigest,
+		Contract:           cfg.Migration.SchemaContract,
+		FailOnSchemaDrift:  cfg.Migration.FailOnSchemaDrift,
+		DateUpdatedColumns: cfg.Migration.DateUpdatedColumns,
+	}
 	gate, err := PrepareStage4SchemaGate(
 		run,
 		discovered,
-		Stage4SchemaGateOptions{
-			SourceEngine:       source.Engine(),
-			TargetEngine:       target.Engine(),
-			TargetMode:         mode,
-			IncludeTables:      cfg.Migration.IncludeTables,
-			ExcludeTables:      cfg.Migration.ExcludeTables,
-			ConfigIdentity:     configDigest,
-			Contract:           cfg.Migration.SchemaContract,
-			FailOnSchemaDrift:  cfg.Migration.FailOnSchemaDrift,
-			DateUpdatedColumns: cfg.Migration.DateUpdatedColumns,
-		},
+		gateOptions,
 	)
 	if err != nil {
 		return result, fmt.Errorf("prepare Stage 4 schema gate: %w", err)
@@ -891,6 +1040,18 @@ func prepareStage4AdapterRun(
 		gate,
 		mode,
 	); err != nil {
+		return result, err
+	}
+	result.evolution, err = prepareStage4AdapterTargetSchema(
+		ctx,
+		run,
+		gateOptions,
+		source,
+		target,
+		mode,
+		gate,
+	)
+	if err != nil {
 		return result, err
 	}
 
@@ -947,12 +1108,26 @@ func prepareStage4AdapterRun(
 	); err != nil {
 		return result, fmt.Errorf("preflight Stage 4 target plan: %w", err)
 	}
+	preflightTables := result.targetTables
+	if result.evolution != nil {
+		preflightTables, err =
+			stage4AdapterExistingEvolutionTargetTables(
+				result.evolution,
+				result.targetTables,
+			)
+		if err != nil {
+			return result, err
+		}
+	}
 	if err := target.PreflightTables(
 		ctx,
-		result.targetTables,
+		preflightTables,
 		mode,
 	); err != nil {
-		return result, fmt.Errorf("preflight Stage 4 target tables: %w", err)
+		return result, fmt.Errorf(
+			"preflight existing Stage 4 target tables before schema evolution: %w",
+			err,
+		)
 	}
 	if preflighter, ok := target.(adapterTargetDestructivePreflighter); ok {
 		if err := preflighter.PreflightDestructive(
@@ -986,6 +1161,16 @@ func prepareStage4AdapterRun(
 		target,
 		plans,
 	)
+	if err != nil {
+		return result, err
+	}
+	result.validationPrimaryKeyEqualityProofs, err =
+		prepareStage4AdapterValidationPrimaryKeyEqualityProofs(
+			cfg.Migration.Validation.Mode,
+			mode,
+			result.validation,
+			gate.ValidationTables,
+		)
 	if err != nil {
 		return result, err
 	}
@@ -1216,6 +1401,443 @@ func planStage4AdapterTargets(
 	return plans, nil
 }
 
+type stage4AdapterTargetSchemaEvolution struct {
+	capability adapterTargetSchemaEvolutionCapability
+	authority  Stage4TargetShapeAuthority
+	pending    state.SchemaSnapshot
+	request    TargetSchemaEvolutionRequest
+	plan       TargetSchemaEvolutionPlan
+	prior      []schema.Table
+	current    []schema.Table
+}
+
+func prepareStage4AdapterTargetSchema(
+	ctx context.Context,
+	run Stage4RunContext,
+	gateOptions Stage4SchemaGateOptions,
+	source sourceAdapter,
+	target targetAdapter,
+	mode string,
+	gate Stage4SchemaGateResult,
+) (*stage4AdapterTargetSchemaEvolution, error) {
+	// Drop/recreate owns its complete target lifecycle through the target
+	// adapter's ordinary deterministic planner. The in-place catalog
+	// evolution protocol is intentionally upsert-only.
+	if mode != "upsert" {
+		return nil, nil
+	}
+	requiresEvolution, decision := stage4AdapterTargetEvolutionDecision(
+		mode,
+		gate.Plan.Decisions,
+	)
+	capability, ok := target.(adapterTargetSchemaEvolutionCapability)
+	if !ok || stage4AdapterTargetSchemaEvolutionCapabilityIsNil(capability) {
+		if !requiresEvolution {
+			return nil, nil
+		}
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 upsert schema action %q for table %s requires a composed target-catalog evolution executor seam",
+				decision.Action,
+				decision.Object.Table,
+			),
+		)
+	}
+	dialect := capability.TargetSchemaEvolutionDialect()
+	if dialect == "" {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 target-catalog evolution capability for %s returned an empty target dialect",
+				target.Engine(),
+			),
+		)
+	}
+	createPlanner := capability.TargetSchemaEvolutionCreatePlanner()
+	if targetSchemaEvolutionCreatePlannerIsNil(createPlanner) {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 target-catalog evolution capability for %s returned a nil create planner",
+				target.Engine(),
+			),
+		)
+	}
+	authority, err := PrepareStage4TargetShapeAuthority(
+		run,
+		gate,
+		gateOptions,
+		Stage4TargetShapeSeed{},
+	)
+	if errors.Is(err, ErrStage4TargetShapeSeedRequired) {
+		catalog, readErr :=
+			capability.ReadTargetSchemaEvolutionCatalog(ctx)
+		if readErr != nil {
+			return nil, fmt.Errorf(
+				"read exact Stage 4 target catalog for shape authority: %w",
+				readErr,
+			)
+		}
+		seed, seedErr := NewStage4TargetShapeSeed(catalog)
+		if seedErr != nil {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"freeze exact Stage 4 target catalog seed: %w",
+					seedErr,
+				),
+			)
+		}
+		authority, err = PrepareStage4TargetShapeAuthority(
+			run,
+			gate,
+			gateOptions,
+			seed,
+		)
+	}
+	if err != nil {
+		return nil, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"prepare Stage 4 target-shape authority: %w",
+				err,
+			),
+		)
+	}
+	projection, err := BuildStage4TargetSchemaEvolutionProjection(
+		gate,
+		authority,
+		source.Engine(),
+		target,
+		mode,
+	)
+	if err != nil {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"project Stage 4 target-catalog evolution: %w",
+				err,
+			),
+		)
+	}
+	pending, err := BindStage4TargetShapeProjection(
+		authority,
+		projection,
+	)
+	if err != nil {
+		return nil, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"bind Stage 4 target-shape projection: %w",
+				err,
+			),
+		)
+	}
+	request, err := NewTargetSchemaEvolutionRequest(
+		dialect,
+		projection,
+		createPlanner,
+	)
+	if err != nil {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"authorize Stage 4 target-catalog evolution: %w",
+				err,
+			),
+		)
+	}
+	plan, err := capability.PreflightTargetSchemaEvolution(ctx, request)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"preflight Stage 4 target-catalog evolution: %w",
+			err,
+		)
+	}
+	if plan.Digest() == "" || plan.Target() != dialect {
+		return nil, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"preflight Stage 4 target-catalog evolution returned invalid plan authority",
+			),
+		)
+	}
+	return &stage4AdapterTargetSchemaEvolution{
+		capability: capability,
+		authority:  authority,
+		pending:    pending,
+		request:    request,
+		plan:       plan,
+		prior:      projection.PriorTables(),
+		current:    projection.CurrentTables(),
+	}, nil
+}
+
+func applyStage4AdapterTargetSchema(
+	ctx context.Context,
+	observer TableObserver,
+	run Stage4RunContext,
+	gate Stage4SchemaGateResult,
+	evolution *stage4AdapterTargetSchemaEvolution,
+) error {
+	if err := stageStage4SchemaGateSnapshots(
+		ctx,
+		run,
+		gate,
+		evolution,
+	); err != nil {
+		return err
+	}
+	if evolution == nil || evolution.plan.Complete() {
+		return nil
+	}
+	if _, err := protectAdapterTargetMutationOnce(
+		ctx,
+		observer,
+		"apply Stage 4 target schema evolution",
+		func() error {
+			return evolution.capability.ApplyTargetSchemaEvolutionPlan(
+				ctx,
+				evolution.plan,
+			)
+		},
+	); err != nil {
+		return fmt.Errorf(
+			"apply Stage 4 target-catalog evolution: %w",
+			err,
+		)
+	}
+	verified, err := evolution.capability.PreflightTargetSchemaEvolution(
+		ctx,
+		evolution.request,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"reverify Stage 4 target-catalog evolution: %w",
+			err,
+		)
+	}
+	if !verified.Complete() {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"reverify Stage 4 target-catalog evolution: target catalog remains incomplete after apply",
+			),
+		)
+	}
+	if verified.Digest() != evolution.plan.Digest() {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"reverify Stage 4 target-catalog evolution: plan digest changed from %s to %s",
+				evolution.plan.Digest(),
+				verified.Digest(),
+			),
+		)
+	}
+	return nil
+}
+
+func stage4AdapterExistingEvolutionTargetTables(
+	evolution *stage4AdapterTargetSchemaEvolution,
+	desired []schema.Table,
+) ([]schema.Table, error) {
+	if evolution == nil {
+		return cloneTargetSchemaEvolutionTables(desired), nil
+	}
+	prior := make(
+		map[targetSchemaEvolutionTableKey]schema.Table,
+		len(evolution.prior),
+	)
+	for _, table := range evolution.prior {
+		key := targetSchemaEvolutionTableKey{
+			schema: table.Schema,
+			table:  table.Name,
+		}
+		if _, duplicate := prior[key]; duplicate {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"Stage 4 target-shape authority contains duplicate prior table %s.%s",
+					key.schema,
+					key.table,
+				),
+			)
+		}
+		prior[key] = cloneStage4RichTable(table)
+	}
+	result := make([]schema.Table, 0, len(desired))
+	for _, table := range desired {
+		key := targetSchemaEvolutionTableKey{
+			schema: table.Schema,
+			table:  table.Name,
+		}
+		existing, found := prior[key]
+		if !found {
+			continue
+		}
+		result = append(result, existing)
+	}
+	sortTargetSchemaEvolutionTables(result)
+	return result, nil
+}
+
+func stage4AdapterCurrentEvolutionTargetTables(
+	evolution *stage4AdapterTargetSchemaEvolution,
+	transfer []schema.Table,
+) ([]schema.Table, error) {
+	if evolution == nil {
+		return cloneTargetSchemaEvolutionTables(transfer), nil
+	}
+	current := make(
+		map[targetSchemaEvolutionTableKey]schema.Table,
+		len(evolution.current),
+	)
+	for _, table := range evolution.current {
+		key := targetSchemaEvolutionTableKey{
+			schema: table.Schema,
+			table:  table.Name,
+		}
+		if _, duplicate := current[key]; duplicate {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"Stage 4 target-shape projection contains duplicate current table %s.%s",
+					key.schema,
+					key.table,
+				),
+			)
+		}
+		current[key] = cloneStage4RichTable(table)
+	}
+	result := make([]schema.Table, 0, len(transfer))
+	for _, table := range transfer {
+		key := targetSchemaEvolutionTableKey{
+			schema: table.Schema,
+			table:  table.Name,
+		}
+		authenticated, found := current[key]
+		if !found {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"Stage 4 target-shape projection is missing current transfer table %s.%s",
+					key.schema,
+					key.table,
+				),
+			)
+		}
+		result = append(result, authenticated)
+	}
+	sortTargetSchemaEvolutionTables(result)
+	return result, nil
+}
+
+func preflightStage4AdapterDesiredTargetAfterEvolution(
+	ctx context.Context,
+	target targetAdapter,
+	prepared stage4AdapterPrepared,
+) error {
+	if prepared.evolution == nil {
+		return nil
+	}
+	currentTables, err := stage4AdapterCurrentEvolutionTargetTables(
+		prepared.evolution,
+		prepared.targetTables,
+	)
+	if err != nil {
+		return err
+	}
+	if err := target.PreflightTables(
+		ctx,
+		cloneTargetSchemaEvolutionTables(currentTables),
+		prepared.mode,
+	); err != nil {
+		return NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"preflight desired Stage 4 target tables after schema evolution: %w",
+				err,
+			),
+		)
+	}
+	if prepared.mode == "upsert" {
+		if err := preflightStage4NetworkReplayIsolation(
+			ctx,
+			target,
+			cloneTargetSchemaEvolutionTables(
+				currentTables,
+			),
+		); err != nil {
+			return fmt.Errorf(
+				"preflight desired Stage 4 network replay isolation after schema evolution: %w",
+				err,
+			)
+		}
+	}
+	return ctx.Err()
+}
+
+func stage4AdapterTargetEvolutionDecision(
+	mode string,
+	decisions []SchemaContractDecision,
+) (bool, SchemaContractDecision) {
+	if mode != "upsert" {
+		return false, SchemaContractDecision{}
+	}
+	for _, decision := range decisions {
+		switch decision.Action {
+		case SchemaContractCreateTable,
+			SchemaContractAddColumn,
+			SchemaContractRelaxNullability,
+			SchemaContractWidenType:
+			return true, decision
+		}
+	}
+	return false, SchemaContractDecision{}
+}
+
+func stage4AdapterTargetSchemaEvolutionCapabilityIsNil(
+	capability adapterTargetSchemaEvolutionCapability,
+) bool {
+	if capability == nil {
+		return true
+	}
+	value := reflect.ValueOf(capability)
+	switch value.Kind() {
+	case reflect.Chan,
+		reflect.Func,
+		reflect.Interface,
+		reflect.Map,
+		reflect.Pointer,
+		reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func targetSchemaEvolutionCreatePlannerIsNil(
+	planner TargetSchemaEvolutionCreatePlanner,
+) bool {
+	if planner == nil {
+		return true
+	}
+	value := reflect.ValueOf(planner)
+	switch value.Kind() {
+	case reflect.Chan,
+		reflect.Func,
+		reflect.Interface,
+		reflect.Map,
+		reflect.Pointer,
+		reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
 func requireStage4AdapterSeams(
 	cfg config.Config,
 	observer TableObserver,
@@ -1237,24 +1859,6 @@ func requireStage4AdapterSeams(
 			),
 		)
 	}
-	if mode == "upsert" {
-		for _, decision := range gate.Plan.Decisions {
-			switch decision.Action {
-			case SchemaContractCreateTable,
-				SchemaContractAddColumn,
-				SchemaContractRelaxNullability,
-				SchemaContractWidenType:
-				return NewTransferError(
-					ErrorClassPolicy,
-					fmt.Errorf(
-						"Stage 4 upsert schema action %q for table %s requires a composed target-catalog evolution executor seam",
-						decision.Action,
-						decision.Object.Table,
-					),
-				)
-			}
-		}
-	}
 	validationMode := cfg.Migration.Validation.Mode
 	if validationMode == "" ||
 		validationMode == config.ValidationCountOnly {
@@ -1269,15 +1873,6 @@ func requireStage4AdapterSeams(
 			),
 		)
 	}
-	if mode == "upsert" {
-		return NewTransferError(
-			ErrorClassPolicy,
-			fmt.Errorf(
-				"Stage 4 validation mode %q in upsert mode requires a composed route-bound primary-key equality proof seam",
-				validationMode,
-			),
-		)
-	}
 	return nil
 }
 
@@ -1287,7 +1882,8 @@ func stage4ValidationProvider(
 	target targetAdapter,
 ) adapterStage4ValidationProbeProvider {
 	for _, candidate := range []any{observer, source, target} {
-		if provider, ok := candidate.(adapterStage4ValidationProbeProvider); ok {
+		if provider, ok := candidate.(adapterStage4ValidationProbeProvider); ok &&
+			!isNilInterface(provider) {
 			return provider
 		}
 	}
@@ -1347,7 +1943,7 @@ func stage4AdapterValidationProbe(
 			err,
 		)
 	}
-	if probe == nil {
+	if isNilInterface(probe) {
 		return nil, NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
@@ -1356,6 +1952,75 @@ func stage4AdapterValidationProbe(
 		)
 	}
 	return probe, nil
+}
+
+func prepareStage4AdapterValidationPrimaryKeyEqualityProofs(
+	validationMode config.ValidationMode,
+	targetMode string,
+	probe ValidationCoreProbe,
+	tables []schema.Table,
+) (map[stage4RichTableKey]string, error) {
+	if targetMode != "upsert" ||
+		(validationMode != config.ValidationNullParity &&
+			validationMode != config.ValidationSample) {
+		return nil, nil
+	}
+	provider, ok := probe.(adapterStage4ValidationEqualityProofProvider)
+	if !ok || isNilInterface(provider) {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 validation mode %q in upsert mode requires a composed route-bound primary-key equality proof seam",
+				validationMode,
+			),
+		)
+	}
+	proofs := make(
+		map[stage4RichTableKey]string,
+		len(tables),
+	)
+	for _, table := range tables {
+		key := stage4RichTableKey{
+			schema: table.Schema,
+			table:  table.Name,
+		}
+		if _, exists := proofs[key]; exists {
+			return nil, NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 validation equality proof inventory duplicates table (%q, %q)",
+					table.Schema,
+					table.Name,
+				),
+			)
+		}
+		proof, err := provider.Stage4ValidationPrimaryKeyEqualityProof(
+			cloneStage4RichTable(table),
+		)
+		if err != nil {
+			return nil, NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"prepare Stage 4 primary-key equality proof for table (%q, %q): %w",
+					table.Schema,
+					table.Name,
+					err,
+				),
+			)
+		}
+		if !validValidationEqualityProofDigest(proof) {
+			return nil, NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 primary-key equality proof for table (%q, %q) is not a canonical SHA-256 digest",
+					table.Schema,
+					table.Name,
+				),
+			)
+		}
+		proofs[key] = proof
+	}
+	return proofs, nil
 }
 
 func stage4AdapterPlansBySource(
@@ -1565,30 +2230,9 @@ func validateStage4AdapterRun(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	plans := stage4AdapterPlansBySource(prepared.plans)
-	specs := make(
-		[]ValidationTableSpec,
-		0,
-		len(prepared.gate.ValidationTables),
-	)
-	for _, table := range prepared.gate.ValidationTables {
-		if _, ok := plans[stage4RichTableKey{
-			schema: table.Schema,
-			table:  table.Name,
-		}]; !ok {
-			return NewTransferError(
-				ErrorClassPolicy,
-				fmt.Errorf(
-					"Stage 4 validation projection contains table (%q, %q) outside the transfer plan",
-					table.Schema,
-					table.Name,
-				),
-			)
-		}
-		specs = append(specs, ValidationTableSpec{
-			Table:      table,
-			Projection: adapterColumnNames(table),
-		})
+	specs, err := stage4AdapterValidationTableSpecs(prepared)
+	if err != nil {
+		return err
 	}
 	report, err := RunValidationCore(
 		ctx,
@@ -1623,6 +2267,59 @@ func validateStage4AdapterRun(
 		)
 	}
 	return nil
+}
+
+func stage4AdapterValidationTableSpecs(
+	prepared stage4AdapterPrepared,
+) ([]ValidationTableSpec, error) {
+	plans := stage4AdapterPlansBySource(prepared.plans)
+	specs := make(
+		[]ValidationTableSpec,
+		0,
+		len(prepared.gate.ValidationTables),
+	)
+	for _, table := range prepared.gate.ValidationTables {
+		if _, ok := plans[stage4RichTableKey{
+			schema: table.Schema,
+			table:  table.Name,
+		}]; !ok {
+			return nil, NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 validation projection contains table (%q, %q) outside the transfer plan",
+					table.Schema,
+					table.Name,
+				),
+			)
+		}
+		var primaryKeyEqualityProof string
+		if prepared.mode == "upsert" &&
+			prepared.validationPrimaryKeyEqualityProofs != nil {
+			primaryKeyEqualityProof =
+				prepared.validationPrimaryKeyEqualityProofs[stage4RichTableKey{
+					schema: table.Schema,
+					table:  table.Name,
+				}]
+			if !validValidationEqualityProofDigest(
+				primaryKeyEqualityProof,
+			) {
+				return nil, NewTransferError(
+					ErrorClassState,
+					fmt.Errorf(
+						"prepared Stage 4 primary-key equality proof for validation table (%q, %q) is missing or invalid",
+						table.Schema,
+						table.Name,
+					),
+				)
+			}
+		}
+		specs = append(specs, ValidationTableSpec{
+			Table:                   table,
+			Projection:              adapterColumnNames(table),
+			PrimaryKeyEqualityProof: primaryKeyEqualityProof,
+		})
+	}
+	return specs, nil
 }
 
 func stage4ValidationConcurrency(tableCount int) int {
@@ -2209,10 +2906,11 @@ func completeStage4AdapterWork(
 	return nil
 }
 
-func publishStage4SchemaGate(
+func stageStage4SchemaGateSnapshots(
 	ctx context.Context,
 	run Stage4RunContext,
 	gate Stage4SchemaGateResult,
+	evolution *stage4AdapterTargetSchemaEvolution,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -2228,8 +2926,47 @@ func publishStage4SchemaGate(
 			),
 		)
 	}
+	if evolution != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := run.Backend.SaveSchemaSnapshot(
+			evolution.pending,
+		); err != nil {
+			return NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"save validated Stage 4 target-shape snapshot before schema DDL: %w",
+					err,
+				),
+			)
+		}
+	}
+	return ctx.Err()
+}
+
+func completeStage4SchemaGateSentinels(
+	ctx context.Context,
+	run Stage4RunContext,
+	gate Stage4SchemaGateResult,
+	evolution *stage4AdapterTargetSchemaEvolution,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if evolution != nil {
+		if err := completeStage4WorkTask(
+			ctx,
+			run,
+			evolution.authority.Task(),
+			stage4TargetShapeRangeID,
+			evolution.authority.TopologyHash(),
+		); err != nil {
+			return fmt.Errorf(
+				"complete validated Stage 4 target-shape sentinel: %w",
+				err,
+			)
+		}
 	}
 	if err := completeStage4WorkTask(
 		ctx,

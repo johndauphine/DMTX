@@ -299,6 +299,261 @@ func TestStage4TargetSchemaEvolutionProjectionPreservesPostgresRetainedObjectNam
 	}
 }
 
+func TestStage4TargetSchemaEvolutionProjectionPreservesPostgresPriorNameAllocatedAroundReservation(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	retained := schema.Table{
+		Schema: "source",
+		Name:   "items",
+		Columns: []schema.Column{
+			stage4TargetSchemaProjectionPrimaryColumn("id", "bigint"),
+			{Name: "code", Type: "text", Nullable: true},
+		},
+		Indexes: []schema.Index{{
+			Name:    "reserved_relation",
+			Columns: []schema.IndexColumn{{Name: "code"}},
+		}},
+	}
+	current := cloneStage4RichTable(retained)
+	current.Columns = append(
+		current.Columns,
+		schema.Column{Name: "note", Type: "text", Nullable: true},
+	)
+	gate := stage4TargetSchemaProjectionGate(
+		t,
+		[]schema.Table{retained},
+		[]schema.Table{current},
+		"upsert",
+		false,
+	)
+	target := &postgresTargetAdapter{namespace: "tenant"}
+	priorTarget, err := target.PlanTables(
+		"postgres",
+		[]schema.Table{retained},
+		"upsert",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorTarget[0].Indexes[0].Name =
+		"reserved_relation_7b60b423c9e1"
+	catalog, err := NewTargetSchemaEvolutionCatalog(
+		priorTarget,
+		[]TargetSchemaEvolutionNameReservation{{
+			Scope:     "relation",
+			Namespace: "tenant",
+			Name:      "reserved_relation",
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := stage4TargetSchemaProjectionAuthorityFromCatalog(
+		t,
+		gate,
+		"postgres",
+		target.Engine(),
+		"upsert",
+		catalog,
+	)
+
+	projection, err := BuildStage4TargetSchemaEvolutionProjection(
+		gate,
+		authority,
+		"postgres",
+		target,
+		"upsert",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for label, tables := range map[string][]schema.Table{
+		"prior":   projection.PriorTables(),
+		"current": projection.CurrentTables(),
+	} {
+		table := stage4TargetSchemaProjectionFindTable(t, tables, "items")
+		if len(table.Indexes) != 1 ||
+			table.Indexes[0].Name != priorTarget[0].Indexes[0].Name {
+			t.Fatalf(
+				"%s prior index = %#v, want exact authority name %q",
+				label,
+				table.Indexes,
+				priorTarget[0].Indexes[0].Name,
+			)
+		}
+	}
+}
+
+func TestStage4TargetSchemaEvolutionProjectionThreadsImmutableReservationsThroughBothEndpoints(
+	t *testing.T,
+) {
+	previous, current := stage4TargetSchemaProjectionSafeTables()
+	gate := stage4TargetSchemaProjectionGate(
+		t,
+		previous,
+		current,
+		"upsert",
+		false,
+	)
+	newFixture := func(
+		t *testing.T,
+		mutate bool,
+	) (
+		*stage4PriorAwareProjectionTestTarget,
+		Stage4TargetShapeAuthority,
+	) {
+		t.Helper()
+		target := &stage4PriorAwareProjectionTestTarget{
+			stage4TargetSchemaProjectionTestTarget: &stage4TargetSchemaProjectionTestTarget{
+				engine:       "postgres",
+				targetSchema: "warehouse",
+			},
+			mutateReservations: mutate,
+		}
+		priorTarget, err := target.PlanTables(
+			"postgres",
+			previous,
+			"upsert",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		catalog, err := NewTargetSchemaEvolutionCatalog(
+			priorTarget,
+			[]TargetSchemaEvolutionNameReservation{{
+				Scope:     "relation",
+				Namespace: "warehouse",
+				Name:      "catalog_reservation",
+			}},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target.planCalls = 0
+		return target, stage4TargetSchemaProjectionAuthorityFromCatalog(
+			t,
+			gate,
+			"postgres",
+			target.Engine(),
+			"upsert",
+			catalog,
+		)
+	}
+
+	t.Run("both endpoints", func(t *testing.T) {
+		target, authority := newFixture(t, false)
+		if _, err := BuildStage4TargetSchemaEvolutionProjection(
+			gate,
+			authority,
+			"postgres",
+			target,
+			"upsert",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if target.priorAwareCalls != 4 {
+			t.Fatalf(
+				"prior-aware planner calls = %d, want two deterministic calls for each endpoint",
+				target.priorAwareCalls,
+			)
+		}
+	})
+	t.Run("mutation fails closed", func(t *testing.T) {
+		target, authority := newFixture(t, true)
+		_, err := BuildStage4TargetSchemaEvolutionProjection(
+			gate,
+			authority,
+			"postgres",
+			target,
+			"upsert",
+		)
+		if err == nil || !strings.Contains(
+			err.Error(),
+			"mutated prior target name reservation evidence",
+		) {
+			t.Fatalf("reservation mutation error = %v", err)
+		}
+		if !reflect.DeepEqual(
+			authority.PriorReservations(),
+			[]TargetSchemaEvolutionNameReservation{{
+				Scope:     "relation",
+				Namespace: "warehouse",
+				Name:      "catalog_reservation",
+			}},
+		) {
+			t.Fatal("planner mutated authority-owned reservation evidence")
+		}
+	})
+}
+
+func TestPostgresPriorAwareTargetPlannerRejectsUnsupportedReservations(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	adapter := &postgresTargetAdapter{namespace: "tenant"}
+	priorSource := []schema.Table{{
+		Schema: "source",
+		Name:   "items",
+		Columns: []schema.Column{
+			stage4TargetSchemaProjectionPrimaryColumn("id", "bigint"),
+		},
+	}}
+	priorTarget, err := adapter.PlanTables(
+		"postgres",
+		priorSource,
+		"upsert",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name        string
+		reservation TargetSchemaEvolutionNameReservation
+		want        string
+	}{
+		{
+			name: "scope",
+			reservation: TargetSchemaEvolutionNameReservation{
+				Scope:     "constraint",
+				Namespace: "tenant",
+				Name:      "reserved",
+			},
+			want: "unsupported name reservation scope",
+		},
+		{
+			name: "namespace",
+			reservation: TargetSchemaEvolutionNameReservation{
+				Scope:     "relation",
+				Namespace: "other",
+				Name:      "reserved",
+			},
+			want: "differs from configured target namespace",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := adapter.PlanTablesAfterPrior(
+				"postgres",
+				priorSource,
+				priorTarget,
+				[]TargetSchemaEvolutionNameReservation{
+					test.reservation,
+				},
+				priorSource,
+				"upsert",
+			)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("reservation error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestStage4TargetSchemaEvolutionProjectionRejectsRetainedRebuildSubobjectsWithoutDurableTargetEvidence(
 	t *testing.T,
 ) {
@@ -1196,6 +1451,27 @@ type stage4TargetSchemaProjectionTestTarget struct {
 	nondeterministic       bool
 	renameFirstTable       bool
 	inventIdentityFrontier bool
+}
+
+type stage4PriorAwareProjectionTestTarget struct {
+	*stage4TargetSchemaProjectionTestTarget
+	priorAwareCalls    int
+	mutateReservations bool
+}
+
+func (target *stage4PriorAwareProjectionTestTarget) PlanTablesAfterPrior(
+	sourceEngine string,
+	_ []schema.Table,
+	_ []schema.Table,
+	reservations []TargetSchemaEvolutionNameReservation,
+	currentSourceTables []schema.Table,
+	mode string,
+) ([]schema.Table, error) {
+	target.priorAwareCalls++
+	if target.mutateReservations && len(reservations) != 0 {
+		reservations[0].Name = "mutated"
+	}
+	return target.PlanTables(sourceEngine, currentSourceTables, mode)
 }
 
 func (target *stage4TargetSchemaProjectionTestTarget) Engine() string {
