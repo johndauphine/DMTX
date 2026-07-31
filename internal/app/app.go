@@ -198,6 +198,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		guard:          guard,
 		resume:         false,
 		spoolDirectory: spoolDirectory,
+		configPath:     configPath,
 	}
 	result, err := migrate.Execute(migrationContext, cfg, observer)
 	if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {

@@ -872,6 +872,17 @@ func prepareStage4AdapterRun(
 	); err != nil {
 		return result, err
 	}
+	if err := publishStage4SchemaDecisions(
+		ctx,
+		observer,
+		run,
+		gate,
+		source.Engine(),
+		target.Engine(),
+		mode,
+	); err != nil {
+		return result, err
+	}
 	if err := requireStage4AdapterSeams(
 		cfg,
 		observer,
@@ -1012,6 +1023,103 @@ func prepareStage4AdapterRun(
 		return result, err
 	}
 	return result, nil
+}
+
+func publishStage4SchemaDecisions(
+	ctx context.Context,
+	observer TableObserver,
+	run Stage4RunContext,
+	gate Stage4SchemaGateResult,
+	sourceEngine string,
+	targetEngine string,
+	targetMode string,
+) error {
+	sink, ok := observer.(Stage4SchemaDecisionObserver)
+	if !ok {
+		if len(gate.Plan.Decisions) == 0 {
+			return nil
+		}
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"Stage 4 schema decisions require a typed decision observer before target planning",
+			),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	previousDigest, err := gate.PreviousSnapshot.Digest()
+	if err != nil {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"digest previous Stage 4 schema decision evidence: %w",
+				err,
+			),
+		)
+	}
+	currentDigest, err := gate.CurrentSnapshot.Digest()
+	if err != nil {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"digest current Stage 4 schema decision evidence: %w",
+				err,
+			),
+		)
+	}
+	successfulDigest, err := gate.Plan.SuccessfulSnapshot.Digest()
+	if err != nil {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"digest successful Stage 4 schema decision evidence: %w",
+				err,
+			),
+		)
+	}
+	decisions := make(
+		[]SchemaContractDecision,
+		len(gate.Plan.Decisions),
+	)
+	for index, decision := range gate.Plan.Decisions {
+		decisions[index] = decision
+		decisions[index].Previous = append(
+			json.RawMessage(nil),
+			decision.Previous...,
+		)
+		decisions[index].Current = append(
+			json.RawMessage(nil),
+			decision.Current...,
+		)
+	}
+	report := Stage4SchemaDecisionReport{
+		RunID:                  run.RunID,
+		Resume:                 run.Resume,
+		Baseline:               gate.Baseline,
+		SourceEngine:           sourceEngine,
+		TargetEngine:           targetEngine,
+		TargetMode:             targetMode,
+		GateTopologyHash:       gate.TopologyHash,
+		PreviousSchemaDigest:   previousDigest,
+		CurrentSchemaDigest:    currentDigest,
+		SuccessfulSchemaDigest: successfulDigest,
+		Decisions:              decisions,
+	}
+	if err := sink.ObserveStage4SchemaDecisions(
+		ctx,
+		report,
+	); err != nil {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"publish Stage 4 schema decisions before target planning: %w",
+				err,
+			),
+		)
+	}
+	return nil
 }
 
 func discoverStage4AdapterTables(

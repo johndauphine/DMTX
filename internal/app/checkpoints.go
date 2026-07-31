@@ -22,6 +22,7 @@ type tableCheckpointObserver struct {
 	resetTopology  bool
 	resume         bool
 	spoolDirectory string
+	configPath     string
 }
 
 // stage4FencedStateBackend is private proof that the application wrapped the
@@ -112,6 +113,32 @@ func (observer tableCheckpointObserver) Stage4RunContext() (
 		return migrate.Stage4RunContext{}, err
 	}
 	return run, nil
+}
+
+func (observer tableCheckpointObserver) ObserveStage4SchemaDecisions(
+	ctx context.Context,
+	report migrate.Stage4SchemaDecisionReport,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(observer.configPath) == "" {
+		return fmt.Errorf("Stage 4 schema decision audit path is required")
+	}
+	if strings.TrimSpace(observer.runID) == "" ||
+		report.RunID != observer.runID {
+		return fmt.Errorf(
+			"Stage 4 schema decision report run %q does not match observer run %q",
+			report.RunID,
+			observer.runID,
+		)
+	}
+	return appendAuditPayload(
+		observer.configPath,
+		observer.runID,
+		stage4SchemaDecisionsAuditEvent,
+		report,
+	)
 }
 
 func stage4SpoolDirectory(statePath, runID string) (string, error) {

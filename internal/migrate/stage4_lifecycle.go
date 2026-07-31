@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -126,6 +127,34 @@ func stage4BackendIsNil(backend Stage4StateBackend) bool {
 // lifecycle composition invokes it only when Stage 4 state is required.
 type Stage4RunObserver interface {
 	Stage4RunContext() (Stage4RunContext, error)
+}
+
+// Stage4SchemaDecisionReport is the complete deterministic fact published
+// after the durable schema gate and its sentinel evidence have been verified.
+// It contains route identity and schema digests, but never endpoint
+// credentials or row data.
+type Stage4SchemaDecisionReport struct {
+	RunID                  string                   `json:"run_id"`
+	Resume                 bool                     `json:"resume"`
+	Baseline               bool                     `json:"baseline"`
+	SourceEngine           string                   `json:"source_engine"`
+	TargetEngine           string                   `json:"target_engine"`
+	TargetMode             string                   `json:"target_mode"`
+	GateTopologyHash       string                   `json:"gate_topology_hash"`
+	PreviousSchemaDigest   string                   `json:"previous_schema_digest"`
+	CurrentSchemaDigest    string                   `json:"current_schema_digest"`
+	SuccessfulSchemaDigest string                   `json:"successful_schema_digest"`
+	Decisions              []SchemaContractDecision `json:"decisions"`
+}
+
+// Stage4SchemaDecisionObserver is optional for legacy/test observers.
+// Production observers implement it to durably publish every baseline,
+// report, retain, evolution, and discard decision before target planning.
+type Stage4SchemaDecisionObserver interface {
+	ObserveStage4SchemaDecisions(
+		context.Context,
+		Stage4SchemaDecisionReport,
+	) error
 }
 
 // ResolveStage4RunContext resolves and validates an optional observer context

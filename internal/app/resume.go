@@ -295,6 +295,7 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			resetTopology:  true,
 			resume:         true,
 			spoolDirectory: spoolDirectory,
+			configPath:     configPath,
 		},
 		existing: existing,
 	}

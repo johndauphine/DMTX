@@ -51,6 +51,13 @@ func (observer stage4AdapterObserver) Stage4RunContext() (
 	return observer.run, nil
 }
 
+func (stage4AdapterObserver) ObserveStage4SchemaDecisions(
+	context.Context,
+	Stage4SchemaDecisionReport,
+) error {
+	return nil
+}
+
 func (observer stage4AdapterObserver) ProtectTargetMutation(
 	ctx context.Context,
 	mutation func() error,
