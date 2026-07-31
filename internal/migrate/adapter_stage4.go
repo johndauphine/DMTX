@@ -114,12 +114,28 @@ func requireStage4AdapterConfigurationSeams(cfg config.Config) error {
 		)
 	}
 	if cfg.Migration.StrictConsistency {
-		return NewTransferError(
-			ErrorClassPolicy,
-			fmt.Errorf(
-				"Stage 4 strict consistency requires a composed adapter snapshot seam",
-			),
+		mode, err := normalizeAdapterTargetMode(
+			cfg.Migration.TargetMode,
 		)
+		if err != nil {
+			return err
+		}
+		if mode != "upsert" {
+			return NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 PostgreSQL strict consistency currently requires target mode upsert",
+				),
+			)
+		}
+		if len(cfg.Migration.DateUpdatedColumns) != 0 {
+			return NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 strict consistency is certified for full-table work; incremental windows retain ordinary live-count semantics",
+				),
+			)
+		}
 	}
 	if cfg.Migration.Validation.Mode == config.ValidationFull {
 		return NewTransferError(
@@ -178,6 +194,7 @@ type stage4AdapterPrepared struct {
 	targetTables                       []schema.Table
 	validation                         ValidationCoreProbe
 	validationPrimaryKeyEqualityProofs map[stage4RichTableKey]string
+	strictSourceRows                   map[stage4RichTableKey]int64
 	sourceCatalog                      map[stage4RichTableKey]schema.Table
 	work                               []stage4AdapterWork
 	network                            *networkStateCoordinator
@@ -203,6 +220,14 @@ func migrateWithStage4Adapters(
 	run Stage4RunContext,
 ) (Result, error) {
 	if _, err := requireStage4TableSetObserver(observer); err != nil {
+		return Result{}, err
+	}
+	if err := requireStage4PostgresStrictRoute(
+		cfg,
+		source,
+		target,
+		mode,
+	); err != nil {
 		return Result{}, err
 	}
 	prepared, err := prepareStage4AdapterRun(
@@ -231,6 +256,13 @@ func migrateWithStage4Adapters(
 	}
 	var networkExecution *stage4AdapterNetworkExecution
 	if mode == "upsert" {
+		var networkOptions []stage4AdapterNetworkAdmissionOption
+		if cfg.Migration.StrictConsistency {
+			networkOptions = append(
+				networkOptions,
+				withStage4StrictSnapshotComposition(),
+			)
+		}
 		networkExecution, err = admitStage4AdapterNetworkTransfer(
 			ctx,
 			cfg,
@@ -239,10 +271,24 @@ func migrateWithStage4Adapters(
 			target,
 			prepared,
 			nil,
+			networkOptions...,
 		)
 		if err != nil {
 			return Result{}, err
 		}
+	}
+	if cfg.Migration.StrictConsistency {
+		return migrateWithStage4PostgresStrictAdapters(
+			ctx,
+			cfg,
+			observer,
+			source,
+			target,
+			prepared,
+			networkExecution,
+			false,
+			nil,
+		)
 	}
 	if networkExecution != nil {
 		if err := checkpointStage4AdapterStableNetworkWork(
@@ -791,6 +837,14 @@ func resumeWithStage4Adapters(
 			),
 		)
 	}
+	if err := requireStage4PostgresStrictRoute(
+		cfg,
+		source,
+		target,
+		mode,
+	); err != nil {
+		return Result{}, err
+	}
 	prepared, err := prepareStage4AdapterRun(
 		ctx,
 		cfg,
@@ -827,6 +881,13 @@ func resumeWithStage4Adapters(
 	}
 	// Static route, target, dependency, replay, and resource admission precedes
 	// BeforeTables and every per-table durable reset/ensure operation.
+	var networkOptions []stage4AdapterNetworkAdmissionOption
+	if cfg.Migration.StrictConsistency {
+		networkOptions = append(
+			networkOptions,
+			withStage4StrictSnapshotComposition(),
+		)
+	}
 	networkExecution, err := admitStage4AdapterNetworkTransfer(
 		ctx,
 		cfg,
@@ -835,9 +896,23 @@ func resumeWithStage4Adapters(
 		target,
 		prepared,
 		nil,
+		networkOptions...,
 	)
 	if err != nil {
 		return resultForValidatedAdapterCheckpoints(validated), err
+	}
+	if cfg.Migration.StrictConsistency {
+		return migrateWithStage4PostgresStrictAdapters(
+			ctx,
+			cfg,
+			observer,
+			source,
+			target,
+			prepared,
+			networkExecution,
+			true,
+			validated,
+		)
 	}
 	if err := networkExecution.prevalidateCompletedTables(
 		ctx,
@@ -2360,9 +2435,29 @@ func stage4AdapterValidationTableSpecs(
 				)
 			}
 		}
+		var strictSourceRows *int64
+		if prepared.strictSourceRows != nil {
+			count, ok := prepared.strictSourceRows[stage4RichTableKey{
+				schema: table.Schema,
+				table:  table.Name,
+			}]
+			if !ok || count < 0 {
+				return nil, NewTransferError(
+					ErrorClassState,
+					fmt.Errorf(
+						"prepared Stage 4 strict-snapshot count for validation table (%q, %q) is missing or invalid",
+						table.Schema,
+						table.Name,
+					),
+				)
+			}
+			value := count
+			strictSourceRows = &value
+		}
 		specs = append(specs, ValidationTableSpec{
 			Table:                   table,
 			Projection:              adapterColumnNames(table),
+			StrictSourceRows:        strictSourceRows,
 			PrimaryKeyEqualityProof: primaryKeyEqualityProof,
 		})
 	}

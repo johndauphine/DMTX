@@ -111,6 +111,55 @@ type StrictConsistencyOpenRequest struct {
 	RequiredMigrationSnapshot *state.StrictMigrationSnapshot
 }
 
+// PlannedStrictConsistencyRequest is the two-phase stable-view request used
+// when the exact durable work topology can only be derived from the stable
+// source view itself. PostgreSQL network pagination is the first production
+// user: its range boundaries must be planned after the exported snapshot
+// exists, while target mutation remains forbidden until the resulting exact
+// work and same-view count evidence are both durable.
+type PlannedStrictConsistencyRequest struct {
+	RunID        string
+	SourceEngine StrictConsistencyEngine
+	Scope        state.StrictSnapshotScope
+	Resume       bool
+	ProcessEpoch string
+	State        StrictConsistencyState
+	Tasks        []state.TaskKey
+}
+
+// PlannedStrictConsistencyOpenRequest contains only structural table
+// identities. No durable attempt is claimed until Plan has checkpointed the
+// exact topology observed through the opened stable view.
+type PlannedStrictConsistencyOpenRequest struct {
+	RunID        string
+	SourceEngine StrictConsistencyEngine
+	Scope        state.StrictSnapshotScope
+	Resume       bool
+	ProcessEpoch string
+	Tasks        []state.TaskKey
+}
+
+// PlannedStrictConsistencyOpener opens an engine-owned stable view without
+// requiring a topology that cannot honestly exist before that view. The
+// returned capture must contain every requested task exactly once; attempt IDs
+// remain empty until the coordinator binds the finalized durable work.
+type PlannedStrictConsistencyOpener interface {
+	OpenPlannedStrictConsistency(
+		context.Context,
+		PlannedStrictConsistencyOpenRequest,
+	) (StrictConsistencySession, error)
+}
+
+// PlannedStrictConsistencyPlanner derives and durably checkpoints exact work
+// through the still-open stable session. It must return the complete finalized
+// attempt identity for every selected task. The coordinator re-reads durable
+// work and persists same-view evidence before returning an executable handle.
+type PlannedStrictConsistencyPlanner func(
+	context.Context,
+	StrictConsistencySession,
+	StrictConsistencyCapture,
+) ([]StrictConsistencyTable, error)
+
 // StrictConsistencyTableCapture contains no rows or credentials. The source
 // session must obtain ExactSourceRowCount through the exact same stable view
 // represented by SnapshotReference.
@@ -602,6 +651,612 @@ func BeginStrictConsistency(
 		execution.migrationSnapshot = &copyOwner
 	}
 	return execution, nil
+}
+
+// BeginPlannedStrictConsistency opens a stable source epoch before exact work
+// planning, then withholds execution authority until the planner has durably
+// checkpointed that exact work and the coordinator has persisted same-view
+// count evidence. This is intentionally a distinct API from
+// BeginStrictConsistency: silently opening a disposable planning snapshot
+// would violate migration-scoped point-in-time semantics.
+func BeginPlannedStrictConsistency(
+	ctx context.Context,
+	request PlannedStrictConsistencyRequest,
+	opener PlannedStrictConsistencyOpener,
+	plan PlannedStrictConsistencyPlanner,
+) (*StrictConsistencyExecution, error) {
+	normalized, err := normalizePlannedStrictConsistencyRequest(request)
+	if err != nil {
+		return nil, NewTransferError(ErrorClassPolicy, err)
+	}
+	if err := validateStrictConsistencyCapability(
+		normalized.SourceEngine,
+		normalized.Scope,
+	); err != nil {
+		return nil, NewTransferError(ErrorClassPolicy, err)
+	}
+	if ctx == nil {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			errors.New("planned strict consistency context is required"),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if isNilInterface(normalized.State) {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			errors.New(
+				"planned strict consistency state backend is required",
+			),
+		)
+	}
+	if isNilInterface(opener) {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			errors.New("planned strict consistency opener is required"),
+		)
+	}
+	if isNilInterface(plan) {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			errors.New("planned strict consistency planner is required"),
+		)
+	}
+
+	var latest state.StrictMigrationSnapshot
+	var latestFound bool
+	if normalized.Scope == state.StrictSnapshotMigration {
+		latest, latestFound, err = normalized.State.
+			LoadLatestStrictMigrationSnapshot(normalized.RunID)
+		if err != nil {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"load durable planned strict migration snapshot: %w",
+					err,
+				),
+			)
+		}
+		if latestFound {
+			base := StrictConsistencyRequest{
+				RunID:        normalized.RunID,
+				SourceEngine: normalized.SourceEngine,
+				Scope:        normalized.Scope,
+				Resume:       normalized.Resume,
+				ProcessEpoch: normalized.ProcessEpoch,
+				State:        normalized.State,
+			}
+			if err := validateDurableMigrationSnapshot(
+				base,
+				latest,
+			); err != nil {
+				return nil, NewTransferError(ErrorClassState, err)
+			}
+			if !normalized.Resume {
+				return nil, NewTransferError(
+					ErrorClassState,
+					errors.New(
+						"a durable strict migration snapshot already exists; continuing this run requires explicit resume",
+					),
+				)
+			}
+			if normalized.SourceEngine == StrictConsistencyPostgres &&
+				normalized.ProcessEpoch == latest.ProcessEpoch {
+				return nil, NewTransferError(
+					ErrorClassPolicy,
+					errors.New(
+						"PostgreSQL migration resume requires a fresh process epoch and a new exported snapshot",
+					),
+				)
+			}
+		}
+	}
+
+	session, err := opener.OpenPlannedStrictConsistency(
+		ctx,
+		PlannedStrictConsistencyOpenRequest{
+			RunID:        normalized.RunID,
+			SourceEngine: normalized.SourceEngine,
+			Scope:        normalized.Scope,
+			Resume:       normalized.Resume,
+			ProcessEpoch: normalized.ProcessEpoch,
+			Tasks: append(
+				[]state.TaskKey(nil),
+				normalized.Tasks...,
+			),
+		},
+	)
+	if err != nil {
+		primary := NewTransferError(ErrorClassPermanent, err)
+		if !isNilInterface(session) {
+			return nil, closeStrictConsistencyAfterFailure(
+				ctx,
+				session,
+				primary,
+			)
+		}
+		return nil, primary
+	}
+	if isNilInterface(session) {
+		return nil, NewTransferError(
+			ErrorClassPermanent,
+			errors.New(
+				"planned strict consistency opener returned a nil session",
+			),
+		)
+	}
+
+	capture, err := session.CaptureSameViewEvidence(ctx)
+	if err != nil {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			NewTransferError(
+				ErrorClassPermanent,
+				fmt.Errorf(
+					"capture planned strict same-view evidence: %w",
+					err,
+				),
+			),
+		)
+	}
+	if err := validateUnboundStrictConsistencyCapture(
+		normalized,
+		capture,
+	); err != nil {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			NewTransferError(ErrorClassPermanent, err),
+		)
+	}
+	if normalized.SourceEngine == StrictConsistencyPostgres &&
+		normalized.Scope == state.StrictSnapshotMigration &&
+		normalized.Resume && latestFound &&
+		(capture.MigrationEpochID == latest.EpochID ||
+			capture.MigrationSnapshotReference ==
+				latest.SnapshotReference) {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			NewTransferError(
+				ErrorClassPermanent,
+				errors.New(
+					"PostgreSQL migration resume must open a new exported snapshot epoch and reference",
+				),
+			),
+		)
+	}
+
+	finalized, err := plan(
+		ctx,
+		session,
+		cloneStrictConsistencyCapture(capture),
+	)
+	if err != nil {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			err,
+		)
+	}
+	finalRequest, err := normalizeStrictConsistencyRequest(
+		StrictConsistencyRequest{
+			RunID:        normalized.RunID,
+			SourceEngine: normalized.SourceEngine,
+			Scope:        normalized.Scope,
+			Resume:       normalized.Resume,
+			ProcessEpoch: normalized.ProcessEpoch,
+			State:        normalized.State,
+			Tables:       finalized,
+		},
+	)
+	if err != nil {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			NewTransferError(ErrorClassPolicy, err),
+		)
+	}
+	if err := requirePlannedStrictConsistencyTaskSet(
+		normalized.Tasks,
+		finalRequest.Tables,
+	); err != nil {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			NewTransferError(ErrorClassState, err),
+		)
+	}
+	if err := requireStrictConsistencyWorkTasks(finalRequest); err != nil {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			NewTransferError(ErrorClassState, err),
+		)
+	}
+	existingEvidence, err := loadStrictConsistencyAttemptEvidence(
+		finalRequest,
+	)
+	if err != nil {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			NewTransferError(ErrorClassState, err),
+		)
+	}
+	capture, err = bindPlannedStrictConsistencyAttempts(
+		capture,
+		finalRequest.Tables,
+	)
+	if err != nil {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			NewTransferError(ErrorClassPermanent, err),
+		)
+	}
+	evidence, owner, err := buildStrictConsistencyEvidence(
+		finalRequest,
+		capture,
+		nil,
+	)
+	if err != nil {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			NewTransferError(ErrorClassPermanent, err),
+		)
+	}
+	if err := reconcileStrictConsistencyAttemptEvidence(
+		finalRequest,
+		evidence,
+		owner,
+		existingEvidence,
+	); err != nil {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			NewTransferError(ErrorClassState, err),
+		)
+	}
+	if owner != nil {
+		if err := normalized.State.SaveStrictMigrationSnapshot(
+			*owner,
+		); err != nil {
+			return nil, closeStrictConsistencyAfterFailure(
+				ctx,
+				session,
+				NewTransferError(
+					ErrorClassState,
+					fmt.Errorf(
+						"persist planned strict migration snapshot before target mutation: %w",
+						err,
+					),
+				),
+			)
+		}
+	}
+	for _, record := range evidence {
+		if err := ctx.Err(); err != nil {
+			return nil, closeStrictConsistencyAfterFailure(
+				ctx,
+				session,
+				err,
+			)
+		}
+		if err := normalized.State.SaveStrictSnapshotEvidence(
+			record,
+		); err != nil {
+			return nil, closeStrictConsistencyAfterFailure(
+				ctx,
+				session,
+				NewTransferError(
+					ErrorClassState,
+					fmt.Errorf(
+						"persist planned strict evidence for %s.%s before target mutation: %w",
+						record.Task.Schema,
+						record.Task.Table,
+						err,
+					),
+				),
+			)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			err,
+		)
+	}
+	if err := requireStrictConsistencyWorkTasks(finalRequest); err != nil {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"revalidate durable planned strict work immediately before authorization: %w",
+					err,
+				),
+			),
+		)
+	}
+
+	execution := &StrictConsistencyExecution{
+		runID:        finalRequest.RunID,
+		sourceEngine: finalRequest.SourceEngine,
+		scope:        finalRequest.Scope,
+		processEpoch: finalRequest.ProcessEpoch,
+		state:        finalRequest.State,
+		tables: append(
+			[]StrictConsistencyTable(nil),
+			finalRequest.Tables...,
+		),
+		evidence: append(
+			[]state.StrictSnapshotEvidence(nil),
+			evidence...,
+		),
+		session: session,
+	}
+	if owner != nil {
+		copyOwner := *owner
+		execution.migrationSnapshot = &copyOwner
+	}
+	return execution, nil
+}
+
+func normalizePlannedStrictConsistencyRequest(
+	request PlannedStrictConsistencyRequest,
+) (PlannedStrictConsistencyRequest, error) {
+	if request.RunID == "" ||
+		strings.TrimSpace(request.RunID) != request.RunID {
+		return PlannedStrictConsistencyRequest{}, errors.New(
+			"planned strict consistency run ID is required and must not have surrounding whitespace",
+		)
+	}
+	engine, err := normalizeStrictConsistencyEngine(request.SourceEngine)
+	if err != nil {
+		return PlannedStrictConsistencyRequest{}, err
+	}
+	if engine != StrictConsistencyPostgres {
+		return PlannedStrictConsistencyRequest{}, fmt.Errorf(
+			"planned strict consistency is not certified for source engine %q",
+			engine,
+		)
+	}
+	if request.ProcessEpoch == "" ||
+		strings.TrimSpace(request.ProcessEpoch) !=
+			request.ProcessEpoch {
+		return PlannedStrictConsistencyRequest{}, errors.New(
+			"planned strict consistency process epoch is required and must not have surrounding whitespace",
+		)
+	}
+	if err := validateCredentialFreeIdentifier(
+		"process epoch",
+		request.ProcessEpoch,
+	); err != nil {
+		return PlannedStrictConsistencyRequest{}, err
+	}
+	if len(request.Tasks) == 0 {
+		return PlannedStrictConsistencyRequest{}, errors.New(
+			"planned strict consistency requires at least one selected table",
+		)
+	}
+	tasks := append([]state.TaskKey(nil), request.Tasks...)
+	seen := make(map[state.TaskKey]struct{}, len(tasks))
+	for index, task := range tasks {
+		if err := task.Validate(); err != nil {
+			return PlannedStrictConsistencyRequest{}, fmt.Errorf(
+				"planned strict consistency task %d: %w",
+				index,
+				err,
+			)
+		}
+		if task.Type != stage4AdapterNetworkTaskType ||
+			task.Schema == "" || task.Partition != "" {
+			return PlannedStrictConsistencyRequest{}, fmt.Errorf(
+				"planned strict consistency task %d requires one unpartitioned %s task with an explicit schema",
+				index,
+				stage4AdapterNetworkTaskType,
+			)
+		}
+		if _, duplicate := seen[task]; duplicate {
+			return PlannedStrictConsistencyRequest{}, fmt.Errorf(
+				"planned strict consistency task is duplicated: type=%q schema=%q table=%q partition=%q",
+				task.Type,
+				task.Schema,
+				task.Table,
+				task.Partition,
+			)
+		}
+		seen[task] = struct{}{}
+	}
+	sort.Slice(tasks, func(left, right int) bool {
+		return strictConsistencyTaskLess(tasks[left], tasks[right])
+	})
+	request.SourceEngine = engine
+	request.Tasks = tasks
+	return request, nil
+}
+
+func validateUnboundStrictConsistencyCapture(
+	request PlannedStrictConsistencyRequest,
+	capture StrictConsistencyCapture,
+) error {
+	migrationScoped := request.Scope == state.StrictSnapshotMigration
+	if migrationScoped {
+		if err := validateCredentialFreeIdentifier(
+			"migration epoch",
+			capture.MigrationEpochID,
+		); err != nil {
+			return err
+		}
+		if err := validateSnapshotReference(
+			capture.MigrationSnapshotReference,
+		); err != nil {
+			return err
+		}
+		if capture.MigrationCapturedAt.IsZero() {
+			return errors.New(
+				"planned strict migration snapshot capture time is required",
+			)
+		}
+	} else if capture.MigrationEpochID != "" ||
+		capture.MigrationSnapshotReference != "" ||
+		!capture.MigrationCapturedAt.IsZero() {
+		return errors.New(
+			"planned table-scoped strict evidence cannot claim a migration epoch or snapshot",
+		)
+	}
+	expected := make(map[state.TaskKey]struct{}, len(request.Tasks))
+	for _, task := range request.Tasks {
+		expected[task] = struct{}{}
+	}
+	seen := make(map[state.TaskKey]struct{}, len(capture.Tables))
+	for index, table := range capture.Tables {
+		if _, ok := expected[table.Task]; !ok {
+			return fmt.Errorf(
+				"planned strict session returned an unexpected task at index %d",
+				index,
+			)
+		}
+		if _, duplicate := seen[table.Task]; duplicate {
+			return fmt.Errorf(
+				"planned strict session returned duplicate evidence for %s.%s",
+				table.Task.Schema,
+				table.Task.Table,
+			)
+		}
+		if table.AttemptID != "" {
+			return fmt.Errorf(
+				"planned strict session prematurely bound attempt evidence for %s.%s",
+				table.Task.Schema,
+				table.Task.Table,
+			)
+		}
+		if table.ExactSourceRowCount < 0 ||
+			table.CapturedAt.IsZero() {
+			return fmt.Errorf(
+				"planned strict session returned invalid count evidence for %s.%s",
+				table.Task.Schema,
+				table.Task.Table,
+			)
+		}
+		if err := validateSnapshotReference(
+			table.SnapshotReference,
+		); err != nil {
+			return fmt.Errorf(
+				"planned strict session reference for %s.%s: %w",
+				table.Task.Schema,
+				table.Task.Table,
+				err,
+			)
+		}
+		if migrationScoped &&
+			table.SnapshotReference !=
+				capture.MigrationSnapshotReference {
+			return fmt.Errorf(
+				"planned strict session table %s.%s differs from the migration snapshot",
+				table.Task.Schema,
+				table.Task.Table,
+			)
+		}
+		seen[table.Task] = struct{}{}
+	}
+	if len(seen) != len(expected) {
+		return errors.New(
+			"planned strict session omitted selected table evidence",
+		)
+	}
+	return nil
+}
+
+func requirePlannedStrictConsistencyTaskSet(
+	expected []state.TaskKey,
+	finalized []StrictConsistencyTable,
+) error {
+	if len(expected) != len(finalized) {
+		return errors.New(
+			"planned strict work does not cover the selected table set",
+		)
+	}
+	selected := make(map[state.TaskKey]struct{}, len(expected))
+	for _, task := range expected {
+		selected[task] = struct{}{}
+	}
+	for _, table := range finalized {
+		if _, ok := selected[table.Task]; !ok {
+			return fmt.Errorf(
+				"planned strict work returned an unexpected task: type=%q schema=%q table=%q partition=%q",
+				table.Task.Type,
+				table.Task.Schema,
+				table.Task.Table,
+				table.Task.Partition,
+			)
+		}
+		delete(selected, table.Task)
+	}
+	if len(selected) != 0 {
+		return errors.New(
+			"planned strict work omitted a selected table task",
+		)
+	}
+	return nil
+}
+
+func bindPlannedStrictConsistencyAttempts(
+	capture StrictConsistencyCapture,
+	tables []StrictConsistencyTable,
+) (StrictConsistencyCapture, error) {
+	attempts := make(
+		map[state.TaskKey]string,
+		len(tables),
+	)
+	for _, table := range tables {
+		attempts[table.Task] = table.AttemptID
+	}
+	result := cloneStrictConsistencyCapture(capture)
+	for index := range result.Tables {
+		attemptID, ok := attempts[result.Tables[index].Task]
+		if !ok {
+			return StrictConsistencyCapture{}, fmt.Errorf(
+				"planned strict evidence has no finalized work for %s.%s",
+				result.Tables[index].Task.Schema,
+				result.Tables[index].Task.Table,
+			)
+		}
+		if result.Tables[index].AttemptID != "" &&
+			result.Tables[index].AttemptID != attemptID {
+			return StrictConsistencyCapture{}, fmt.Errorf(
+				"planned strict evidence changed its finalized attempt for %s.%s",
+				result.Tables[index].Task.Schema,
+				result.Tables[index].Task.Table,
+			)
+		}
+		result.Tables[index].AttemptID = attemptID
+	}
+	return result, nil
+}
+
+func cloneStrictConsistencyCapture(
+	capture StrictConsistencyCapture,
+) StrictConsistencyCapture {
+	capture.Tables = append(
+		[]StrictConsistencyTableCapture(nil),
+		capture.Tables...,
+	)
+	return capture
+}
+
+func strictConsistencyTaskLess(left, right state.TaskKey) bool {
+	return strictConsistencyTableLess(
+		StrictConsistencyTable{Task: left},
+		StrictConsistencyTable{Task: right},
+	)
 }
 
 func normalizeStrictConsistencyRequest(

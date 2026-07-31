@@ -82,8 +82,9 @@ type postgresStrictReader struct {
 }
 
 var (
-	_ StrictConsistencyOpener  = (*PostgresStrictConsistencyOpener)(nil)
-	_ StrictConsistencySession = (*PostgresStrictConsistencySession)(nil)
+	_ StrictConsistencyOpener        = (*PostgresStrictConsistencyOpener)(nil)
+	_ PlannedStrictConsistencyOpener = (*PostgresStrictConsistencyOpener)(nil)
+	_ StrictConsistencySession       = (*PostgresStrictConsistencySession)(nil)
 )
 
 // NewPostgresStrictConsistencyOpener returns a fail-closed PostgreSQL opener.
@@ -319,6 +320,164 @@ func (opener *PostgresStrictConsistencyOpener) OpenStrictConsistency(
 		))
 	}
 	return session, nil
+}
+
+// OpenPlannedStrictConsistency opens the exported PostgreSQL view before its
+// pagination-bound durable topology exists. The ordinary opener is reused for
+// all TLS/version/transaction admission and ownership. Its process-local
+// placeholder attempts are erased before return; BeginPlannedStrictConsistency
+// is the only component allowed to bind finalized attempts after exact work is
+// durable.
+func (opener *PostgresStrictConsistencyOpener) OpenPlannedStrictConsistency(
+	ctx context.Context,
+	request PlannedStrictConsistencyOpenRequest,
+) (StrictConsistencySession, error) {
+	normalized, err := normalizePostgresPlannedOpenRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	tables := make(
+		[]StrictConsistencyTable,
+		len(normalized.Tasks),
+	)
+	for index, task := range normalized.Tasks {
+		payload := []byte(
+			normalized.RunID + "\x00" +
+				normalized.ProcessEpoch + "\x00" +
+				task.Type + "\x00" +
+				task.Schema + "\x00" +
+				task.Table + "\x00" +
+				task.Partition,
+		)
+		digest := sha256.Sum256(payload)
+		topology := "planned-" + hex.EncodeToString(digest[:])
+		attemptID, err := BuildStrictConsistencyAttemptID(
+			task,
+			topology,
+			0,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"build PostgreSQL planned strict placeholder for %s.%s: %w",
+				task.Schema,
+				task.Table,
+				err,
+			)
+		}
+		tables[index] = StrictConsistencyTable{
+			Task:             task,
+			AttemptID:        attemptID,
+			WorkTopologyHash: topology,
+		}
+	}
+	raw, err := opener.OpenStrictConsistency(
+		ctx,
+		StrictConsistencyOpenRequest{
+			RunID:        normalized.RunID,
+			SourceEngine: normalized.SourceEngine,
+			Scope:        normalized.Scope,
+			Resume:       normalized.Resume,
+			ProcessEpoch: normalized.ProcessEpoch,
+			Tables:       tables,
+		},
+	)
+	if err != nil {
+		return raw, err
+	}
+	session, ok := raw.(*PostgresStrictConsistencySession)
+	if !ok || session == nil {
+		primary := errors.New(
+			"PostgreSQL planned strict opener returned an unexpected session",
+		)
+		if !isNilInterface(raw) {
+			if cleanupErr := closeStrictConsistencySession(
+				ctx,
+				raw,
+			); cleanupErr != nil {
+				return nil, errors.Join(
+					primary,
+					fmt.Errorf(
+						"release unexpected PostgreSQL planned strict session: %w",
+						cleanupErr,
+					),
+				)
+			}
+		}
+		return nil, primary
+	}
+	session.mu.Lock()
+	for index := range session.capture.Tables {
+		session.capture.Tables[index].AttemptID = ""
+	}
+	session.mu.Unlock()
+	return session, nil
+}
+
+func normalizePostgresPlannedOpenRequest(
+	request PlannedStrictConsistencyOpenRequest,
+) (PlannedStrictConsistencyOpenRequest, error) {
+	if request.SourceEngine != StrictConsistencyPostgres {
+		return PlannedStrictConsistencyOpenRequest{}, fmt.Errorf(
+			"PostgreSQL planned strict opener cannot serve source engine %q",
+			request.SourceEngine,
+		)
+	}
+	if request.Scope != state.StrictSnapshotTable &&
+		request.Scope != state.StrictSnapshotMigration {
+		return PlannedStrictConsistencyOpenRequest{}, fmt.Errorf(
+			"PostgreSQL planned strict consistency scope %q is unsupported",
+			request.Scope,
+		)
+	}
+	if err := validateCredentialFreeIdentifier(
+		"PostgreSQL planned strict run ID",
+		request.RunID,
+	); err != nil {
+		return PlannedStrictConsistencyOpenRequest{}, err
+	}
+	if err := validateCredentialFreeIdentifier(
+		"PostgreSQL planned strict process epoch",
+		request.ProcessEpoch,
+	); err != nil {
+		return PlannedStrictConsistencyOpenRequest{}, err
+	}
+	if len(request.Tasks) == 0 {
+		return PlannedStrictConsistencyOpenRequest{}, errors.New(
+			"PostgreSQL planned strict consistency requires selected tables",
+		)
+	}
+	tasks := append([]state.TaskKey(nil), request.Tasks...)
+	seen := make(map[state.TaskKey]struct{}, len(tasks))
+	for index, task := range tasks {
+		if err := task.Validate(); err != nil {
+			return PlannedStrictConsistencyOpenRequest{}, fmt.Errorf(
+				"PostgreSQL planned strict table %d: %w",
+				index,
+				err,
+			)
+		}
+		if task.Type != stage4AdapterNetworkTaskType ||
+			task.Schema == "" || task.Partition != "" {
+			return PlannedStrictConsistencyOpenRequest{}, fmt.Errorf(
+				"PostgreSQL planned strict table %d requires one unpartitioned %s task with an explicit schema",
+				index,
+				stage4AdapterNetworkTaskType,
+			)
+		}
+		if _, duplicate := seen[task]; duplicate {
+			return PlannedStrictConsistencyOpenRequest{}, fmt.Errorf(
+				"PostgreSQL planned strict table task is duplicated: schema=%q table=%q",
+				task.Schema,
+				task.Table,
+			)
+		}
+		seen[task] = struct{}{}
+	}
+	sort.Slice(tasks, func(left, right int) bool {
+		return strictConsistencyTaskLess(tasks[left], tasks[right])
+	})
+	request.Tasks = tasks
+	return request, nil
 }
 
 // CaptureSameViewEvidence returns the exact counts captured through the

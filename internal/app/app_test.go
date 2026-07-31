@@ -106,7 +106,7 @@ func TestRunRejectsStrictConsistencyBeforeStateCreation(t *testing.T) {
 	}
 	if !strings.Contains(
 		errors.String(),
-		`source engine sqlite does not support strict consistency scope "table"`,
+		`Stage 4 strict consistency scope "table" is certified only for PostgreSQL-to-PostgreSQL upsert`,
 	) {
 		t.Fatalf("stderr = %q", errors.String())
 	}

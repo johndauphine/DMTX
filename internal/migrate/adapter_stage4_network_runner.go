@@ -71,6 +71,7 @@ type stage4AdapterNetworkExecution struct {
 	retryPolicy RetryPolicy
 
 	nextGlobalRange uint64
+	finalizeWork    func(stage4AdapterWork) (stage4AdapterWork, error)
 }
 
 // stage4AdapterNetworkWave is one table's exact range set. Tables execute in
@@ -95,6 +96,20 @@ type stage4AdapterNetworkTableExecution struct {
 	global      []NetworkRangePlan
 }
 
+type stage4AdapterNetworkAdmissionOptions struct {
+	strictSnapshotComposition bool
+}
+
+type stage4AdapterNetworkAdmissionOption func(
+	*stage4AdapterNetworkAdmissionOptions,
+)
+
+func withStage4StrictSnapshotComposition() stage4AdapterNetworkAdmissionOption {
+	return func(options *stage4AdapterNetworkAdmissionOptions) {
+		options.strictSnapshotComposition = true
+	}
+}
+
 // admitStage4AdapterNetworkTransfer is read-only. The caller invokes it before
 // checkpointing or target.PrepareTables, then passes the returned execution to
 // runStage4AdapterNetworkTransfer after all ordinary BeforeTable callbacks.
@@ -108,6 +123,7 @@ func admitStage4AdapterNetworkTransfer(
 	target targetAdapter,
 	prepared stage4AdapterPrepared,
 	resourceOverride *config.EffectiveTransferPlan,
+	optionValues ...stage4AdapterNetworkAdmissionOption,
 ) (*stage4AdapterNetworkExecution, error) {
 	if ctx == nil {
 		return nil, NewTransferError(
@@ -118,7 +134,23 @@ func admitStage4AdapterNetworkTransfer(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := requireStage4AdapterNetworkMode(cfg, prepared); err != nil {
+	options := stage4AdapterNetworkAdmissionOptions{}
+	for _, option := range optionValues {
+		if option == nil {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"Stage 4 network admission option is unavailable",
+				),
+			)
+		}
+		option(&options)
+	}
+	if err := requireStage4AdapterNetworkMode(
+		cfg,
+		prepared,
+		options,
+	); err != nil {
 		return nil, err
 	}
 	if err := prepared.run.Validate(); err != nil {
@@ -206,6 +238,13 @@ func admitStage4AdapterNetworkTransfer(
 	)
 	if err != nil {
 		return nil, err
+	}
+	if options.strictSnapshotComposition {
+		resources, err =
+			reserveStage4AdapterStrictSnapshotOwner(resources)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := validateStage4AdapterNetworkDependencyOrder(
 		prepared.plans,
@@ -661,6 +700,7 @@ func (execution *stage4AdapterNetworkExecution) openTable(
 	ctx context.Context,
 	planIndex int,
 	resume bool,
+	stableSessions ...*adapterStableNetworkTableSession,
 ) (_ *stage4AdapterNetworkTableExecution, resultErr error) {
 	if execution == nil || !execution.deferred {
 		return nil, NewTransferError(
@@ -686,6 +726,14 @@ func (execution *stage4AdapterNetworkExecution) openTable(
 			fmt.Errorf("Stage 4 stable table index is outside the plan"),
 		)
 	}
+	if len(stableSessions) > 1 {
+		return nil, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"Stage 4 stable table accepts at most one owned source session",
+			),
+		)
+	}
 	execution.mu.Lock()
 	if execution.binding || execution.bound || execution.started {
 		execution.mu.Unlock()
@@ -708,17 +756,32 @@ func (execution *stage4AdapterNetworkExecution) openTable(
 	plan := cloneStage4AdapterNetworkTablePlan(
 		execution.prepared.plans[planIndex],
 	)
-	session, err := OpenAdapterStableNetworkTableSource(
-		ctx,
-		execution.source,
-		plan.source,
-	)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"open Stage 4 stable source view for %s: %w",
-			plan.source.Name,
-			err,
+	var session *adapterStableNetworkTableSession
+	if len(stableSessions) == 1 {
+		session = stableSessions[0]
+		if session == nil {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"Stage 4 supplied stable source session for %s is unavailable",
+					plan.source.Name,
+				),
+			)
+		}
+	} else {
+		var err error
+		session, err = OpenAdapterStableNetworkTableSource(
+			ctx,
+			execution.source,
+			plan.source,
 		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"open Stage 4 stable source view for %s: %w",
+				plan.source.Name,
+				err,
+			)
+		}
 	}
 	defer func() {
 		if resultErr == nil {
@@ -803,6 +866,17 @@ func (execution *stage4AdapterNetworkExecution) openTable(
 	)
 	if err != nil {
 		return nil, err
+	}
+	if execution.finalizeWork != nil {
+		finalized, finalizeErr := execution.finalizeWork(bound[0])
+		if finalizeErr != nil {
+			return nil, fmt.Errorf(
+				"finalize Stage 4 stable work identity for %s: %w",
+				plan.source.Name,
+				finalizeErr,
+			)
+		}
+		bound[0] = finalized
 	}
 	coordinator, err := newStage4AdapterNetworkCoordinator(
 		execution.prepared.run,
@@ -982,6 +1056,48 @@ func clampStage4AdapterNetworkReaders(
 			ErrorClassPolicy,
 			fmt.Errorf(
 				"Stage 4 stable source resources cannot schedule admitted readers and writers",
+			),
+		)
+	}
+	return resources, nil
+}
+
+// reserveStage4AdapterStrictSnapshotOwner keeps the PostgreSQL snapshot
+// exporter inside the same admitted connection envelope as imported readers
+// and writers. Prefer retaining reader parallelism because independent
+// imported readers are the strict route's source-side concurrency mechanism.
+func reserveStage4AdapterStrictSnapshotOwner(
+	resources config.EffectiveTransferPlan,
+) (config.EffectiveTransferPlan, error) {
+	if resources.ConnectionLimit.Value >=
+		resources.Readers.Value+resources.Writers.Value+1 {
+		return resources, nil
+	}
+	switch {
+	case resources.Writers.Value > 1:
+		resources.Writers = config.EffectiveInt{
+			Value:      resources.Writers.Value - 1,
+			Provenance: config.ProvenanceSafetyClamped,
+		}
+	case resources.Readers.Value > 1:
+		resources.Readers = config.EffectiveInt{
+			Value:      resources.Readers.Value - 1,
+			Provenance: config.ProvenanceSafetyClamped,
+		}
+	default:
+		return config.EffectiveTransferPlan{}, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 strict consistency requires connection_limit of at least 3 for one snapshot owner, one reader, and one writer",
+			),
+		)
+	}
+	if resources.ConnectionLimit.Value <
+		resources.Readers.Value+resources.Writers.Value+1 {
+		return config.EffectiveTransferPlan{}, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 strict consistency cannot reserve its snapshot owner inside the admitted connection limit",
 			),
 		)
 	}
@@ -1924,6 +2040,19 @@ func (
 			)
 		}
 	}
+	if execution.finalizeWork != nil {
+		base, err = execution.finalizeWork(base)
+		if err != nil {
+			return stage4AdapterWork{}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"restore Stage 4 completed strict topology for %s: %w",
+					base.task.Table,
+					err,
+				),
+			)
+		}
+	}
 	return base, nil
 }
 
@@ -1968,6 +2097,7 @@ func stage4AdapterKeyTupleFromState(
 func requireStage4AdapterNetworkMode(
 	cfg config.Config,
 	prepared stage4AdapterPrepared,
+	options stage4AdapterNetworkAdmissionOptions,
 ) error {
 	if cfg.Migration.TargetMode != "upsert" ||
 		prepared.mode != "upsert" {
@@ -1978,11 +2108,21 @@ func requireStage4AdapterNetworkMode(
 			),
 		)
 	}
-	if cfg.Migration.StrictConsistency {
+	if cfg.Migration.StrictConsistency &&
+		!options.strictSnapshotComposition {
 		return NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
 				"Stage 4 strict consistency requires a composed network snapshot runner",
+			),
+		)
+	}
+	if !cfg.Migration.StrictConsistency &&
+		options.strictSnapshotComposition {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"Stage 4 strict network snapshot composition was enabled without strict consistency",
 			),
 		)
 	}

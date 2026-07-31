@@ -28,11 +28,14 @@ func resolveMigration(
 		return resolvedAdapterRoute{}, err
 	}
 	if cfg.Migration.StrictConsistency {
-		return resolvedAdapterRoute{}, fmt.Errorf(
-			"source engine %s does not support strict consistency scope %q in this implementation",
-			source.engine,
-			strictScope,
-		)
+		if source.engine != "postgres" ||
+			target.engine != "postgres" ||
+			cfg.Migration.TargetMode != "upsert" {
+			return resolvedAdapterRoute{}, fmt.Errorf(
+				"Stage 4 strict consistency scope %q is certified only for PostgreSQL-to-PostgreSQL upsert",
+				strictScope,
+			)
+		}
 	}
 	if config.SameEndpoint(cfg.Source, cfg.Target) {
 		return resolvedAdapterRoute{}, fmt.Errorf(

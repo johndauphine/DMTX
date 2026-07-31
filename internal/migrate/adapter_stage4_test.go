@@ -304,7 +304,7 @@ func TestStage4AdapterFailsBeforeTargetPlanningWhenRequiredSeamIsMissing(
 			configure: func(cfg *config.Config) {
 				cfg.Migration.StrictConsistency = true
 			},
-			wantError:  "snapshot seam",
+			wantError:  "certified only for PostgreSQL-to-PostgreSQL upsert",
 			targetMode: "upsert",
 		},
 		{

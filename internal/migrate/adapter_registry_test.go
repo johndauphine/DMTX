@@ -416,7 +416,7 @@ func TestStrictConsistencyPrecedesAdapterConstruction(t *testing.T) {
 	}
 }
 
-func TestBuiltInRoutesRejectStrictConsistencyScopes(t *testing.T) {
+func TestBuiltInRoutesRejectUncertifiedStrictConsistencyScopes(t *testing.T) {
 	pairs := make([]adapterPair, 0, len(builtInAdapters.certified))
 	for pair := range builtInAdapters.certified {
 		pairs = append(pairs, pair)
@@ -450,7 +450,7 @@ func TestBuiltInRoutesRejectStrictConsistencyScopes(t *testing.T) {
 					if err == nil ||
 						!strings.Contains(
 							err.Error(),
-							"source engine "+pair.source,
+							"certified only for PostgreSQL-to-PostgreSQL upsert",
 						) ||
 						!strings.Contains(
 							err.Error(),
@@ -466,6 +466,71 @@ func TestBuiltInRoutesRejectStrictConsistencyScopes(t *testing.T) {
 					}
 				},
 			)
+		}
+	}
+}
+
+func TestPostgresToPostgresUpsertAdmitsStrictConsistencyScopes(
+	t *testing.T,
+) {
+	registry, err := newAdapterRegistry(
+		[]sourceRole{{
+			engine: "postgres",
+			open: func(
+				context.Context,
+				config.Endpoint,
+			) (sourceAdapter, error) {
+				return nil, nil
+			},
+		}},
+		[]targetRole{{
+			engine: "postgres",
+			capability: engine.Capability{
+				Upsert:   true,
+				BulkPath: "test batches",
+			},
+			open: func(
+				context.Context,
+				config.Endpoint,
+			) (targetAdapter, error) {
+				return nil, nil
+			},
+		}},
+		[]adapterPair{{source: "postgres", target: "postgres"}},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scope := range []string{"table", "migration"} {
+		cfg := config.Config{
+			Source: config.Endpoint{
+				Type:     "postgres",
+				Host:     "source.example.test",
+				Database: "source",
+			},
+			Target: config.Endpoint{
+				Type:     "postgres",
+				Host:     "target.example.test",
+				Database: "target",
+			},
+			Migration: config.Migration{
+				TargetMode:             "upsert",
+				StrictConsistency:      true,
+				StrictConsistencyScope: scope,
+			},
+		}
+		route, err := resolveMigration(cfg, registry)
+		if err != nil {
+			t.Fatalf(
+				"resolve PostgreSQL strict scope %s: %v",
+				scope,
+				err,
+			)
+		}
+		if route.source.engine != "postgres" ||
+			route.target.engine != "postgres" {
+			t.Fatalf("strict route = %#v", route)
 		}
 	}
 }
