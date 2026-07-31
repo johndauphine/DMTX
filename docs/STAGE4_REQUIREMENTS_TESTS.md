@@ -604,6 +604,20 @@ unsafe-evolution matrix had no fixtures was wrong. What remains is
 
 ### E. Dry-run (Section 7.2) — started 2026-07-31
 
+**Hazard to know before implementing target preflight.** Verified 2026-07-31 by
+probe: with `modernc.org/sqlite`, `sql.Open` is lazy and creates nothing, but
+`db.Ping()` **creates the database file**. A target preflight that connects the
+way every other code path connects would therefore create the target during a
+dry run, silently breaking the zero-mutation guarantee — and for a
+`drop_recreate` migration into a new SQLite file, a not-yet-existing target is
+the normal case, not an error. Target preflight must distinguish "target does
+not exist yet, which is fine" from "target exists but is unusable", and must not
+reach for a connection to answer the first. The regression guard already exists:
+`TestStage4DryRunDisclosesTuningAndDeletePolicy` asserts the dry run leaves the
+directory containing only the source file, so this mistake fails a test rather
+than shipping.
+
+
 Tuning disclosure with provenance and delete-policy disclosure have landed, and
 the zero-mutation guarantee is now asserted rather than assumed. Remaining:
 
