@@ -380,29 +380,37 @@ not weakened, by S4.2.
 
 ## Section 12 — Validation
 
-Current validation is SQLite count-only (`TestValidateSQLiteReturnsStableMismatchFinding`,
-`TestValidateSQLiteAllowsTargetSupersetForUpsert`). The following Stage 4
-contracts remain incomplete.
+**Substantially corrected 2026-07-31.** The original text — "current validation
+is SQLite count-only" — is obsolete. Mode inclusion, timeout and estimate
+policy, reconciliation-aware count policy, strict-snapshot counts, NULL parity,
+deterministic sampling, and canonical value comparison are all implemented, with
+roughly 50 fixtures in `validation_core_test.go`, `validation_values_test.go`,
+and `adapter_validation_database_test.go`. None of the proposed fixture names
+below were used; the implementations chose different names.
 
-| Normative behavior | Required missing fixtures |
-|---|---|
-| Mode inclusion: default/count, NULL parity, sample; explicit rejection of unimplemented `full`. | `TestValidationModeInclusion`, `TestValidationFullModeRejected`. |
-| Exact per-table count with timeout; estimate only after timeout. | `TestValidationExactCountTimeoutThenEstimate`. |
-| Exact timeout fails by default even when estimate matches; estimate mismatch fails; explicit log-only policy is honored. | `TestValidationTimeoutPolicyMatrix`, `TestValidationEstimateMismatchPolicyMatrix`. |
-| Rebuild requires equality; upsert permits superset only when reconciliation is not strict; strict snapshot uses persisted count. | `TestValidationCountPolicyByModeAndReconciliation`, `TestValidationUsesPersistedStrictSnapshotCount`. |
-| Bound deep-validation table concurrency/time and return all findings in stable table order. | `TestDeepValidationConcurrencyTimeoutAndStableOrder`. |
-| Sample selects deterministically by complete PK. | `TestSampleValidationUsesCompletePrimaryKeyDeterministically`. |
-| Canonical values are typed and length-delimited; equal integer widths/times compare correctly; NULL/text/bytes cannot collide; timestamps retain represented precision. | `TestValidationCanonicalValueMatrix`. |
-| Findings remain structured/deterministic on failure. | `TestValidationFailureFactsAreCompleteAndStable`. |
-| AI hypotheses cannot change deterministic results. | **Stage 5 boundary:** `TestAIValidationTriageCannotAlterEvidence`. |
+| Normative behavior | Current evidence | Remaining proof |
+|---|---|---|
+| Mode inclusion: default/count, NULL parity, sample; explicit rejection of unimplemented `full`. | **Covered:** `TestBuildValidationPlanIsInclusiveAndRejectsFull`, and config-level rejection in `TestParseRejectsInvalidProductionSemantics`. | None. |
+| Exact per-table count with timeout; estimate only after timeout. | **Covered:** `TestValidationCoreExactTimeoutAndEstimatePolicy`, `TestValidationCoreDoesNotEstimateAfterNonTimeoutFailure`, `TestValidationCoreRecognizesDriverErrorAfterExactDeadline`. | None. |
+| Exact timeout fails by default even when estimate matches; estimate mismatch fails; explicit log-only policy is honored. | **Covered:** `TestValidationCoreExactTimeoutAndEstimatePolicy`, `TestValidationCoreDeepTimeoutsHonorLogOnlyPolicy`. | None. |
+| Rebuild requires equality; upsert permits superset only when reconciliation is not strict; strict snapshot uses persisted count. | **Covered:** `TestValidationCoreCountTargetPolicies`, `TestValidationCoreUsesPerTableReconciliationStrictness`, `TestValidationCoreStrictSnapshotCountIsAuthoritative`, `TestStage4AdapterValidationSpecsRequireStrictSnapshotCount`. | None. |
+| Bound deep-validation table concurrency/time and return all findings in stable table order. | **Covered:** `TestValidationCoreBoundsDeepTableTime`, `TestValidationCoreFindingsHaveStableTableOrder`, `TestValidationCoreRejectsUnboundedInvocation`. | None. |
+| Sample selects deterministically by complete PK. | **Covered:** `TestValidationCoreSampleUsesCompletePKAndCanonicalValues`, `TestValidationSampleDescriptorRequiresCompletePrimaryKeyAndProjection`, `TestValidationCoreSampleRejectsNullablePrimaryKeyBeforeDeepProbes`, `TestCompareValidationPrimaryKeyValuesUsesTypedCompositeOrder`, `TestValidationCoreRejectsNonIncreasingSourcePrimaryKeysBeforeTarget`. | None. |
+| Canonical values are typed and length-delimited; equal integer widths/times compare correctly; NULL/text/bytes cannot collide; timestamps retain represented precision. | **Covered by twelve fixtures:** `TestCanonicalValidationRowKeepsSemanticTypesCollisionFree`, `TestCanonicalValidationRowLengthFramesCannotCollide`, `TestCanonicalValidationRowRejectsTextBinaryConfusion`, `TestCanonicalValidationRowPreservesLargeIntegersWithoutFloat`, `TestCanonicalValidationRowNormalizesFloatSpecialValues`, `TestCanonicalValidationFloatUsesOneInjectiveDomain`, `TestCanonicalValidationDecimalRejectsNonSQLRationalSyntax`, `TestCanonicalValidationDateAndTimeRejectDiscardedComponents`, `TestCanonicalValidationUUIDRequiresCanonicalHyphenPositions`, `TestCanonicalValidationRowNormalizesDriverShapesBySemanticType`, `TestCanonicalValidationRowRejectsUnexpectedShapeWithoutValue`, `TestCanonicalValidationSQLiteANYPreservesRuntimeStorageClass`. | None. |
+| NULL parity detects systematic conversion loss. | **Covered:** `TestValidationCoreNullParityDetectsSystematicConversion`, plus the upsert-scope guards `TestValidationCoreUpsertNullParityUsesSourceOwnedTargetScope`, `TestValidationCoreUpsertNullParityRequiresRouteEqualityProof`, `TestValidationCoreUpsertNullParityRejectsUnsafePrimaryKey`, `TestValidationCoreUpsertNullParityRejectsNullPrimaryKeyEvidence`, `TestValidationCoreUpsertNullParityRejectsMismatchedProofEcho`. | Live per-engine matrix. |
+| Findings remain structured/deterministic on failure and never leak row values. | **Covered:** `TestValidationCoreFindingsHaveStableTableOrder`, `TestValidationCoreSampleMismatchFactsDoNotLeakValues`, `TestValidationCoreFailsClosedOnIncompleteEvidence`, `TestValidationCoreRejectsNullCountsAboveAuthoritativeRows`. | None. |
+| AI hypotheses cannot change deterministic results. | **Stage 5 boundary:** `TestAIValidationTriageCannotAlterEvidence`. | Stage 5. |
 
-Required live fixtures:
+Required live fixtures — this is the only part of Section 12 still open. The
+deep-probe contract has two live proofs today,
+`TestPostgresDatabaseValidationProbeStableTLSLive` and
+`TestStage4AdapterPostgresStableDeepValidationComposedRouteLiveTLS`, plus
+non-live deep semantics in `TestSQLiteDatabaseValidationProbeDeepSemantics` and
+`TestDatabaseValidationProbeFailsClosed`. Still **missing**:
 
-- `TestPostgresValidationModesLive`
 - `TestSQLServerValidationModesLive`
 - `TestMySQLValidationModesLive`
 - `TestMariaDBValidationModesLive`
-- `TestSQLiteValidationModes`
 - `TestStage4ValidationRouteMatrixLive`
 - `TestValidationTimeoutFallbackEngineMatrixLive`
 
@@ -558,11 +566,13 @@ Every certified-cell implementation needs its family. Missing, by name:
 - `TestStage4CertifiedRelationalTransferLifecycleLive`
 - `TestStage4CertifiedRelationalUpsertReplayMatrixLive`
 
-### B. Validation (Section 12) — largest unimplemented section
+### B. Validation (Section 12) — logic done, live matrix open
 
-Count-only and SQLite-only today. Every fixture in Section 12 is missing except
-the two existing SQLite count tests. This is a full slice, not a gap fill, and
-it blocks acceptance 21.9.
+Not a slice. The mode, timeout, policy, NULL-parity, sampling, and canonical
+value contracts are all implemented and covered non-live. What remains is
+`TestSQLServerValidationModesLive`, `TestMySQLValidationModesLive`,
+`TestMariaDBValidationModesLive`, `TestStage4ValidationRouteMatrixLive`, and
+`TestValidationTimeoutFallbackEngineMatrixLive` — all gated on block G.
 
 ### C. Strict consistency for the four remaining engines
 
@@ -645,9 +655,11 @@ Reordered 2026-07-31. The two original top risks are closed.
    approval quota is exhausted until 2026-08-06. Until it runs, every live row
    in this document reflects an earlier tree, and `go test ./...` passing locally
    proves nothing about the live gates.
-3. **Validation is still count-only.** Timeout fallbacks, reconciliation policy,
-   NULL parity, and canonical samples all need engine-level live proof. Section
-   12 remains almost entirely open and is the largest unimplemented section.
+3. **Validation logic is implemented but proven on one engine.** Section 12's
+   contracts are covered by roughly 50 non-live fixtures; what is missing is the
+   per-engine live matrix. The risk is inverted from what it looks like: the
+   algorithms are done, so the remaining failure mode is an engine-specific
+   driver or type behavior that only live proof surfaces.
 4. **Schema-contract modes are partially implemented.** `evolve` and projection
    are proven for PostgreSQL; `freeze`, `report`, `discard_value` pruning, and
    the entity-default matrix have no fixtures. Treating the contract as DDL-only
