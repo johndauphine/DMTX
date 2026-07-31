@@ -337,6 +337,42 @@ func TestValidateMySQLRetainedColumnTreatsUUIDAsPhysicalVarchar36(
 	}
 }
 
+func TestValidateMySQLRetainedColumnComparesExactSpatialMetadata(
+	t *testing.T,
+) {
+	srid := uint32(4326)
+	planned := schema.Column{
+		Name: "position",
+		Type: "point",
+		DeclaredType: &schema.DeclaredType{
+			Base: "point",
+			Spatial: &schema.SpatialTypeMetadata{
+				Subtype: schema.SpatialSubtypePoint,
+				SRID:    &srid,
+			},
+		},
+	}
+	actual := planned
+	actualDeclaration := *planned.DeclaredType
+	actualSpatial := *planned.DeclaredType.Spatial
+	actualSRID := *planned.DeclaredType.Spatial.SRID
+	actualSpatial.SRID = &actualSRID
+	actualDeclaration.Spatial = &actualSpatial
+	actual.DeclaredType = &actualDeclaration
+	if err := validateMySQLRetainedColumn(planned, actual); err != nil {
+		t.Fatalf("exact retained spatial column was rejected: %v", err)
+	}
+
+	*actual.DeclaredType.Spatial.SRID = 0
+	if err := validateMySQLRetainedColumn(planned, actual); err == nil {
+		t.Fatal("retained spatial SRID drift was accepted")
+	}
+	actual.DeclaredType.Spatial.SRID = nil
+	if err := validateMySQLRetainedColumn(planned, actual); err == nil {
+		t.Fatal("unspecified retained spatial SRID replaced explicit SRID")
+	}
+}
+
 func TestValidateMySQLRetainedTableShapeIgnoresObjectCatalogOrder(
 	t *testing.T,
 ) {

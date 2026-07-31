@@ -698,10 +698,16 @@ func mySQL80SourceColumnFromCatalog(
 	if !validMySQLSourceIdentifier(catalog.name) ||
 		(catalog.nullable != "YES" && catalog.nullable != "NO") ||
 		catalog.generation != "" ||
-		catalog.comment != "" ||
-		catalog.srid.Valid {
+		catalog.comment != "" {
 		return schema.Column{}, metadata, mysqlSourcePolicy(
 			"column catalog shape",
+			catalog.name+" "+catalog.columnType,
+		)
+	}
+	spatialSubtype, spatial := mySQL80SpatialSubtype(catalog.dataType)
+	if catalog.srid.Valid && !spatial {
+		return schema.Column{}, metadata, mysqlSourcePolicy(
+			"column spatial catalog shape",
 			catalog.name+" "+catalog.columnType,
 		)
 	}
@@ -980,6 +986,36 @@ func mySQL80SourceColumnFromCatalog(
 			Base:      catalog.dataType,
 			Arguments: []int{int(catalog.datetimePrecision.Int64)},
 		}
+	case "geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		"geomcollection":
+		if !spatial ||
+			catalog.columnType != catalog.dataType ||
+			!mySQLNonCharacterColumn(catalog) ||
+			catalog.numericPrecision.Valid ||
+			catalog.numericScale.Valid ||
+			catalog.datetimePrecision.Valid ||
+			catalog.defaultValue.Valid ||
+			metadata.autoIncrement ||
+			metadata.defaultGenerated ||
+			catalog.srid.Valid &&
+				(catalog.srid.Int64 < 0 ||
+					catalog.srid.Int64 > int64(^uint32(0))) {
+			return schema.Column{}, metadata, unsupportedMySQLSourceType(catalog)
+		}
+		var srid *uint32
+		if catalog.srid.Valid {
+			value := uint32(catalog.srid.Int64)
+			srid = &value
+		}
+		column.Type = string(spatialSubtype)
+		column.DeclaredType = &schema.DeclaredType{
+			Base: catalog.dataType,
+			Spatial: &schema.SpatialTypeMetadata{
+				Subtype: spatialSubtype,
+				SRID:    srid,
+			},
+		}
 	case "json":
 		if catalog.columnType != "json" ||
 			catalog.characterLength.Valid ||
@@ -1035,6 +1071,31 @@ func mySQLNonCharacterColumn(
 		!catalog.octetLength.Valid &&
 		!catalog.characterSet.Valid &&
 		!catalog.collation.Valid
+}
+
+func mySQL80SpatialSubtype(
+	value string,
+) (schema.SpatialSubtype, bool) {
+	switch value {
+	case "geometry":
+		return schema.SpatialSubtypeGeometry, true
+	case "point":
+		return schema.SpatialSubtypePoint, true
+	case "linestring":
+		return schema.SpatialSubtypeLineString, true
+	case "polygon":
+		return schema.SpatialSubtypePolygon, true
+	case "multipoint":
+		return schema.SpatialSubtypeMultiPoint, true
+	case "multilinestring":
+		return schema.SpatialSubtypeMultiLineString, true
+	case "multipolygon":
+		return schema.SpatialSubtypeMultiPolygon, true
+	case "geomcollection":
+		return schema.SpatialSubtypeGeometryCollection, true
+	default:
+		return "", false
+	}
 }
 
 func unsupportedMySQLSourceType(

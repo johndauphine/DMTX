@@ -821,6 +821,78 @@ func TestProjectMySQLTargetTableClonesSourceMetadata(t *testing.T) {
 	}
 }
 
+func TestProjectMySQLTargetTablePreservesOracleSpatialMetadata(
+	t *testing.T,
+) {
+	srid := uint32(4326)
+	source := schema.Table{
+		Schema:         "source",
+		Name:           "places",
+		MySQLCollation: "utf8mb4_0900_bin",
+		Columns: []schema.Column{
+			{
+				Name:               "id",
+				Type:               "bigint",
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 1,
+				DeclaredType:       &schema.DeclaredType{Base: "bigint"},
+			},
+			{
+				Name: "position",
+				Type: "point",
+				DeclaredType: &schema.DeclaredType{
+					Base: "point",
+					Spatial: &schema.SpatialTypeMetadata{
+						Subtype: schema.SpatialSubtypePoint,
+						SRID:    &srid,
+					},
+				},
+			},
+		},
+	}
+	projected, err := projectMySQLTargetTable(
+		"mysql",
+		source,
+		engine.MySQLServerFlavorOracle80,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spatial := projected.Columns[1].DeclaredType.Spatial
+	if spatial == nil ||
+		spatial.Subtype != schema.SpatialSubtypePoint ||
+		spatial.SRID == nil ||
+		*spatial.SRID != 4326 {
+		t.Fatalf("projected spatial metadata = %#v", spatial)
+	}
+	*spatial.SRID = 0
+	if source.Columns[1].DeclaredType.Spatial.SRID == nil ||
+		*source.Columns[1].DeclaredType.Spatial.SRID != 4326 {
+		t.Fatal("MySQL spatial projection aliases source SRID metadata")
+	}
+
+	if _, err := projectMySQLTargetTable(
+		"mysql",
+		source,
+		engine.MySQLServerFlavorMariaDB1011,
+	); err == nil {
+		t.Fatal("MariaDB target accepted Oracle MySQL spatial metadata")
+	}
+
+	indexed := source
+	indexed.Indexes = []schema.Index{{
+		Name:    "places_position_idx",
+		Columns: []schema.IndexColumn{{Name: "position"}},
+	}}
+	if _, err := projectMySQLTargetTable(
+		"mysql",
+		indexed,
+		engine.MySQLServerFlavorOracle80,
+	); err == nil {
+		t.Fatal("unmodeled MySQL spatial index was accepted")
+	}
+}
+
 func TestProjectMySQLTargetTablePinsFlavorCollation(t *testing.T) {
 	mysqlSource := schema.Table{
 		Name:           "items",

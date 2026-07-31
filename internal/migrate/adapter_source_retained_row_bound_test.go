@@ -729,6 +729,87 @@ func TestMySQLFamilyRetainedRowWidthUsesCatalogAndLiveEvidence(
 	}
 }
 
+func TestMySQLSpatialRetainedRowWidthUsesExactLivePayloadEvidence(
+	t *testing.T,
+) {
+	t.Parallel()
+	srid := uint32(4326)
+	table := schema.Table{
+		Schema: "source",
+		Name:   "places",
+		Columns: []schema.Column{
+			retainedTestDeclaredColumn("id", "bigint", "bigint"),
+			{
+				Name: "position",
+				Type: "point",
+				DeclaredType: &schema.DeclaredType{
+					Base: "point",
+					Spatial: &schema.SpatialTypeMetadata{
+						Subtype: schema.SpatialSubtypePoint,
+						SRID:    &srid,
+					},
+				},
+			},
+		},
+	}
+	connector := &adapterRetainedBoundTestConnector{
+		columns: []string{"dmtx_retained_1"},
+		rows:    [][]driver.Value{{int64(25)}},
+	}
+	database := sql.OpenDB(connector)
+	t.Cleanup(func() { _ = database.Close() })
+	source := &relationalSourceAdapter{
+		spec:      relationalSourceSpec{engine: "mysql"},
+		database:  database,
+		namespace: "source",
+	}
+	stable, err := newAdapterRetainedStableRelationalView(
+		source,
+		&adapterRetainedBoundTestStableView{
+			queryer: database,
+			engine:  "mysql",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := stable.PlanRetainedRowWidth(
+		context.Background(),
+		table,
+		adapterColumnNames(table),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !evidence.Trustworthy ||
+		evidence.CompleteColumnCount != 2 ||
+		evidence.UpperBoundBytes < 25 {
+		t.Fatalf("spatial retained-row evidence = %+v", evidence)
+	}
+	if query := connector.observedQuery(); !strings.Contains(
+		query,
+		"CAST(OCTET_LENGTH(`position`) AS SIGNED)",
+	) {
+		t.Fatalf("spatial retained query = %q", query)
+	}
+
+	invalid := table
+	invalid.Columns = append([]schema.Column(nil), table.Columns...)
+	declaration := *invalid.Columns[1].DeclaredType
+	spatial := *declaration.Spatial
+	spatial.SRID = nil
+	spatial.Subtype = schema.SpatialSubtypeGeometry
+	declaration.Spatial = &spatial
+	invalid.Columns[1].DeclaredType = &declaration
+	if _, err := planMySQLRetainedRowBound(
+		invalid.Schema,
+		invalid,
+		invalid.Columns,
+	); err == nil {
+		t.Fatal("mismatched spatial subtype entered retained-row planning")
+	}
+}
+
 func TestSQLServerRetainedRowWidthUsesCatalogAndLiveEvidence(
 	t *testing.T,
 ) {

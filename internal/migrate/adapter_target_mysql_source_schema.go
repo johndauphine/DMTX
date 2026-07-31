@@ -39,6 +39,13 @@ func projectMySQLTargetTable(
 	if err != nil {
 		return schema.Table{}, err
 	}
+	if err := validateMySQLSpatialTargetProjection(
+		sourceEngine,
+		target,
+		targetFlavor,
+	); err != nil {
+		return schema.Table{}, err
+	}
 	if err := normalizeMySQLTargetCollation(
 		sourceEngine,
 		&target,
@@ -47,6 +54,82 @@ func projectMySQLTargetTable(
 		return schema.Table{}, err
 	}
 	return target, nil
+}
+
+func validateMySQLSpatialTargetProjection(
+	sourceEngine string,
+	table schema.Table,
+	targetFlavor engine.MySQLServerFlavor,
+) error {
+	spatialColumns := make(map[string]struct{})
+	for _, column := range table.Columns {
+		if column.DeclaredType == nil ||
+			column.DeclaredType.Spatial == nil {
+			continue
+		}
+		if sourceEngine != "mysql" ||
+			targetFlavor != engine.MySQLServerFlavorOracle80 {
+			return mysqlProjectionPolicy(
+				"map spatial metadata to MySQL-family target",
+				table.Name+"."+column.Name,
+			)
+		}
+		if err := schema.ValidateDeclaredType(
+			*column.DeclaredType,
+		); err != nil {
+			return mysqlProjectionPolicy(
+				"map MySQL spatial metadata",
+				table.Name+"."+column.Name,
+			)
+		}
+		subtype := string(column.DeclaredType.Spatial.Subtype)
+		if column.Type != subtype ||
+			column.DeclaredType.Base != mySQLSpatialCatalogBase(
+				column.DeclaredType.Spatial.Subtype,
+			) ||
+			column.Default != nil ||
+			column.PrimaryKey ||
+			column.PrimaryKeyPosition != 0 {
+			return mysqlProjectionPolicy(
+				"map MySQL spatial column",
+				table.Name+"."+column.Name,
+			)
+		}
+		spatialColumns[column.Name] = struct{}{}
+	}
+	if len(spatialColumns) == 0 {
+		return nil
+	}
+	for _, index := range table.Indexes {
+		for _, column := range index.Columns {
+			if _, spatial := spatialColumns[column.Name]; spatial {
+				return mysqlProjectionPolicy(
+					"map MySQL spatial index",
+					table.Name+"."+index.Name+"."+column.Name,
+				)
+			}
+		}
+	}
+	for _, foreignKey := range table.ForeignKeys {
+		for _, column := range foreignKey.Columns {
+			if _, spatial := spatialColumns[column]; spatial {
+				return mysqlProjectionPolicy(
+					"map MySQL spatial foreign key",
+					table.Name+"."+foreignKey.Name+"."+column,
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func mySQLSpatialCatalogBase(
+	subtype schema.SpatialSubtype,
+) string {
+	if subtype == schema.SpatialSubtypeGeometryCollection {
+		return "geomcollection"
+	}
+	return string(subtype)
 }
 
 func normalizeMySQLTargetCollation(
@@ -99,6 +182,30 @@ func cloneMySQLTargetTable(source schema.Table) schema.Table {
 				[]int(nil),
 				source.Columns[index].DeclaredType.Arguments...,
 			)
+			if source.Columns[index].DeclaredType.Spatial != nil {
+				spatial := *source.Columns[index].DeclaredType.Spatial
+				if spatial.SRID != nil {
+					srid := *spatial.SRID
+					spatial.SRID = &srid
+				}
+				declaration.Spatial = &spatial
+			}
+			if source.Columns[index].DeclaredType.MySQL != nil {
+				mysql := *source.Columns[index].DeclaredType.MySQL
+				mysql.EnumMembers = append(
+					[]string(nil),
+					mysql.EnumMembers...,
+				)
+				mysql.SetMembers = append(
+					[]string(nil),
+					mysql.SetMembers...,
+				)
+				if mysql.BitWidth != nil {
+					width := *mysql.BitWidth
+					mysql.BitWidth = &width
+				}
+				declaration.MySQL = &mysql
+			}
 			cloned.Columns[index].DeclaredType = &declaration
 		}
 		cloned.Columns[index].Default = cloneSchemaExpression(

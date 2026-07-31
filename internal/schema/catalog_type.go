@@ -234,7 +234,9 @@ func validateSpatialCatalogModifiers(
 	}
 	if base != "geometry" &&
 		base != "geography" &&
-		base != string(subtype) {
+		base != string(subtype) &&
+		!(base == "geomcollection" &&
+			subtype == SpatialSubtypeGeometryCollection) {
 		return invalidCatalogModifiers(
 			value.Base,
 			"spatial base and subtype disagree",
@@ -423,7 +425,7 @@ func catalogSpatialBase(base string) bool {
 	switch base {
 	case "geometry", "geography", "point", "linestring", "polygon",
 		"multipoint", "multilinestring", "multipolygon",
-		"geometrycollection":
+		"geometrycollection", "geomcollection":
 		return true
 	default:
 		return false

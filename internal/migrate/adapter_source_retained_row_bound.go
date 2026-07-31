@@ -1054,6 +1054,13 @@ func mySQLRetainedColumnBound(
 			return bound, errors.New("JSON declaration is invalid")
 		}
 		bound = mySQLLiveRetainedColumnBound(column.Name)
+	case "geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		"geometrycollection":
+		if !validMySQLRetainedSpatialDeclaration(column) {
+			return bound, errors.New("spatial declaration is invalid")
+		}
+		bound = mySQLLiveRetainedColumnBound(column.Name)
 	case "date":
 		if !exactAdapterDeclaredType(column.DeclaredType, "date") {
 			return bound, errors.New("date declaration is invalid")
@@ -1084,6 +1091,21 @@ func mySQLRetainedColumnBound(
 		)
 	}
 	return bound, nil
+}
+
+func validMySQLRetainedSpatialDeclaration(
+	column schema.Column,
+) bool {
+	if column.DeclaredType == nil ||
+		column.DeclaredType.Spatial == nil ||
+		column.DeclaredType.Base != mySQLSpatialCatalogBase(
+			column.DeclaredType.Spatial.Subtype,
+		) ||
+		string(column.DeclaredType.Spatial.Subtype) != column.Type ||
+		len(column.DeclaredType.Arguments) != 0 {
+		return false
+	}
+	return schema.ValidateDeclaredType(*column.DeclaredType) == nil
 }
 
 func mySQLLiveRetainedColumnBound(

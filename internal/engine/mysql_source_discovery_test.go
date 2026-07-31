@@ -411,6 +411,180 @@ func TestMySQL80SourceColumnFromCatalogFailsClosed(t *testing.T) {
 	}
 }
 
+func TestMySQL80SourceColumnFromCatalogPreservesSpatialMetadata(
+	t *testing.T,
+) {
+	explicitZero := sql.NullInt64{Valid: true}
+	maximumSRID := sql.NullInt64{
+		Int64: int64(^uint32(0)),
+		Valid: true,
+	}
+	tests := []struct {
+		dataType string
+		subtype  schema.SpatialSubtype
+		srid     sql.NullInt64
+	}{
+		{
+			dataType: "geometry",
+			subtype:  schema.SpatialSubtypeGeometry,
+		},
+		{
+			dataType: "point",
+			subtype:  schema.SpatialSubtypePoint,
+			srid:     explicitZero,
+		},
+		{
+			dataType: "linestring",
+			subtype:  schema.SpatialSubtypeLineString,
+			srid:     maximumSRID,
+		},
+		{
+			dataType: "polygon",
+			subtype:  schema.SpatialSubtypePolygon,
+		},
+		{
+			dataType: "multipoint",
+			subtype:  schema.SpatialSubtypeMultiPoint,
+		},
+		{
+			dataType: "multilinestring",
+			subtype:  schema.SpatialSubtypeMultiLineString,
+		},
+		{
+			dataType: "multipolygon",
+			subtype:  schema.SpatialSubtypeMultiPolygon,
+		},
+		{
+			dataType: "geomcollection",
+			subtype:  schema.SpatialSubtypeGeometryCollection,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.dataType, func(t *testing.T) {
+			catalog := baseMySQL80ColumnCatalog(
+				"shape",
+				test.dataType,
+				test.dataType,
+			)
+			catalog.srid = test.srid
+			column, metadata, err := mySQL80SourceColumnFromCatalog(
+				catalog,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if metadata != (mysql80SourceColumnMetadata{}) ||
+				column.Type != string(test.subtype) ||
+				column.DeclaredType == nil ||
+				column.DeclaredType.Base != test.dataType ||
+				column.DeclaredType.Spatial == nil ||
+				column.DeclaredType.Spatial.Subtype != test.subtype {
+				t.Fatalf("spatial column = %#v, metadata = %#v", column, metadata)
+			}
+			gotSRID := column.DeclaredType.Spatial.SRID
+			if !test.srid.Valid {
+				if gotSRID != nil {
+					t.Fatalf("unspecified SRID = %d, want nil", *gotSRID)
+				}
+			} else if gotSRID == nil ||
+				*gotSRID != uint32(test.srid.Int64) {
+				t.Fatalf("SRID = %v, want %d", gotSRID, test.srid.Int64)
+			}
+			if err := schema.ValidateDeclaredType(
+				*column.DeclaredType,
+			); err != nil {
+				t.Fatalf("canonical spatial metadata: %v", err)
+			}
+		})
+	}
+}
+
+func TestMySQL80SourceSpatialColumnFailsClosedOnCatalogMismatch(
+	t *testing.T,
+) {
+	valid := baseMySQL80ColumnCatalog(
+		"shape",
+		"point",
+		"point",
+	)
+	tests := map[string]func(*mysql80SourceColumnCatalog){
+		"column type mismatch": func(value *mysql80SourceColumnCatalog) {
+			value.columnType = "geometry"
+		},
+		"negative SRID": func(value *mysql80SourceColumnCatalog) {
+			value.srid = sql.NullInt64{Int64: -1, Valid: true}
+		},
+		"oversized SRID": func(value *mysql80SourceColumnCatalog) {
+			value.srid = sql.NullInt64{
+				Int64: int64(^uint32(0)) + 1,
+				Valid: true,
+			}
+		},
+		"character length": func(value *mysql80SourceColumnCatalog) {
+			value.characterLength = sql.NullInt64{Int64: 32, Valid: true}
+		},
+		"octet length": func(value *mysql80SourceColumnCatalog) {
+			value.octetLength = sql.NullInt64{Int64: 32, Valid: true}
+		},
+		"numeric precision": func(value *mysql80SourceColumnCatalog) {
+			value.numericPrecision = sql.NullInt64{Int64: 10, Valid: true}
+		},
+		"numeric scale": func(value *mysql80SourceColumnCatalog) {
+			value.numericScale = sql.NullInt64{Valid: true}
+		},
+		"datetime precision": func(value *mysql80SourceColumnCatalog) {
+			value.datetimePrecision = sql.NullInt64{Valid: true}
+		},
+		"character set": func(value *mysql80SourceColumnCatalog) {
+			value.characterSet = sql.NullString{
+				String: "binary",
+				Valid:  true,
+			}
+		},
+		"collation": func(value *mysql80SourceColumnCatalog) {
+			value.collation = sql.NullString{
+				String: "binary",
+				Valid:  true,
+			}
+		},
+		"default": func(value *mysql80SourceColumnCatalog) {
+			value.defaultValue = sql.NullString{
+				String: "point(1 2)",
+				Valid:  true,
+			}
+		},
+		"default generated": func(value *mysql80SourceColumnCatalog) {
+			value.extra = "DEFAULT_GENERATED"
+		},
+		"auto increment": func(value *mysql80SourceColumnCatalog) {
+			value.extra = "auto_increment"
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			value := valid
+			mutate(&value)
+			if _, _, err := mySQL80SourceColumnFromCatalog(value); err == nil {
+				t.Fatal("expected malformed spatial catalog to fail closed")
+			}
+		})
+	}
+
+	nonSpatial := baseMySQL80ColumnCatalog("payload", "json", "json")
+	nonSpatial.srid = sql.NullInt64{Valid: true}
+	if _, _, err := mySQL80SourceColumnFromCatalog(nonSpatial); err == nil {
+		t.Fatal("expected SRS_ID on a non-spatial type to fail closed")
+	}
+	unknown := baseMySQL80ColumnCatalog(
+		"shape",
+		"circularstring",
+		"circularstring",
+	)
+	if _, _, err := mySQL80SourceColumnFromCatalog(unknown); err == nil {
+		t.Fatal("expected unknown spatial subtype to fail closed")
+	}
+}
+
 func TestMySQL80SourceTimeColumnFailsClosedOnUnexpectedCatalogShapes(
 	t *testing.T,
 ) {

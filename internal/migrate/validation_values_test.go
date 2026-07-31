@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"bytes"
 	"database/sql"
 	"math"
 	"strings"
@@ -9,6 +10,72 @@ import (
 
 	"github.com/johndauphine/dmtx/internal/schema"
 )
+
+func TestStage4SpatialValidationUsesExactBinaryRepresentation(t *testing.T) {
+	t.Parallel()
+
+	srid := uint32(4326)
+	table := schema.Table{
+		Name: "places",
+		Columns: []schema.Column{
+			{
+				Name:               "id",
+				Type:               "bigint",
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 1,
+				DeclaredType:       &schema.DeclaredType{Base: "bigint"},
+			},
+			{
+				Name: "position",
+				Type: "point",
+				DeclaredType: &schema.DeclaredType{
+					Base: "point",
+					Spatial: &schema.SpatialTypeMetadata{
+						Subtype: schema.SpatialSubtypePoint,
+						SRID:    &srid,
+					},
+				},
+			},
+		},
+	}
+	descriptor, err := newValidationSampleDescriptor(
+		table,
+		[]string{"id", "position"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := canonicalValidationRow(
+		descriptor,
+		[]any{int64(1), []byte{0xe6, 0x10, 0, 0, 1, 1}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same, err := canonicalValidationRow(
+		descriptor,
+		[]any{int64(1), []byte{0xe6, 0x10, 0, 0, 1, 1}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	different, err := canonicalValidationRow(
+		descriptor,
+		[]any{int64(1), []byte{0, 0, 0, 0, 1, 1}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, same) || bytes.Equal(first, different) {
+		t.Fatal("spatial validation did not preserve exact SRID/WKB bytes")
+	}
+	if _, err := canonicalValidationRow(
+		descriptor,
+		[]any{int64(1), "POINT(1 2)"},
+	); err == nil {
+		t.Fatal("spatial validation accepted a lossy text representation")
+	}
+}
 
 func TestCanonicalValidationRowNormalizesDriverShapesBySemanticType(t *testing.T) {
 	t.Parallel()

@@ -221,7 +221,9 @@ func validationKindForColumn(column schema.Column) (validationValueKind, error) 
 		"json", "jsonb", "xml", "enum", "set":
 		return validationText, nil
 	case "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob",
-		"bytea", "image":
+		"bytea", "image", "geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		"geometrycollection":
 		return validationBytes, nil
 	case "date":
 		return validationDate, nil

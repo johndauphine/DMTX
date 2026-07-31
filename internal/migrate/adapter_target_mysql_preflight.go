@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 
@@ -423,11 +424,10 @@ func validateMySQLRetainedColumn(
 		if planned.DeclaredType != nil || actual.DeclaredType != nil {
 			return fmt.Errorf("declared type presence differs")
 		}
-	} else if planned.DeclaredType.Base != actual.DeclaredType.Base ||
-		!slices.Equal(
-			planned.DeclaredType.Arguments,
-			actual.DeclaredType.Arguments,
-		) {
+	} else if !reflect.DeepEqual(
+		*planned.DeclaredType,
+		*actual.DeclaredType,
+	) {
 		return fmt.Errorf("declared type differs")
 	}
 	plannedSQL, plannedErr := renderMySQLRetainedColumn(planned)
