@@ -50,20 +50,31 @@ func (store SQLiteStore) ensureStage4TableInventory(
 	if err != nil {
 		return err
 	}
-	stored, found, err := readSQLiteStage4TableInventory(
+	stored, storedPayload, found, err := readSQLiteStage4TableInventory(
 		transaction,
 		inventory.RunID,
 	)
 	if err != nil {
 		return err
 	}
-	if found {
-		return validateStage4TableInventoryReceipt(stored, inventory)
-	}
 	if latest.Outcome != Running || !latest.Resumable {
 		return fmt.Errorf(
 			"%w: table inventory requires an active resumable run",
 			ErrStateTransition,
+		)
+	}
+	if found {
+		if validateStage4TableInventoryReceipt(
+			stored,
+			inventory,
+		) == nil {
+			return nil
+		}
+		return reviseSQLiteStage4TableInventory(
+			transaction,
+			stored,
+			storedPayload,
+			inventory,
 		)
 	}
 	if err := requireSQLiteStage4InventoryPrerequisites(
@@ -109,7 +120,7 @@ func (store SQLiteStore) ensureStage4TableInventory(
 func readSQLiteStage4TableInventory(
 	transaction *sql.Tx,
 	runID string,
-) (Stage4TableInventoryReceipt, bool, error) {
+) (Stage4TableInventoryReceipt, string, bool, error) {
 	payload, found, err := loadSQLiteStage4Record(
 		transaction,
 		stage4AggregateInventoryRecord,
@@ -118,16 +129,84 @@ func readSQLiteStage4TableInventory(
 		stage4SingletonRecordID,
 	)
 	if err != nil || !found {
-		return Stage4TableInventoryReceipt{}, found, err
+		return Stage4TableInventoryReceipt{}, "", found, err
 	}
 	var receipt Stage4TableInventoryReceipt
 	if err := json.Unmarshal([]byte(payload), &receipt); err != nil {
-		return Stage4TableInventoryReceipt{}, false, fmt.Errorf(
+		return Stage4TableInventoryReceipt{}, "", false, fmt.Errorf(
 			"decode Stage 4 table inventory: %w",
 			err,
 		)
 	}
-	return receipt, true, nil
+	return receipt, payload, true, nil
+}
+
+// reviseSQLiteStage4TableInventory replaces a pre-mutation inventory in place.
+// The window is guarded by validateStage4InventoryRevision; the snapshot
+// authority is revalidated because the revision still binds itself to it.
+func reviseSQLiteStage4TableInventory(
+	transaction *sql.Tx,
+	stored Stage4TableInventoryReceipt,
+	storedPayload string,
+	inventory Stage4TableInventory,
+) error {
+	var receipts, completedTables int
+	if err := transaction.QueryRow(`
+		SELECT COUNT(*) FROM stage4_records
+		WHERE run_id = ? AND kind = ?
+	`, inventory.RunID, stage4AggregateTableRecord).Scan(&receipts); err != nil {
+		return fmt.Errorf("inspect aggregate table receipts: %w", err)
+	}
+	if err := transaction.QueryRow(`
+		SELECT COUNT(*) FROM tasks
+		WHERE run_id = ? AND status = 'completed'
+	`, inventory.RunID).Scan(&completedTables); err != nil {
+		return fmt.Errorf("inspect completed ordinary tables: %w", err)
+	}
+	if err := validateStage4InventoryRevision(
+		stored,
+		inventory,
+		receipts,
+		completedTables,
+	); err != nil {
+		return err
+	}
+	snapshots, err := readSQLiteAggregateSnapshots(
+		transaction,
+		inventory.RunID,
+	)
+	if err != nil {
+		return err
+	}
+	if err := validateStage4InventorySnapshot(inventory, snapshots); err != nil {
+		return err
+	}
+	receipt, err := newStage4TableInventoryReceipt(inventory)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		return fmt.Errorf("encode Stage 4 table inventory: %w", err)
+	}
+	if err := updateSQLiteStage4Record(
+		transaction,
+		stage4AggregateInventoryRecord,
+		inventory.RunID,
+		stage4MigrationTaskKey,
+		stage4SingletonRecordID,
+		storedPayload,
+		string(payload),
+	); err != nil {
+		return err
+	}
+	if err := stage4BeforeInventoryCommit(); err != nil {
+		return fmt.Errorf("prepare Stage 4 table inventory revision: %w", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit Stage 4 table inventory revision: %w", err)
+	}
+	return nil
 }
 
 func requireSQLiteStage4InventoryPrerequisites(
@@ -225,7 +304,7 @@ func (store SQLiteStore) loadStage4TableInventory(
 	}
 	defer transaction.Rollback()
 
-	stored, found, err := readSQLiteStage4TableInventory(transaction, runID)
+	stored, _, found, err := readSQLiteStage4TableInventory(transaction, runID)
 	if err != nil || !found {
 		return Stage4TableInventoryReceipt{}, found, err
 	}
@@ -332,7 +411,7 @@ func (store SQLiteStore) completeStage4Table(
 	); err != nil {
 		return err
 	}
-	inventory, inventoryFound, err := readSQLiteStage4TableInventory(
+	inventory, _, inventoryFound, err := readSQLiteStage4TableInventory(
 		transaction,
 		completion.RunID,
 	)
@@ -604,7 +683,7 @@ func (store SQLiteStore) completeStage4Run(
 	case completion.CompletedAt.Before(latest.StartedAt):
 		return fmt.Errorf("%w: run completion precedes start", ErrStateTransition)
 	}
-	inventory, inventoryFound, err := readSQLiteStage4TableInventory(
+	inventory, _, inventoryFound, err := readSQLiteStage4TableInventory(
 		transaction,
 		completion.RunID,
 	)

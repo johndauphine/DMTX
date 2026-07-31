@@ -349,6 +349,124 @@ func testStage4AggregateReadScope(
 	}
 }
 
+// TestStage4AggregateInventoryRevision pins the narrow window in which a table
+// inventory may be replanned. A resumed run whose source grew must be able to
+// revise its range plan, or it becomes unrecoverable rather than merely failed;
+// the window must close the moment any table publishes terminal evidence.
+func TestStage4AggregateInventoryRevision(t *testing.T) {
+	factories := map[string]stage4AggregateFactory{
+		"sqlite": func(t *testing.T) (Backend, func() Backend) {
+			path := filepath.Join(t.TempDir(), "state.db")
+			return SQLiteStore{Path: path}, func() Backend {
+				return SQLiteStore{Path: path}
+			}
+		},
+		"yaml": func(t *testing.T) (Backend, func() Backend) {
+			path := filepath.Join(t.TempDir(), "state.yaml")
+			return YAMLStore{Path: path}, func() Backend {
+				return YAMLStore{Path: path}
+			}
+		},
+	}
+	for name, factory := range factories {
+		t.Run(name, func(t *testing.T) {
+			t.Run("replans before terminal evidence", func(t *testing.T) {
+				testStage4AggregateInventoryReplan(t, factory)
+			})
+			t.Run("is fixed after terminal evidence", func(t *testing.T) {
+				testStage4AggregateInventoryFixed(t, factory)
+			})
+			t.Run("schema authority is immutable", func(t *testing.T) {
+				testStage4AggregateInventorySchemaFixed(t, factory)
+			})
+		})
+	}
+}
+
+// stage4AggregateFixtureInventory rebuilds the fixture's published inventory so
+// a test can vary exactly one field.
+func stage4AggregateFixtureInventory(
+	t *testing.T,
+	fixture stage4AggregateFixture,
+) Stage4TableInventory {
+	t.Helper()
+	receipt, found, err := fixture.aggregate.LoadStage4TableInventory(
+		fixture.runID,
+	)
+	if err != nil || !found {
+		t.Fatalf("fixture inventory found=%v err=%v", found, err)
+	}
+	return receipt.Inventory
+}
+
+func testStage4AggregateInventoryReplan(
+	t *testing.T,
+	factory stage4AggregateFactory,
+) {
+	t.Helper()
+	fixture := newStage4AggregateFixture(t, factory, false)
+	revised := stage4AggregateFixtureInventory(t, fixture)
+	revised.Tables[0].Ranges = []Stage4InventoryRange{{ID: "0"}, {ID: "1"}}
+	if err := fixture.aggregate.EnsureStage4TableInventory(
+		revised,
+	); err != nil {
+		t.Fatalf("replan before terminal evidence: %v", err)
+	}
+	stored := stage4AggregateFixtureInventory(t, fixture)
+	if len(stored.Tables[0].Ranges) != 2 {
+		t.Fatalf("revised inventory = %#v", stored)
+	}
+	// The revision is durable and replayable on its own terms.
+	if err := fixture.aggregate.EnsureStage4TableInventory(
+		revised,
+	); err != nil {
+		t.Fatalf("replay revised inventory: %v", err)
+	}
+}
+
+func testStage4AggregateInventoryFixed(
+	t *testing.T,
+	factory stage4AggregateFactory,
+) {
+	t.Helper()
+	fixture := newStage4AggregateFixture(t, factory, false)
+	if err := fixture.aggregate.CompleteStage4Table(
+		fixture.completion,
+	); err != nil {
+		t.Fatal(err)
+	}
+	revised := stage4AggregateFixtureInventory(t, fixture)
+	revised.Tables[0].Ranges = []Stage4InventoryRange{{ID: "0"}, {ID: "1"}}
+	err := fixture.aggregate.EnsureStage4TableInventory(revised)
+	if !errors.Is(err, ErrImmutableEvidence) {
+		t.Fatalf("revision after terminal evidence = %v", err)
+	}
+	stored := stage4AggregateFixtureInventory(t, fixture)
+	if len(stored.Tables[0].Ranges) != 1 {
+		t.Fatalf("refused revision still mutated the inventory: %#v", stored)
+	}
+}
+
+func testStage4AggregateInventorySchemaFixed(
+	t *testing.T,
+	factory stage4AggregateFactory,
+) {
+	t.Helper()
+	fixture := newStage4AggregateFixture(t, factory, false)
+	revised := stage4AggregateFixtureInventory(t, fixture)
+	revised.SchemaTopologyHash = "different-schema-topology"
+	revised.Tables[0].Ranges = []Stage4InventoryRange{{ID: "0"}, {ID: "1"}}
+	err := fixture.aggregate.EnsureStage4TableInventory(revised)
+	if !errors.Is(err, ErrImmutableEvidence) {
+		t.Fatalf("schema authority revision = %v", err)
+	}
+	stored := stage4AggregateFixtureInventory(t, fixture)
+	if stored.SchemaTopologyHash != "schema-topology" ||
+		len(stored.Tables[0].Ranges) != 1 {
+		t.Fatalf("refused revision still mutated the inventory: %#v", stored)
+	}
+}
+
 // TestStage4AggregateReadRejectsTamperedReceipt proves the read path is
 // fail-closed rather than a raw decode. Both stores share the validation
 // helper, so corrupting one durable document exercises it for both.

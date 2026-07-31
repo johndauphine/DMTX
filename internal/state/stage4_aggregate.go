@@ -219,6 +219,45 @@ func normalizeStage4TableInventory(
 	return inventory, nil
 }
 
+// validateStage4InventoryRevision permits replacing a table inventory that no
+// table has yet built terminal evidence on. A resumed run may legitimately
+// replan its range set — a source that grew during an outage yields a different
+// partition count — and freezing the first plan forever would make such a run
+// unrecoverable rather than merely failed.
+//
+// The revision window is deliberately narrow. The schema authority is immutable
+// across it, and it closes permanently the moment any table publishes an
+// aggregate receipt or completes its ordinary checkpoint, because from then on
+// the inventory is the authority those terminal records were validated against.
+func validateStage4InventoryRevision(
+	stored Stage4TableInventoryReceipt,
+	next Stage4TableInventory,
+	receipts int,
+	completedTables int,
+) error {
+	receipt, err := normalizeStoredStage4TableInventory(stored)
+	if err != nil {
+		return err
+	}
+	if receipts != 0 || completedTables != 0 {
+		return fmt.Errorf(
+			"%w: Stage 4 table inventory is fixed once a table published terminal evidence",
+			ErrImmutableEvidence,
+		)
+	}
+	current := receipt.Inventory
+	if current.RunID != next.RunID ||
+		current.SchemaTask != next.SchemaTask ||
+		current.SchemaTopologyHash != next.SchemaTopologyHash ||
+		current.SchemaSnapshotDigest != next.SchemaSnapshotDigest {
+		return fmt.Errorf(
+			"%w: Stage 4 table inventory schema authority cannot be revised",
+			ErrImmutableEvidence,
+		)
+	}
+	return nil
+}
+
 func newStage4TableInventoryReceipt(
 	inventory Stage4TableInventory,
 ) (Stage4TableInventoryReceipt, error) {

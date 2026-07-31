@@ -39,16 +39,23 @@ func (store YAMLStore) EnsureStage4TableInventory(
 			}
 			stored, found = candidate, true
 		}
-		if found {
-			return false, validateStage4TableInventoryReceipt(
-				stored,
-				normalized,
-			)
-		}
 		if latest.Outcome != Running || !latest.Resumable {
 			return false, fmt.Errorf(
 				"%w: table inventory requires an active resumable run",
 				ErrStateTransition,
+			)
+		}
+		if found {
+			if validateStage4TableInventoryReceipt(
+				stored,
+				normalized,
+			) == nil {
+				return false, nil
+			}
+			return reviseYAMLStage4TableInventory(
+				document,
+				stored,
+				normalized,
 			)
 		}
 		for _, task := range document.Tasks {
@@ -142,6 +149,82 @@ func (store YAMLStore) EnsureStage4TableInventory(
 		return stage4AggregateError("table inventory", err)
 	}
 	return nil
+}
+
+// reviseYAMLStage4TableInventory replaces a pre-mutation inventory in place.
+// The window is guarded by validateStage4InventoryRevision; the snapshot
+// authority is revalidated because the revision still binds itself to it.
+func reviseYAMLStage4TableInventory(
+	document *yamlStateDocument,
+	stored Stage4TableInventoryReceipt,
+	inventory Stage4TableInventory,
+) (bool, error) {
+	receipts := 0
+	for _, receipt := range document.Stage4TableCompletions {
+		if receipt.Completion.RunID == inventory.RunID {
+			receipts++
+		}
+	}
+	completedTables := 0
+	for _, task := range document.Tasks {
+		if task.RunID == inventory.RunID && task.Status == "completed" {
+			completedTables++
+		}
+	}
+	if err := validateStage4InventoryRevision(
+		stored,
+		inventory,
+		receipts,
+		completedTables,
+	); err != nil {
+		return false, err
+	}
+	snapshots := make(map[TaskKey]SchemaSnapshot)
+	for _, snapshot := range document.SchemaSnapshots {
+		if snapshot.RunID != inventory.RunID {
+			continue
+		}
+		if _, duplicate := snapshots[snapshot.Task]; duplicate {
+			return false, fmt.Errorf(
+				"%w: duplicate schema snapshot for task %#v",
+				ErrImmutableEvidence,
+				snapshot.Task,
+			)
+		}
+		snapshots[snapshot.Task] = snapshot
+	}
+	if err := validateStage4InventorySnapshot(
+		inventory,
+		snapshots,
+	); err != nil {
+		return false, err
+	}
+	receipt, err := newStage4TableInventoryReceipt(inventory)
+	if err != nil {
+		return false, err
+	}
+	replaced := false
+	for index := range document.Stage4TableInventories {
+		if document.Stage4TableInventories[index].Inventory.RunID !=
+			inventory.RunID {
+			continue
+		}
+		document.Stage4TableInventories[index] = receipt
+		replaced = true
+	}
+	if !replaced {
+		return false, fmt.Errorf(
+			"%w: Stage 4 table inventory disappeared during revision",
+			ErrStateTransition,
+		)
+	}
+	if err := stage4BeforeInventoryCommit(); err != nil {
+		return false, fmt.Errorf(
+			"prepare Stage 4 table inventory revision: %w",
+			err,
+		)
+	}
+	return true, nil
 }
 
 func (store YAMLStore) LoadStage4TableInventory(
