@@ -51,11 +51,11 @@ const postgresSourcePrimaryKeyQuery = `
 
 func discoverPostgresSourcePrimaryKey(
 	ctx context.Context,
-	database *sql.DB,
+	queryer PostgresCatalogQueryer,
 	tableObjectID int64,
 	table *schema.Table,
 ) error {
-	rows, err := database.QueryContext(
+	rows, err := queryer.QueryContext(
 		ctx,
 		postgresSourcePrimaryKeyQuery,
 		tableObjectID,
@@ -252,11 +252,11 @@ const postgresSourceIndexesQuery = `
 
 func discoverPostgresSourceIndexes(
 	ctx context.Context,
-	database *sql.DB,
+	queryer PostgresCatalogQueryer,
 	tableObjectID int64,
 	table schema.Table,
 ) ([]schema.Index, error) {
-	rows, err := database.QueryContext(
+	rows, err := queryer.QueryContext(
 		ctx,
 		postgresSourceIndexesQuery,
 		tableObjectID,
@@ -459,11 +459,11 @@ const postgresSourceChecksQuery = `
 
 func discoverPostgresSourceChecks(
 	ctx context.Context,
-	database *sql.DB,
+	queryer PostgresCatalogQueryer,
 	tableObjectID int64,
 	table schema.Table,
 ) ([]schema.CheckConstraint, error) {
-	rows, err := database.QueryContext(
+	rows, err := queryer.QueryContext(
 		ctx,
 		postgresSourceChecksQuery,
 		tableObjectID,
@@ -632,11 +632,11 @@ const postgresSourceForeignKeysQuery = `
 
 func discoverPostgresSourceForeignKeys(
 	ctx context.Context,
-	database *sql.DB,
+	queryer PostgresCatalogQueryer,
 	tableObjectID int64,
 	table schema.Table,
 ) ([]schema.ForeignKey, error) {
-	rows, err := database.QueryContext(
+	rows, err := queryer.QueryContext(
 		ctx,
 		postgresSourceForeignKeysQuery,
 		tableObjectID,

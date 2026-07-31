@@ -104,9 +104,10 @@ const sqlServerSourcePrimaryKeyQuery = `
 // fail-closed SQL Server 2022 contract.
 func discoverSQLServerSourcePrimaryKey(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 	table *schema.Table,
 	tableObjectID int64,
+	targetPhysicalPrimaryKey bool,
 ) error {
 	rows, err := database.QueryContext(
 		ctx,
@@ -211,6 +212,7 @@ func discoverSQLServerSourcePrimaryKey(
 	positions, err := sqlServerSourcePrimaryKeyFromCatalog(
 		*table,
 		catalogs[0],
+		targetPhysicalPrimaryKey,
 	)
 	if err != nil {
 		return err
@@ -254,8 +256,18 @@ func sameSQLServerPrimaryKeyCatalog(
 func sqlServerSourcePrimaryKeyFromCatalog(
 	table schema.Table,
 	catalog sqlServerSourcePrimaryKeyCatalog,
+	targetPhysicalPrimaryKey bool,
 ) (map[string]int, error) {
 	identity := sqlServerSourceIdentity(table, catalog.name)
+	validPhysicalIndex := catalog.indexType == 1 &&
+		catalog.indexTypeDescription == "CLUSTERED"
+	if targetPhysicalPrimaryKey {
+		validPhysicalIndex =
+			(catalog.indexType == 1 &&
+				catalog.indexTypeDescription == "CLUSTERED") ||
+				(catalog.indexType == 2 &&
+					catalog.indexTypeDescription == "NONCLUSTERED")
+	}
 	if catalog.tableObjectID <= 0 ||
 		catalog.namespace != table.Schema ||
 		catalog.table != table.Name ||
@@ -266,8 +278,7 @@ func sqlServerSourcePrimaryKeyFromCatalog(
 		catalog.parentObjectID != catalog.tableObjectID ||
 		catalog.indexID <= 0 ||
 		catalog.indexName != catalog.name ||
-		catalog.indexType != 1 ||
-		catalog.indexTypeDescription != "CLUSTERED" ||
+		!validPhysicalIndex ||
 		!catalog.unique ||
 		!catalog.primary ||
 		catalog.uniqueConstraint ||
@@ -293,7 +304,7 @@ func sqlServerSourcePrimaryKeyFromCatalog(
 			source.keyOrdinal != index+1 ||
 			source.partitionOrdinal != 0 ||
 			source.columnStoreOrdinal != 0 ||
-			source.descending ||
+			(source.descending && !targetPhysicalPrimaryKey) ||
 			source.included ||
 			source.columnID <= 0 ||
 			!exists ||
@@ -397,9 +408,10 @@ const sqlServerSourceIndexesQuery = `
 
 func discoverSQLServerSourceIndexes(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 	table schema.Table,
 	tableObjectID int64,
+	targetPhysicalIndex bool,
 ) ([]schema.Index, error) {
 	rows, err := database.QueryContext(
 		ctx,
@@ -499,7 +511,11 @@ func discoverSQLServerSourceIndexes(
 			)
 		}
 		ids[catalog.indexID] = struct{}{}
-		index, err := sqlServerSourceIndexFromCatalog(table, catalog)
+		index, err := sqlServerSourceIndexFromCatalog(
+			table,
+			catalog,
+			targetPhysicalIndex,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -538,6 +554,7 @@ func sameSQLServerIndexCatalog(
 func sqlServerSourceIndexFromCatalog(
 	table schema.Table,
 	catalog sqlServerSourceIndexCatalog,
+	targetPhysicalIndex bool,
 ) (schema.Index, error) {
 	identity := sqlServerSourceIdentity(table, catalog.name)
 	if catalog.tableObjectID <= 0 ||
@@ -576,7 +593,8 @@ func sqlServerSourceIndexFromCatalog(
 			source.columnID <= 0 ||
 			!exists ||
 			catalog.unique && column.Nullable ||
-			sqlServerSourceColumnHasNonportableComparison(column) ||
+			(sqlServerSourceColumnHasNonportableComparison(column) &&
+				!targetPhysicalIndex) ||
 			source.collation.Valid !=
 				sqlServerSourceColumnIsText(column) {
 			return schema.Index{}, sqlServerSourcePolicy(
@@ -650,7 +668,7 @@ const sqlServerSourceChecksQuery = `
 
 func discoverSQLServerSourceChecks(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 	table schema.Table,
 	tableObjectID int64,
 ) ([]schema.CheckConstraint, error) {
@@ -926,7 +944,7 @@ const sqlServerSourceForeignKeysQuery = `
 
 func discoverSQLServerSourceForeignKeys(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 	table schema.Table,
 	tableObjectID int64,
 ) ([]schema.ForeignKey, error) {

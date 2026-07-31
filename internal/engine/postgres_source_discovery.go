@@ -23,8 +23,15 @@ func VerifyPostgres16Source(
 	ctx context.Context,
 	database *sql.DB,
 ) error {
+	return verifyPostgres16Source(ctx, database)
+}
+
+func verifyPostgres16Source(
+	ctx context.Context,
+	queryer PostgresCatalogQueryer,
+) error {
 	var version int
-	if err := database.QueryRowContext(
+	if err := queryer.QueryRowContext(
 		ctx,
 		`SELECT current_setting('server_version_num')::integer`,
 	).Scan(&version); err != nil {
@@ -107,12 +114,12 @@ const postgresSourceTableCatalogQuery = `
 
 func readPostgresSourceTableCatalog(
 	ctx context.Context,
-	database *sql.DB,
+	queryer PostgresCatalogQueryer,
 	namespace string,
 	name string,
 ) (postgresSourceTableCatalog, error) {
 	var result postgresSourceTableCatalog
-	err := database.QueryRowContext(
+	err := queryer.QueryRowContext(
 		ctx,
 		postgresSourceTableCatalogQuery,
 		namespace,
@@ -294,12 +301,12 @@ const postgresSourceColumnsQuery = `
 
 func readPostgresSourceColumns(
 	ctx context.Context,
-	database *sql.DB,
+	queryer PostgresCatalogQueryer,
 	table postgresSourceTableCatalog,
 	namespace string,
 	name string,
 ) ([]schema.Column, []string, error) {
-	rows, err := database.QueryContext(
+	rows, err := queryer.QueryContext(
 		ctx,
 		postgresSourceColumnsQuery,
 		table.objectID,
@@ -552,16 +559,16 @@ func unsupportedPostgresSourceType(
 
 func inspectPostgres16Table(
 	ctx context.Context,
-	database *sql.DB,
+	queryer PostgresCatalogQueryer,
 	namespace string,
 	name string,
 ) (schema.Table, error) {
-	if err := VerifyPostgres16Source(ctx, database); err != nil {
+	if err := verifyPostgres16Source(ctx, queryer); err != nil {
 		return schema.Table{}, err
 	}
 	tableCatalog, err := readPostgresSourceTableCatalog(
 		ctx,
-		database,
+		queryer,
 		namespace,
 		name,
 	)
@@ -570,7 +577,7 @@ func inspectPostgres16Table(
 	}
 	columns, identities, err := readPostgresSourceColumns(
 		ctx,
-		database,
+		queryer,
 		tableCatalog,
 		namespace,
 		name,
@@ -585,7 +592,7 @@ func inspectPostgres16Table(
 	}
 	if err := discoverPostgresSourcePrimaryKey(
 		ctx,
-		database,
+		queryer,
 		tableCatalog.objectID,
 		&table,
 	); err != nil {
@@ -594,7 +601,7 @@ func inspectPostgres16Table(
 	if len(identities) == 1 {
 		identity, err := discoverPostgresSourceIdentity(
 			ctx,
-			database,
+			queryer,
 			table,
 			identities[0],
 		)
@@ -605,7 +612,7 @@ func inspectPostgres16Table(
 	}
 	table.Indexes, err = discoverPostgresSourceIndexes(
 		ctx,
-		database,
+		queryer,
 		tableCatalog.objectID,
 		table,
 	)
@@ -614,7 +621,7 @@ func inspectPostgres16Table(
 	}
 	table.Checks, err = discoverPostgresSourceChecks(
 		ctx,
-		database,
+		queryer,
 		tableCatalog.objectID,
 		table,
 	)
@@ -623,7 +630,7 @@ func inspectPostgres16Table(
 	}
 	table.ForeignKeys, err = discoverPostgresSourceForeignKeys(
 		ctx,
-		database,
+		queryer,
 		tableCatalog.objectID,
 		table,
 	)
@@ -744,7 +751,7 @@ const postgresSourceIdentitySequenceQuery = `
 
 func discoverPostgresSourceIdentity(
 	ctx context.Context,
-	database *sql.DB,
+	queryer PostgresCatalogQueryer,
 	table schema.Table,
 	columnName string,
 ) (*schema.Identity, error) {
@@ -754,7 +761,7 @@ func discoverPostgresSourceIdentity(
 	); err != nil {
 		return nil, err
 	}
-	rows, err := database.QueryContext(
+	rows, err := queryer.QueryContext(
 		ctx,
 		postgresSourceIdentitySequenceQuery,
 		table.Schema,

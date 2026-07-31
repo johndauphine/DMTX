@@ -176,6 +176,28 @@ func VerifyMySQLTarget(
 	return flavor, nil
 }
 
+// VerifyMySQLTargetForFlavor re-runs the complete flavor-pinned target
+// contract through a caller-supplied queryer. Target replay fencing uses this
+// with its pinned *sql.Tx so per-session SQL modes and constraint switches are
+// proven on the exact connection that will execute page DML.
+func VerifyMySQLTargetForFlavor(
+	ctx context.Context,
+	queryer MySQLCatalogQueryer,
+	flavor MySQLServerFlavor,
+) error {
+	if queryer == nil {
+		return fmt.Errorf("verify MySQL target: catalog queryer is required")
+	}
+	switch flavor {
+	case MySQLServerFlavorOracle80:
+		return verifyMySQL80Target(ctx, queryer)
+	case MySQLServerFlavorMariaDB1011:
+		return verifyMariaDB1011Target(ctx, queryer)
+	default:
+		return fmt.Errorf("unsupported MySQL target flavor")
+	}
+}
+
 // DetectMySQLServerFlavor reads the live server identity and rejects ambiguous
 // or inconsistent MySQL-compatible distributions.
 func DetectMySQLServerFlavor(

@@ -57,7 +57,7 @@ const mysql80SourcePrimaryKeyQuery = `
 
 func discoverMySQL80SourcePrimaryKey(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table *schema.Table,
 ) error {
 	rows, err := database.QueryContext(
@@ -204,7 +204,7 @@ const mysql80SourceIndexesQuery = `
 
 func discoverMySQL80SourceIndexes(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table schema.Table,
 ) ([]schema.Index, error) {
 	rows, err := database.QueryContext(
@@ -408,7 +408,7 @@ const mysql80SourceChecksQuery = `
 
 func discoverMySQL80SourceChecks(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table schema.Table,
 ) ([]schema.CheckConstraint, error) {
 	rows, err := database.QueryContext(
@@ -525,7 +525,7 @@ const mysql80SourceForeignKeysQuery = `
 
 func discoverMySQL80SourceForeignKeys(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table schema.Table,
 ) ([]schema.ForeignKey, error) {
 	rows, err := database.QueryContext(

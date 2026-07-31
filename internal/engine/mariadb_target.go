@@ -108,7 +108,14 @@ func VerifyMariaDB1011Target(
 	ctx context.Context,
 	database *sql.DB,
 ) error {
-	catalog, err := readMariaDB1011TargetServerCatalog(ctx, database)
+	return verifyMariaDB1011Target(ctx, database)
+}
+
+func verifyMariaDB1011Target(
+	ctx context.Context,
+	queryer MySQLCatalogQueryer,
+) error {
+	catalog, err := readMariaDB1011TargetServerCatalog(ctx, queryer)
 	if err != nil {
 		return err
 	}
@@ -117,7 +124,7 @@ func VerifyMariaDB1011Target(
 
 func readMariaDB1011TargetServerCatalog(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 ) (mariaDB1011TargetServerCatalog, error) {
 	var catalog mariaDB1011TargetServerCatalog
 	err := database.QueryRowContext(

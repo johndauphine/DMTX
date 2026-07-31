@@ -24,7 +24,14 @@ func VerifyMySQL80Source(
 	ctx context.Context,
 	database *sql.DB,
 ) error {
-	catalog, err := readMySQL80ServerCatalog(ctx, database)
+	return verifyMySQL80Source(ctx, database)
+}
+
+func verifyMySQL80Source(
+	ctx context.Context,
+	queryer MySQLCatalogQueryer,
+) error {
+	catalog, err := readMySQL80ServerCatalog(ctx, queryer)
 	if err != nil {
 		return err
 	}
@@ -37,7 +44,14 @@ func VerifyMySQL80Target(
 	ctx context.Context,
 	database *sql.DB,
 ) error {
-	catalog, err := readMySQL80ServerCatalog(ctx, database)
+	return verifyMySQL80Target(ctx, database)
+}
+
+func verifyMySQL80Target(
+	ctx context.Context,
+	queryer MySQLCatalogQueryer,
+) error {
+	catalog, err := readMySQL80ServerCatalog(ctx, queryer)
 	if err != nil {
 		return err
 	}
@@ -48,7 +62,7 @@ func VerifyMySQL80Target(
 		return err
 	}
 	var generateInvisiblePrimaryKey, requirePrimaryKey int
-	if err := database.QueryRowContext(
+	if err := queryer.QueryRowContext(
 		ctx,
 		`SELECT
 			@@session.sql_generate_invisible_primary_key,
@@ -129,7 +143,7 @@ func validateMySQL80TargetVersion(
 
 func readMySQL80ServerCatalog(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 ) (mysql80SourceServerCatalog, error) {
 	var catalog mysql80SourceServerCatalog
 	err := database.QueryRowContext(ctx, mysql80SourceServerCatalogQuery).Scan(
@@ -358,7 +372,7 @@ const mysql80SourceTableCatalogQuery = `
 
 func readMySQL80SourceTableCatalog(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	namespace string,
 	name string,
 ) (mysql80SourceTableCatalog, error) {
@@ -529,7 +543,7 @@ const mysql80SourceColumnsQuery = `
 
 func readMySQL80SourceColumns(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table mysql80SourceTableCatalog,
 	namespace string,
 	name string,
@@ -1034,11 +1048,11 @@ func unsupportedMySQLSourceType(
 
 func inspectMySQL80Table(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	namespace string,
 	name string,
 ) (schema.Table, error) {
-	if err := VerifyMySQL80Source(ctx, database); err != nil {
+	if err := verifyMySQL80Source(ctx, database); err != nil {
 		return schema.Table{}, err
 	}
 	tableCatalog, err := readMySQL80SourceTableCatalog(

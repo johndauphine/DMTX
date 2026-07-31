@@ -12,6 +12,14 @@ import (
 	_ "github.com/microsoft/go-mssqldb"
 )
 
+// SQLServerCatalogQueryer is the read-only catalog surface used by SQL Server
+// table discovery. Both *sql.DB and *sql.Tx implement it so retained-target
+// replay proofs can run the exact discovery contract under their table lock.
+type SQLServerCatalogQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 // SQLServerDSN creates an encrypted SQL Server URI without logging or
 // resolving password templates.
 func SQLServerDSN(endpoint config.Endpoint) (string, error) {
@@ -145,8 +153,73 @@ func ListSQLServerTables(ctx context.Context, database *sql.DB, namespace string
 // InspectSQLServerTable discovers deterministic column and ordered primary-key
 // metadata for a base table.
 func InspectSQLServerTable(ctx context.Context, database *sql.DB, namespace, name string) (schema.Table, error) {
+	return InspectSQLServerTableWithQueryer(
+		ctx,
+		database,
+		namespace,
+		name,
+	)
+}
+
+// InspectSQLServerTableWithQueryer runs the same complete, stable SQL Server
+// 2022 table/column/identity/index/CHECK/foreign-key discovery through a
+// caller-supplied queryer.
+func InspectSQLServerTableWithQueryer(
+	ctx context.Context,
+	queryer SQLServerCatalogQueryer,
+	namespace string,
+	name string,
+) (schema.Table, error) {
+	if queryer == nil {
+		return schema.Table{}, fmt.Errorf(
+			"inspect SQL Server table %s.%s: catalog queryer is required",
+			namespace,
+			name,
+		)
+	}
 	if namespace == "" {
 		namespace = "dbo"
 	}
-	return inspectSQLServer2022Table(ctx, database, namespace, name)
+	if err := verifySQLServer2022Source(ctx, queryer); err != nil {
+		return schema.Table{}, err
+	}
+	return inspectSQLServer2022Table(
+		ctx,
+		queryer,
+		namespace,
+		name,
+		false,
+	)
+}
+
+// InspectSQLServerTargetTableWithQueryer applies the same full table-shape
+// discovery while accepting primary-key clustering and sort direction as
+// target-only physical choices. Those choices do not change MERGE key
+// equality and are intentionally absent from the retained schema model.
+func InspectSQLServerTargetTableWithQueryer(
+	ctx context.Context,
+	queryer SQLServerCatalogQueryer,
+	namespace string,
+	name string,
+) (schema.Table, error) {
+	if queryer == nil {
+		return schema.Table{}, fmt.Errorf(
+			"inspect SQL Server target table %s.%s: catalog queryer is required",
+			namespace,
+			name,
+		)
+	}
+	if namespace == "" {
+		namespace = "dbo"
+	}
+	if err := verifySQLServer2022Target(ctx, queryer); err != nil {
+		return schema.Table{}, err
+	}
+	return inspectSQLServer2022Table(
+		ctx,
+		queryer,
+		namespace,
+		name,
+		true,
+	)
 }

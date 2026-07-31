@@ -21,7 +21,14 @@ func VerifySQLServer2022Source(
 	ctx context.Context,
 	database *sql.DB,
 ) error {
-	catalog, err := readSQLServer2022SourceCatalog(ctx, database)
+	return verifySQLServer2022Source(ctx, database)
+}
+
+func verifySQLServer2022Source(
+	ctx context.Context,
+	queryer SQLServerCatalogQueryer,
+) error {
+	catalog, err := readSQLServer2022SourceCatalog(ctx, queryer)
 	if err != nil {
 		return err
 	}
@@ -37,7 +44,14 @@ func VerifySQLServer2022Target(
 	ctx context.Context,
 	database *sql.DB,
 ) error {
-	catalog, err := readSQLServer2022SourceCatalog(ctx, database)
+	return verifySQLServer2022Target(ctx, database)
+}
+
+func verifySQLServer2022Target(
+	ctx context.Context,
+	queryer SQLServerCatalogQueryer,
+) error {
+	catalog, err := readSQLServer2022SourceCatalog(ctx, queryer)
 	if err != nil {
 		return err
 	}
@@ -93,7 +107,7 @@ const sqlServer2022SourceCatalogQuery = `
 
 func readSQLServer2022SourceCatalog(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 ) (sqlServer2022SourceCatalog, error) {
 	var result sqlServer2022SourceCatalog
 	err := database.QueryRowContext(
@@ -301,7 +315,7 @@ const sqlServerSourceTableCatalogQuery = `
 
 func readSQLServerSourceTableCatalog(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 	namespace string,
 	name string,
 ) (sqlServerSourceTableCatalog, error) {
@@ -519,7 +533,7 @@ const sqlServerSourceColumnsQuery = `
 
 func readSQLServerSourceColumns(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 	table sqlServerSourceTableCatalog,
 	namespace string,
 	name string,
@@ -1040,15 +1054,17 @@ func sqlServerTemporalPrecision(base string, scale int) int {
 
 func inspectSQLServer2022Table(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 	namespace string,
 	name string,
+	targetPhysicalPrimaryKey bool,
 ) (schema.Table, error) {
 	first, firstObjectID, err := inspectSQLServer2022TableOnce(
 		ctx,
 		database,
 		namespace,
 		name,
+		targetPhysicalPrimaryKey,
 	)
 	if err != nil {
 		return schema.Table{}, err
@@ -1058,6 +1074,7 @@ func inspectSQLServer2022Table(
 		database,
 		namespace,
 		name,
+		targetPhysicalPrimaryKey,
 	)
 	if err != nil {
 		return schema.Table{}, err
@@ -1074,9 +1091,10 @@ func inspectSQLServer2022Table(
 
 func inspectSQLServer2022TableOnce(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 	namespace string,
 	name string,
+	targetPhysicalPrimaryKey bool,
 ) (schema.Table, int64, error) {
 	catalog, err := readSQLServerSourceTableCatalog(
 		ctx,
@@ -1107,6 +1125,7 @@ func inspectSQLServer2022TableOnce(
 		database,
 		&table,
 		catalog.objectID,
+		targetPhysicalPrimaryKey,
 	); err != nil {
 		return schema.Table{}, 0, err
 	}
@@ -1123,6 +1142,7 @@ func inspectSQLServer2022TableOnce(
 		database,
 		table,
 		catalog.objectID,
+		targetPhysicalPrimaryKey,
 	)
 	if err != nil {
 		return schema.Table{}, 0, err

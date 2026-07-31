@@ -13,6 +13,15 @@ import (
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
+// PostgresCatalogQueryer is the read-only catalog surface used by PostgreSQL
+// 16 source discovery. Both *sql.DB and *sql.Tx implement it, which lets a
+// table-stable reader rerun the complete version and catalog contract through
+// the exact transaction that owns its REPEATABLE READ snapshot.
+type PostgresCatalogQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 // PostgresDSN creates a URI connection string without logging or resolving
 // password templates. Callers must keep its value out of operator output.
 func PostgresDSN(endpoint config.Endpoint) (string, error) {
@@ -85,8 +94,32 @@ func ListPostgresTables(ctx context.Context, database *sql.DB, schema string) ([
 // contract supported by DMTX. Unsupported or ambiguous catalog shapes fail
 // closed before a target adapter is opened.
 func InspectPostgresTable(ctx context.Context, database *sql.DB, namespace, name string) (schema.Table, error) {
+	return InspectPostgresTableWithQueryer(
+		ctx,
+		database,
+		namespace,
+		name,
+	)
+}
+
+// InspectPostgresTableWithQueryer runs the complete version-pinned PostgreSQL
+// 16 table/column/identity/index/CHECK/foreign-key discovery through a
+// caller-supplied queryer.
+func InspectPostgresTableWithQueryer(
+	ctx context.Context,
+	queryer PostgresCatalogQueryer,
+	namespace string,
+	name string,
+) (schema.Table, error) {
+	if queryer == nil {
+		return schema.Table{}, fmt.Errorf(
+			"inspect PostgreSQL table %s.%s: catalog queryer is required",
+			namespace,
+			name,
+		)
+	}
 	if namespace == "" {
 		namespace = "public"
 	}
-	return inspectPostgres16Table(ctx, database, namespace, name)
+	return inspectPostgres16Table(ctx, queryer, namespace, name)
 }

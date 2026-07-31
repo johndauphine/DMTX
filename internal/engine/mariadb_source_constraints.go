@@ -53,7 +53,7 @@ const mariaDB1011SourcePrimaryKeyQuery = `
 
 func discoverMariaDB1011SourcePrimaryKey(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table *schema.Table,
 ) error {
 	rows, err := database.QueryContext(
@@ -195,7 +195,7 @@ const mariaDB1011SourceIndexesQuery = `
 
 func discoverMariaDB1011SourceIndexes(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table schema.Table,
 ) ([]schema.Index, error) {
 	rows, err := database.QueryContext(
@@ -373,7 +373,7 @@ const mariaDB1011SourceChecksQuery = `
 
 func discoverMariaDB1011SourceChecks(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table *schema.Table,
 ) ([]schema.CheckConstraint, error) {
 	rows, err := database.QueryContext(
@@ -555,7 +555,7 @@ func mariaDB1011JSONCheckColumn(value string) (string, bool) {
 
 func discoverMariaDB1011SourceForeignKeys(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table schema.Table,
 ) ([]schema.ForeignKey, error) {
 	rows, err := database.QueryContext(
