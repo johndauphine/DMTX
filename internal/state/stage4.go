@@ -386,9 +386,6 @@ func normalizeTimestamp(value TimestampWatermark) (TimestampWatermark, error) {
 	if strings.TrimSpace(value.Column) == "" {
 		return TimestampWatermark{}, fmt.Errorf("watermark column is required")
 	}
-	if value.Value.IsZero() {
-		return TimestampWatermark{}, fmt.Errorf("watermark value is required")
-	}
 	value.Value = value.Value.UTC()
 	return value, nil
 }

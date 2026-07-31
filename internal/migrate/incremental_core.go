@@ -849,12 +849,6 @@ func beginIncrementalAttempt(
 		return state.IncrementalAttempt{}, err
 	}
 	if sampled != nil {
-		if sampled.IsZero() {
-			return state.IncrementalAttempt{}, NewTransferError(
-				ErrorClassPolicy,
-				errors.New("sampled incremental upper fence is zero"),
-			)
-		}
 		upper := state.TimestampWatermark{
 			Column: request.Plan.DateColumn.Name,
 			Value:  sampled.UTC(),
@@ -1035,12 +1029,6 @@ func validateStoredIncrementalAttempt(
 			return NewTransferError(
 				ErrorClassState,
 				fmt.Errorf("stored incremental %s has a blank column", evidence.label),
-			)
-		}
-		if evidence.watermark.Value.IsZero() {
-			return NewTransferError(
-				ErrorClassState,
-				fmt.Errorf("stored incremental %s has a zero value", evidence.label),
 			)
 		}
 	}

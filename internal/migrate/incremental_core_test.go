@@ -330,6 +330,46 @@ func TestExecuteIncrementalBaselineWithOnlyNullTimestampsCommitsNil(t *testing.T
 	}
 }
 
+func TestExecuteIncrementalMinimumSQLTimestampIsNotMissing(t *testing.T) {
+	plan := incrementalTestPlan(t)
+	store := newIncrementalFakeState()
+	request := incrementalTestRequest(
+		store,
+		plan,
+		time.Date(2026, 7, 30, 14, 30, 0, 0, time.UTC),
+	)
+	minimum := time.Time{}
+	request.SampleUpperFence = fixedIncrementalFence(minimum)
+	request.Transfer = func(
+		_ context.Context,
+		read IncrementalReadPlan,
+	) error {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		if read.Scope != IncrementalReadFullTable ||
+			store.active.UpperFence == nil ||
+			!store.active.UpperFence.Value.Equal(minimum) {
+			t.Fatalf(
+				"minimum SQL timestamp read=%#v active=%#v",
+				read,
+				store.active,
+			)
+		}
+		return nil
+	}
+	result, err := ExecuteIncrementalTable(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Completed ||
+		result.Attempt.UpperFence == nil ||
+		!result.Attempt.UpperFence.Value.Equal(minimum) ||
+		store.commit.Watermark == nil ||
+		!store.commit.Watermark.Value.Equal(minimum) {
+		t.Fatalf("minimum SQL timestamp result=%#v commit=%#v", result, store.commit)
+	}
+}
+
 func TestExecuteIncrementalWindowUsesDurableLowerAndImmutableUpper(t *testing.T) {
 	plan := incrementalTestPlan(t)
 	store := newIncrementalFakeState()
@@ -1351,13 +1391,6 @@ func TestExecuteIncrementalRejectsRegressedFenceChangedColumnAndMutatedPlan(t *t
 			},
 			want: "mutated after planning",
 		},
-		{
-			name: "zero sampled fence",
-			configure: func(_ *incrementalFakeState, request *IncrementalExecutionRequest) {
-				request.SampleUpperFence = fixedIncrementalFence(time.Time{})
-			},
-			want: "upper fence is zero",
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1430,18 +1463,6 @@ func TestExecuteIncrementalResumeRejectsUnexpectedAttemptOrEvidence(t *testing.T
 			},
 			want: "has a blank column",
 		},
-		{
-			name: "zero loaded watermark value",
-			active: state.IncrementalAttempt{
-				RunID: "run-1", Task: incrementalTask(), AttemptID: "attempt-1",
-				Mode: state.IncrementalWindow, Status: state.IncrementalRunning,
-				StartedAt: started,
-				LowerWatermark: &state.TimestampWatermark{
-					Column: "updated_at", Value: time.Time{},
-				},
-			},
-			want: "has a zero value",
-		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store := newIncrementalFakeState()
@@ -1484,13 +1505,6 @@ func TestExecuteIncrementalRejectsCorruptedHistoricalWatermarkBeforeSampling(t *
 				Column: " ", Value: started,
 			},
 			want: "has a blank column",
-		},
-		{
-			name: "zero value",
-			watermark: state.TimestampWatermark{
-				Column: "updated_at", Value: time.Time{},
-			},
-			want: "has a zero value",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

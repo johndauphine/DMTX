@@ -35,6 +35,9 @@ func TestStage4BackendConformance(t *testing.T) {
 			t.Run("incremental fence and atomic completion", func(t *testing.T) {
 				testStage4IncrementalAttempt(t, factory)
 			})
+			t.Run("minimum timestamp watermark round trip", func(t *testing.T) {
+				testStage4MinimumTimestampWatermark(t, factory)
+			})
 			t.Run("delete results", func(t *testing.T) {
 				testStage4DeleteReconciliation(t, factory)
 			})
@@ -514,6 +517,61 @@ func testStage4IncrementalAttempt(t *testing.T, factory stage4BackendFactory) {
 		TopologyHash: "topology-1", Watermark: &upper, CompletedAt: completedAt,
 	}); !errors.Is(err, ErrUnknownWork) {
 		t.Fatalf("unknown incremental attempt error = %v", err)
+	}
+}
+
+func testStage4MinimumTimestampWatermark(
+	t *testing.T,
+	factory stage4BackendFactory,
+) {
+	t.Helper()
+	backend, reopen := factory(t)
+	stage4, runID, key, started := initializeStage4Backend(t, backend)
+	minimum := TimestampWatermark{
+		Column: "updated_at",
+		Value:  time.Time{},
+	}
+	attempt := IncrementalAttempt{
+		RunID: runID, Task: key, AttemptID: "minimum-timestamp",
+		Mode: IncrementalBaseline, UpperFence: &minimum, StartedAt: started,
+	}
+	if _, created, err := stage4.BeginIncrementalAttempt(attempt); err != nil ||
+		!created {
+		t.Fatalf("begin minimum timestamp created=%v err=%v", created, err)
+	}
+	if err := backend.(RangeBackend).CompleteRange(
+		runID,
+		key,
+		"0",
+		"topology-1",
+		0,
+		started.Add(time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := stage4.CommitIncrementalAttempt(IncrementalCommit{
+		RunID: runID, Task: key, AttemptID: attempt.AttemptID,
+		TopologyHash: "topology-1", Watermark: &minimum,
+		CompletedAt: started.Add(2 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	restored, found, err := reopen().(Stage4Backend).LoadIncrementalAttempt(
+		runID,
+		key,
+		attempt.AttemptID,
+	)
+	if err != nil || !found ||
+		restored.UpperFence == nil ||
+		!restored.UpperFence.Value.Equal(time.Time{}) ||
+		restored.CommittedWatermark == nil ||
+		!restored.CommittedWatermark.Value.Equal(time.Time{}) {
+		t.Fatalf(
+			"minimum timestamp attempt = %#v found=%v err=%v",
+			restored,
+			found,
+			err,
+		)
 	}
 }
 
