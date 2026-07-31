@@ -338,7 +338,7 @@ permanently at the first terminal table evidence.
 | Normative behavior | Current evidence | Remaining proof |
 |---|---|---|
 | Task exists durably before destructive mutation. | **Covered base:** `TestTaskInitializationFailurePrecedesTargetMutation`. | Network live regression in S4.2. |
-| Unresolved periodic/final/task/watermark/run-completion write failure prevents success with state exit 6. | **Partial:** `TestAdapterRunnerReturnsOnlyCompletedProgressWhenLaterCheckpointFails`, `TestSQLitePartialResultKeepsRowsAfterAggregateCheckpointFailure`, `TestMigrationAttemptDisposition`, crash-boundary tests. | `TestStage4EveryRequiredWriteFailureReturnsStateExitSix` across both backends. |
+| Unresolved periodic/final/task/watermark/run-completion write failure prevents success with state exit 6. | **Covered:** `TestStage4EveryRequiredWriteFailureReturnsStateExitSix` drives each required write to failure and proves it classifies as a state failure and maps to exit 6; `TestStage4RequiredWriteFailureOutranksTransferClassification` pins the precedence so a durable write failure is never reported as a transfer error. Retained context: `TestAdapterRunnerReturnsOnlyCompletedProgressWhenLaterCheckpointFails`, `TestSQLitePartialResultKeepsRowsAfterAggregateCheckpointFailure`, `TestMigrationAttemptDisposition`. | The run-completion write is covered by `publishStage4RunSuccess` returning a state-classified error; a live route proof belongs in the S4.9 matrix. |
 | Unknown task writes reject. | **Covered base:** `TestSQLiteStoreRequiresKnownRunningTaskForCompletion`, range backend unknown-work checks. | Add every new Stage 4 write to `TestStage4UnknownTaskWritesReject`. |
 | Periodic save may degrade only if final safe frontier supersedes it, with audit evidence. | **Missing as complete behavior.** | `TestPeriodicCheckpointFailureCanBeSupersededAndAudited`, `TestPeriodicCheckpointFailureWithoutFinalSaveIsFatal`. |
 | State failure after target commit directs repair-and-resume, not competing fresh run. | **Partial:** errors remain resumable, but remedy contract is absent. | `TestPostCommitStateFailureNamesRepairAndResume`. |
@@ -448,7 +448,7 @@ it cannot implement safely until separately admitted.
 |---|---|
 | Full/YAML backends share restartability conformance. | **Covered base;** extend with `TestStage4BackendConformance`. |
 | YAML replacement survives crash/concurrent writers. | **Covered base;** rerun expanded `TestStage4YAMLAtomicReplacementCrashMatrix`. |
-| Unknown/required-write failures prevent success. | **Partial;** missing `TestStage4EveryRequiredWriteFailureReturnsStateExitSix`. |
+| Unknown/required-write failures prevent success. | **Covered:** `TestStage4EveryRequiredWriteFailureReturnsStateExitSix`. |
 | Task creation fails before mutation. | **Covered base;** network live regression required. |
 | Periodic failure may be superseded only by audited final save. | **Missing:** two proposed periodic-checkpoint fixtures. |
 | Two processes racing one target produce one owner. | **Missing explicit process test:** `TestTargetLeaseTwoProcessRace`. |
@@ -599,7 +599,7 @@ due/candidate reporting, and estimate provenance.
 - `TestClickHouseIncrementalRejectedBeforeMutationLive`
 - `TestClickHouseDeleteReconcileRejectedBeforeMutationLive`
 - `TestTargetLeaseTwoProcessRace`, `TestDifferentCanonicalTargetsRunConcurrently`
-- `TestStage4EveryRequiredWriteFailureReturnsStateExitSix`
+- ~~`TestStage4EveryRequiredWriteFailureReturnsStateExitSix`~~ — **closed 2026-07-31**
 - periodic-checkpoint supersession pair (Section 11.3)
 - engine retry classifiers (Section 8.6) — six fixtures
 - `TestStage4LiveMatrixEnvironmentRequired`
