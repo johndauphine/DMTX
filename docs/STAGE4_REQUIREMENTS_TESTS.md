@@ -295,7 +295,7 @@ Epoch and evidence primitives now covered by
 | SQL Server table: shared table view/lock; writes to that table wait. | `TestSQLServerStrictTableLockLive`. |
 | SQL Server migration: one supported database snapshot; writers do not block. | `TestSQLServerStrictMigrationDatabaseSnapshotLive`. |
 | MySQL/MariaDB table: parallel InnoDB repeatable-read sessions opened under brief `LOCK TABLES`; verify engine and privilege. | `TestMySQLStrictTableSnapshotLive`, `TestMariaDBStrictTableSnapshotLive`, `TestMySQLStrictRejectsEngineOrLockPrivilegeLive`. |
-| SQLite table: one serializable reader and no parallel source readers. | `TestSQLiteStrictTableSnapshot`. |
+| SQLite table: one serializable reader and no parallel source readers. | **Implemented 2026-07-31.** `SQLiteStrictConsistencyOpener` in `strict_consistency_sqlite.go`; proven by `TestSQLiteStrictTableSnapshot`, `TestSQLiteStrictRejectsParallelSourceReaders`, `TestSQLiteStrictRejectsUnsupportedRequests`, and `TestSQLiteStrictCloseIsIdempotentAndFinal`. Needs no live server, so it is fully proven now. **Contract note:** in default rollback-journal mode the read transaction blocks source writers with SQLITE_BUSY. The view is stable because writers wait. The opener deliberately does not switch the source to WAL — journal mode is a persistent property of the user database and strict consistency must not silently reconfigure the source. |
 | MySQL/SQLite migration and every ClickHouse strict scope reject before mutation. | `TestStrictConsistencyUnsupportedScopesBeforeMutation` and TLS live sentinels. |
 | Full-table strict count comes from the same view, is persisted, and controls validation; later live drift is informational. | `TestStrictSnapshotCountIsPersistedAndAuthoritativeLive`. |
 | PostgreSQL process resume opens and reports a new epoch while preserving per-table replay correctness. | **Covered:** `TestStage4PostgresStrictResumeUsesNewEpochAndReplaysLiveTLS`. |
@@ -595,11 +595,24 @@ value contracts are all implemented and covered non-live. What remains is
 `TestMariaDBValidationModesLive`, `TestStage4ValidationRouteMatrixLive`, and
 `TestValidationTimeoutFallbackEngineMatrixLive` — all gated on block G.
 
-### C. Strict consistency for the four remaining engines
+### C. Strict consistency for the remaining engines
 
-MySQL, MariaDB, SQL Server, and SQLite each need their supported scope
-implemented and live-proven; every ClickHouse scope must reject. PostgreSQL is
-done and is the reference implementation.
+**SQLite is done as of 2026-07-31** and was misclassified as live-gated: it is
+an embedded engine, so its whole contract is provable without a server. That
+correction matters for planning — do not assume a block is endpoint-blocked
+just because its neighbours are.
+
+MySQL, MariaDB, and SQL Server still need their supported scope implemented,
+and those genuinely do need live servers. Every ClickHouse scope must reject —
+already covered by `TestBuiltInRoutesRejectUncertifiedStrictConsistencyScopes`,
+which walks every certified pair and both scopes through `ValidateMigration`,
+so rejection precedes any connection. PostgreSQL remains the reference
+implementation; SQLite is the simplest worked example of the opener contract.
+
+Not yet wired: the SQLite opener implements `StrictConsistencyOpener` but no
+route selects it, and `ValidateMigration` still rejects SQLite strict. Admitting
+the route is the next step and needs the certified-pair policy updated
+deliberately, not as a side effect.
 
 ### D. Schema-contract modes — logic done, live matrix open
 
