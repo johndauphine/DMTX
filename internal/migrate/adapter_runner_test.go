@@ -22,6 +22,12 @@ type recordingAdapterSource struct {
 	table  schema.Table
 	tables []schema.Table
 	rows   []string
+	ids    []int64
+
+	stableReaderLimit int
+	beforeStableOpen  func(*recordingAdapterSource)
+	readRanges        *[]uint64
+	stableCloseErr    error
 }
 
 func (source *recordingAdapterSource) definitions() []schema.Table {
@@ -40,6 +46,56 @@ func (source *recordingAdapterSource) payloads() []string {
 
 func (source *recordingAdapterSource) Engine() string {
 	return "postgres"
+}
+
+func (*recordingAdapterSource) networkStableRangePageSource() {}
+
+func (source *recordingAdapterSource) openStableNetworkTableSource(
+	ctx context.Context,
+	table schema.Table,
+) (*adapterStableNetworkTableSession, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if source.beforeStableOpen != nil {
+		source.beforeStableOpen(source)
+	}
+	catalog, err := source.InspectTable(ctx, table.Name)
+	if err != nil {
+		return nil, err
+	}
+	if catalog.Schema != table.Schema {
+		return nil, fmt.Errorf("stable source schema changed")
+	}
+	snapshot := &recordingAdapterSource{
+		events:     source.events,
+		table:      cloneStage4RichTable(source.table),
+		rows:       append([]string(nil), source.rows...),
+		ids:        append([]int64(nil), source.ids...),
+		readRanges: source.readRanges,
+	}
+	if source.tables != nil {
+		snapshot.tables = make([]schema.Table, len(source.tables))
+		for index := range source.tables {
+			snapshot.tables[index] =
+				cloneStage4RichTable(source.tables[index])
+		}
+	}
+	readerLimit := source.stableReaderLimit
+	if readerLimit == 0 {
+		readerLimit = 1
+	}
+	return &adapterStableNetworkTableSession{
+		source:      snapshot,
+		readerLimit: readerLimit,
+		closeFn: func() error {
+			*source.events = append(
+				*source.events,
+				"source_stable_close:"+table.Name,
+			)
+			return source.stableCloseErr
+		},
+	}, nil
 }
 
 func (source *recordingAdapterSource) DisplayName() string {
@@ -108,6 +164,18 @@ func (source *recordingAdapterSource) CountRows(
 	return len(source.payloads()), nil
 }
 
+func (source *recordingAdapterSource) identifiers() []int64 {
+	payloads := source.payloads()
+	if source.ids == nil {
+		result := make([]int64, len(payloads))
+		for index := range result {
+			result[index] = int64(index + 1)
+		}
+		return result
+	}
+	return append([]int64(nil), source.ids...)
+}
+
 func (source *recordingAdapterSource) PlanPagination(
 	_ context.Context,
 	table schema.Table,
@@ -120,11 +188,20 @@ func (source *recordingAdapterSource) PlanPagination(
 			requestedPartitions,
 		)
 	}
-	ranges := SplitIntegerRange(
-		1,
-		int64(len(source.payloads())),
-		requestedPartitions,
-	)
+	identifiers := source.identifiers()
+	if len(identifiers) != len(source.payloads()) {
+		return PaginationPlan{}, fmt.Errorf(
+			"recording source identifier count differs from rows",
+		)
+	}
+	var ranges []PaginationRange
+	if len(identifiers) != 0 {
+		ranges = SplitIntegerRange(
+			identifiers[0],
+			identifiers[len(identifiers)-1],
+			requestedPartitions,
+		)
+	}
 	if len(ranges) == 0 {
 		ranges = []PaginationRange{{ID: 0, Empty: true}}
 	}
@@ -171,6 +248,157 @@ func (source *recordingAdapterSource) PlanPagination(
 	}
 	plan.TopologyHash = topology
 	return plan, nil
+}
+
+func (source *recordingAdapterSource) PlanRetainedRowWidth(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+) (RuntimeRowWidthEvidence, error) {
+	if err := ctx.Err(); err != nil {
+		return RuntimeRowWidthEvidence{}, err
+	}
+	if table.Schema != "public" ||
+		len(columns) != 2 ||
+		columns[0] != "id" ||
+		columns[1] != "payload" {
+		return RuntimeRowWidthEvidence{}, fmt.Errorf(
+			"unexpected retained-row projection %#v for %#v",
+			columns,
+			table,
+		)
+	}
+	var upper int64
+	payloads := source.payloads()
+	if len(payloads) == 0 {
+		payloads = []string{""}
+	}
+	for index, payload := range payloads {
+		retained, err := measureAdapterRetainedRowBytes(
+			[]any{int64(index + 1), []byte(payload)},
+		)
+		if err != nil {
+			return RuntimeRowWidthEvidence{}, err
+		}
+		if retained > upper {
+			upper = retained
+		}
+	}
+	return RuntimeRowWidthEvidence{
+		Trustworthy:         true,
+		CompleteColumnCount: len(columns),
+		ExpectedColumnCount: len(columns),
+		UpperBoundBytes:     upper,
+	}, nil
+}
+
+func (source *recordingAdapterSource) ReadNetworkRangePage(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	pagination PaginationPlan,
+	plannedRange PaginationRange,
+	request NetworkReadRequest,
+) (NetworkReadPage, error) {
+	if source.readRanges != nil {
+		*source.readRanges = append(
+			*source.readRanges,
+			request.Range.RangeIndex,
+		)
+	}
+	admission, err := admitAdapterNetworkRangePage(
+		ctx,
+		source.Engine(),
+		table.Schema,
+		table,
+		columns,
+		pagination,
+		plannedRange,
+		request,
+	)
+	if err != nil {
+		return NetworkReadPage{}, err
+	}
+	if admission.terminal {
+		return NetworkReadPage{
+			EndFrontier: cloneNetworkBytes(request.StartFrontier),
+			Exhausted:   true,
+		}, nil
+	}
+
+	start := int64(0)
+	if admission.hasEffective {
+		start = admission.effective[0]
+	}
+	upper := admission.upper[0]
+	payloads := source.payloads()
+	page := NetworkReadPage{
+		Rows:     make([][]any, 0, request.MaxRows),
+		RowBytes: make([]int64, 0, request.MaxRows),
+	}
+	var last int64
+	identifiers := source.identifiers()
+	if len(identifiers) != len(payloads) {
+		return NetworkReadPage{}, fmt.Errorf(
+			"recording source identifier count differs from rows",
+		)
+	}
+	for rowIndex, id := range identifiers {
+		if id <= start || id > upper {
+			continue
+		}
+		if len(page.Rows) >= request.MaxRows {
+			break
+		}
+		row := []any{
+			id,
+			[]byte(payloads[rowIndex]),
+		}
+		retained, err := measureAdapterRetainedRowBytes(row)
+		if err != nil {
+			return NetworkReadPage{}, err
+		}
+		if retained < 1 || retained > request.Range.MaxRowBytes {
+			return NetworkReadPage{}, fmt.Errorf(
+				"recording source row exceeds admitted bound",
+			)
+		}
+		page.Rows = append(page.Rows, row)
+		page.RowBytes = append(page.RowBytes, retained)
+		page.RetainedBytes += retained
+		last = id
+	}
+	if len(page.Rows) == 0 {
+		if request.ReplayExpected != nil {
+			return NetworkReadPage{}, fmt.Errorf(
+				"replayed recording source page disappeared",
+			)
+		}
+		page.EndFrontier = cloneNetworkBytes(request.StartFrontier)
+		page.Exhausted = true
+		return page, nil
+	}
+	page.EndFrontier, err = adapterRangePageEncodeFrontier(
+		[]int64{last},
+	)
+	if err != nil {
+		return NetworkReadPage{}, err
+	}
+	page.Exhausted = len(page.Rows) < request.MaxRows || last == upper
+	if request.ReplayExpected != nil {
+		page.Exhausted = request.ReplayExpected.Exhausted
+	}
+	page.Fingerprint, err = fingerprintAdapterNetworkRangePage(
+		admission,
+		page,
+	)
+	if err != nil {
+		return NetworkReadPage{}, err
+	}
+	if err := verifyAdapterNetworkRangeReplay(request, page); err != nil {
+		return NetworkReadPage{}, err
+	}
+	return page, nil
 }
 
 func (source *recordingAdapterSource) Close() error {
@@ -227,9 +455,11 @@ type recordingAdapterTarget struct {
 	planned      []string
 	finalized    []string
 	batches      []int
+	networkKeys  map[string]map[string]struct{}
 	receipt      *WriteReceipt
 	writeErr     error
 	preflightErr error
+	isolationErr error
 	prepareErr   error
 	finalizeErr  error
 	protected    *bool
@@ -237,6 +467,15 @@ type recordingAdapterTarget struct {
 
 func (target *recordingAdapterTarget) Engine() string {
 	return "sqlite"
+}
+
+func (*recordingAdapterTarget) stage4NetworkIdempotentUpsertTarget() {}
+
+func (target *recordingAdapterTarget) PreflightStage4NetworkReplayIsolation(
+	context.Context,
+	[]schema.Table,
+) error {
+	return target.isolationErr
 }
 
 func (target *recordingAdapterTarget) PlanTables(
@@ -339,6 +578,49 @@ func (target *recordingAdapterTarget) WriteBatch(
 		AttemptedRows: count,
 		CommittedRows: count,
 	}, target.writeErr
+}
+
+func (target *recordingAdapterTarget) WriteStage4NetworkBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) (WriteReceipt, error) {
+	if target.networkKeys == nil {
+		target.networkKeys = make(map[string]map[string]struct{})
+	}
+	keys := target.networkKeys[table.Name]
+	if keys == nil {
+		keys = make(map[string]struct{})
+		target.networkKeys[table.Name] = keys
+	}
+	newRows := 0
+	for _, row := range rows {
+		if len(row) == 0 {
+			continue
+		}
+		key := fmt.Sprintf("%T:%v", row[0], row[0])
+		if _, exists := keys[key]; exists {
+			continue
+		}
+		keys[key] = struct{}{}
+		newRows++
+	}
+	priorRows := 0
+	if target.rowsByTable != nil {
+		priorRows = target.rowsByTable[table.Name]
+	}
+	receipt, err := target.WriteBatch(
+		ctx,
+		table,
+		columns,
+		"upsert",
+		rows,
+	)
+	if target.rowsByTable != nil {
+		target.rowsByTable[table.Name] = priorRows + newRows
+	}
+	return receipt, err
 }
 
 func (target *recordingAdapterTarget) CountRows(

@@ -28,6 +28,10 @@ type relationalSourceAdapter struct {
 	spec      relationalSourceSpec
 	database  *sql.DB
 	namespace string
+	// mySQLFlavor is live server evidence recorded before a table-stable
+	// session pins the source's only connection. It is revalidated by the
+	// flavor-specific inspector inside that pinned transaction.
+	mySQLFlavor engine.MySQLServerFlavor
 }
 
 func (adapter *relationalSourceAdapter) postgresDatabaseHandle() *sql.DB {
@@ -74,7 +78,7 @@ func openMySQLSourceAdapter(
 	ctx context.Context,
 	endpoint config.Endpoint,
 ) (sourceAdapter, error) {
-	return openRelationalSourceAdapter(ctx, endpoint, relationalSourceSpec{
+	source, err := openRelationalSourceAdapter(ctx, endpoint, relationalSourceSpec{
 		engine:      "mysql",
 		displayName: "MySQL/MariaDB",
 		defaultNamespace: func(endpoint config.Endpoint) string {
@@ -89,6 +93,32 @@ func openMySQLSourceAdapter(
 		wrapRows:       wrapMySQLSourceRows,
 		preflightRows:  preflightMySQLSourceRows,
 	})
+	if err != nil {
+		return nil, err
+	}
+	adapter, ok := source.(*relationalSourceAdapter)
+	if !ok || adapter == nil {
+		_ = source.Close()
+		return nil, fmt.Errorf(
+			"MySQL-family source opened with an invalid adapter",
+		)
+	}
+	flavor, err := engine.DetectMySQLServerFlavor(ctx, adapter.database)
+	if err != nil {
+		if closeErr := adapter.Close(); closeErr != nil {
+			return nil, fmt.Errorf(
+				"record MySQL-family source flavor: %w (close: %v)",
+				err,
+				closeErr,
+			)
+		}
+		return nil, fmt.Errorf(
+			"record MySQL-family source flavor: %w",
+			err,
+		)
+	}
+	adapter.mySQLFlavor = flavor
+	return adapter, nil
 }
 
 func openSQLServerSourceAdapter(

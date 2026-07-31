@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"reflect"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/engine"
+	"github.com/johndauphine/dmtx/internal/schema"
 )
 
 func TestPostgresNetworkRangePageLiveTLS(t *testing.T) {
@@ -49,6 +51,7 @@ func TestPostgresNetworkRangePageLiveTLS(t *testing.T) {
 	namespace := "dmtx_range_" +
 		strconv.FormatInt(time.Now().UnixNano(), 36)
 	tableName := "tuple_events"
+	rowNumberName := "text_events"
 	if _, err := setup.ExecContext(
 		ctx,
 		"CREATE SCHEMA "+postgresIdentifier(namespace),
@@ -70,6 +73,7 @@ func TestPostgresNetworkRangePageLiveTLS(t *testing.T) {
 		}
 	})
 	qualified := postgresQualified(namespace, tableName)
+	rowNumberQualified := postgresQualified(namespace, rowNumberName)
 	for _, statement := range []string{
 		`CREATE TABLE ` + qualified + ` (
 			tenant BIGINT NOT NULL,
@@ -84,6 +88,14 @@ func TestPostgresNetworkRangePageLiveTLS(t *testing.T) {
 			(1, 4, '04', 'middle'),
 			(3, 1, '050607', 'later'),
 			(3, 9007199254741000, '08', 'maximum')`,
+		`CREATE TABLE ` + rowNumberQualified + ` (
+			code TEXT NOT NULL PRIMARY KEY,
+			payload TEXT NOT NULL
+		)`,
+		`INSERT INTO ` + rowNumberQualified + ` VALUES
+			('a', 'one'),
+			('c', 'three'),
+			('e', 'five')`,
 	} {
 		if _, err := setup.ExecContext(ctx, statement); err != nil {
 			t.Fatalf("create PostgreSQL range-page fixture: %v", err)
@@ -118,6 +130,13 @@ func TestPostgresNetworkRangePageLiveTLS(t *testing.T) {
 			{3, 1},
 			{3, 9_007_199_254_741_000},
 		},
+	)
+	assertAdapterStableRowNumberRangePageLive(
+		t,
+		ctx,
+		source,
+		rowNumberName,
+		[]string{"a", "c", "e"},
 	)
 }
 
@@ -214,22 +233,27 @@ func testMySQLFamilyNetworkRangePageLiveTLS(
 	}
 	tableName := "dmtx_range_" +
 		strconv.FormatInt(time.Now().UnixNano(), 36)
+	rowNumberName := tableName + "_text"
 	qualified := mySQLQualified(parsed.DBName, tableName)
+	rowNumberQualified := mySQLQualified(parsed.DBName, rowNumberName)
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(
 			context.Background(),
 			10*time.Second,
 		)
 		defer cleanupCancel()
-		if _, err := setup.ExecContext(
-			cleanupCtx,
-			"DROP TABLE IF EXISTS "+qualified,
-		); err != nil {
-			t.Errorf(
-				"drop %s range-page table: %v",
-				fixture.name,
-				err,
-			)
+		for _, name := range []string{rowNumberName, tableName} {
+			if _, err := setup.ExecContext(
+				cleanupCtx,
+				"DROP TABLE IF EXISTS "+
+					mySQLQualified(parsed.DBName, name),
+			); err != nil {
+				t.Errorf(
+					"drop %s range-page table: %v",
+					fixture.name,
+					err,
+				)
+			}
 		}
 	})
 	for _, statement := range []string{
@@ -254,6 +278,15 @@ func testMySQLFamilyNetworkRangePageLiveTLS(
 			 '2024-04-05 06:07:08.654321', '06:07:08.654321'),
 			(3, 9007199254741000, X'08', 'maximum',
 			 '2024-05-06 07:08:09.999999', '23:59:59.999999')`,
+		`CREATE TABLE ` + rowNumberQualified + ` (
+			code VARCHAR(16) NOT NULL PRIMARY KEY,
+			payload LONGTEXT NOT NULL
+		) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE ` +
+			fixture.collation,
+		`INSERT INTO ` + rowNumberQualified + ` VALUES
+			('a', 'one'),
+			('c', 'three'),
+			('e', 'five')`,
 	} {
 		if _, err := setup.ExecContext(ctx, statement); err != nil {
 			t.Fatalf(
@@ -288,6 +321,208 @@ func testMySQLFamilyNetworkRangePageLiveTLS(
 			{3, 9_007_199_254_741_000},
 		},
 	)
+	assertAdapterStableRowNumberRangePageLive(
+		t,
+		ctx,
+		source,
+		rowNumberName,
+		[]string{"a", "c", "e"},
+	)
+	assertMySQLFamilyStableSnapshotLive(
+		t,
+		ctx,
+		setup,
+		source,
+		parsed.DBName,
+		rowNumberName,
+	)
+}
+
+func assertMySQLFamilyStableSnapshotLive(
+	t *testing.T,
+	ctx context.Context,
+	setup *sql.DB,
+	source sourceAdapter,
+	databaseName string,
+	tableName string,
+) {
+	t.Helper()
+	table, err := source.InspectTable(ctx, tableName)
+	if err != nil {
+		t.Fatalf("inspect MySQL-family stable snapshot table: %v", err)
+	}
+	first, err := OpenAdapterStableNetworkTableSource(ctx, source, table)
+	if err != nil {
+		t.Fatalf("open first MySQL-family stable snapshot: %v", err)
+	}
+	defer func() {
+		if err := first.Close(); err != nil {
+			t.Errorf("close first MySQL-family stable snapshot: %v", err)
+		}
+	}()
+	stable, err := first.Source()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setup.ExecContext(
+		ctx,
+		"INSERT INTO "+mySQLQualified(databaseName, tableName)+
+			" VALUES ('g', 'inserted after snapshot')",
+	); err != nil {
+		t.Fatalf("mutate MySQL-family source after stable snapshot: %v", err)
+	}
+	got := collectStableRowNumberKeysLive(
+		t,
+		ctx,
+		stable,
+		table,
+		2,
+	)
+	if want := []string{"a", "c", "e"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf(
+			"first MySQL-family stable snapshot keys = %#v, want %#v",
+			got,
+			want,
+		)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first MySQL-family stable snapshot: %v", err)
+	}
+
+	later, err := OpenAdapterStableNetworkTableSource(ctx, source, table)
+	if err != nil {
+		t.Fatalf("open later MySQL-family stable snapshot: %v", err)
+	}
+	defer func() {
+		if err := later.Close(); err != nil {
+			t.Errorf("close later MySQL-family stable snapshot: %v", err)
+		}
+	}()
+	laterStable, err := later.Source()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = collectStableRowNumberKeysLive(
+		t,
+		ctx,
+		laterStable,
+		table,
+		2,
+	)
+	if want := []string{"a", "c", "e", "g"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf(
+			"later MySQL-family stable snapshot keys = %#v, want %#v",
+			got,
+			want,
+		)
+	}
+}
+
+func collectStableRowNumberKeysLive(
+	t *testing.T,
+	ctx context.Context,
+	stable adapterStableNetworkSource,
+	table schema.Table,
+	partitions int,
+) []string {
+	t.Helper()
+	pagination, err := stable.PlanPagination(ctx, table, partitions)
+	if err != nil {
+		t.Fatalf("plan stable ROW_NUMBER snapshot ranges: %v", err)
+	}
+	if pagination.Strategy != PaginationRowNumber ||
+		len(pagination.Ranges) != partitions {
+		t.Fatalf("stable ROW_NUMBER snapshot plan = %#v", pagination)
+	}
+	columns := adapterColumnNames(table)
+	evidence, err := stable.PlanRetainedRowWidth(ctx, table, columns)
+	if err != nil {
+		t.Fatalf("plan stable ROW_NUMBER snapshot retained width: %v", err)
+	}
+	keys := make([]string, 0)
+	for rangeIndex, planned := range pagination.Ranges {
+		request := stableRangePageRequest(
+			table.Schema,
+			table.Name,
+			pagination,
+			uint64(rangeIndex),
+			evidence.UpperBoundBytes,
+			1,
+		)
+		exhausted := false
+		for pageIndex := 0; pageIndex < 32; pageIndex++ {
+			page, err := stable.ReadNetworkRangePage(
+				ctx,
+				table,
+				columns,
+				pagination,
+				planned,
+				request,
+			)
+			if err != nil {
+				t.Fatalf(
+					"read stable ROW_NUMBER snapshot range %d page %d: %v",
+					rangeIndex,
+					pageIndex,
+					err,
+				)
+			}
+			if len(page.Rows) == 0 {
+				if !page.Exhausted || len(page.RowBytes) != 0 {
+					t.Fatalf(
+						"empty stable ROW_NUMBER snapshot page = %#v",
+						page,
+					)
+				}
+				exhausted = true
+				break
+			}
+			if len(page.Rows) != 1 ||
+				len(page.RowBytes) != 1 ||
+				page.RowBytes[0] > evidence.UpperBoundBytes {
+				t.Fatalf(
+					"stable ROW_NUMBER snapshot page = %#v",
+					page,
+				)
+			}
+			keys = append(
+				keys,
+				stableLiveKeyString(t, page.Rows[0][0]),
+			)
+			if page.Exhausted {
+				exhausted = true
+				break
+			}
+			request.Sequence++
+			request.StartFrontier = cloneNetworkBytes(page.EndFrontier)
+		}
+		if !exhausted {
+			t.Fatalf(
+				"stable ROW_NUMBER snapshot range %d did not exhaust",
+				rangeIndex,
+			)
+		}
+	}
+	return keys
+}
+
+func stableLiveKeyString(t *testing.T, value any) string {
+	t.Helper()
+	switch key := value.(type) {
+	case string:
+		return key
+	case []byte:
+		return string(key)
+	case int64:
+		return strconv.FormatInt(key, 10)
+	case int32:
+		return strconv.FormatInt(int64(key), 10)
+	case int:
+		return strconv.FormatInt(int64(key), 10)
+	default:
+		t.Fatalf("stable ROW_NUMBER key has driver type %T", value)
+		return ""
+	}
 }
 
 func TestSQLServerNetworkRangePageLiveTLS(t *testing.T) {
@@ -319,19 +554,32 @@ func TestSQLServerNetworkRangePageLiveTLS(t *testing.T) {
 	}
 	tableName := "dmtx_range_" +
 		strconv.FormatInt(time.Now().UnixNano(), 36)
+	rowNumberName := tableName + "_text"
+	varbinaryName := tableName + "_varbinary"
 	primaryKey := tableName + "_pk"
+	rowNumberPrimaryKey := rowNumberName + "_pk"
+	varbinaryPrimaryKey := varbinaryName + "_pk"
 	qualified := sqlServerQualified("dbo", tableName)
+	rowNumberQualified := sqlServerQualified("dbo", rowNumberName)
+	varbinaryQualified := sqlServerQualified("dbo", varbinaryName)
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(
 			context.Background(),
 			10*time.Second,
 		)
 		defer cleanupCancel()
-		if _, err := setup.ExecContext(
-			cleanupCtx,
-			"DROP TABLE IF EXISTS "+qualified,
-		); err != nil {
-			t.Errorf("drop SQL Server range-page table: %v", err)
+		for _, name := range []string{
+			varbinaryName,
+			rowNumberName,
+			tableName,
+		} {
+			if _, err := setup.ExecContext(
+				cleanupCtx,
+				"DROP TABLE IF EXISTS "+
+					sqlServerQualified("dbo", name),
+			); err != nil {
+				t.Errorf("drop SQL Server range-page table: %v", err)
+			}
 		}
 	})
 	for _, statement := range []string{
@@ -359,6 +607,32 @@ func TestSQLServerNetworkRangePageLiveTLS(t *testing.T) {
 			(9007199254741000, 0x050607, 'maximum', 99999999999999.9999,
 			 '33112233-4455-6677-8899-aabbccddeeff',
 			 '23:59:59.999999')`,
+		`CREATE TABLE ` + rowNumberQualified + ` (
+			[code] TINYINT NOT NULL,
+			[payload] VARCHAR(MAX)
+				COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL,
+			CONSTRAINT ` + sqlServerIdentifier(rowNumberPrimaryKey) +
+			` PRIMARY KEY CLUSTERED ([code])
+		)`,
+		`INSERT INTO ` + rowNumberQualified + ` VALUES
+			(1, 'one'),
+			(3, 'three'),
+			(5, 'five')`,
+		`CREATE TABLE ` + varbinaryQualified + ` (
+			[tenant] INT NOT NULL,
+			[digest] VARBINARY(4) NOT NULL,
+			[payload] VARCHAR(32)
+				COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL,
+			CONSTRAINT ` + sqlServerIdentifier(varbinaryPrimaryKey) +
+			` PRIMARY KEY CLUSTERED ([tenant], [digest])
+		)`,
+		`INSERT INTO ` + varbinaryQualified + ` VALUES
+			(1, 0x01, 'one-short'),
+			(1, 0x0101, 'one-long'),
+			(1, 0x02, 'two-short'),
+			(2, 0x00, 'zero-short'),
+			(2, 0x0001, 'zero-long'),
+			(3, 0xFF, 'maximum')`,
 	} {
 		if _, err := setup.ExecContext(ctx, statement); err != nil {
 			t.Fatalf("create SQL Server range-page fixture: %v", err)
@@ -385,6 +659,419 @@ func TestSQLServerNetworkRangePageLiveTLS(t *testing.T) {
 			{9_007_199_254_741_000},
 		},
 	)
+	assertAdapterStableRowNumberRangePageLive(
+		t,
+		ctx,
+		source,
+		rowNumberName,
+		[]string{"1", "3", "5"},
+	)
+	assertSQLServerVarbinaryStableRowNumberLive(
+		t,
+		ctx,
+		source,
+		varbinaryName,
+		[]sqlServerVarbinaryLiveKey{
+			{tenant: 1, digest: []byte{0x01}},
+			{tenant: 1, digest: []byte{0x01, 0x01}},
+			{tenant: 1, digest: []byte{0x02}},
+			{tenant: 2, digest: []byte{0x00}},
+			{tenant: 2, digest: []byte{0x00, 0x01}},
+			{tenant: 3, digest: []byte{0xff}},
+		},
+	)
+}
+
+func TestSQLServerStableNetworkTableLockLifecycleLiveTLS(t *testing.T) {
+	dsn := os.Getenv("DMTX_TEST_MSSQL_DSN")
+	caPath := os.Getenv("DMTX_TEST_MSSQL_CA")
+	if dsn == "" || caPath == "" {
+		t.Skip(
+			"set DMTX_TEST_MSSQL_DSN and DMTX_TEST_MSSQL_CA " +
+				"to run the SQL Server stable-lock sentinel",
+		)
+	}
+	endpoint := sqlServerCommonFixtureEndpoint(t, dsn, caPath)
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		45*time.Second,
+	)
+	defer cancel()
+	setup, err := sql.Open("sqlserver", dsn)
+	if err != nil {
+		t.Fatalf("open SQL Server stable-lock setup: %T", err)
+	}
+	t.Cleanup(func() {
+		if err := setup.Close(); err != nil {
+			t.Errorf("close SQL Server stable-lock setup: %v", err)
+		}
+	})
+	if err := setup.PingContext(ctx); err != nil {
+		t.Fatalf("ping SQL Server stable-lock setup: %T", err)
+	}
+	source, err := openSQLServerSourceAdapter(ctx, endpoint)
+	if err != nil {
+		t.Fatalf("open SQL Server stable-lock source: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := source.Close(); err != nil {
+			t.Errorf("close SQL Server stable-lock source: %v", err)
+		}
+	})
+	prefix := "dmtx_stable_lock_" +
+		strconv.FormatInt(time.Now().UnixNano(), 36)
+	for _, mode := range []string{"close", "cancel", "early_error"} {
+		t.Run(mode, func(t *testing.T) {
+			tableName := prefix + "_" + mode
+			qualified := sqlServerQualified("dbo", tableName)
+			if _, err := setup.ExecContext(
+				ctx,
+				`CREATE TABLE `+qualified+` (
+					[id] BIGINT NOT NULL,
+					[payload] VARCHAR(32)
+						COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL,
+					CONSTRAINT `+
+					sqlServerIdentifier(tableName+"_pk")+
+					` PRIMARY KEY CLUSTERED ([id])
+				);
+				INSERT INTO `+qualified+` VALUES (1, 'before');`,
+			); err != nil {
+				t.Fatalf("create SQL Server stable-lock fixture: %v", err)
+			}
+			t.Cleanup(func() {
+				cleanupCtx, cleanupCancel := context.WithTimeout(
+					context.Background(),
+					10*time.Second,
+				)
+				defer cleanupCancel()
+				if _, err := setup.ExecContext(
+					cleanupCtx,
+					"DROP TABLE IF EXISTS "+qualified,
+				); err != nil {
+					t.Errorf(
+						"drop SQL Server stable-lock fixture: %v",
+						err,
+					)
+				}
+			})
+			table, err := source.InspectTable(ctx, tableName)
+			if err != nil {
+				t.Fatalf("inspect SQL Server stable-lock table: %v", err)
+			}
+			sessionCtx, cancelSession := context.WithCancel(ctx)
+			defer cancelSession()
+			session, err := OpenAdapterStableNetworkTableSource(
+				sessionCtx,
+				source,
+				table,
+			)
+			if err != nil {
+				t.Fatalf("open SQL Server stable-lock session: %v", err)
+			}
+			sessionReleased := false
+			defer func() {
+				if sessionReleased {
+					return
+				}
+				if err := session.Close(); err != nil &&
+					!errors.Is(err, context.Canceled) {
+					t.Errorf(
+						"close SQL Server stable-lock session: %v",
+						err,
+					)
+				}
+			}()
+			writerCtx, cancelWriter := context.WithTimeout(ctx, 10*time.Second)
+			defer cancelWriter()
+			writerDone := make(chan error, 1)
+			go func() {
+				_, err := setup.ExecContext(
+					writerCtx,
+					"INSERT INTO "+qualified+
+						" VALUES (2, 'after')",
+				)
+				writerDone <- err
+			}()
+			select {
+			case writerErr := <-writerDone:
+				t.Fatalf(
+					"SQL Server writer did not block behind %s session: %v",
+					mode,
+					writerErr,
+				)
+			case <-time.After(250 * time.Millisecond):
+			}
+
+			switch mode {
+			case "close":
+				if err := session.Close(); err != nil {
+					t.Fatalf("release SQL Server stable lock: %v", err)
+				}
+				sessionReleased = true
+			case "cancel":
+				cancelSession()
+				if err := session.Close(); err != nil &&
+					!errors.Is(err, context.Canceled) {
+					t.Fatalf(
+						"close cancelled SQL Server stable lock: %v",
+						err,
+					)
+				}
+				sessionReleased = true
+			case "early_error":
+				earlyFailure := errors.New(
+					"forced stable-reader early failure",
+				)
+				err := func() (result error) {
+					defer func() {
+						if closeErr := session.Close(); closeErr != nil {
+							result = errors.Join(result, closeErr)
+						}
+					}()
+					return earlyFailure
+				}()
+				if !errors.Is(err, earlyFailure) {
+					t.Fatalf(
+						"SQL Server early stable-reader error = %v",
+						err,
+					)
+				}
+				sessionReleased = true
+			default:
+				t.Fatalf("unknown stable-lock release mode %q", mode)
+			}
+			select {
+			case writerErr := <-writerDone:
+				if writerErr != nil {
+					t.Fatalf(
+						"SQL Server writer after %s release: %v",
+						mode,
+						writerErr,
+					)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf(
+					"SQL Server writer remained blocked after %s release",
+					mode,
+				)
+			}
+
+			later, err := OpenAdapterStableNetworkTableSource(
+				ctx,
+				source,
+				table,
+			)
+			if err != nil {
+				t.Fatalf(
+					"open later SQL Server stable-lock session: %v",
+					err,
+				)
+			}
+			defer func() {
+				if err := later.Close(); err != nil {
+					t.Errorf(
+						"close later SQL Server stable-lock session: %v",
+						err,
+					)
+				}
+			}()
+			laterStable, err := later.Source()
+			if err != nil {
+				t.Fatal(err)
+			}
+			count, err := laterStable.CountRows(ctx, table)
+			if err != nil || count != 2 {
+				t.Fatalf(
+					"later SQL Server stable-lock count = %d, %v",
+					count,
+					err,
+				)
+			}
+		})
+	}
+}
+
+type sqlServerVarbinaryLiveKey struct {
+	tenant int64
+	digest []byte
+}
+
+func assertSQLServerVarbinaryStableRowNumberLive(
+	t *testing.T,
+	ctx context.Context,
+	source sourceAdapter,
+	tableName string,
+	want []sqlServerVarbinaryLiveKey,
+) {
+	t.Helper()
+	// SQL Server source discovery currently rejects binary primary keys. Model
+	// the exact catalog shape explicitly so this live test protects the
+	// pagination layer if discovery is widened later: unequal-length
+	// VARBINARY values must never enter tuple-keyset comparison.
+	table := schema.Table{
+		Schema: "dbo",
+		Name:   tableName,
+		Columns: []schema.Column{
+			{
+				Name:               "tenant",
+				Type:               "integer",
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 1,
+				DeclaredType: &schema.DeclaredType{
+					Base: "int",
+				},
+			},
+			{
+				Name:               "digest",
+				Type:               "blob",
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 2,
+				DeclaredType: &schema.DeclaredType{
+					Base:      "varbinary",
+					Arguments: []int{4},
+				},
+			},
+			{
+				Name: "payload",
+				Type: "text",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "varchar",
+					Arguments: []int{32},
+				},
+			},
+		},
+	}
+	session, err := OpenAdapterStableNetworkTableSource(
+		ctx,
+		source,
+		table,
+	)
+	if err != nil {
+		t.Fatalf("open SQL Server VARBINARY stable source: %v", err)
+	}
+	defer func() {
+		if err := session.Close(); err != nil {
+			t.Errorf("close SQL Server VARBINARY stable source: %v", err)
+		}
+	}()
+	stable, err := session.Source()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pagination, err := stable.PlanPagination(ctx, table, 2)
+	if err != nil {
+		t.Fatalf("plan SQL Server VARBINARY pagination: %v", err)
+	}
+	if pagination.Strategy != PaginationRowNumber ||
+		len(pagination.Ranges) != 2 ||
+		!reflect.DeepEqual(
+			pagination.Keys,
+			[]KeySpec{
+				{Name: "tenant", Kind: KeyInteger},
+				{Name: "digest", Kind: KeyBytes},
+			},
+		) {
+		t.Fatalf(
+			"SQL Server VARBINARY pagination plan = %#v",
+			pagination,
+		)
+	}
+	columns := adapterColumnNames(table)
+	tenantIndex := columnIndex(columns, "tenant")
+	digestIndex := columnIndex(columns, "digest")
+	if tenantIndex < 0 || digestIndex < 0 {
+		t.Fatalf("SQL Server VARBINARY columns = %#v", columns)
+	}
+	evidence, err := stable.PlanRetainedRowWidth(
+		ctx,
+		table,
+		columns,
+	)
+	if err != nil {
+		t.Fatalf("plan SQL Server VARBINARY retained width: %v", err)
+	}
+
+	got := make([]sqlServerVarbinaryLiveKey, 0, len(want))
+	for rangeIndex, planned := range pagination.Ranges {
+		request := stableRangePageRequest(
+			table.Schema,
+			table.Name,
+			pagination,
+			uint64(rangeIndex),
+			evidence.UpperBoundBytes,
+			1,
+		)
+		completed := false
+		for pageIndex := 0; pageIndex < len(want)+1; pageIndex++ {
+			page, err := stable.ReadNetworkRangePage(
+				ctx,
+				table,
+				columns,
+				pagination,
+				planned,
+				request,
+			)
+			if err != nil {
+				t.Fatalf(
+					"read SQL Server VARBINARY range %d page %d: %v",
+					rangeIndex,
+					pageIndex,
+					err,
+				)
+			}
+			if len(page.Rows) != 1 ||
+				len(page.RowBytes) != 1 ||
+				page.RowBytes[0] > evidence.UpperBoundBytes {
+				t.Fatalf(
+					"SQL Server VARBINARY range %d page %d = %#v",
+					rangeIndex,
+					pageIndex,
+					page,
+				)
+			}
+			tenant, ok := adapterRangePageInt64(
+				page.Rows[0][tenantIndex],
+			)
+			digest, digestOK :=
+				page.Rows[0][digestIndex].([]byte)
+			if !ok || !digestOK {
+				t.Fatalf(
+					"SQL Server VARBINARY key types = %T/%T",
+					page.Rows[0][tenantIndex],
+					page.Rows[0][digestIndex],
+				)
+			}
+			got = append(got, sqlServerVarbinaryLiveKey{
+				tenant: tenant,
+				digest: append([]byte(nil), digest...),
+			})
+			assertOrdinalFrontier(
+				t,
+				page.EndFrontier,
+				int64(len(got)),
+			)
+			if page.Exhausted {
+				completed = true
+				break
+			}
+			request.Sequence++
+			request.StartFrontier =
+				cloneNetworkBytes(page.EndFrontier)
+		}
+		if !completed {
+			t.Fatalf(
+				"SQL Server VARBINARY range %d did not exhaust",
+				rangeIndex,
+			)
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf(
+			"SQL Server VARBINARY stable keys = %#v, want %#v",
+			got,
+			want,
+		)
+	}
 }
 
 func assertAdapterNetworkRangePageLive(
@@ -399,11 +1086,26 @@ func assertAdapterNetworkRangePageLive(
 	if err != nil {
 		t.Fatalf("inspect network range-page table: %v", err)
 	}
-	planner, err := requirePaginationSourceAdapter(source)
+	session, err := OpenAdapterStableNetworkTableSource(ctx, source, table)
+	if err != nil {
+		t.Fatalf("open table-stable network source: %v", err)
+	}
+	defer func() {
+		if err := session.Close(); err != nil {
+			t.Errorf("close table-stable network source: %v", err)
+		}
+	}()
+	stable, err := session.Source()
 	if err != nil {
 		t.Fatal(err)
 	}
-	pagination, err := planner.PlanPagination(ctx, table, 1)
+	if session.ReaderLimit() != 1 {
+		t.Fatalf(
+			"table-stable source reader limit = %d, want 1",
+			session.ReaderLimit(),
+		)
+	}
+	pagination, err := stable.PlanPagination(ctx, table, 1)
 	if err != nil {
 		t.Fatalf("plan network range-page table: %v", err)
 	}
@@ -414,18 +1116,13 @@ func assertAdapterNetworkRangePageLive(
 		t.Fatalf("network range-page plan = %#v", pagination)
 	}
 	columns := adapterColumnNames(table)
-	evidence, err := planAdapterSourceRetainedRowWidth(
+	evidence, err := stable.PlanRetainedRowWidth(
 		ctx,
-		source,
 		table,
 		columns,
 	)
 	if err != nil {
 		t.Fatalf("plan network range retained width: %v", err)
-	}
-	capability, err := requireAdapterNetworkRangePageSource(source)
-	if err != nil {
-		t.Fatal(err)
 	}
 	request := NetworkReadRequest{
 		Range: NetworkRangePlan{
@@ -440,7 +1137,7 @@ func assertAdapterNetworkRangePageLive(
 	}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	if _, err := capability.ReadNetworkRangePage(
+	if _, err := stable.ReadNetworkRangePage(
 		canceled,
 		table,
 		columns,
@@ -454,7 +1151,7 @@ func assertAdapterNetworkRangePageLive(
 	var firstRequest NetworkReadRequest
 	var firstPage NetworkReadPage
 	for pageIndex := 0; pageIndex < 16; pageIndex++ {
-		page, err := capability.ReadNetworkRangePage(
+		page, err := stable.ReadNetworkRangePage(
 			ctx,
 			table,
 			columns,
@@ -546,7 +1243,7 @@ func assertAdapterNetworkRangePageLive(
 		Exhausted:     firstPage.Exhausted,
 	}
 	replay.MaxRows = len(firstPage.Rows)
-	replayed, err := capability.ReadNetworkRangePage(
+	replayed, err := stable.ReadNetworkRangePage(
 		ctx,
 		table,
 		columns,
@@ -564,6 +1261,134 @@ func assertAdapterNetworkRangePageLive(
 			"network range replay changed: %#v / %#v",
 			firstPage,
 			replayed,
+		)
+	}
+}
+
+func assertAdapterStableRowNumberRangePageLive(
+	t *testing.T,
+	ctx context.Context,
+	source sourceAdapter,
+	tableName string,
+	wantKeys []string,
+) {
+	t.Helper()
+	table, err := source.InspectTable(ctx, tableName)
+	if err != nil {
+		t.Fatalf("inspect stable ROW_NUMBER table: %v", err)
+	}
+	session, err := OpenAdapterStableNetworkTableSource(ctx, source, table)
+	if err != nil {
+		t.Fatalf("open stable ROW_NUMBER table source: %v", err)
+	}
+	defer func() {
+		if err := session.Close(); err != nil {
+			t.Errorf("close stable ROW_NUMBER table source: %v", err)
+		}
+	}()
+	stable, err := session.Source()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := stable.(adapterNetworkStableRangePageSource); !ok {
+		t.Fatal("stable ROW_NUMBER source lacks admission marker")
+	}
+	pagination, err := stable.PlanPagination(ctx, table, 2)
+	if err != nil {
+		t.Fatalf("plan stable ROW_NUMBER ranges: %v", err)
+	}
+	if pagination.Strategy != PaginationRowNumber ||
+		len(pagination.Ranges) != 2 {
+		t.Fatalf("stable ROW_NUMBER plan = %#v", pagination)
+	}
+	columns := adapterColumnNames(table)
+	evidence, err := stable.PlanRetainedRowWidth(ctx, table, columns)
+	if err != nil {
+		t.Fatalf("plan stable ROW_NUMBER retained width: %v", err)
+	}
+	gotKeys := make([]string, 0, len(wantKeys))
+	for rangeIndex, planned := range pagination.Ranges {
+		request := NetworkReadRequest{
+			Range: NetworkRangePlan{
+				RangeIndex:   uint64(rangeIndex),
+				TableSchema:  table.Schema,
+				TableName:    table.Name,
+				TopologyHash: "stable-row-number-live",
+				Pagination:   pagination.Strategy,
+				MaxRowBytes:  evidence.UpperBoundBytes,
+			},
+			MaxRows: 1,
+		}
+		completed := false
+		for pageIndex := 0; pageIndex < len(wantKeys)+1; pageIndex++ {
+			page, err := stable.ReadNetworkRangePage(
+				ctx,
+				table,
+				columns,
+				pagination,
+				planned,
+				request,
+			)
+			if err != nil {
+				t.Fatalf(
+					"read stable ROW_NUMBER range %d page %d: %v",
+					rangeIndex,
+					pageIndex,
+					err,
+				)
+			}
+			if len(page.Rows) != 1 ||
+				len(page.RowBytes) != 1 ||
+				page.RowBytes[0] > evidence.UpperBoundBytes {
+				t.Fatalf(
+					"stable ROW_NUMBER range %d page %d = %#v",
+					rangeIndex,
+					pageIndex,
+					page,
+				)
+			}
+			switch key := page.Rows[0][0].(type) {
+			case string:
+				gotKeys = append(gotKeys, key)
+			case []byte:
+				gotKeys = append(gotKeys, string(key))
+			case int64:
+				gotKeys = append(gotKeys, strconv.FormatInt(key, 10))
+			case int32:
+				gotKeys = append(
+					gotKeys,
+					strconv.FormatInt(int64(key), 10),
+				)
+			case int:
+				gotKeys = append(
+					gotKeys,
+					strconv.FormatInt(int64(key), 10),
+				)
+			default:
+				t.Fatalf(
+					"stable ROW_NUMBER key has driver type %T",
+					page.Rows[0][0],
+				)
+			}
+			if page.Exhausted {
+				completed = true
+				break
+			}
+			request.Sequence++
+			request.StartFrontier = cloneNetworkBytes(page.EndFrontier)
+		}
+		if !completed {
+			t.Fatalf(
+				"stable ROW_NUMBER range %d did not exhaust",
+				rangeIndex,
+			)
+		}
+	}
+	if !reflect.DeepEqual(gotKeys, wantKeys) {
+		t.Fatalf(
+			"stable ROW_NUMBER keys = %#v, want %#v",
+			gotKeys,
+			wantKeys,
 		)
 	}
 }
@@ -651,8 +1476,11 @@ func assertAdapterRangePageSourceCursorReleased(
 	t.Helper()
 	switch typed := source.(type) {
 	case *relationalSourceAdapter:
-		if inUse := typed.database.Stats().InUse; inUse != 0 {
-			t.Fatalf("range-page source retains %d database connection(s)", inUse)
+		if inUse := typed.database.Stats().InUse; inUse != 1 {
+			t.Fatalf(
+				"table-stable range-page source uses %d connections, want 1",
+				inUse,
+			)
 		}
 	case *sqliteSourceAdapter:
 		if inUse := typed.database.Stats().InUse; inUse > 1 {

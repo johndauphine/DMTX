@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -36,6 +37,7 @@ type adapterRetainedLengthQueryer interface {
 // Callers must not copy evidence out of that view's execution lifetime.
 type adapterRetainedStableViewQueryer interface {
 	adapterRetainedLengthQueryer
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 	retainedStableViewEngine() string
 }
 
@@ -50,6 +52,17 @@ type postgresAdapterRetainedStableView struct {
 type adapterRetainedStableRelationalView struct {
 	source *relationalSourceAdapter
 	view   adapterRetainedStableViewQueryer
+
+	mu                sync.Mutex
+	retainedRowBounds map[string]int64
+	paginationPlans   map[string]PaginationPlan
+	tableScope        *adapterStableTableIdentity
+	tableCatalog      *schema.Table
+}
+
+type adapterStableTableIdentity struct {
+	schema string
+	table  string
 }
 
 func newAdapterRetainedStableRelationalView(
@@ -70,8 +83,10 @@ func newAdapterRetainedStableRelationalView(
 		)
 	}
 	return &adapterRetainedStableRelationalView{
-		source: adapter,
-		view:   view,
+		source:            adapter,
+		view:              view,
+		retainedRowBounds: make(map[string]int64),
+		paginationPlans:   make(map[string]PaginationPlan),
 	}, nil
 }
 
@@ -103,6 +118,14 @@ func (view *postgresAdapterRetainedStableView) QueryContext(
 	return view.queryer.QueryContext(ctx, query, arguments...)
 }
 
+func (view *postgresAdapterRetainedStableView) QueryRowContext(
+	ctx context.Context,
+	query string,
+	arguments ...any,
+) *sql.Row {
+	return view.queryer.QueryRowContext(ctx, query, arguments...)
+}
+
 func (*postgresAdapterRetainedStableView) retainedStableViewEngine() string {
 	return "postgres"
 }
@@ -119,6 +142,9 @@ func (view *adapterRetainedStableRelationalView) OpenRows(
 		return nil, errors.New(
 			"stable retained-row source view is unavailable",
 		)
+	}
+	if err := view.admitTable(table); err != nil {
+		return nil, err
 	}
 	rows, err := view.view.QueryContext(
 		ctx,
@@ -267,6 +293,9 @@ func (view *adapterRetainedStableRelationalView) PlanRetainedRowWidth(
 			view.source.spec.engine,
 		)
 	}
+	if err := view.admitTable(table); err != nil {
+		return RuntimeRowWidthEvidence{}, err
+	}
 	plan, columnCount, err := view.source.planRetainedRowBound(
 		table,
 		columns,
@@ -278,12 +307,241 @@ func (view *adapterRetainedStableRelationalView) PlanRetainedRowWidth(
 	if err != nil {
 		return RuntimeRowWidthEvidence{}, err
 	}
+	view.mu.Lock()
+	view.retainedRowBounds[adapterStableRetainedIdentity(
+		table,
+		columns,
+	)] = upper
+	view.mu.Unlock()
 	return RuntimeRowWidthEvidence{
 		Trustworthy:         true,
 		CompleteColumnCount: columnCount,
 		ExpectedColumnCount: columnCount,
 		UpperBoundBytes:     upper,
 	}, nil
+}
+
+// PlanPagination materializes every boundary through the exact stable queryer
+// used by retained-width scans and range reads. Every strategy requires a
+// topology recorded here, preventing a plan from another snapshot from being
+// paired accidentally with this otherwise-stable reader.
+func (view *adapterRetainedStableRelationalView) PlanPagination(
+	ctx context.Context,
+	table schema.Table,
+	requestedPartitions int,
+) (PaginationPlan, error) {
+	if ctx == nil {
+		return PaginationPlan{}, adapterPaginationPolicy(
+			"plan stable view",
+			errors.New("context is required"),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return PaginationPlan{}, err
+	}
+	if view == nil || view.source == nil || isNilInterface(view.view) {
+		return PaginationPlan{}, adapterPaginationPolicy(
+			"plan stable view",
+			errors.New("stable relational source view is unavailable"),
+		)
+	}
+	if view.view.retainedStableViewEngine() != view.source.spec.engine {
+		return PaginationPlan{}, adapterPaginationPolicy(
+			"plan stable view",
+			fmt.Errorf(
+				"stable source view engine differs from source engine %q",
+				view.source.spec.engine,
+			),
+		)
+	}
+	if err := view.admitTable(table); err != nil {
+		return PaginationPlan{}, err
+	}
+	plan, err := planAdapterSourcePagination(
+		ctx,
+		view.source.spec.engine,
+		view.source.namespace,
+		view.view,
+		table,
+		requestedPartitions,
+	)
+	if err != nil {
+		return PaginationPlan{}, err
+	}
+	view.mu.Lock()
+	view.paginationPlans[adapterStablePaginationIdentity(
+		table,
+		plan.TopologyHash,
+	)] = clonePaginationPlan(plan)
+	view.mu.Unlock()
+	return plan, nil
+}
+
+func (view *adapterRetainedStableRelationalView) admitNetworkRangeRead(
+	table schema.Table,
+	columns []string,
+	pagination PaginationPlan,
+	maxRowBytes int64,
+) error {
+	if view == nil {
+		return errors.New("stable relational source view is unavailable")
+	}
+	if err := view.admitTable(table); err != nil {
+		return err
+	}
+	view.mu.Lock()
+	retainedIdentity := adapterStableRetainedIdentity(table, columns)
+	paginationIdentity := adapterStablePaginationIdentity(
+		table,
+		pagination.TopologyHash,
+	)
+	retained, retainedOK := view.retainedRowBounds[retainedIdentity]
+	recordedPagination, paginationOK :=
+		view.paginationPlans[paginationIdentity]
+	view.mu.Unlock()
+	if !retainedOK || retained <= 0 || retained != maxRowBytes {
+		return errors.New(
+			"stable range read lacks an exact same-view retained-row proof",
+		)
+	}
+	if !paginationOK ||
+		!equalAdapterStablePaginationPlan(
+			recordedPagination,
+			pagination,
+		) {
+		return errors.New(
+			"stable range read lacks an exact same-view pagination plan",
+		)
+	}
+	return nil
+}
+
+func equalAdapterStablePaginationPlan(
+	left PaginationPlan,
+	right PaginationPlan,
+) bool {
+	if left.Strategy != right.Strategy ||
+		left.TopologyHash != right.TopologyHash ||
+		len(left.Keys) != len(right.Keys) ||
+		len(left.Ranges) != len(right.Ranges) {
+		return false
+	}
+	for index := range left.Keys {
+		if left.Keys[index] != right.Keys[index] {
+			return false
+		}
+	}
+	for index := range left.Ranges {
+		leftRange := left.Ranges[index]
+		rightRange := right.Ranges[index]
+		if leftRange.ID != rightRange.ID ||
+			leftRange.FirstRow != rightRange.FirstRow ||
+			leftRange.LastRow != rightRange.LastRow ||
+			leftRange.Empty != rightRange.Empty ||
+			!equalAdapterStableKeyTuple(
+				leftRange.Lower,
+				rightRange.Lower,
+			) ||
+			!equalAdapterStableKeyTuple(
+				leftRange.Upper,
+				rightRange.Upper,
+			) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalAdapterStableKeyTuple(left *KeyTuple, right *KeyTuple) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	if len(*left) != len(*right) {
+		return false
+	}
+	for index := range *left {
+		if (*left)[index] != (*right)[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func (view *adapterRetainedStableRelationalView) Engine() string {
+	if view == nil || view.source == nil {
+		return ""
+	}
+	return view.source.spec.engine
+}
+
+func (view *adapterRetainedStableRelationalView) DisplayName() string {
+	if view == nil || view.source == nil {
+		return ""
+	}
+	return view.source.spec.displayName
+}
+
+func (view *adapterRetainedStableRelationalView) bindTableScope(
+	table schema.Table,
+) error {
+	if view == nil {
+		return errors.New("stable relational source view is unavailable")
+	}
+	if table.Name == "" {
+		return errors.New("stable relational table scope is empty")
+	}
+	scope := adapterStableTableIdentity{
+		schema: table.Schema,
+		table:  table.Name,
+	}
+	view.mu.Lock()
+	defer view.mu.Unlock()
+	if view.tableScope != nil && *view.tableScope != scope {
+		return errors.New(
+			"stable relational source view already has a different table scope",
+		)
+	}
+	view.tableScope = &scope
+	catalog := cloneStage4RichTable(table)
+	view.tableCatalog = &catalog
+	return nil
+}
+
+func (view *adapterRetainedStableRelationalView) admitTable(
+	table schema.Table,
+) error {
+	if view == nil {
+		return errors.New("stable relational source view is unavailable")
+	}
+	view.mu.Lock()
+	scope := view.tableScope
+	view.mu.Unlock()
+	if scope != nil &&
+		(scope.schema != table.Schema || scope.table != table.Name) {
+		return fmt.Errorf(
+			"stable relational source view is scoped to %s.%s, not %s.%s",
+			scope.schema,
+			scope.table,
+			table.Schema,
+			table.Name,
+		)
+	}
+	return nil
+}
+
+func adapterStableRetainedIdentity(
+	table schema.Table,
+	columns []string,
+) string {
+	return table.Schema + "\x00" + table.Name + "\x00" +
+		strings.Join(columns, "\x00")
+}
+
+func adapterStablePaginationIdentity(
+	table schema.Table,
+	topology string,
+) string {
+	return table.Schema + "\x00" + table.Name + "\x00" + topology
 }
 
 func (adapter *relationalSourceAdapter) planRetainedRowBound(
@@ -806,7 +1064,10 @@ func mySQLRetainedColumnBound(
 		if !validAdapterRequiredPrecision(column.DeclaredType, "time") {
 			return bound, errors.New("time declaration is invalid")
 		}
-		bound.fixedBytes = int64(unsafe.Sizeof([]byte(nil))) + 15
+		// MySQL-family TIME is an interval, not a wall-clock value. TIME(6)
+		// ranges through -838:59:59.999999, whose driver representation is
+		// 17 bytes including its sign.
+		bound.fixedBytes = int64(unsafe.Sizeof([]byte(nil))) + 17
 	case "datetime", "timestamp":
 		if !validAdapterRequiredPrecision(
 			column.DeclaredType,

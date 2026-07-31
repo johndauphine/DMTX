@@ -101,6 +101,27 @@ func TestAdapterNetworkRangePageQueryUsesExactEngineSemantics(
 				int64(2), int64(10),
 			},
 		},
+		{
+			name:      "SQL Server signed tuple",
+			engine:    "mssql",
+			namespace: "dbo",
+			columns:   []string{"tenant", "id", "payload"},
+			keys:      keys,
+			effective: []int64{1, 2},
+			upper:     []int64{9, 10},
+			wantSQL: "SELECT TOP (@p1) [tenant], [id], [payload] FROM " +
+				"[dbo].[events] WHERE " +
+				"(([tenant] > @p2) OR " +
+				"([tenant] = @p3 AND [id] > @p4)) AND " +
+				"(([tenant] < @p5) OR " +
+				"([tenant] = @p6 AND [id] <= @p7)) " +
+				"ORDER BY [tenant] ASC, [id] ASC",
+			wantArgs: []any{
+				3,
+				int64(1), int64(1), int64(2),
+				int64(9), int64(9), int64(10),
+			},
+		},
 	}
 	for _, test := range tests {
 		test := test

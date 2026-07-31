@@ -428,7 +428,7 @@ func TestSQLServerPaginationPlanningLive(t *testing.T) {
 		integerName,
 		tupleName,
 		"",
-		PaginationRowNumber,
+		PaginationTupleKeyset,
 	)
 }
 

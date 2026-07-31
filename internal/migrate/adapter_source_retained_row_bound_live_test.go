@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/johndauphine/dmtx/internal/config"
@@ -173,30 +174,33 @@ func TestPostgresRetainedRowWidthLiveTLS(t *testing.T) {
 
 func TestMySQLRetainedRowWidthLiveTLS(t *testing.T) {
 	testMySQLFamilyRetainedRowWidthLiveTLS(t, mysqlRetainedLiveFixture{
-		name:      "MySQL",
-		dsnEnv:    "DMTX_TEST_MYSQL_DSN",
-		caEnv:     "DMTX_TEST_MYSQL_CA",
-		tlsConfig: "dmtx_test",
-		collation: "utf8mb4_0900_bin",
+		name:                "MySQL",
+		dsnEnv:              "DMTX_TEST_MYSQL_DSN",
+		caEnv:               "DMTX_TEST_MYSQL_CA",
+		tlsConfig:           "dmtx_test",
+		collation:           "utf8mb4_0900_bin",
+		maximumNegativeTime: "-838:59:59.000000",
 	})
 }
 
 func TestMariaDBRetainedRowWidthLiveTLS(t *testing.T) {
 	testMySQLFamilyRetainedRowWidthLiveTLS(t, mysqlRetainedLiveFixture{
-		name:      "MariaDB",
-		dsnEnv:    "DMTX_TEST_MARIADB_DSN",
-		caEnv:     "DMTX_TEST_MARIADB_CA",
-		tlsConfig: "dmtx_mariadb_test",
-		collation: "utf8mb4_nopad_bin",
+		name:                "MariaDB",
+		dsnEnv:              "DMTX_TEST_MARIADB_DSN",
+		caEnv:               "DMTX_TEST_MARIADB_CA",
+		tlsConfig:           "dmtx_mariadb_test",
+		collation:           "utf8mb4_nopad_bin",
+		maximumNegativeTime: "-838:59:59.999999",
 	})
 }
 
 type mysqlRetainedLiveFixture struct {
-	name      string
-	dsnEnv    string
-	caEnv     string
-	tlsConfig string
-	collation string
+	name                string
+	dsnEnv              string
+	caEnv               string
+	tlsConfig           string
+	collation           string
+	maximumNegativeTime string
 }
 
 func testMySQLFamilyRetainedRowWidthLiveTLS(
@@ -319,6 +323,13 @@ func testMySQLFamilyRetainedRowWidthLiveTLS(
 		table,
 		adapterColumnNames(table),
 	)
+	assertTableStableLiveSourceRowsWithinRetainedBound(
+		t,
+		ctx,
+		source,
+		table,
+		adapterColumnNames(table),
+	)
 	assertLiveSourceRowsWithinRetainedBound(
 		t,
 		ctx,
@@ -334,6 +345,102 @@ func testMySQLFamilyRetainedRowWidthLiveTLS(
 			"updated_at",
 		},
 	)
+	assertMySQLFamilyMaximumNegativeTimeRetainedBound(
+		t,
+		ctx,
+		setup,
+		source,
+		table,
+		qualified,
+		fixture.maximumNegativeTime,
+	)
+}
+
+func assertMySQLFamilyMaximumNegativeTimeRetainedBound(
+	t *testing.T,
+	ctx context.Context,
+	setup *sql.DB,
+	source sourceAdapter,
+	table schema.Table,
+	qualified string,
+	value string,
+) {
+	t.Helper()
+	if value == "" {
+		t.Fatal("maximum negative MySQL-family TIME fixture is required")
+	}
+	if _, err := setup.ExecContext(
+		ctx,
+		"UPDATE "+qualified+" SET local_time = ? WHERE id = 1",
+		value,
+	); err != nil {
+		t.Fatalf("write maximum negative MySQL-family TIME: %v", err)
+	}
+	var (
+		raw    string
+		length int
+	)
+	if err := setup.QueryRowContext(
+		ctx,
+		"SELECT CAST(local_time AS CHAR), "+
+			"OCTET_LENGTH(CAST(local_time AS CHAR)) FROM "+
+			qualified+" WHERE id = 1",
+	).Scan(&raw, &length); err != nil {
+		t.Fatalf("read maximum negative MySQL-family TIME: %v", err)
+	}
+	if raw != value || length != 17 || len(raw) != 17 {
+		t.Fatalf(
+			"maximum negative MySQL-family TIME = %q bytes=%d, want %q/17",
+			raw,
+			length,
+			value,
+		)
+	}
+	var timeColumn *schema.Column
+	for index := range table.Columns {
+		if table.Columns[index].Name == "local_time" {
+			timeColumn = &table.Columns[index]
+			break
+		}
+	}
+	if timeColumn == nil {
+		t.Fatal("MySQL-family retained fixture omits local_time")
+	}
+	bound, err := mySQLRetainedColumnBound(*timeColumn)
+	if err != nil {
+		t.Fatalf("plan maximum negative MySQL-family TIME: %v", err)
+	}
+	want := int64(unsafe.Sizeof([]byte(nil))) + int64(length)
+	if bound.fixedBytes != want {
+		t.Fatalf(
+			"MySQL-family TIME retained bytes = %d, want %d",
+			bound.fixedBytes,
+			want,
+		)
+	}
+	rows, err := source.OpenRows(
+		ctx,
+		table,
+		[]string{"local_time"},
+	)
+	if err != nil {
+		t.Fatalf("open maximum negative MySQL-family TIME row: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatalf(
+			"read maximum negative MySQL-family TIME row: %v",
+			rows.Err(),
+		)
+	}
+	var scanned any
+	err = rows.Scan(&scanned)
+	if err == nil || !strings.Contains(err.Error(), "invalid time value") {
+		t.Fatalf(
+			"maximum negative MySQL-family TIME scan error = %v, want fail-closed conversion",
+			err,
+		)
+	}
 }
 
 func TestSQLServerRetainedRowWidthLiveTLS(t *testing.T) {
@@ -431,6 +538,13 @@ func TestSQLServerRetainedRowWidthLiveTLS(t *testing.T) {
 		table,
 		adapterColumnNames(table),
 	)
+	assertTableStableLiveSourceRowsWithinRetainedBound(
+		t,
+		ctx,
+		source,
+		table,
+		adapterColumnNames(table),
+	)
 	assertLiveSourceRowsWithinRetainedBound(
 		t,
 		ctx,
@@ -469,6 +583,89 @@ func assertMutableLiveSourceRejectsDynamicRetainedBound(
 			source.DisplayName(),
 			err,
 		)
+	}
+}
+
+func assertTableStableLiveSourceRowsWithinRetainedBound(
+	t *testing.T,
+	ctx context.Context,
+	source sourceAdapter,
+	table schema.Table,
+	columns []string,
+) {
+	t.Helper()
+	session, err := OpenAdapterStableNetworkTableSource(
+		ctx,
+		source,
+		table,
+	)
+	if err != nil {
+		t.Fatalf("open stable retained-row table source: %v", err)
+	}
+	defer func() {
+		if err := session.Close(); err != nil {
+			t.Errorf("close stable retained-row table source: %v", err)
+		}
+	}()
+	stable, err := session.Source()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pagination, err := stable.PlanPagination(ctx, table, 1)
+	if err != nil {
+		t.Fatalf("plan stable retained-row pagination: %v", err)
+	}
+	evidence, err := stable.PlanRetainedRowWidth(ctx, table, columns)
+	if err != nil {
+		t.Fatalf("plan stable retained-row width: %v", err)
+	}
+	request := NetworkReadRequest{
+		Range: NetworkRangePlan{
+			RangeIndex:   0,
+			TableSchema:  table.Schema,
+			TableName:    table.Name,
+			TopologyHash: "stable-retained-live",
+			Pagination:   pagination.Strategy,
+			MaxRowBytes:  evidence.UpperBoundBytes,
+		},
+		MaxRows: 1,
+	}
+	rows := 0
+	for pageIndex := 0; pageIndex < 16; pageIndex++ {
+		page, err := stable.ReadNetworkRangePage(
+			ctx,
+			table,
+			columns,
+			pagination,
+			pagination.Ranges[0],
+			request,
+		)
+		if err != nil {
+			t.Fatalf(
+				"read stable retained-row page %d: %v",
+				pageIndex,
+				err,
+			)
+		}
+		if len(page.Rows) != 1 ||
+			len(page.RowBytes) != 1 ||
+			page.RowBytes[0] > evidence.UpperBoundBytes {
+			t.Fatalf(
+				"stable retained-row page %d = %#v, bound=%d",
+				pageIndex,
+				page,
+				evidence.UpperBoundBytes,
+			)
+		}
+		rows++
+		if page.Exhausted {
+			break
+		}
+		request.Sequence++
+		request.StartFrontier = cloneNetworkBytes(page.EndFrontier)
+	}
+	if rows != 2 {
+		t.Fatalf("stable retained-row pages = %d, want 2", rows)
 	}
 }
 
@@ -710,18 +907,18 @@ func assertPostgresStableRetainedRangePages(
 	columns []string,
 	upperBound int64,
 ) error {
-	upper := KeyTuple{IntegerKey(2)}
-	pagination := PaginationPlan{
-		Strategy: PaginationIntegerKeyset,
-		Keys: []KeySpec{{
-			Name: "id",
-			Kind: KeyInteger,
-		}},
-		Ranges: []PaginationRange{{
-			ID:    0,
-			Upper: &upper,
-		}},
-		TopologyHash: strings.Repeat("a", 64),
+	pagination, err := stable.PlanPagination(ctx, table, 1)
+	if err != nil {
+		return fmt.Errorf(
+			"plan PostgreSQL retained snapshot pagination: %w",
+			err,
+		)
+	}
+	if pagination.Strategy != PaginationIntegerKeyset ||
+		len(pagination.Ranges) != 1 {
+		return fmt.Errorf(
+			"PostgreSQL retained snapshot pagination is malformed",
+		)
 	}
 	request := NetworkReadRequest{
 		Range: NetworkRangePlan{

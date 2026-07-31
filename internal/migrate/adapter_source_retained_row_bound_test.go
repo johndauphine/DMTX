@@ -657,7 +657,7 @@ func TestMySQLFamilyRetainedRowWidthUsesCatalogAndLiveEvidence(
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = int64(1076)
+	const want = int64(1080)
 	if evidence.UpperBoundBytes != want {
 		t.Fatalf("MySQL retained bound = %d, want %d", evidence.UpperBoundBytes, want)
 	}
@@ -680,7 +680,7 @@ func TestMySQLFamilyRetainedRowWidthUsesCatalogAndLiveEvidence(
 		[]byte{1, 2, 3, 4},
 		[]byte(`{"a":1}`),
 		time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC),
-		"23:59:59.999999",
+		"-838:59:59.999999",
 		time.Date(2026, 7, 30, 10, 11, 12, 0, time.UTC),
 	})
 	if err != nil {
@@ -702,7 +702,7 @@ func TestMySQLFamilyRetainedRowWidthUsesCatalogAndLiveEvidence(
 			[]byte{1, 2, 3, 4},
 			[]byte(`{"a":1}`),
 			[]byte("2026-07-30"),
-			[]byte("23:59:59.999999"),
+			[]byte("-838:59:59.999999"),
 			[]byte("2026-07-30 10:11:12.000000"),
 		},
 		[]any{
@@ -713,7 +713,7 @@ func TestMySQLFamilyRetainedRowWidthUsesCatalogAndLiveEvidence(
 			[]byte{1, 2, 3, 4},
 			[]byte(`{"a":1}`),
 			time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC),
-			"23:59:59.999999",
+			"-838:59:59.999999",
 			time.Date(2026, 7, 30, 10, 11, 12, 0, time.UTC),
 		},
 	)
@@ -1033,7 +1033,7 @@ type adapterRetainedBoundTestConnector struct {
 }
 
 type adapterRetainedBoundTestStableView struct {
-	queryer adapterRetainedLengthQueryer
+	queryer adapterPaginationQueryer
 	engine  string
 }
 
@@ -1043,6 +1043,14 @@ func (view *adapterRetainedBoundTestStableView) QueryContext(
 	arguments ...any,
 ) (*sql.Rows, error) {
 	return view.queryer.QueryContext(ctx, query, arguments...)
+}
+
+func (view *adapterRetainedBoundTestStableView) QueryRowContext(
+	ctx context.Context,
+	query string,
+	arguments ...any,
+) *sql.Row {
+	return view.queryer.QueryRowContext(ctx, query, arguments...)
 }
 
 func (view *adapterRetainedBoundTestStableView) retainedStableViewEngine() string {

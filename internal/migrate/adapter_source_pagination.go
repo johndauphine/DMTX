@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -444,7 +445,7 @@ func adapterPaginationStrategy(
 				adapterPaginationExactSQLiteRowID(keys[0])) {
 		return PaginationIntegerKeyset
 	}
-	if len(keys) > 1 &&
+	if len(keys) >= 1 &&
 		adapterPaginationTupleComparisonProven(
 			sourceEngine,
 			table,
@@ -461,23 +462,94 @@ func adapterPaginationTupleComparisonProven(
 	keys []schema.Column,
 ) bool {
 	switch sourceEngine {
-	case "postgres", "mysql":
+	case "postgres", "mysql", "mssql":
 	case "sqlite":
 		if !table.SQLiteStrict {
 			return false
 		}
 	default:
-		// SQL Server has no native row-value comparison. The row-number
-		// fallback keeps the complete primary key ordering without inventing
-		// an unproven disjunctive comparison seam.
 		return false
 	}
 	for _, column := range keys {
-		if !adapterPaginationExactSignedInteger(sourceEngine, column) {
+		if !adapterPaginationComparableTupleKey(
+			sourceEngine,
+			table,
+			column,
+		) {
 			return false
 		}
 	}
 	return true
+}
+
+func adapterPaginationComparableTupleKey(
+	sourceEngine string,
+	table schema.Table,
+	column schema.Column,
+) bool {
+	if adapterPaginationExactSignedInteger(sourceEngine, column) {
+		return true
+	}
+	switch adapterPaginationKeyKind(sourceEngine, column) {
+	case KeyText:
+		return adapterPaginationComparableTextKey(
+			sourceEngine,
+			table,
+			column,
+		)
+	case KeyBytes:
+		return adapterPaginationComparableBytesKey(
+			sourceEngine,
+			column,
+		)
+	default:
+		return false
+	}
+}
+
+func adapterPaginationComparableTextKey(
+	sourceEngine string,
+	table schema.Table,
+	column schema.Column,
+) bool {
+	// A catalog binary collation alone is insufficient: MySQL and SQL Server
+	// may implicitly convert a plain driver string parameter before comparing
+	// it, while PostgreSQL discovery does not retain an explicit C/POSIX
+	// column-collation proof. Until the query builder renders an engine-exact
+	// declared cast/collation and live conformance proves its ORDER BY
+	// equivalence, every text key uses stable ROW_NUMBER.
+	_, _, _ = sourceEngine, table, column
+	return false
+}
+
+func adapterPaginationComparableBytesKey(
+	sourceEngine string,
+	column schema.Column,
+) bool {
+	switch sourceEngine {
+	case "postgres":
+		return column.Type == "bytea" && column.DeclaredType == nil
+	case "mysql":
+		return column.DeclaredType != nil &&
+			(column.DeclaredType.Base == "binary" ||
+				column.DeclaredType.Base == "varbinary") &&
+			len(column.DeclaredType.Arguments) == 1 &&
+			column.DeclaredType.Arguments[0] > 0
+	case "mssql":
+		return column.DeclaredType != nil &&
+			column.DeclaredType.Base == "binary" &&
+			len(column.DeclaredType.Arguments) == 1 &&
+			column.DeclaredType.Arguments[0] > 0
+	case "sqlite":
+		return column.DeclaredType != nil &&
+			column.DeclaredType.Base == "blob" &&
+			adapterPaginationPlainDeclaration(
+				column.DeclaredType,
+				false,
+			)
+	default:
+		return false
+	}
 }
 
 func adapterPaginationExactSignedInteger(
@@ -668,7 +740,7 @@ func adapterPaginationTupleRanges(
 
 	ranges := make([]PaginationRange, 0, requestedPartitions)
 	var previous *KeyTuple
-	var previousValues []int64
+	var previousValues KeyTuple
 	for rows.Next() {
 		values := make([]any, len(keys))
 		destinations := make([]any, len(keys)+1)
@@ -694,9 +766,14 @@ func adapterPaginationTupleRanges(
 			)
 		}
 		tuple := make(KeyTuple, len(keys))
-		integers := make([]int64, len(keys))
 		for index, value := range values {
-			integer, err := adapterPaginationInt64(value)
+			typed, err := adapterPaginationTypedKey(
+				value,
+				adapterPaginationKeyKind(
+					sourceEngine,
+					keys[index],
+				),
+			)
 			if err != nil {
 				return nil, fmt.Errorf(
 					"scan tuple boundary for %s key %s: %w",
@@ -705,12 +782,11 @@ func adapterPaginationTupleRanges(
 					err,
 				)
 			}
-			integers[index] = integer
-			tuple[index] = IntegerKey(integer)
+			tuple[index] = typed
 		}
 		if len(previousValues) > 0 &&
-			!adapterPaginationTupleAfter(
-				integers,
+			!adapterPaginationKeyTupleAfter(
+				tuple,
 				previousValues,
 			) {
 			return nil, fmt.Errorf(
@@ -726,7 +802,7 @@ func adapterPaginationTupleRanges(
 		})
 		previousCopy := append(KeyTuple(nil), tuple...)
 		previous = &previousCopy
-		previousValues = append([]int64(nil), integers...)
+		previousValues = append(KeyTuple(nil), tuple...)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf(
@@ -820,9 +896,9 @@ func adapterPaginationTupleBoundaryQuery(
 	tableName string,
 	keys []schema.Column,
 ) (string, error) {
-	if len(keys) < 2 {
+	if len(keys) < 1 {
 		return "", errors.New(
-			"tuple boundary query requires a composite primary key",
+			"tuple boundary query requires a primary key",
 		)
 	}
 	qualified, err := adapterPaginationQualified(
@@ -892,6 +968,132 @@ func adapterPaginationTupleAfter(
 		}
 	}
 	return false
+}
+
+func adapterPaginationKeyTupleAfter(
+	value KeyTuple,
+	previous KeyTuple,
+) bool {
+	if len(value) != len(previous) {
+		return false
+	}
+	for index := range value {
+		comparison, ok := adapterPaginationKeyCompare(
+			value[index],
+			previous[index],
+		)
+		if !ok {
+			return false
+		}
+		switch {
+		case comparison > 0:
+			return true
+		case comparison < 0:
+			return false
+		}
+	}
+	return false
+}
+
+func adapterPaginationKeyCompare(
+	left KeyValue,
+	right KeyValue,
+) (int, bool) {
+	if left.Kind != right.Kind {
+		return 0, false
+	}
+	switch left.Kind {
+	case KeyInteger:
+		leftValue, leftErr := strconv.ParseInt(left.Encoded, 10, 64)
+		rightValue, rightErr := strconv.ParseInt(right.Encoded, 10, 64)
+		if leftErr != nil || rightErr != nil ||
+			strconv.FormatInt(leftValue, 10) != left.Encoded ||
+			strconv.FormatInt(rightValue, 10) != right.Encoded {
+			return 0, false
+		}
+		switch {
+		case leftValue < rightValue:
+			return -1, true
+		case leftValue > rightValue:
+			return 1, true
+		default:
+			return 0, true
+		}
+	case KeyText:
+		if !utf8.ValidString(left.Encoded) ||
+			!utf8.ValidString(right.Encoded) {
+			return 0, false
+		}
+		return strings.Compare(left.Encoded, right.Encoded), true
+	case KeyBytes:
+		leftValue, leftErr := left.SQLValue()
+		rightValue, rightErr := right.SQLValue()
+		if leftErr != nil || rightErr != nil {
+			return 0, false
+		}
+		leftBytes, leftOK := leftValue.([]byte)
+		rightBytes, rightOK := rightValue.([]byte)
+		if !leftOK || !rightOK ||
+			BytesKey(leftBytes).Encoded != left.Encoded ||
+			BytesKey(rightBytes).Encoded != right.Encoded {
+			return 0, false
+		}
+		return bytes.Compare(leftBytes, rightBytes), true
+	default:
+		return 0, false
+	}
+}
+
+func adapterPaginationTypedKey(
+	value any,
+	kind KeyKind,
+) (KeyValue, error) {
+	if value == nil {
+		return KeyValue{}, errors.New("NULL tuple keys are unsafe")
+	}
+	switch kind {
+	case KeyInteger:
+		integer, err := adapterPaginationInt64(value)
+		if err != nil {
+			return KeyValue{}, err
+		}
+		return IntegerKey(integer), nil
+	case KeyText:
+		switch typed := value.(type) {
+		case string:
+			if !utf8.ValidString(typed) {
+				return KeyValue{}, errors.New("text key is invalid UTF-8")
+			}
+			return TextKey(typed), nil
+		case []byte:
+			if !utf8.Valid(typed) {
+				return KeyValue{}, errors.New("text key is invalid UTF-8")
+			}
+			return TextKey(string(typed)), nil
+		default:
+			return KeyValue{}, fmt.Errorf(
+				"text key has unexpected driver type %T",
+				value,
+			)
+		}
+	case KeyBytes:
+		switch typed := value.(type) {
+		case []byte:
+			return BytesKey(typed), nil
+		case string:
+			return BytesKey([]byte(typed)), nil
+		default:
+			return KeyValue{}, fmt.Errorf(
+				"byte key has unexpected driver type %T",
+				value,
+			)
+		}
+	default:
+		return KeyValue{}, fmt.Errorf(
+			"key has unsupported restorable kind %q",
+			kind,
+		)
+	}
 }
 
 func adapterPaginationInt64(value any) (int64, error) {

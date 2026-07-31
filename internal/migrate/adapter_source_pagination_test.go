@@ -68,6 +68,19 @@ func TestAdapterPaginationStrategyIsConservative(t *testing.T) {
 			kinds:    []KeyKind{KeyInteger, KeyInteger},
 		},
 		{
+			name:   "PostgreSQL bytea scalar",
+			engine: "postgres",
+			table: schema.Table{
+				Schema: "public",
+				Name:   "events",
+				Columns: []schema.Column{
+					primary("digest", "bytea", 1, nil),
+				},
+			},
+			strategy: PaginationTupleKeyset,
+			kinds:    []KeyKind{KeyBytes},
+		},
+		{
 			name:   "MySQL signed bigint",
 			engine: "mysql",
 			table: schema.Table{
@@ -190,7 +203,7 @@ func TestAdapterPaginationStrategyIsConservative(t *testing.T) {
 			kinds:    []KeyKind{""},
 		},
 		{
-			name:   "SQL Server composite uses ROW_NUMBER",
+			name:   "SQL Server signed composite uses tuple keyset",
 			engine: "mssql",
 			table: schema.Table{
 				Schema: "dbo",
@@ -210,8 +223,62 @@ func TestAdapterPaginationStrategyIsConservative(t *testing.T) {
 					),
 				},
 			},
-			strategy: PaginationRowNumber,
+			strategy: PaginationTupleKeyset,
 			kinds:    []KeyKind{KeyInteger, KeyInteger},
+		},
+		{
+			name:   "SQL Server varbinary composite uses ROW_NUMBER",
+			engine: "mssql",
+			table: schema.Table{
+				Schema: "dbo",
+				Name:   "events",
+				Columns: []schema.Column{
+					primary(
+						"tenant",
+						"integer",
+						1,
+						&schema.DeclaredType{Base: "int"},
+					),
+					primary(
+						"digest",
+						"blob",
+						2,
+						&schema.DeclaredType{
+							Base:      "varbinary",
+							Arguments: []int{16},
+						},
+					),
+				},
+			},
+			strategy: PaginationRowNumber,
+			kinds:    []KeyKind{KeyInteger, KeyBytes},
+		},
+		{
+			name:   "SQL Server fixed binary composite uses tuple keyset",
+			engine: "mssql",
+			table: schema.Table{
+				Schema: "dbo",
+				Name:   "events",
+				Columns: []schema.Column{
+					primary(
+						"tenant",
+						"integer",
+						1,
+						&schema.DeclaredType{Base: "int"},
+					),
+					primary(
+						"digest",
+						"blob",
+						2,
+						&schema.DeclaredType{
+							Base:      "binary",
+							Arguments: []int{16},
+						},
+					),
+				},
+			},
+			strategy: PaginationTupleKeyset,
+			kinds:    []KeyKind{KeyInteger, KeyBytes},
 		},
 		{
 			name:   "converter touched temporal key uses ROW_NUMBER",
@@ -722,6 +789,15 @@ func TestSQLiteSourceAdapterPlansPaginationLive(t *testing.T) {
 			('b', 'two'),
 			('c', 'three');
 
+		CREATE TABLE binary_ids (
+			digest BLOB NOT NULL PRIMARY KEY,
+			payload TEXT NOT NULL
+		) STRICT;
+		INSERT INTO binary_ids VALUES
+			(X'00FF', 'one'),
+			(X'0100', 'two'),
+			(X'FF00', 'three');
+
 		CREATE TABLE empty_text_ids (
 			code TEXT NOT NULL PRIMARY KEY
 		);
@@ -855,6 +931,33 @@ func TestSQLiteSourceAdapterPlansPaginationLive(t *testing.T) {
 			[]KeySpec{{Name: "code", Kind: KeyText}},
 		) {
 		t.Fatalf("text plan = %#v", textPlan)
+	}
+
+	binaryTable, err := source.InspectTable(
+		context.Background(),
+		"binary_ids",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryPlan, err := planner.PlanPagination(
+		context.Background(),
+		binaryTable,
+		2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binaryPlan.Strategy != PaginationTupleKeyset ||
+		len(binaryPlan.Ranges) != 2 ||
+		len(binaryPlan.Keys) != 1 ||
+		binaryPlan.Keys[0].Kind != KeyBytes {
+		t.Fatalf("binary plan = %#v", binaryPlan)
+	}
+	binaryUpper, err := (*binaryPlan.Ranges[1].Upper)[0].SQLValue()
+	if err != nil ||
+		!reflect.DeepEqual(binaryUpper, []byte{0xff, 0x00}) {
+		t.Fatalf("binary upper = %#v, %v", binaryUpper, err)
 	}
 
 	emptyTable, err := source.InspectTable(

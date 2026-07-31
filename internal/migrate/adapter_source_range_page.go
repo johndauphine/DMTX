@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/schema"
@@ -59,6 +60,14 @@ type adapterRangePageAdmission struct {
 	hasStart     bool
 	effective    []int64
 	hasEffective bool
+	keyLower     KeyTuple
+	keyUpper     KeyTuple
+	keyStart     KeyTuple
+	keyEffective KeyTuple
+	firstRow     int64
+	lastRow      int64
+	effectiveRow int64
+	rowNumber    bool
 	terminal     bool
 	rangePlan    PaginationRange
 	pagination   PaginationPlan
@@ -138,7 +147,15 @@ func (view *adapterRetainedStableRelationalView) ReadNetworkRangePage(
 			view.source.spec.engine,
 		))
 	}
-	return readAdapterNetworkRangePage(
+	if err := view.admitNetworkRangeRead(
+		table,
+		columns,
+		pagination,
+		request.Range.MaxRowBytes,
+	); err != nil {
+		return NetworkReadPage{}, adapterRangePagePolicy(err)
+	}
+	return readStableAdapterNetworkRangePage(
 		ctx,
 		view.source.spec.engine,
 		view.source.namespace,
@@ -165,7 +182,7 @@ func (adapter *sqliteSourceAdapter) ReadNetworkRangePage(
 			errors.New("SQLite source snapshot is not open"),
 		)
 	}
-	return readAdapterNetworkRangePage(
+	return readStableAdapterNetworkRangePage(
 		ctx,
 		"sqlite",
 		"",
@@ -191,7 +208,62 @@ func readAdapterNetworkRangePage(
 	plannedRange PaginationRange,
 	request NetworkReadRequest,
 ) (NetworkReadPage, error) {
-	admission, err := admitAdapterNetworkRangePage(
+	return readAdapterNetworkRangePageWithStability(
+		ctx,
+		engine,
+		namespace,
+		queryer,
+		wrapRows,
+		table,
+		columns,
+		pagination,
+		plannedRange,
+		request,
+		false,
+	)
+}
+
+func readStableAdapterNetworkRangePage(
+	ctx context.Context,
+	engine string,
+	namespace string,
+	queryer adapterRangePageQueryer,
+	wrapRows func(adapterRows, schema.Table, []string) adapterRows,
+	table schema.Table,
+	columns []string,
+	pagination PaginationPlan,
+	plannedRange PaginationRange,
+	request NetworkReadRequest,
+) (NetworkReadPage, error) {
+	return readAdapterNetworkRangePageWithStability(
+		ctx,
+		engine,
+		namespace,
+		queryer,
+		wrapRows,
+		table,
+		columns,
+		pagination,
+		plannedRange,
+		request,
+		true,
+	)
+}
+
+func readAdapterNetworkRangePageWithStability(
+	ctx context.Context,
+	engine string,
+	namespace string,
+	queryer adapterRangePageQueryer,
+	wrapRows func(adapterRows, schema.Table, []string) adapterRows,
+	table schema.Table,
+	columns []string,
+	pagination PaginationPlan,
+	plannedRange PaginationRange,
+	request NetworkReadRequest,
+	stableView bool,
+) (NetworkReadPage, error) {
+	admission, err := admitAdapterNetworkRangePageWithStability(
 		ctx,
 		engine,
 		namespace,
@@ -200,6 +272,7 @@ func readAdapterNetworkRangePage(
 		pagination,
 		plannedRange,
 		request,
+		stableView,
 	)
 	if err != nil {
 		return NetworkReadPage{}, err
@@ -256,13 +329,25 @@ func readAdapterNetworkRangePage(
 				errors.New("replayed network range page disappeared"),
 			)
 		}
+		if admission.rowNumber && !admission.terminal {
+			return NetworkReadPage{}, adapterRangePageState(
+				errors.New(
+					"stable ROW_NUMBER range disappeared inside its immutable interval",
+				),
+			)
+		}
 		page.EndFrontier = cloneNetworkBytes(request.StartFrontier)
 		page.Exhausted = true
 		return page, nil
 	}
 
-	page.Exhausted = len(page.Rows) < request.MaxRows ||
-		adapterRangePageTupleCompare(last, admission.upper) == 0
+	if admission.rowNumber {
+		page.Exhausted = admission.effectiveRow+
+			int64(len(page.Rows)) == admission.lastRow
+	} else {
+		page.Exhausted = len(page.Rows) < request.MaxRows ||
+			adapterRangePageKeyTupleCompare(last, admission.keyUpper) == 0
+	}
 	if request.ReplayExpected != nil {
 		// Replay MaxRows is the durable issued row count, not necessarily the
 		// larger limit used by the original short terminal read. Preserve the
@@ -295,6 +380,30 @@ func admitAdapterNetworkRangePage(
 	pagination PaginationPlan,
 	plannedRange PaginationRange,
 	request NetworkReadRequest,
+) (adapterRangePageAdmission, error) {
+	return admitAdapterNetworkRangePageWithStability(
+		ctx,
+		engine,
+		namespace,
+		table,
+		selected,
+		pagination,
+		plannedRange,
+		request,
+		false,
+	)
+}
+
+func admitAdapterNetworkRangePageWithStability(
+	ctx context.Context,
+	engine string,
+	namespace string,
+	table schema.Table,
+	selected []string,
+	pagination PaginationPlan,
+	plannedRange PaginationRange,
+	request NetworkReadRequest,
+	stableView bool,
 ) (adapterRangePageAdmission, error) {
 	if ctx == nil {
 		return adapterRangePageAdmission{}, adapterRangePagePolicy(
@@ -359,9 +468,22 @@ func admitAdapterNetworkRangePage(
 			)
 		}
 	case PaginationTupleKeyset:
-		if len(keys) < 2 {
+		if len(keys) < 1 ||
+			!adapterPaginationTupleComparisonProven(
+				engine,
+				table,
+				keys,
+			) {
 			return adapterRangePageAdmission{}, adapterRangePagePolicy(
-				errors.New("tuple keyset requires a complete composite primary key"),
+				errors.New("tuple keyset lacks complete order-equivalence evidence"),
+			)
+		}
+	case PaginationRowNumber:
+		if !stableView {
+			return adapterRangePageAdmission{}, adapterRangePagePolicy(
+				errors.New(
+					"ROW_NUMBER range reads require the stable source view that materialized their boundaries",
+				),
 			)
 		}
 	default:
@@ -379,12 +501,23 @@ func admitAdapterNetworkRangePage(
 	}
 	for index, key := range pagination.Keys {
 		if key.Name != keys[index].Name ||
-			key.Kind != KeyInteger ||
-			!adapterPaginationExactSignedInteger(engine, keys[index]) {
+			key.Kind != adapterPaginationKeyKind(engine, keys[index]) {
 			return adapterRangePageAdmission{}, adapterRangePagePolicy(
 				fmt.Errorf(
-					"pagination key %d is not an exact signed integer in primary-key order",
+					"pagination key %d differs from exact primary-key order evidence",
 					index,
+				),
+			)
+		}
+		if pagination.Strategy == PaginationIntegerKeyset &&
+			(key.Kind != KeyInteger ||
+				!adapterPaginationExactSignedInteger(
+					engine,
+					keys[index],
+				)) {
+			return adapterRangePageAdmission{}, adapterRangePagePolicy(
+				errors.New(
+					"integer keyset is not an exact signed-integer primary key",
 				),
 			)
 		}
@@ -419,7 +552,22 @@ func admitAdapterNetworkRangePage(
 			)
 		}
 	}
-	lower, hasLower, err := adapterRangePageBound(
+	if pagination.Strategy == PaginationRowNumber {
+		return admitAdapterRowNumberRangePage(
+			engine,
+			namespace,
+			table,
+			ordered,
+			selected,
+			keys,
+			indexes,
+			pagination,
+			plannedRange,
+			request,
+		)
+	}
+
+	lower, hasLower, err := adapterRangePageKeyBound(
 		plannedRange.Lower,
 		pagination.Keys,
 	)
@@ -428,7 +576,7 @@ func admitAdapterNetworkRangePage(
 			errors.New("network range lower bound is malformed"),
 		)
 	}
-	upper, hasUpper, err := adapterRangePageBound(
+	upper, hasUpper, err := adapterRangePageKeyBound(
 		plannedRange.Upper,
 		pagination.Keys,
 	)
@@ -437,9 +585,9 @@ func admitAdapterNetworkRangePage(
 			errors.New("network range upper bound is malformed"),
 		)
 	}
-	start, hasStart, err := adapterRangePageFrontier(
+	start, hasStart, err := adapterRangePageKeyFrontier(
 		request.StartFrontier,
-		len(pagination.Keys),
+		pagination.Keys,
 	)
 	if err != nil {
 		return adapterRangePageAdmission{}, adapterRangePageState(
@@ -467,18 +615,18 @@ func admitAdapterNetworkRangePage(
 			request:     request,
 		}, nil
 	}
-	if hasLower && adapterRangePageTupleCompare(lower, upper) >= 0 {
+	if hasLower && adapterRangePageKeyTupleCompare(lower, upper) >= 0 {
 		return adapterRangePageAdmission{}, adapterRangePagePolicy(
 			errors.New("network range bounds do not advance"),
 		)
 	}
 	if hasStart && hasLower &&
-		adapterRangePageTupleCompare(start, lower) < 0 {
+		adapterRangePageKeyTupleCompare(start, lower) < 0 {
 		return adapterRangePageAdmission{}, adapterRangePageState(
 			errors.New("network start frontier precedes its immutable range"),
 		)
 	}
-	if hasStart && adapterRangePageTupleCompare(start, upper) > 0 {
+	if hasStart && adapterRangePageKeyTupleCompare(start, upper) > 0 {
 		return adapterRangePageAdmission{}, adapterRangePageState(
 			errors.New("network start frontier exceeds its immutable range"),
 		)
@@ -490,31 +638,35 @@ func admitAdapterNetworkRangePage(
 		hasEffective = true
 	}
 	terminal := hasStart &&
-		adapterRangePageTupleCompare(start, upper) == 0
+		adapterRangePageKeyTupleCompare(start, upper) == 0
 	if terminal && request.ReplayExpected != nil {
 		return adapterRangePageAdmission{}, adapterRangePageState(
 			errors.New("replay starts at an exhausted range frontier"),
 		)
 	}
 	if request.ReplayExpected != nil {
-		expectedEnd, valid, err := adapterRangePageFrontier(
+		expectedEnd, valid, err := adapterRangePageKeyFrontier(
 			request.ReplayExpected.EndFrontier,
-			len(pagination.Keys),
+			pagination.Keys,
 		)
 		if err != nil || !valid ||
 			hasEffective &&
-				adapterRangePageTupleCompare(
+				adapterRangePageKeyTupleCompare(
 					expectedEnd,
 					effective,
 				) <= 0 ||
-			adapterRangePageTupleCompare(expectedEnd, upper) > 0 ||
-			adapterRangePageTupleCompare(expectedEnd, upper) == 0 &&
+			adapterRangePageKeyTupleCompare(expectedEnd, upper) > 0 ||
+			adapterRangePageKeyTupleCompare(expectedEnd, upper) == 0 &&
 				!request.ReplayExpected.Exhausted {
 			return adapterRangePageAdmission{}, adapterRangePageState(
 				errors.New("durable replay end frontier is malformed"),
 			)
 		}
 	}
+	lowerIntegers, _ := adapterRangePageIntegerTuple(lower)
+	upperIntegers, _ := adapterRangePageIntegerTuple(upper)
+	startIntegers, _ := adapterRangePageIntegerTuple(start)
+	effectiveIntegers, _ := adapterRangePageIntegerTuple(effective)
 	return adapterRangePageAdmission{
 		engine:       engine,
 		namespace:    namespace,
@@ -523,13 +675,125 @@ func admitAdapterNetworkRangePage(
 		columnNames:  append([]string(nil), selected...),
 		keys:         append([]KeySpec(nil), pagination.Keys...),
 		keyIndexes:   indexes,
-		lower:        lower,
+		lower:        lowerIntegers,
 		hasLower:     hasLower,
-		upper:        upper,
-		start:        start,
+		upper:        upperIntegers,
+		start:        startIntegers,
 		hasStart:     hasStart,
-		effective:    effective,
+		effective:    effectiveIntegers,
 		hasEffective: hasEffective,
+		keyLower:     append(KeyTuple(nil), lower...),
+		keyUpper:     append(KeyTuple(nil), upper...),
+		keyStart:     append(KeyTuple(nil), start...),
+		keyEffective: append(KeyTuple(nil), effective...),
+		terminal:     terminal,
+		rangePlan:    plannedRange,
+		pagination:   pagination,
+		request:      request,
+	}, nil
+}
+
+func admitAdapterRowNumberRangePage(
+	engine string,
+	namespace string,
+	table schema.Table,
+	columns []schema.Column,
+	columnNames []string,
+	keys []schema.Column,
+	keyIndexes []int,
+	pagination PaginationPlan,
+	plannedRange PaginationRange,
+	request NetworkReadRequest,
+) (adapterRangePageAdmission, error) {
+	if plannedRange.Lower != nil || plannedRange.Upper != nil {
+		return adapterRangePageAdmission{}, adapterRangePagePolicy(
+			errors.New("ROW_NUMBER range carries tuple bounds"),
+		)
+	}
+	if plannedRange.Empty {
+		if plannedRange.FirstRow != 1 ||
+			plannedRange.LastRow != 0 ||
+			len(pagination.Ranges) != 1 ||
+			request.StartFrontier != nil ||
+			request.ReplayExpected != nil {
+			return adapterRangePageAdmission{}, adapterRangePagePolicy(
+				errors.New("empty ROW_NUMBER range is malformed"),
+			)
+		}
+		return adapterRangePageAdmission{
+			engine:       engine,
+			namespace:    namespace,
+			table:        table,
+			columns:      columns,
+			columnNames:  append([]string(nil), columnNames...),
+			keys:         append([]KeySpec(nil), pagination.Keys...),
+			keyIndexes:   append([]int(nil), keyIndexes...),
+			firstRow:     1,
+			effectiveRow: 0,
+			rowNumber:    true,
+			terminal:     true,
+			rangePlan:    plannedRange,
+			pagination:   pagination,
+			request:      request,
+		}, nil
+	}
+	if plannedRange.FirstRow < 1 ||
+		plannedRange.LastRow < plannedRange.FirstRow {
+		return adapterRangePageAdmission{}, adapterRangePagePolicy(
+			errors.New("ROW_NUMBER range interval is malformed"),
+		)
+	}
+	start, hasStart, err := adapterRangePageOrdinalFrontier(
+		request.StartFrontier,
+	)
+	if err != nil {
+		return adapterRangePageAdmission{}, adapterRangePageState(err)
+	}
+	effective := plannedRange.FirstRow - 1
+	if hasStart {
+		if start < effective || start > plannedRange.LastRow {
+			return adapterRangePageAdmission{}, adapterRangePageState(
+				errors.New(
+					"ROW_NUMBER start frontier is outside its immutable interval",
+				),
+			)
+		}
+		effective = start
+	}
+	terminal := effective == plannedRange.LastRow
+	if terminal && request.ReplayExpected != nil {
+		return adapterRangePageAdmission{}, adapterRangePageState(
+			errors.New("replay starts at an exhausted ROW_NUMBER interval"),
+		)
+	}
+	if expected := request.ReplayExpected; expected != nil {
+		end, valid, endErr := adapterRangePageOrdinalFrontier(
+			expected.EndFrontier,
+		)
+		if endErr != nil || !valid ||
+			end <= effective ||
+			end > plannedRange.LastRow ||
+			expected.Exhausted != (end == plannedRange.LastRow) {
+			return adapterRangePageAdmission{}, adapterRangePageState(
+				errors.New(
+					"durable ROW_NUMBER replay end frontier is malformed",
+				),
+			)
+		}
+	}
+	_ = keys
+	return adapterRangePageAdmission{
+		engine:       engine,
+		namespace:    namespace,
+		table:        table,
+		columns:      columns,
+		columnNames:  append([]string(nil), columnNames...),
+		keys:         append([]KeySpec(nil), pagination.Keys...),
+		keyIndexes:   append([]int(nil), keyIndexes...),
+		firstRow:     plannedRange.FirstRow,
+		lastRow:      plannedRange.LastRow,
+		effectiveRow: effective,
+		rowNumber:    true,
 		terminal:     terminal,
 		rangePlan:    plannedRange,
 		pagination:   pagination,
@@ -570,7 +834,8 @@ func validateAdapterRangePageInventory(
 		!adapterRangePageRangeEqual(plan.Ranges[selected.ID], selected) {
 		return errors.New("pagination range is absent from the immutable plan")
 	}
-	var previous []int64
+	var previous KeyTuple
+	var previousLast int64
 	for index, planned := range plan.Ranges {
 		if planned.ID != index {
 			return errors.New("pagination range IDs are not contiguous")
@@ -578,9 +843,26 @@ func validateAdapterRangePageInventory(
 		if planned.Empty {
 			if len(plan.Ranges) != 1 || index != 0 ||
 				planned.Lower != nil || planned.Upper != nil ||
-				planned.FirstRow != 0 || planned.LastRow != 0 {
+				planned.LastRow != 0 ||
+				plan.Strategy == PaginationRowNumber &&
+					planned.FirstRow != 1 ||
+				plan.Strategy != PaginationRowNumber &&
+					planned.FirstRow != 0 {
 				return errors.New("empty pagination range is malformed")
 			}
+			continue
+		}
+		if plan.Strategy == PaginationRowNumber {
+			if planned.Lower != nil || planned.Upper != nil ||
+				planned.FirstRow < 1 ||
+				planned.LastRow < planned.FirstRow ||
+				index == 0 && planned.FirstRow != 1 ||
+				index > 0 && planned.FirstRow != previousLast+1 {
+				return errors.New(
+					"ROW_NUMBER pagination range is malformed",
+				)
+			}
+			previousLast = planned.LastRow
 			continue
 		}
 		if planned.FirstRow != 0 || planned.LastRow != 0 ||
@@ -589,14 +871,14 @@ func validateAdapterRangePageInventory(
 			index > 0 && planned.Lower == nil {
 			return errors.New("keyset pagination range is malformed")
 		}
-		lower, hasLower, err := adapterRangePageBound(
+		lower, hasLower, err := adapterRangePageKeyBound(
 			planned.Lower,
 			plan.Keys,
 		)
 		if err != nil {
 			return errors.New("pagination lower bound is malformed")
 		}
-		upper, _, err := adapterRangePageBound(
+		upper, _, err := adapterRangePageKeyBound(
 			planned.Upper,
 			plan.Keys,
 		)
@@ -605,11 +887,11 @@ func validateAdapterRangePageInventory(
 		}
 		if index > 0 &&
 			(!hasLower ||
-				adapterRangePageTupleCompare(lower, previous) != 0) {
+				adapterRangePageKeyTupleCompare(lower, previous) != 0) {
 			return errors.New("pagination ranges are not contiguous")
 		}
 		if hasLower &&
-			adapterRangePageTupleCompare(upper, lower) <= 0 {
+			adapterRangePageKeyTupleCompare(upper, lower) <= 0 {
 			return errors.New("pagination range does not advance")
 		}
 		previous = upper
@@ -647,36 +929,36 @@ func adapterRangePageKeyTupleEqual(
 	return true
 }
 
-func adapterRangePageBound(
+func adapterRangePageKeyBound(
 	bound *KeyTuple,
 	keys []KeySpec,
-) ([]int64, bool, error) {
+) (KeyTuple, bool, error) {
 	if bound == nil {
 		return nil, false, nil
 	}
 	if len(*bound) != len(keys) {
 		return nil, false, errors.New("bound width differs from key width")
 	}
-	result := make([]int64, len(keys))
+	result := make(KeyTuple, len(keys))
 	for index, value := range *bound {
-		if keys[index].Kind != KeyInteger ||
-			value.Kind != KeyInteger {
+		if keys[index].Kind == "" ||
+			value.Kind != keys[index].Kind {
 			return nil, false, errors.New("bound kind differs from key kind")
 		}
-		parsed, err := strconv.ParseInt(value.Encoded, 10, 64)
-		if err != nil ||
-			strconv.FormatInt(parsed, 10) != value.Encoded {
-			return nil, false, errors.New("bound integer is not canonical")
+		if _, ok := adapterPaginationKeyCompare(value, value); !ok {
+			return nil, false, errors.New(
+				"bound key encoding is not canonical",
+			)
 		}
-		result[index] = parsed
+		result[index] = value
 	}
 	return result, true, nil
 }
 
-func adapterRangePageFrontier(
+func adapterRangePageKeyFrontier(
 	encoded []byte,
-	width int,
-) ([]int64, bool, error) {
+	keys []KeySpec,
+) (KeyTuple, bool, error) {
 	tuple, valid, err := decodeNetworkStateFrontier(encoded)
 	if err != nil {
 		return nil, false, errors.New("typed frontier is invalid")
@@ -684,22 +966,76 @@ func adapterRangePageFrontier(
 	if !valid {
 		return nil, false, nil
 	}
-	if len(tuple) != width {
+	if len(tuple) != len(keys) {
 		return nil, false, errors.New("typed frontier width differs from key width")
 	}
-	result := make([]int64, width)
+	result := make(KeyTuple, len(keys))
 	for index, value := range tuple {
-		if value.Kind != state.ValueInt64 {
-			return nil, false, errors.New("typed frontier is not signed-integer")
+		switch keys[index].Kind {
+		case KeyInteger:
+			if value.Kind != state.ValueInt64 {
+				return nil, false, errors.New(
+					"typed frontier kind differs from pagination key",
+				)
+			}
+			result[index] = KeyValue{
+				Kind:    KeyInteger,
+				Encoded: value.Encoded,
+			}
+		case KeyText:
+			if value.Kind != state.ValueText {
+				return nil, false, errors.New(
+					"typed frontier kind differs from pagination key",
+				)
+			}
+			result[index] = KeyValue{
+				Kind:    KeyText,
+				Encoded: value.Encoded,
+			}
+		case KeyBytes:
+			if value.Kind != state.ValueBytes {
+				return nil, false, errors.New(
+					"typed frontier kind differs from pagination key",
+				)
+			}
+			result[index] = KeyValue{
+				Kind:    KeyBytes,
+				Encoded: value.Encoded,
+			}
+		default:
+			return nil, false, errors.New(
+				"pagination key has no typed frontier representation",
+			)
 		}
-		parsed, err := strconv.ParseInt(value.Encoded, 10, 64)
-		if err != nil ||
-			strconv.FormatInt(parsed, 10) != value.Encoded {
-			return nil, false, errors.New("typed frontier integer is not canonical")
+		if _, ok := adapterPaginationKeyCompare(
+			result[index],
+			result[index],
+		); !ok {
+			return nil, false, errors.New(
+				"typed frontier key is not canonical",
+			)
 		}
-		result[index] = parsed
 	}
 	return result, true, nil
+}
+
+func adapterRangePageOrdinalFrontier(
+	encoded []byte,
+) (int64, bool, error) {
+	tuple, valid, err := adapterRangePageKeyFrontier(
+		encoded,
+		[]KeySpec{{Name: "row_number", Kind: KeyInteger}},
+	)
+	if err != nil || !valid {
+		return 0, valid, err
+	}
+	value, err := strconv.ParseInt(tuple[0].Encoded, 10, 64)
+	if err != nil {
+		return 0, false, errors.New(
+			"ROW_NUMBER frontier is not a signed integer",
+		)
+	}
+	return value, true, nil
 }
 
 func adapterRangePageTopologyToken(value string) bool {
@@ -714,6 +1050,9 @@ func adapterRangePageTopologyToken(value string) bool {
 func buildAdapterNetworkRangePageQuery(
 	admission adapterRangePageAdmission,
 ) (adapterRangePageQuery, error) {
+	if admission.rowNumber {
+		return buildAdapterRowNumberRangePageQuery(admission)
+	}
 	projection, err := adapterRangePageProjection(
 		admission.engine,
 		admission.table,
@@ -744,11 +1083,19 @@ func buildAdapterNetworkRangePageQuery(
 	query += projection + " FROM " + qualified
 	predicates := make([]string, 0, 2)
 	if admission.hasEffective {
-		predicate, values, next, err := adapterRangePagePredicate(
+		effective, err := adapterRangePageAdmissionTuple(
+			admission.keyEffective,
+			admission.effective,
+			admission.keys,
+		)
+		if err != nil {
+			return adapterRangePageQuery{}, err
+		}
+		predicate, values, next, err := adapterRangePageKeyPredicate(
 			admission.engine,
 			admission.keys,
 			">",
-			admission.effective,
+			effective,
 			position,
 		)
 		if err != nil {
@@ -758,11 +1105,19 @@ func buildAdapterNetworkRangePageQuery(
 		args = append(args, values...)
 		position = next
 	}
-	predicate, values, next, err := adapterRangePagePredicate(
+	upper, err := adapterRangePageAdmissionTuple(
+		admission.keyUpper,
+		admission.upper,
+		admission.keys,
+	)
+	if err != nil {
+		return adapterRangePageQuery{}, err
+	}
+	predicate, values, next, err := adapterRangePageKeyPredicate(
 		admission.engine,
 		admission.keys,
 		"<=",
-		admission.upper,
+		upper,
 		position,
 	)
 	if err != nil {
@@ -784,6 +1139,115 @@ func buildAdapterNetworkRangePageQuery(
 		args = append(args, limit)
 	}
 	return adapterRangePageQuery{SQL: query, Args: args}, nil
+}
+
+func buildAdapterRowNumberRangePageQuery(
+	admission adapterRangePageAdmission,
+) (adapterRangePageQuery, error) {
+	if admission.firstRow < 1 ||
+		admission.lastRow < admission.firstRow ||
+		admission.effectiveRow < admission.firstRow-1 ||
+		admission.effectiveRow >= admission.lastRow {
+		return adapterRangePageQuery{}, errors.New(
+			"ROW_NUMBER query has an invalid immutable interval",
+		)
+	}
+	projection, err := adapterRangePageProjection(
+		admission.engine,
+		admission.table,
+		admission.columnNames,
+	)
+	if err != nil {
+		return adapterRangePageQuery{}, err
+	}
+	qualified, err := adapterPaginationQualified(
+		admission.engine,
+		admission.namespace,
+		admission.table.Name,
+	)
+	if err != nil {
+		return adapterRangePageQuery{}, err
+	}
+	keyNames := make([]string, len(admission.keys))
+	for index, key := range admission.keys {
+		keyNames[index] = key.Name
+	}
+	if len(keyNames) == 0 {
+		return adapterRangePageQuery{}, errors.New(
+			"ROW_NUMBER query requires a complete primary key",
+		)
+	}
+	aliasName := adapterPaginationAlias(
+		append(
+			append([]string(nil), admission.columnNames...),
+			keyNames...,
+		),
+		"dmtx_network_row_number",
+	)
+	alias := adapterPaginationIdentifier(admission.engine, aliasName)
+	order := adapterPaginationOrderBy(
+		admission.engine,
+		keyNames,
+		false,
+	)
+	outerProjection := adapterPaginationQuotedColumns(
+		admission.engine,
+		admission.columnNames,
+	)
+	position := 1
+	args := make([]any, 0, 3)
+	top := ""
+	if admission.engine == "mssql" {
+		top = "TOP (" +
+			adapterPaginationPlaceholder(admission.engine, position) +
+			") "
+		args = append(args, admission.request.MaxRows)
+		position++
+	}
+	lower := adapterPaginationPlaceholder(admission.engine, position)
+	args = append(args, admission.effectiveRow)
+	position++
+	upper := adapterPaginationPlaceholder(admission.engine, position)
+	args = append(args, admission.lastRow)
+	position++
+	query := "WITH dmtx_network_ranked AS (" +
+		"SELECT " + projection + ", ROW_NUMBER() OVER (ORDER BY " +
+		order + ") AS " + alias + " FROM " + qualified +
+		") SELECT " + top + outerProjection +
+		" FROM dmtx_network_ranked WHERE " + alias + " > " + lower +
+		" AND " + alias + " <= " + upper +
+		" ORDER BY " + alias
+	if admission.engine != "mssql" {
+		query += " LIMIT " +
+			adapterPaginationPlaceholder(admission.engine, position)
+		args = append(args, admission.request.MaxRows)
+	}
+	return adapterRangePageQuery{SQL: query, Args: args}, nil
+}
+
+func adapterRangePageAdmissionTuple(
+	typed KeyTuple,
+	integers []int64,
+	keys []KeySpec,
+) (KeyTuple, error) {
+	if len(typed) == len(keys) {
+		return append(KeyTuple(nil), typed...), nil
+	}
+	if len(integers) != len(keys) {
+		return nil, errors.New(
+			"range query bound differs from pagination key width",
+		)
+	}
+	result := make(KeyTuple, len(integers))
+	for index, value := range integers {
+		if keys[index].Kind != KeyInteger {
+			return nil, errors.New(
+				"range query lacks its typed key bound",
+			)
+		}
+		result[index] = IntegerKey(value)
+	}
+	return result, nil
 }
 
 func adapterRangePageProjection(
@@ -815,30 +1279,61 @@ func adapterRangePagePredicate(
 	values []int64,
 	position int,
 ) (string, []any, int, error) {
+	typed := make(KeyTuple, len(values))
+	for index, value := range values {
+		typed[index] = IntegerKey(value)
+	}
+	return adapterRangePageKeyPredicate(
+		engine,
+		keys,
+		operator,
+		typed,
+		position,
+	)
+}
+
+func adapterRangePageKeyPredicate(
+	engine string,
+	keys []KeySpec,
+	operator string,
+	values KeyTuple,
+	position int,
+) (string, []any, int, error) {
 	if len(keys) == 0 || len(keys) != len(values) ||
 		(operator != ">" && operator != "<=") {
 		return "", nil, position, errors.New(
 			"range predicate has an invalid key shape",
 		)
 	}
-	for _, key := range keys {
-		if key.Kind != KeyInteger {
+	arguments := make([]any, len(values))
+	for index, key := range keys {
+		if key.Kind == "" || values[index].Kind != key.Kind {
 			return "", nil, position, errors.New(
-				"range predicate requires exact signed-integer keys",
+				"range predicate key kind differs from its bound",
 			)
 		}
+		value, err := values[index].SQLValue()
+		if err != nil {
+			return "", nil, position, errors.New(
+				"range predicate key encoding is invalid",
+			)
+		}
+		arguments[index] = value
 	}
 	if len(keys) == 1 {
 		placeholder := adapterPaginationPlaceholder(engine, position)
 		return adapterPaginationIdentifier(engine, keys[0].Name) +
 				" " + operator + " " + placeholder,
-			[]any{values[0]},
+			[]any{arguments[0]},
 			position + 1,
 			nil
 	}
 	if engine == "mssql" {
-		return "", nil, position, errors.New(
-			"SQL Server tuple keysets are not an approved pagination strategy",
+		return adapterRangePageSQLServerTuplePredicate(
+			keys,
+			operator,
+			arguments,
+			position,
 		)
 	}
 	names := make([]string, len(keys))
@@ -850,7 +1345,7 @@ func adapterRangePagePredicate(
 			engine,
 			position+index,
 		)
-		args[index] = values[index]
+		args[index] = arguments[index]
 	}
 	return "(" + strings.Join(names, ", ") + ") " + operator +
 			" (" + strings.Join(placeholders, ", ") + ")",
@@ -859,17 +1354,76 @@ func adapterRangePagePredicate(
 		nil
 }
 
+func adapterRangePageSQLServerTuplePredicate(
+	keys []KeySpec,
+	operator string,
+	values []any,
+	position int,
+) (string, []any, int, error) {
+	if len(keys) < 2 || len(keys) != len(values) ||
+		(operator != ">" && operator != "<=") {
+		return "", nil, position, errors.New(
+			"SQL Server tuple predicate has an invalid key shape",
+		)
+	}
+	terms := make([]string, len(keys))
+	arguments := make([]any, 0, len(keys)*(len(keys)+1)/2)
+	next := position
+	for termIndex := range keys {
+		parts := make([]string, 0, termIndex+1)
+		for equalIndex := 0; equalIndex < termIndex; equalIndex++ {
+			parts = append(
+				parts,
+				adapterPaginationIdentifier(
+					"mssql",
+					keys[equalIndex].Name,
+				)+" = "+
+					adapterPaginationPlaceholder("mssql", next),
+			)
+			arguments = append(arguments, values[equalIndex])
+			next++
+		}
+		comparison := operator
+		if operator == "<=" && termIndex < len(keys)-1 {
+			comparison = "<"
+		}
+		parts = append(
+			parts,
+			adapterPaginationIdentifier(
+				"mssql",
+				keys[termIndex].Name,
+			)+" "+comparison+" "+
+				adapterPaginationPlaceholder("mssql", next),
+		)
+		arguments = append(arguments, values[termIndex])
+		next++
+		terms[termIndex] = "(" + strings.Join(parts, " AND ") + ")"
+	}
+	return "(" + strings.Join(terms, " OR ") + ")",
+		arguments,
+		next,
+		nil
+}
+
 func scanAdapterNetworkRangePage(
 	rows adapterRows,
 	admission adapterRangePageAdmission,
-) (NetworkReadPage, []int64, error) {
+) (NetworkReadPage, KeyTuple, error) {
 	page := NetworkReadPage{
 		Rows:     make([][]any, 0, admission.request.MaxRows),
 		RowBytes: make([]int64, 0, admission.request.MaxRows),
 	}
-	var previous []int64
-	if admission.hasEffective {
-		previous = append([]int64(nil), admission.effective...)
+	var previous KeyTuple
+	if admission.hasEffective && !admission.rowNumber {
+		var err error
+		previous, err = adapterRangePageAdmissionTuple(
+			admission.keyEffective,
+			admission.effective,
+			admission.keys,
+		)
+		if err != nil {
+			return NetworkReadPage{}, nil, adapterRangePagePolicy(err)
+		}
 	}
 	for len(page.Rows) < admission.request.MaxRows && rows.Next() {
 		values := make([]any, len(admission.columnNames))
@@ -888,31 +1442,37 @@ func scanAdapterNetworkRangePage(
 			)
 		}
 		owned := cloneAdapterRow(values)
-		frontier, err := adapterRangePageRowFrontier(
-			owned,
-			admission,
-		)
-		if err != nil {
-			return NetworkReadPage{}, nil, err
-		}
-		if previous != nil &&
-			adapterRangePageTupleCompare(frontier, previous) <= 0 {
-			return NetworkReadPage{}, nil, NewTransferError(
-				ErrorClassState,
-				fmt.Errorf(
-					"source network range order did not advance for table %s",
-					admission.table.Name,
-				),
+		if !admission.rowNumber {
+			frontier, err := adapterRangePageRowKeyFrontier(
+				owned,
+				admission,
 			)
-		}
-		if adapterRangePageTupleCompare(frontier, admission.upper) > 0 {
-			return NetworkReadPage{}, nil, NewTransferError(
-				ErrorClassState,
-				fmt.Errorf(
-					"source network range exceeded its immutable upper bound for table %s",
-					admission.table.Name,
-				),
-			)
+			if err != nil {
+				return NetworkReadPage{}, nil, err
+			}
+			if previous != nil &&
+				adapterRangePageKeyTupleCompare(frontier, previous) <= 0 {
+				return NetworkReadPage{}, nil, NewTransferError(
+					ErrorClassState,
+					fmt.Errorf(
+						"source network range order did not advance for table %s",
+						admission.table.Name,
+					),
+				)
+			}
+			if adapterRangePageKeyTupleCompare(
+				frontier,
+				admission.keyUpper,
+			) > 0 {
+				return NetworkReadPage{}, nil, NewTransferError(
+					ErrorClassState,
+					fmt.Errorf(
+						"source network range exceeded its immutable upper bound for table %s",
+						admission.table.Name,
+					),
+				)
+			}
+			previous = frontier
 		}
 		retained, err := measureAdapterRetainedRowBytes(owned)
 		if err != nil {
@@ -939,7 +1499,6 @@ func scanAdapterNetworkRangePage(
 		page.Rows = append(page.Rows, owned)
 		page.RowBytes = append(page.RowBytes, retained)
 		page.RetainedBytes += retained
-		previous = frontier
 	}
 	if err := rows.Err(); err != nil {
 		return NetworkReadPage{}, nil, fmt.Errorf(
@@ -951,7 +1510,30 @@ func scanAdapterNetworkRangePage(
 	if len(page.Rows) == 0 {
 		return page, nil, nil
 	}
-	frontier, err := adapterRangePageEncodeFrontier(previous)
+	var frontier []byte
+	var err error
+	if admission.rowNumber {
+		expected := admission.lastRow - admission.effectiveRow
+		if expected > int64(admission.request.MaxRows) {
+			expected = int64(admission.request.MaxRows)
+		}
+		if int64(len(page.Rows)) != expected {
+			return NetworkReadPage{}, nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"stable ROW_NUMBER range for table %s returned an incomplete immutable interval",
+					admission.table.Name,
+				),
+			)
+		}
+		frontier, err = adapterRangePageEncodeFrontier(
+			[]int64{
+				admission.effectiveRow + int64(len(page.Rows)),
+			},
+		)
+	} else {
+		frontier, err = adapterRangePageEncodeKeyFrontier(previous)
+	}
 	if err != nil {
 		return NetworkReadPage{}, nil, NewTransferError(
 			ErrorClassState,
@@ -962,19 +1544,22 @@ func scanAdapterNetworkRangePage(
 	return page, previous, nil
 }
 
-func adapterRangePageRowFrontier(
+func adapterRangePageRowKeyFrontier(
 	row []any,
 	admission adapterRangePageAdmission,
-) ([]int64, error) {
-	result := make([]int64, len(admission.keyIndexes))
+) (KeyTuple, error) {
+	result := make(KeyTuple, len(admission.keyIndexes))
 	for index, columnIndex := range admission.keyIndexes {
 		if columnIndex < 0 || columnIndex >= len(row) {
 			return nil, adapterRangePagePolicy(
 				errors.New("source pagination key is absent from the selected row"),
 			)
 		}
-		value, ok := adapterRangePageInt64(row[columnIndex])
-		if !ok {
+		value, err := adapterPaginationTypedKey(
+			row[columnIndex],
+			admission.keys[index].Kind,
+		)
+		if err != nil {
 			return nil, NewTransferError(
 				ErrorClassConversion,
 				fmt.Errorf(
@@ -984,6 +1569,26 @@ func adapterRangePageRowFrontier(
 			)
 		}
 		result[index] = value
+	}
+	return result, nil
+}
+
+func adapterRangePageRowFrontier(
+	row []any,
+	admission adapterRangePageAdmission,
+) ([]int64, error) {
+	typed, err := adapterRangePageRowKeyFrontier(row, admission)
+	if err != nil {
+		return nil, err
+	}
+	result, ok := adapterRangePageIntegerTuple(typed)
+	if !ok {
+		return nil, NewTransferError(
+			ErrorClassConversion,
+			errors.New(
+				"source pagination frontier is not a signed-integer tuple",
+			),
+		)
 	}
 	return result, nil
 }
@@ -1023,6 +1628,52 @@ func adapterRangePageEncodeFrontier(values []int64) ([]byte, error) {
 	return encodeNetworkStateFrontier(tuple, true)
 }
 
+func adapterRangePageEncodeKeyFrontier(
+	values KeyTuple,
+) ([]byte, error) {
+	tuple := make(state.TypedTuple, len(values))
+	for index, value := range values {
+		switch value.Kind {
+		case KeyInteger:
+			parsed, err := strconv.ParseInt(value.Encoded, 10, 64)
+			if err != nil ||
+				strconv.FormatInt(parsed, 10) != value.Encoded {
+				return nil, errors.New(
+					"pagination integer frontier is not canonical",
+				)
+			}
+			tuple[index] = state.Int64Value(parsed)
+		case KeyText:
+			if !utf8.ValidString(value.Encoded) {
+				return nil, errors.New(
+					"pagination text frontier is invalid UTF-8",
+				)
+			}
+			tuple[index] = state.TextValue(value.Encoded)
+		case KeyBytes:
+			decoded, err := value.SQLValue()
+			if err != nil {
+				return nil, errors.New(
+					"pagination byte frontier is not canonical",
+				)
+			}
+			bytesValue, ok := decoded.([]byte)
+			if !ok || BytesKey(bytesValue).Encoded != value.Encoded {
+				return nil, errors.New(
+					"pagination byte frontier is not canonical",
+				)
+			}
+			tuple[index] = state.BytesValue(bytesValue)
+		default:
+			return nil, fmt.Errorf(
+				"pagination frontier has unsupported kind %q",
+				value.Kind,
+			)
+		}
+	}
+	return encodeNetworkStateFrontier(tuple, true)
+}
+
 func adapterRangePageTupleCompare(left, right []int64) int {
 	if len(left) != len(right) {
 		return 0
@@ -1036,6 +1687,40 @@ func adapterRangePageTupleCompare(left, right []int64) int {
 		}
 	}
 	return 0
+}
+
+func adapterRangePageKeyTupleCompare(left, right KeyTuple) int {
+	if len(left) != len(right) {
+		return 0
+	}
+	for index := range left {
+		comparison, ok := adapterPaginationKeyCompare(
+			left[index],
+			right[index],
+		)
+		if !ok {
+			return 0
+		}
+		if comparison != 0 {
+			return comparison
+		}
+	}
+	return 0
+}
+
+func adapterRangePageIntegerTuple(value KeyTuple) ([]int64, bool) {
+	result := make([]int64, len(value))
+	for index, key := range value {
+		if key.Kind != KeyInteger {
+			return nil, false
+		}
+		parsed, err := strconv.ParseInt(key.Encoded, 10, 64)
+		if err != nil || strconv.FormatInt(parsed, 10) != key.Encoded {
+			return nil, false
+		}
+		result[index] = parsed
+	}
+	return result, true
 }
 
 func fingerprintAdapterNetworkRangePage(
