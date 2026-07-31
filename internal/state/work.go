@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"time"
+	"unicode/utf8"
 )
 
 var (
@@ -27,6 +29,37 @@ type TaskKey struct {
 func (key TaskKey) Validate() error {
 	if key.Type == "" || key.Table == "" {
 		return fmt.Errorf("task type and table are required")
+	}
+	for _, field := range [...]struct {
+		name  string
+		value string
+	}{
+		{name: "type", value: key.Type},
+		{name: "schema", value: key.Schema},
+		{name: "table", value: key.Table},
+		{name: "partition", value: key.Partition},
+	} {
+		if !utf8.ValidString(field.value) {
+			return fmt.Errorf(
+				"task %s contains invalid UTF-8",
+				field.name,
+			)
+		}
+		if len(field.value) > maximumTaskKeyFieldBytes {
+			return fmt.Errorf(
+				"task %s exceeds %d bytes",
+				field.name,
+				maximumTaskKeyFieldBytes,
+			)
+		}
+		for _, character := range field.value {
+			if character == 0 {
+				return fmt.Errorf(
+					"task %s contains NUL",
+					field.name,
+				)
+			}
+		}
 	}
 	return nil
 }
@@ -72,13 +105,28 @@ func BytesValue(value []byte) TypedValue {
 func (value TypedValue) Validate() error {
 	switch value.Kind {
 	case ValueInt64:
-		if _, err := strconv.ParseInt(value.Encoded, 10, 64); err != nil {
+		parsed, err := strconv.ParseInt(value.Encoded, 10, 64)
+		if err != nil {
 			return fmt.Errorf("invalid int64 value: %w", err)
 		}
+		if strconv.FormatInt(parsed, 10) != value.Encoded {
+			return fmt.Errorf(
+				"invalid int64 value: non-canonical encoding",
+			)
+		}
 	case ValueText:
+		if !utf8.ValidString(value.Encoded) {
+			return fmt.Errorf("invalid text value: invalid UTF-8")
+		}
 	case ValueBytes:
-		if _, err := base64.StdEncoding.DecodeString(value.Encoded); err != nil {
+		decoded, err := base64.StdEncoding.DecodeString(value.Encoded)
+		if err != nil {
 			return fmt.Errorf("invalid byte value: %w", err)
+		}
+		if base64.StdEncoding.EncodeToString(decoded) != value.Encoded {
+			return fmt.Errorf(
+				"invalid byte value: non-canonical encoding",
+			)
 		}
 	case ValueNull:
 		if value.Encoded != "" {
@@ -126,12 +174,18 @@ func (tuple TypedTuple) Validate(allowNull bool) error {
 }
 
 type PendingAcknowledgement struct {
-	Sequence      uint64     `json:"sequence" yaml:"sequence"`
-	ChunkRows     int64      `json:"chunk_rows" yaml:"chunk_rows"`
-	DurableRows   int64      `json:"durable_rows" yaml:"durable_rows"`
-	Attempts      int        `json:"attempts" yaml:"attempts"`
-	Frontier      TypedTuple `json:"frontier,omitempty" yaml:"frontier,omitempty"`
-	FrontierValid bool       `json:"frontier_valid,omitempty" yaml:"frontier_valid,omitempty"`
+	Sequence           uint64     `json:"sequence" yaml:"sequence"`
+	ChunkRows          int64      `json:"chunk_rows" yaml:"chunk_rows"`
+	DurableRows        int64      `json:"durable_rows" yaml:"durable_rows"`
+	Attempts           int        `json:"attempts" yaml:"attempts"`
+	StartFrontier      TypedTuple `json:"start_frontier,omitempty" yaml:"start_frontier,omitempty"`
+	StartFrontierValid bool       `json:"start_frontier_valid,omitempty" yaml:"start_frontier_valid,omitempty"`
+	IssuedEndFrontier  TypedTuple `json:"issued_end_frontier,omitempty" yaml:"issued_end_frontier,omitempty"`
+	IssuedEndValid     bool       `json:"issued_end_valid,omitempty" yaml:"issued_end_valid,omitempty"`
+	Frontier           TypedTuple `json:"frontier,omitempty" yaml:"frontier,omitempty"`
+	FrontierValid      bool       `json:"frontier_valid,omitempty" yaml:"frontier_valid,omitempty"`
+	Fingerprint        string     `json:"fingerprint,omitempty" yaml:"fingerprint,omitempty"`
+	Exhausted          bool       `json:"exhausted,omitempty" yaml:"exhausted,omitempty"`
 }
 
 type WorkTask struct {
@@ -194,15 +248,19 @@ type RangeAcknowledgement struct {
 // process stops after commit but before acknowledgement, resume can select the
 // insert-only replay path for this exact sequence.
 type RangeChunkIntent struct {
-	RunID         string
-	Task          TaskKey
-	RangeID       string
-	TopologyHash  string
-	Sequence      uint64
-	ChunkRows     int64
-	EndFrontier   TypedTuple
-	FrontierValid bool
-	At            time.Time
+	RunID              string
+	Task               TaskKey
+	RangeID            string
+	TopologyHash       string
+	Sequence           uint64
+	ChunkRows          int64
+	StartFrontier      TypedTuple
+	StartFrontierValid bool
+	EndFrontier        TypedTuple
+	FrontierValid      bool
+	Fingerprint        string
+	Exhausted          bool
+	At                 time.Time
 }
 
 // RangeAttempt authorizes one target-driver invocation for an unresolved
@@ -255,6 +313,13 @@ func validateWorkPlan(task WorkTask, ranges []RangeState) (WorkTask, []RangeStat
 	if task.Status != "running" {
 		return WorkTask{}, nil, fmt.Errorf("new work task must be running")
 	}
+	if task.Attempts != 0 || task.Retries != 0 ||
+		task.Error != "" || !task.UpdatedAt.IsZero() ||
+		!task.CompletedAt.IsZero() {
+		return WorkTask{}, nil, fmt.Errorf(
+			"new work task contains mutable progress evidence",
+		)
+	}
 	now := task.StartedAt
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -278,6 +343,30 @@ func validateWorkPlan(task WorkTask, ranges []RangeState) (WorkTask, []RangeStat
 		}
 		if workRange.Strategy != "" && workRange.Strategy != task.Strategy {
 			return WorkTask{}, nil, fmt.Errorf("range %s has mismatched strategy", workRange.ID)
+		}
+		if workRange.Status != "" ||
+			workRange.NextSequence != 0 ||
+			workRange.SequenceOffset != 0 ||
+			workRange.RowsDone != 0 ||
+			workRange.CommittedPrefix != 0 ||
+			workRange.Attempts != 0 ||
+			workRange.Retries != 0 ||
+			workRange.Error != "" ||
+			len(workRange.Frontier) != 0 ||
+			workRange.FrontierValid ||
+			len(workRange.Pending) != 0 ||
+			!workRange.UpdatedAt.IsZero() ||
+			!workRange.CompletedAt.IsZero() {
+			return WorkTask{}, nil, fmt.Errorf(
+				"range %s contains mutable progress evidence",
+				workRange.ID,
+			)
+		}
+		if workRange.RowsTotal < 0 {
+			return WorkTask{}, nil, fmt.Errorf(
+				"range %s has negative planned row count",
+				workRange.ID,
+			)
 		}
 		if len(workRange.Lower) > 0 {
 			if err := workRange.Lower.Validate(false); err != nil {
@@ -308,29 +397,64 @@ func applyRangeChunkIntent(workRange RangeState, intent RangeChunkIntent) (Range
 	if intent.TopologyHash != workRange.TopologyHash {
 		return RangeState{}, fmt.Errorf("%w: range %q", ErrTopologyChanged, workRange.ID)
 	}
-	if intent.ChunkRows <= 0 || intent.Sequence < workRange.NextSequence {
+	if intent.ChunkRows <= 0 ||
+		intent.Sequence < workRange.NextSequence ||
+		intent.Sequence == math.MaxUint64 {
 		return RangeState{}, fmt.Errorf("%w: invalid issued sequence", ErrRangeOrder)
+	}
+	if !intent.StartFrontierValid && len(intent.StartFrontier) != 0 {
+		return RangeState{}, fmt.Errorf(
+			"%w: invalid issued start frontier carries values",
+			ErrRangeOrder,
+		)
+	}
+	if intent.StartFrontierValid {
+		if err := intent.StartFrontier.Validate(false); err != nil {
+			return RangeState{}, fmt.Errorf("%w: invalid issued start frontier: %v", ErrRangeOrder, err)
+		}
 	}
 	if intent.FrontierValid {
 		if err := intent.EndFrontier.Validate(false); err != nil {
 			return RangeState{}, fmt.Errorf("%w: invalid issued frontier: %v", ErrRangeOrder, err)
 		}
+	} else if len(intent.EndFrontier) != 0 {
+		return RangeState{}, fmt.Errorf(
+			"%w: invalid issued frontier carries values",
+			ErrRangeOrder,
+		)
+	}
+	if intent.Fingerprint != "" &&
+		!validRangeFactToken(intent.Fingerprint) {
+		return RangeState{}, fmt.Errorf(
+			"%w: invalid issued fingerprint",
+			ErrRangeOrder,
+		)
 	}
 	for _, pending := range workRange.Pending {
 		if pending.Sequence != intent.Sequence {
 			continue
 		}
 		if pending.ChunkRows == intent.ChunkRows && pending.DurableRows == 0 &&
-			pending.FrontierValid == intent.FrontierValid && typedTupleEqual(pending.Frontier, intent.EndFrontier) {
+			pending.StartFrontierValid == intent.StartFrontierValid &&
+			typedTupleEqual(pending.StartFrontier, intent.StartFrontier) &&
+			pendingIssuedEndEqual(pending, intent) &&
+			pending.Fingerprint == intent.Fingerprint &&
+			pending.Exhausted == intent.Exhausted {
 			return workRange, nil
 		}
 		return RangeState{}, fmt.Errorf("%w: sequence %d was already issued differently", ErrRangeOrder, intent.Sequence)
 	}
 	workRange.Pending = append(workRange.Pending, PendingAcknowledgement{
-		Sequence:      intent.Sequence,
-		ChunkRows:     intent.ChunkRows,
-		Frontier:      append(TypedTuple(nil), intent.EndFrontier...),
-		FrontierValid: intent.FrontierValid,
+		Sequence:           intent.Sequence,
+		ChunkRows:          intent.ChunkRows,
+		StartFrontier:      append(TypedTuple(nil), intent.StartFrontier...),
+		StartFrontierValid: intent.StartFrontierValid,
+		IssuedEndFrontier:  append(TypedTuple(nil), intent.EndFrontier...),
+		IssuedEndValid:     intent.FrontierValid,
+		Frontier:           append(TypedTuple(nil), intent.EndFrontier...),
+		FrontierValid:      intent.FrontierValid,
+		Fingerprint:        intent.Fingerprint,
+		Exhausted:          intent.Exhausted,
 	})
 	sort.Slice(workRange.Pending, func(left, right int) bool {
 		return workRange.Pending[left].Sequence < workRange.Pending[right].Sequence
@@ -369,7 +493,28 @@ func applyRangeAttempt(workTask WorkTask, workRange RangeState, attempt RangeAtt
 	if pending.ChunkRows <= 0 || pending.DurableRows < 0 || pending.DurableRows >= pending.ChunkRows {
 		return WorkTask{}, RangeState{}, fmt.Errorf("%w: sequence %d is already resolved", ErrRangeOrder, attempt.Sequence)
 	}
+	if pending.Attempts < 0 ||
+		workRange.Attempts < 0 ||
+		workRange.Retries < 0 ||
+		workTask.Attempts < 0 ||
+		workTask.Retries < 0 {
+		return WorkTask{}, RangeState{}, fmt.Errorf(
+			"%w: range attempt counters are negative",
+			ErrRangeOrder,
+		)
+	}
 	retry := pending.Attempts > 0
+	if pending.Attempts == maximumStateInt ||
+		workRange.Attempts == maximumStateInt ||
+		workTask.Attempts == maximumStateInt ||
+		retry &&
+			(workRange.Retries == maximumStateInt ||
+				workTask.Retries == maximumStateInt) {
+		return WorkTask{}, RangeState{}, fmt.Errorf(
+			"%w: range attempt counters overflow",
+			ErrRangeOrder,
+		)
+	}
 	pending.Attempts++
 	workRange.Attempts++
 	workTask.Attempts++
@@ -392,8 +537,14 @@ func applyRangeAcknowledgement(workRange RangeState, acknowledgement RangeAcknow
 	if acknowledgement.TopologyHash != workRange.TopologyHash {
 		return RangeState{}, fmt.Errorf("%w: range %q", ErrTopologyChanged, workRange.ID)
 	}
-	if acknowledgement.ChunkRows <= 0 || acknowledgement.AttemptOffset < 0 || acknowledgement.DurableRows <= 0 ||
-		acknowledgement.AttemptOffset+acknowledgement.DurableRows > acknowledgement.ChunkRows {
+	if acknowledgement.ChunkRows <= 0 ||
+		acknowledgement.AttemptOffset < 0 ||
+		acknowledgement.DurableRows <= 0 ||
+		acknowledgement.AttemptOffset >
+			acknowledgement.ChunkRows ||
+		acknowledgement.DurableRows >
+			acknowledgement.ChunkRows-
+				acknowledgement.AttemptOffset {
 		return RangeState{}, fmt.Errorf("%w: invalid durable prefix", ErrRangeOrder)
 	}
 	if acknowledgement.FrontierValid {
@@ -421,6 +572,15 @@ func applyRangeAcknowledgement(workRange RangeState, acknowledgement RangeAcknow
 	if pending.ChunkRows != acknowledgement.ChunkRows || pending.DurableRows != acknowledgement.AttemptOffset {
 		return RangeState{}, fmt.Errorf("%w: sequence %d expected offset %d", ErrRangeOrder, acknowledgement.Sequence, pending.DurableRows)
 	}
+	if workRange.RowsDone < 0 ||
+		workRange.SequenceOffset < 0 ||
+		pending.DurableRows >
+			pending.ChunkRows-acknowledgement.DurableRows {
+		return RangeState{}, fmt.Errorf(
+			"%w: durable row counters overflow",
+			ErrRangeOrder,
+		)
+	}
 	pending.DurableRows += acknowledgement.DurableRows
 	pending.Frontier = acknowledgement.Frontier
 	pending.FrontierValid = acknowledgement.FrontierValid
@@ -435,7 +595,14 @@ func applyRangeAcknowledgement(workRange RangeState, acknowledgement RangeAcknow
 		if pending.DurableRows < workRange.SequenceOffset {
 			return RangeState{}, fmt.Errorf("%w: durable offset regressed", ErrRangeOrder)
 		}
-		workRange.RowsDone += pending.DurableRows - workRange.SequenceOffset
+		delta := pending.DurableRows - workRange.SequenceOffset
+		if workRange.RowsDone > math.MaxInt64-delta {
+			return RangeState{}, fmt.Errorf(
+				"%w: durable row count overflows",
+				ErrRangeOrder,
+			)
+		}
+		workRange.RowsDone += delta
 		workRange.CommittedPrefix = pending.DurableRows
 		workRange.SequenceOffset = pending.DurableRows
 		if pending.FrontierValid {
@@ -444,6 +611,12 @@ func applyRangeAcknowledgement(workRange RangeState, acknowledgement RangeAcknow
 		}
 		if pending.DurableRows != pending.ChunkRows {
 			break
+		}
+		if workRange.NextSequence == math.MaxUint64 {
+			return RangeState{}, fmt.Errorf(
+				"%w: range sequence overflows",
+				ErrRangeOrder,
+			)
 		}
 		workRange.NextSequence++
 		workRange.SequenceOffset = 0
@@ -487,3 +660,40 @@ func typedTupleEqual(left, right TypedTuple) bool {
 	}
 	return true
 }
+
+func pendingIssuedEndEqual(
+	pending PendingAcknowledgement,
+	intent RangeChunkIntent,
+) bool {
+	if pending.IssuedEndValid || len(pending.IssuedEndFrontier) != 0 {
+		return pending.IssuedEndValid == intent.FrontierValid &&
+			typedTupleEqual(
+				pending.IssuedEndFrontier,
+				intent.EndFrontier,
+			)
+	}
+	return pending.FrontierValid == intent.FrontierValid &&
+		typedTupleEqual(pending.Frontier, intent.EndFrontier)
+}
+
+func validRangeFactToken(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' ||
+			character == '.' || character == '_' ||
+			character == ':' || character == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+const (
+	maximumStateInt          = int(^uint(0) >> 1)
+	maximumTaskKeyFieldBytes = 512
+)
