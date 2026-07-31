@@ -22,9 +22,21 @@ type Plan struct {
 	Deletes    *PlannedDelete `json:"deletes,omitempty"`
 }
 
+// RowCountProvenance labels how a planned row count was obtained. Every source
+// path currently issues an exact COUNT(*), so no dry-run row count is an
+// estimate. The label exists so that a future cheaper path cannot start
+// reporting estimates through a field operators already read as exact.
+type RowCountProvenance string
+
+const (
+	RowCountExact    RowCountProvenance = "exact"
+	RowCountEstimate RowCountProvenance = "estimate"
+)
+
 type PlannedTable struct {
-	Name string `json:"name"`
-	Rows int    `json:"rows"`
+	Name           string             `json:"name"`
+	Rows           int                `json:"rows"`
+	RowsProvenance RowCountProvenance `json:"rows_provenance"`
 }
 
 // PlannedSetting is one effective tuning value with the provenance that
@@ -170,7 +182,9 @@ func discoverDryRunPlan(ctx context.Context, cfg config.Config) (Plan, error) {
 		if err != nil {
 			return Plan{}, fmt.Errorf("count source table %s: %w", name, err)
 		}
-		plan.Tables = append(plan.Tables, PlannedTable{Name: name, Rows: rows})
+		plan.Tables = append(plan.Tables, PlannedTable{
+			Name: name, Rows: rows, RowsProvenance: RowCountExact,
+		})
 	}
 	return plan, nil
 }
@@ -203,7 +217,9 @@ func sqlServerDryRun(ctx context.Context, cfg config.Config) (Plan, error) {
 		if err := source.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+sqlServerQualified(namespace, name)).Scan(&rows); err != nil {
 			return Plan{}, fmt.Errorf("count SQL Server source table %s: %w", name, err)
 		}
-		plan.Tables = append(plan.Tables, PlannedTable{Name: name, Rows: rows})
+		plan.Tables = append(plan.Tables, PlannedTable{
+			Name: name, Rows: rows, RowsProvenance: RowCountExact,
+		})
 	}
 	return plan, nil
 }
@@ -236,7 +252,9 @@ func mySQLDryRun(ctx context.Context, cfg config.Config) (Plan, error) {
 		if err := source.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+mySQLQualified(namespace, name)).Scan(&rows); err != nil {
 			return Plan{}, fmt.Errorf("count MySQL source table %s: %w", name, err)
 		}
-		plan.Tables = append(plan.Tables, PlannedTable{Name: name, Rows: rows})
+		plan.Tables = append(plan.Tables, PlannedTable{
+			Name: name, Rows: rows, RowsProvenance: RowCountExact,
+		})
 	}
 	return plan, nil
 }
@@ -269,7 +287,9 @@ func postgresDryRun(ctx context.Context, cfg config.Config) (Plan, error) {
 		if err := source.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+postgresQualified(namespace, name)).Scan(&rows); err != nil {
 			return Plan{}, fmt.Errorf("count PostgreSQL source table %s: %w", name, err)
 		}
-		plan.Tables = append(plan.Tables, PlannedTable{Name: name, Rows: rows})
+		plan.Tables = append(plan.Tables, PlannedTable{
+			Name: name, Rows: rows, RowsProvenance: RowCountExact,
+		})
 	}
 	return plan, nil
 }

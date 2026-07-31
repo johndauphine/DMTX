@@ -3,10 +3,12 @@ package app
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/johndauphine/dmtx/internal/migrate"
 	_ "modernc.org/sqlite"
 )
 
@@ -67,8 +69,17 @@ func TestRunDryRunDiscoversSQLiteWithoutMutatingTargetOrState(t *testing.T) {
 	if code := Run([]string{"run", "--config", configPath, "--dry-run"}, &output, &errors); code != Success {
 		t.Fatalf("exit code = %d, stderr = %s", code, errors.String())
 	}
-	if !bytes.Contains(output.Bytes(), []byte(`"tables":[{"name":"notes","rows":1}]`)) {
-		t.Fatalf("plan = %q", output.String())
+	// Decode rather than substring-match: the plan is an extensible JSON
+	// contract, and a literal match breaks on every additive disclosure without
+	// telling you whether the fields this test cares about are still right.
+	var plan migrate.Plan
+	if err := json.Unmarshal(output.Bytes(), &plan); err != nil {
+		t.Fatalf("decode plan %q: %v", output.String(), err)
+	}
+	if len(plan.Tables) != 1 ||
+		plan.Tables[0].Name != "notes" ||
+		plan.Tables[0].Rows != 1 {
+		t.Fatalf("plan tables = %#v", plan.Tables)
 	}
 	if _, err := os.Stat(targetPath); !os.IsNotExist(err) {
 		t.Fatalf("dry run created target: %v", err)

@@ -83,6 +83,17 @@ func TestStage4DryRunDisclosesTuningAndDeletePolicy(t *testing.T) {
 		)
 	}
 
+	// Every source path issues an exact COUNT(*), so nothing here may be
+	// labelled an estimate. A duration estimate is deliberately absent: there is
+	// no throughput evidence to derive one from, and inventing one would be the
+	// exact failure this label guards against.
+	if len(plan.Tables) != 1 || plan.Tables[0].Rows != 2 {
+		t.Fatalf("plan tables = %#v", plan.Tables)
+	}
+	if plan.Tables[0].RowsProvenance != RowCountExact {
+		t.Fatalf("row count provenance = %q", plan.Tables[0].RowsProvenance)
+	}
+
 	if plan.Deletes == nil {
 		t.Fatal("dry run disclosed no delete policy")
 	}
