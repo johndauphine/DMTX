@@ -603,7 +603,14 @@ Every certified-cell implementation needs its family. Missing, by name:
   that validation could fail against a real database at all. It deletes a target
   row behind the tool's back and requires the reason to name the row-count
   disagreement, not merely that something failed.
-- `TestStage4CertifiedRelationalCrashResumeMatrixLive` (both state backends)
+- `TestStage4CertifiedRelationalCrashResumeMatrixLive` — the per-route matrix is
+  still open, but the **both state backends** half is now satisfied for the
+  network route: `TestStage4PostgresTLSToSQLiteNetworkCrashResumeLive` runs the
+  same crash and resume against SQLite and YAML as subtests, and
+  `TestStage4PostgresDeleteCompositionCrashResumeLiveTLS` covers the delete
+  route on YAML. Running one route on one backend had left backend-specific
+  crash bugs invisible, and the two differ genuinely: SQLite commits a
+  transaction, YAML replaces a whole document.
 - ~~`TestStage4CertifiedRelationalTransferLifecycleLive`~~ — **satisfied
   2026-07-31** by the per-engine stable-runner sentinels rather than a new
   fixture: `TestStage4MySQLStableRunnerLiveTLS`,

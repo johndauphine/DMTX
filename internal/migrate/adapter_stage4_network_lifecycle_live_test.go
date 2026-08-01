@@ -18,7 +18,42 @@ import (
 	"github.com/johndauphine/dmtx/internal/state"
 )
 
+// TestStage4PostgresTLSToSQLiteNetworkCrashResumeLive runs the same crash and
+// resume against both durable state backends. Running one route on one backend
+// leaves a backend-specific crash bug invisible, and the two backends have
+// genuinely different atomicity: SQLite commits a transaction, YAML replaces a
+// whole document.
+// stage4LiveStateBackend is both the ordinary run surface the fixture needs to
+// initialize a run and the Stage 4 surface the route needs. Both durable
+// backends satisfy it.
+type stage4LiveStateBackend interface {
+	state.Backend
+	Stage4StateBackend
+}
+
 func TestStage4PostgresTLSToSQLiteNetworkCrashResumeLive(t *testing.T) {
+	for name, newBackend := range map[string]func(*testing.T) stage4LiveStateBackend{
+		"sqlite": func(t *testing.T) stage4LiveStateBackend {
+			return state.SQLiteStore{
+				Path: filepath.Join(t.TempDir(), "state.db"),
+			}
+		},
+		"yaml": func(t *testing.T) stage4LiveStateBackend {
+			return state.YAMLStore{
+				Path: filepath.Join(t.TempDir(), "state.yaml"),
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			testStage4PostgresNetworkCrashResumeLive(t, newBackend(t))
+		})
+	}
+}
+
+func testStage4PostgresNetworkCrashResumeLive(
+	t *testing.T,
+	rawBackend stage4LiveStateBackend,
+) {
 	dsn := os.Getenv("DMTX_TEST_POSTGRES_DSN")
 	if dsn == "" {
 		t.Skip(
@@ -119,9 +154,6 @@ func TestStage4PostgresTLSToSQLiteNetworkCrashResumeLive(t *testing.T) {
 		tableName,
 	)
 
-	rawBackend := state.SQLiteStore{
-		Path: filepath.Join(t.TempDir(), "state.db"),
-	}
 	runID := "stage4-pg-sqlite-network-resume"
 	initializeStage4LifecycleRun(
 		t,
