@@ -140,8 +140,13 @@ silently. With the full set above, 9 skip and everything else runs.
 
 ### Result: the whole matrix is green
 
-`go test ./... -count=1` and `go test -race ./... -count=1` both pass with every
-live TLS endpoint enabled. All eight packages green under both.
+`go test ./... -count=1` and `go test -race ./... -count=1` both pass with the
+**full** environment above — every engine, both target databases, and the admin
+DSN. All eight packages green under both, no data races.
+
+This is the widest configuration the repository supports. Reproduce it with the
+provisioning commands and exports above; anything narrower silently skips tests
+rather than failing, which is how the gaps below stayed hidden.
 
 The run initially surfaced six failures, all in `internal/migrate`. Each was
 verified **pre-existing** by rerunning it in a detached worktree at `ccc985b`,
