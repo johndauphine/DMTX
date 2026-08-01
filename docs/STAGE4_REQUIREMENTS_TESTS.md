@@ -795,10 +795,14 @@ the zero-mutation guarantee is now asserted rather than assumed. Remaining:
 
 - ~~`TestDeterministicTuningPreservesPinnedIntent`~~ — **closed 2026-07-31**
 - `TestDeleteReconcileDryRunReportsDueCandidates` — reporting half of dry-run
-- `TestClickHouseIncrementalRejectedBeforeMutationLive` — the non-live half is
-  already covered by `TestRequireIncrementalSourceRejectsClickHouse`; only the
-  live sentinel is open
-- `TestClickHouseDeleteReconcileRejectedBeforeMutationLive`
+- ~~`TestClickHouseIncrementalRejectedBeforeMutationLive`~~ and
+  ~~`TestClickHouseDeleteReconcileRejectedBeforeMutationLive`~~ — **closed
+  2026-07-31**, against a live ClickHouse endpoint. Both refusals arrive one
+  layer earlier than the fixture names imply: ClickHouse is a rebuild-only
+  target and does not support upsert at all, which both incremental and delete
+  require, so those routes are unreachable by construction rather than gated by
+  a feature-specific check. The tests assert that real reason rather than a
+  hoped-for one, and also assert the table lifecycle was never entered.
 - ~~`TestTargetLeaseTwoProcessRace`, `TestDifferentCanonicalTargetsRunConcurrently`~~ — **closed 2026-07-31**
 - ~~`TestStage4EveryRequiredWriteFailureReturnsStateExitSix`~~ — **closed 2026-07-31**
 - periodic-checkpoint supersession pair (Section 11.3) — **blocked on a product
