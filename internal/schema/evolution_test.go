@@ -1518,11 +1518,14 @@ func TestRenderColumnEvolutionFailsClosedForUnsupportedTargetsAndInputs(
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got, err := RenderColumnEvolution(SQLite, operation); err != nil ||
+		!strings.Contains(got, " ADD COLUMN ") {
+		t.Fatalf("SQLite nullable addition = %q, %v", got, err)
+	}
 	for _, test := range []struct {
 		target Dialect
 		reason string
 	}{
-		{target: SQLite, reason: "in-place evolution"},
 		{target: ClickHouse, reason: "requires rebuild"},
 		{target: Dialect("oracle"), reason: "unknown target"},
 	} {

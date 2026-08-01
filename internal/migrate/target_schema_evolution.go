@@ -29,6 +29,13 @@ const (
 
 const targetSchemaEvolutionVerificationTimeout = 10 * time.Second
 
+// sqliteTargetEvolutionCopySwapStatement is an immutable-operation marker, not
+// executable SQL.  SQLite cannot perform the proved relax/widen transitions
+// in-place.  The SQLite target adapter recognizes this marker only after it
+// has independently revalidated the exact before/after catalog states and
+// executes its retained-row copy/swap bundle under BEGIN IMMEDIATE.
+const sqliteTargetEvolutionCopySwapStatement = "dmtx:sqlite:retained-row-copy-swap:v1"
+
 // TargetSchemaEvolutionError preserves a classifiable failure without
 // converting an uncertain or partially applied target into success.
 type TargetSchemaEvolutionError struct {
@@ -770,7 +777,7 @@ func prepareTargetSchemaEvolutionDefinition(
 		)
 	}
 	switch request.target {
-	case schema.Postgres, schema.SQLServer, schema.MySQL:
+	case schema.Postgres, schema.SQLServer, schema.MySQL, schema.SQLite:
 	default:
 		return targetSchemaEvolutionDefinition{}, targetSchemaEvolutionError(
 			TargetSchemaEvolutionInvalidPlan,
@@ -1736,6 +1743,14 @@ func proveAndRenderTargetSchemaEvolution(
 				targetSchemaEvolutionObjectName(specification.object),
 			err,
 		)
+	}
+	// SQLite has no safe in-place form for either operation.  The generic
+	// proof above remains the authority for what can change; only the target
+	// adapter owns the physical retained-row rebuild needed to enact it.
+	if target == schema.SQLite &&
+		(specification.action == SchemaContractRelaxNullability ||
+			specification.action == SchemaContractWidenType) {
+		return sqliteTargetEvolutionCopySwapStatement, nil
 	}
 	statement, err := schema.RenderColumnEvolution(target, proof)
 	if err != nil {

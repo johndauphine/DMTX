@@ -75,6 +75,34 @@ func (
 	return bound, found
 }
 
+func (
+	execution *stage4AdapterNetworkExecution,
+) markStage4AdapterPostgresDeleteTerminalAuthenticated(
+	planIndex int,
+	strict bool,
+) error {
+	if execution == nil || execution.prepared.deletes == nil ||
+		planIndex < 0 || planIndex >= len(execution.prepared.plans) {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 PostgreSQL delete terminal authentication is unavailable"),
+		)
+	}
+	execution.mu.Lock()
+	defer execution.mu.Unlock()
+	bound, found := execution.deleteTransferred[planIndex]
+	if !found || !bound.taskCompleted {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 PostgreSQL delete terminal evidence is unavailable for table %s", execution.prepared.plans[planIndex].source.Name),
+		)
+	}
+	bound.terminalAuthenticated = true
+	bound.terminalStrict = strict
+	execution.deleteTransferred[planIndex] = bound
+	return nil
+}
+
 // classifyStage4AdapterPostgresDeleteTransferredTable is read-only. Partial
 // work deliberately returns found=false so the ordinary reset/replay path can
 // recover it. Fully transferred work is reconstructed from durable bounds and
@@ -679,8 +707,27 @@ func prevalidateStage4AdapterPostgresDeleteCompletedTargets(
 		bound, found := execution.stage4AdapterPostgresDeleteTransferredTable(
 			planIndex,
 		)
-		if !found || !bound.terminalAuthenticated {
+		if !found || !bound.taskCompleted {
 			continue
+		}
+		if !bound.terminalAuthenticated {
+			strict, err := authenticateStage4AdapterPostgresDeleteTerminal(
+				ctx,
+				prepared.deletes,
+				planIndex,
+				bound.work,
+			)
+			if err != nil {
+				return err
+			}
+			if err := execution.markStage4AdapterPostgresDeleteTerminalAuthenticated(
+				planIndex,
+				strict,
+			); err != nil {
+				return err
+			}
+			bound.terminalAuthenticated = true
+			bound.terminalStrict = strict
 		}
 		targetRows, err := target.CountRows(ctx, plan.target)
 		if err != nil {

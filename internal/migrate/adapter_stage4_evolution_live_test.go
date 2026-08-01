@@ -59,6 +59,7 @@ func TestStage4AdapterPostgresSchemaEvolutionComposedRouteLiveTLS(
 		current       schema.Table
 		wantOperation SchemaContractAction
 		wantRetained  bool
+		wantVarchar   int
 	}{
 		{
 			name: "create table",
@@ -138,6 +139,42 @@ func TestStage4AdapterPostgresSchemaEvolutionComposedRouteLiveTLS(
 			}(),
 			wantOperation: SchemaContractRelaxNullability,
 			wantRetained:  true,
+		},
+		{
+			// This must travel through the composed route rather than only the
+			// native PostgreSQL planner. It is the target-matrix proof that a
+			// safe existing-column type widening reaches the production target
+			// capability before the first transfer write.
+			name: "widen safe varchar",
+			prior: func() schema.Table {
+				table := stage4AdapterTestTable()
+				table.Columns[1].Type = "varchar"
+				table.Columns[1].DeclaredType = &schema.DeclaredType{
+					Base: "varchar", Arguments: []int{10},
+				}
+				return table
+			},
+			priorDDL: func(namespace string) []string {
+				return []string{
+					"CREATE TABLE " + postgresQualified(namespace, "items") +
+						` ("id" bigint NOT NULL PRIMARY KEY, "payload" varchar(10) NOT NULL)`,
+				}
+			},
+			contract: config.SchemaContract{
+				Tables:   config.SchemaContractReport,
+				Columns:  config.SchemaContractEvolve,
+				DataType: config.SchemaContractEvolve,
+			},
+			current: func() schema.Table {
+				table := stage4AdapterTestTable()
+				table.Columns[1].Type = "varchar"
+				table.Columns[1].DeclaredType = &schema.DeclaredType{
+					Base: "varchar", Arguments: []int{32},
+				}
+				return table
+			}(),
+			wantOperation: SchemaContractWidenType,
+			wantVarchar:   32,
 		},
 	}
 	for _, test := range tests {
@@ -288,6 +325,28 @@ func TestStage4AdapterPostgresSchemaEvolutionComposedRouteLiveTLS(
 					wantNullable,
 				)
 			}
+			if test.wantVarchar != 0 {
+				var width sql.NullInt64
+				if err := database.QueryRowContext(
+					ctx,
+					`SELECT character_maximum_length
+					   FROM information_schema.columns
+					  WHERE table_schema = $1
+					    AND table_name = $2
+					    AND column_name = 'payload'`,
+					namespace,
+					test.current.Name,
+				).Scan(&width); err != nil {
+					t.Fatalf("read evolved PostgreSQL payload width: %v", err)
+				}
+				if !width.Valid || width.Int64 != int64(test.wantVarchar) {
+					t.Fatalf(
+						"PostgreSQL payload width = %#v, want %d",
+						width,
+						test.wantVarchar,
+					)
+				}
+			}
 			var rows int
 			if err := database.QueryRowContext(
 				ctx,
@@ -311,19 +370,23 @@ func TestStage4AdapterPostgresSchemaEvolutionComposedRouteLiveTLS(
 			if err != nil {
 				t.Fatal(err)
 			}
+			// Aggregate schema sentinels intentionally remain running here. The
+			// app publishes them atomically with the successful run outcome after
+			// validation audit persistence; completing them in the migration
+			// runner would recreate the terminal-evidence timestamp conflict.
 			for _, key := range []state.TaskKey{
 				stage4SchemaGateTask,
 				stage4TargetShapeTask,
 			} {
-				var completed bool
+				var pending bool
 				for _, task := range tasks {
-					if task.Key == key && task.Status == "completed" {
-						completed = true
+					if task.Key == key && task.Status == "running" {
+						pending = true
 					}
 				}
-				if !completed {
+				if !pending {
 					t.Fatalf(
-						"PostgreSQL evolution sentinel %#v is incomplete: %#v",
+						"PostgreSQL evolution sentinel %#v is not pending aggregate publication: %#v",
 						key,
 						tasks,
 					)

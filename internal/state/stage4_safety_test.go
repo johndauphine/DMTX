@@ -972,7 +972,7 @@ work_ranges:
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.HasPrefix(string(data), "version: 4\n") {
+		if !strings.HasPrefix(string(data), "version: 5\n") {
 			t.Fatalf("upgraded YAML version:\n%s", data)
 		}
 		tasks, ranges, err := store.ListWork("legacy")
@@ -997,9 +997,9 @@ work_ranges:
 			t.Fatal(err)
 		}
 		if _, err := database.Exec(`
-			UPDATE state_schema_versions SET version = 2
+			UPDATE state_schema_versions SET version = ?
 			WHERE component = 'stage4_state'
-		`); err != nil {
+		`, sqliteStage4SchemaVersion+1); err != nil {
 			database.Close()
 			t.Fatal(err)
 		}

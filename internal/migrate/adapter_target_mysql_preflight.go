@@ -172,6 +172,13 @@ func validateMySQLRetainedTableShape(
 ) error {
 	planned = mysqlTableShapeWithoutFrontier(planned)
 	actual = mysqlTableShapeWithoutFrontier(actual)
+	// Schema evolution rehydrates durable source/target evidence, whose
+	// canonical JSON represents a modifier-free declaration as an empty
+	// argument array. Native MySQL discovery represents the same declaration
+	// with nil. Normalize only that representation detail before the exact
+	// target-shape comparison; every real modifier remains significant.
+	normalizeMySQLTargetDeclaredTypeArguments(&planned)
+	normalizeMySQLTargetDeclaredTypeArguments(&actual)
 	if planned.Schema != actual.Schema ||
 		planned.Name != actual.Name ||
 		planned.MySQLCollation != actual.MySQLCollation ||

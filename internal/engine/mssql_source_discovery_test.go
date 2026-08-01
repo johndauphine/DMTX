@@ -64,6 +64,48 @@ func TestValidateSQLServer2022SourceCatalog(t *testing.T) {
 	}
 }
 
+func TestValidateSQLServer2022MigrationSnapshotCatalog(t *testing.T) {
+	base := sqlServer2022SourceCatalog{
+		productMajorVersion: 16,
+		engineEdition:       3,
+		productVersion:      "16.0.4250.1",
+		edition:             "Developer Edition (64-bit)",
+		databaseName:        "dmtx_snapshot",
+		compatibilityLevel:  160,
+		state:               "ONLINE",
+		userAccess:          "MULTI_USER",
+		containment:         "NONE",
+		readOnly:            true,
+		sourceDatabaseID:    sql.NullInt64{Int64: 7, Valid: true},
+	}
+	if err := validateSQLServer2022MigrationSnapshotCatalog(base); err != nil {
+		t.Fatalf("valid SQL Server migration snapshot catalog: %v", err)
+	}
+	if err := validateSQLServer2022SourceCatalog(base); err == nil {
+		t.Fatal("ordinary SQL Server source admission accepted a database snapshot")
+	}
+	for name, mutate := range map[string]func(*sqlServer2022SourceCatalog){
+		"writable": func(value *sqlServer2022SourceCatalog) {
+			value.readOnly = false
+		},
+		"missing source database identity": func(value *sqlServer2022SourceCatalog) {
+			value.sourceDatabaseID = sql.NullInt64{}
+		},
+		"invalid source database identity": func(value *sqlServer2022SourceCatalog) {
+			value.sourceDatabaseID.Int64 = 0
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := base
+			mutate(&value)
+			var policy *schema.PolicyError
+			if err := validateSQLServer2022MigrationSnapshotCatalog(value); !errors.As(err, &policy) {
+				t.Fatalf("error = %v, want PolicyError", err)
+			}
+		})
+	}
+}
+
 func TestValidSQLServerSourceIdentifierRejectsLossySurrogateDecode(
 	t *testing.T,
 ) {

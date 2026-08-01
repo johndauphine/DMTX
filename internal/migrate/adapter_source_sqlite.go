@@ -17,8 +17,10 @@ import (
 )
 
 type sqliteSourceAdapter struct {
-	database *sql.DB
-	snapshot *sql.Tx
+	database                  *sql.DB
+	snapshot                  *sql.Tx
+	incrementalDeleteMonitor  *sql.Conn
+	incrementalDeleteDataVers int64
 }
 
 var _ sourceAdapter = (*sqliteSourceAdapter)(nil)
@@ -60,11 +62,21 @@ func openSQLiteSourceAdapter(
 		_ = database.Close()
 		return nil, fmt.Errorf("open SQLite source: %w", err)
 	}
+	// An independent read-only connection records the source data version
+	// before the retained snapshot starts. SQLite incremental+delete checks it
+	// immediately before it scans source keys, so a later source commit cannot
+	// be mistaken for part of that retained view.
+	monitor, dataVersion, err := openSQLiteIncrementalDeleteMonitor(ctx, database)
+	if err != nil {
+		_ = database.Close()
+		return nil, err
+	}
 	snapshot, err := database.BeginTx(
 		ctx,
 		&sql.TxOptions{ReadOnly: true},
 	)
 	if err != nil {
+		_ = monitor.Close()
 		_ = database.Close()
 		return nil, fmt.Errorf("begin SQLite source snapshot: %w", err)
 	}
@@ -74,13 +86,64 @@ func openSQLiteSourceAdapter(
 		`SELECT COUNT(*) FROM sqlite_schema`,
 	).Scan(&schemaEntries); err != nil {
 		_ = snapshot.Rollback()
+		_ = monitor.Close()
 		_ = database.Close()
 		return nil, fmt.Errorf("establish SQLite source snapshot: %w", err)
 	}
 	return &sqliteSourceAdapter{
-		database: database,
-		snapshot: snapshot,
+		database:                  database,
+		snapshot:                  snapshot,
+		incrementalDeleteMonitor:  monitor,
+		incrementalDeleteDataVers: dataVersion,
 	}, nil
+}
+
+func openSQLiteIncrementalDeleteMonitor(
+	ctx context.Context,
+	database *sql.DB,
+) (*sql.Conn, int64, error) {
+	if database == nil {
+		return nil, 0, errors.New("SQLite source database is unavailable")
+	}
+	monitor, err := database.Conn(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("open SQLite source change monitor: %w", err)
+	}
+	var dataVersion int64
+	if err := monitor.QueryRowContext(ctx, "PRAGMA data_version").Scan(&dataVersion); err != nil {
+		_ = monitor.Close()
+		return nil, 0, fmt.Errorf("read SQLite source change monitor: %w", err)
+	}
+	return monitor, dataVersion, nil
+}
+
+// VerifyIncrementalDeleteAuthority rejects a fresh source-key scan once a
+// writer has committed after the retained source view began. Replays use a
+// previously durable delete plan instead of trying to recreate this view.
+func (adapter *sqliteSourceAdapter) VerifyIncrementalDeleteAuthority(
+	ctx context.Context,
+) error {
+	if adapter == nil || adapter.snapshot == nil ||
+		adapter.incrementalDeleteMonitor == nil {
+		return errors.New("SQLite retained incremental delete authority is unavailable")
+	}
+	if ctx == nil {
+		return errors.New("SQLite incremental delete authority context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var current int64
+	if err := adapter.incrementalDeleteMonitor.QueryRowContext(
+		ctx,
+		"PRAGMA data_version",
+	).Scan(&current); err != nil {
+		return fmt.Errorf("read SQLite incremental delete source change monitor: %w", err)
+	}
+	if current != adapter.incrementalDeleteDataVers {
+		return fmt.Errorf("SQLite source changed after the retained incremental snapshot was established")
+	}
+	return nil
 }
 
 func sqliteReadOnlyURI(path string) string {
@@ -115,6 +178,7 @@ func (adapter *sqliteSourceAdapter) ListTables(
 		WHERE schema = 'main'
 		  AND type = 'table'
 		  AND lower(substr(name, 1, 7)) <> 'sqlite_'
+		  AND lower(name) <> 'dmtx_internal_delete_batch_receipts'
 		ORDER BY name COLLATE BINARY
 	`)
 	if err != nil {
@@ -140,6 +204,12 @@ func (adapter *sqliteSourceAdapter) InspectTable(
 	ctx context.Context,
 	name string,
 ) (schema.Table, error) {
+	if strings.EqualFold(name, sqliteDeleteJournalTable) {
+		return schema.Table{}, fmt.Errorf(
+			"SQLite table %s is private DMTX delete receipt state and is not a migratable source table",
+			sqliteDeleteJournalTable,
+		)
+	}
 	if err := rejectSQLiteTableTriggers(ctx, adapter.snapshot, name); err != nil {
 		return schema.Table{}, err
 	}
@@ -248,6 +318,14 @@ func (adapter *sqliteSourceAdapter) Close() error {
 			result = errors.Join(
 				result,
 				fmt.Errorf("close SQLite source snapshot: %w", err),
+			)
+		}
+	}
+	if adapter != nil && adapter.incrementalDeleteMonitor != nil {
+		if err := adapter.incrementalDeleteMonitor.Close(); err != nil {
+			result = errors.Join(
+				result,
+				fmt.Errorf("close SQLite source change monitor: %w", err),
 			)
 		}
 	}

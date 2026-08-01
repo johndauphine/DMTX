@@ -17,6 +17,31 @@ import (
 func MaterializeSchemaSnapshot(
 	snapshot SchemaSnapshot,
 ) ([]Table, error) {
+	return materializeSchemaSnapshot(snapshot, materializeSnapshotCheck)
+}
+
+// MaterializeSchemaSnapshotForDialect reconstructs a durable target snapshot
+// using the target's already-authenticated expression semantics. SQLite CHECK
+// expressions must not be reinterpreted as PostgreSQL expressions: SQLite's
+// integer boolean-domain checks (for example, enabled IN (0, 1)) are exact
+// target authority but need not be type-compatible PostgreSQL predicates.
+// Other dialects retain the established portable/PostgreSQL proof until they
+// provide an equally strict target-specific reparser.
+func MaterializeSchemaSnapshotForDialect(
+	snapshot SchemaSnapshot,
+	dialect Dialect,
+) ([]Table, error) {
+	checkMaterializer := materializeSnapshotCheck
+	if dialect == SQLite {
+		checkMaterializer = materializeSnapshotSQLiteCheck
+	}
+	return materializeSchemaSnapshot(snapshot, checkMaterializer)
+}
+
+func materializeSchemaSnapshot(
+	snapshot SchemaSnapshot,
+	checkMaterializer func(string, []Column) (Expression, error),
+) ([]Table, error) {
 	normalized, err := snapshot.normalized()
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -27,7 +52,10 @@ func MaterializeSchemaSnapshot(
 
 	tables := make([]Table, len(normalized.Tables))
 	for index, snapshotTable := range normalized.Tables {
-		table, err := materializeSnapshotTable(snapshotTable)
+		table, err := materializeSnapshotTableWithCheck(
+			snapshotTable,
+			checkMaterializer,
+		)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"materialize schema snapshot table %s: %w",
@@ -75,6 +103,16 @@ func MaterializeSchemaSnapshot(
 }
 
 func materializeSnapshotTable(snapshot SnapshotTable) (Table, error) {
+	return materializeSnapshotTableWithCheck(
+		snapshot,
+		materializeSnapshotCheck,
+	)
+}
+
+func materializeSnapshotTableWithCheck(
+	snapshot SnapshotTable,
+	checkMaterializer func(string, []Column) (Expression, error),
+) (Table, error) {
 	if err := validateSnapshotMaterializedText(
 		"MySQL collation",
 		snapshot.MySQLCollation,
@@ -193,7 +231,7 @@ func materializeSnapshotTable(snapshot SnapshotTable) (Table, error) {
 	}
 
 	for index, snapshotCheck := range snapshot.Checks {
-		expression, err := materializeSnapshotCheck(
+		expression, err := checkMaterializer(
 			snapshotCheck.Expression,
 			table.Columns,
 		)
@@ -335,6 +373,56 @@ func materializeSnapshotCheck(
 		)
 	}
 	return expression, nil
+}
+
+func materializeSnapshotSQLiteCheck(
+	value string,
+	columns []Column,
+) (Expression, error) {
+	if !utf8.ValidString(value) ||
+		strings.ContainsRune(value, '\x00') ||
+		value != strings.TrimSpace(value) {
+		return Expression{}, fmt.Errorf(
+			"CHECK is not canonical UTF-8 expression SQL",
+		)
+	}
+	// SQLite stores booleans as the exact integer domain used by the target
+	// projection (and enforced with enabled IN (0, 1)). Reuse the structural
+	// portable predicate parser after adapting only that authenticated storage
+	// representation. This deliberately admits the proven portable subset, not
+	// arbitrary SQLite grammar: parser member resolution rejects unknown
+	// columns and malformed predicates before durable evidence is trusted.
+	resolved := make([]Column, len(columns))
+	for index, column := range columns {
+		resolved[index] = column
+		if canonicalEvolutionGenericType(column.Type) != "boolean" {
+			continue
+		}
+		resolved[index].Type = "integer"
+		resolved[index].DeclaredType = &DeclaredType{Base: "integer"}
+	}
+	expression := Expression{sql: value, kind: expressionCheck}
+	root, err := parsePlannedPostgresCheck(expression, resolved)
+	if err != nil {
+		return Expression{}, fmt.Errorf(
+			"parse canonical SQLite CHECK structurally: %w", err,
+		)
+	}
+	canonical := Expression{
+		sql: renderCanonicalPortableCheck(
+			root,
+			portableCheckPrecedenceLowest,
+		),
+		kind: expressionCheck,
+	}
+	reparsed, err := parsePlannedPostgresCheck(canonical, resolved)
+	if err != nil || makePostgresCheckSignature(root) !=
+		makePostgresCheckSignature(reparsed) {
+		return Expression{}, fmt.Errorf(
+			"canonical SQLite CHECK does not structurally round-trip",
+		)
+	}
+	return canonical, nil
 }
 
 func validateSnapshotMaterializedText(

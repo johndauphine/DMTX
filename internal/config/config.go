@@ -140,7 +140,11 @@ func effectivePort(endpoint Endpoint) int {
 	if endpoint.Port != 0 {
 		return endpoint.Port
 	}
-	switch endpoint.Type {
+	engine, err := CanonicalEngine(endpoint.Type)
+	if err != nil {
+		return 0
+	}
+	switch engine {
 	case "postgres":
 		return 5432
 	case "mssql":

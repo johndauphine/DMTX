@@ -95,7 +95,7 @@ func TestPlanPostgresMySQLSourceDataProbesBuildsExactQueries(
 	target := source
 	target.Schema = "public"
 	target.Columns = append([]schema.Column(nil), source.Columns...)
-	target.Columns[1].Type = "text"
+	target.Columns[1].Type = "varchar"
 	target.Columns[1].DeclaredType = &schema.DeclaredType{
 		Base:      "varchar",
 		Arguments: []int{24},
@@ -213,7 +213,7 @@ func TestPlanPostgresMySQLSourceDataProbesFailsClosed(
 			mutate: func(plan *adapterTablePlan) {
 				plan.target.Columns[1].Type = "bytea"
 			},
-			wantErr: `target column payload has type "bytea", want text`,
+			wantErr: `target column payload has type "bytea", want text or varchar`,
 		},
 		{
 			name: "unrenderable CHECK",

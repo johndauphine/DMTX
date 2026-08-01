@@ -6,17 +6,19 @@ import (
 	"testing"
 )
 
-// stage4LiveEnvironment is every endpoint the Stage 4 exit gate depends on.
-// Stage 4 adds no engines beyond Stage 3, but it does add routes that need a
-// distinct PostgreSQL target — delete reconciliation, strict consistency, and
-// the composed incremental route all run PostgreSQL-to-PostgreSQL.
+// stage4LiveEnvironment is every connection fact the Stage 4 exit gate
+// depends on. Stage 4 adds no engine beyond Stage 3, but its MySQL/MariaDB
+// evolution and delete-recovery fixtures also need administrators to create,
+// grant, verify, and remove isolated target databases.
 var stage4LiveEnvironment = []string{
 	"DMTX_TEST_POSTGRES_DSN",
 	"DMTX_TEST_MYSQL_DSN",
 	"DMTX_TEST_MYSQL_TARGET_DSN",
+	"DMTX_TEST_MYSQL_ADMIN_DSN",
 	"DMTX_TEST_MYSQL_CA",
 	"DMTX_TEST_MARIADB_DSN",
 	"DMTX_TEST_MARIADB_TARGET_DSN",
+	"DMTX_TEST_MARIADB_ADMIN_DSN",
 	"DMTX_TEST_MARIADB_CA",
 	"DMTX_TEST_MSSQL_DSN",
 	"DMTX_TEST_MSSQL_TARGET_DSN",
@@ -44,16 +46,20 @@ func TestStage4LiveMatrixEnvironmentRequired(t *testing.T) {
 		)
 	}
 
-	missing := make([]string, 0, len(stage4LiveEnvironment))
-	for _, name := range stage4LiveEnvironment {
-		if strings.TrimSpace(os.Getenv(name)) == "" {
-			missing = append(missing, name)
-		}
-	}
+	missing := stage4LiveEnvironmentMissing(os.Getenv)
 	if len(missing) != 0 {
 		t.Fatalf(
 			"Stage 4 live matrix is required but environment variables are missing: %s",
 			strings.Join(missing, ", "),
+		)
+	}
+	if failures := stage4LiveEnvironmentPreflight(
+		os.Getenv,
+		verifyStage4ClickHouseTLSHostname,
+	); len(failures) != 0 {
+		t.Fatalf(
+			"Stage 4 live matrix is required but environment preflight failed: %s",
+			strings.Join(failures, "; "),
 		)
 	}
 }

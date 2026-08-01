@@ -71,6 +71,137 @@ func TestPostgresStage4NetworkWriterFencesProofAndWriteInOneTransaction(
 	}
 }
 
+func TestPostgresStage4NetworkRebuildWriterSeparatesFreshAndReplay(
+	t *testing.T,
+) {
+	table := postgresStage4NetworkWriterTestTable()
+	columns := []string{"id", "code"}
+	rows := [][]any{{int64(1), "original"}, {int64(2), "new"}}
+
+	t.Run("fresh is strict target COPY", func(t *testing.T) {
+		writer, transaction := newPostgresStage4NetworkTestWriter()
+		receipt, err := writer.WriteStage4NetworkRebuildBatch(
+			context.Background(),
+			table,
+			columns,
+			NetworkWriteFreshInsert,
+			rows,
+		)
+		if err != nil {
+			t.Fatalf("fresh rebuild write: %v", err)
+		}
+		assertPostgresReceipt(t, receipt, CommitDurable, 2, 2)
+		if got, want := transaction.operations, []string{
+			"begin",
+			"fence",
+			"proof",
+			"write-copy",
+			"commit",
+		}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("fresh operations = %#v, want %#v", got, want)
+		}
+		if got, want := transaction.copyTargets,
+			[][]string{{"public", "parents"}}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("fresh COPY targets = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("issued replay is insert only", func(t *testing.T) {
+		writer, transaction := newPostgresStage4NetworkTestWriter()
+		receipt, err := writer.WriteStage4NetworkRebuildBatch(
+			context.Background(),
+			table,
+			columns,
+			NetworkWriteDuplicateSafeInsertOnly,
+			rows,
+		)
+		if err != nil {
+			t.Fatalf("replay rebuild write: %v", err)
+		}
+		assertPostgresReceipt(t, receipt, CommitDurable, 2, 2)
+		if got, want := transaction.operations, []string{
+			"begin",
+			"fence",
+			"proof",
+			"write-exec",
+			"write-copy",
+			"write-exec",
+			"commit",
+		}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("replay operations = %#v, want %#v", got, want)
+		}
+		if got, want := transaction.copyTargets,
+			[][]string{{"pg_temp", postgresStageTableName(table, columns)}}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("replay COPY targets = %#v, want %#v", got, want)
+		}
+		statement := transaction.statements[len(transaction.statements)-1]
+		if want := postgresInsertOnlyStageStatement(
+			table,
+			columns,
+			postgresStageTableName(table, columns),
+		); statement != want {
+			t.Fatalf("replay statement = %q, want %q", statement, want)
+		}
+		if strings.Contains(statement, "DO UPDATE") {
+			t.Fatalf("replay statement can update a row: %q", statement)
+		}
+	})
+}
+
+func TestPostgresStage4NetworkRebuildWriterFreshConflictDoesNotCommit(
+	t *testing.T,
+) {
+	writer, transaction := newPostgresStage4NetworkTestWriter()
+	conflict := errors.New("duplicate key with sensitive row data")
+	transaction.copyErr = conflict
+	receipt, err := writer.WriteStage4NetworkRebuildBatch(
+		context.Background(),
+		postgresStage4NetworkWriterTestTable(),
+		[]string{"id", "code"},
+		NetworkWriteFreshInsert,
+		[][]any{{int64(1), "source"}},
+	)
+	if !errors.Is(err, conflict) || strings.Contains(
+		err.Error(),
+		"sensitive row data",
+	) {
+		t.Fatalf("fresh conflict error = %v", err)
+	}
+	assertPostgresReceipt(t, receipt, CommitNotCommitted, 1, 0)
+	if got, want := transaction.operations, []string{
+		"begin",
+		"fence",
+		"proof",
+		"write-copy",
+		"rollback",
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("fresh conflict operations = %#v, want %#v", got, want)
+	}
+}
+
+func TestPostgresStage4NetworkRebuildWriterRejectsKeylessBeforeConnection(
+	t *testing.T,
+) {
+	writer, transaction := newPostgresStage4NetworkTestWriter()
+	table := postgresStage4NetworkWriterTestTable()
+	table.Columns[0].PrimaryKey = false
+	table.Columns[0].PrimaryKeyPosition = 0
+	receipt, err := writer.WriteStage4NetworkRebuildBatch(
+		context.Background(),
+		table,
+		[]string{"id", "code"},
+		NetworkWriteFreshInsert,
+		[][]any{{int64(1), "source"}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "no primary key") {
+		t.Fatalf("keyless rebuild error = %v", err)
+	}
+	assertPostgresReceipt(t, receipt, CommitNotCommitted, 1, 0)
+	if len(transaction.operations) != 0 {
+		t.Fatalf("keyless rebuild acquired a connection: %#v", transaction.operations)
+	}
+}
+
 func TestPostgresStage4NetworkWriterRollsBackBeforeAnyWriteOnFenceOrProofFailure(
 	t *testing.T,
 ) {
@@ -436,6 +567,26 @@ func TestPostgresTargetStage4NetworkWriterRequiresCertifiedDelegate(
 	}
 	assertPostgresReceipt(t, receipt, CommitDurable, 1, 1)
 
+	receipt, err = adapter.WriteStage4NetworkRebuildBatch(
+		context.Background(),
+		postgresStage4NetworkWriterTestTable(),
+		[]string{"id", "code"},
+		NetworkWriteDuplicateSafeInsertOnly,
+		[][]any{{int64(1), "unchanged"}},
+	)
+	if err != nil {
+		t.Fatalf("WriteStage4NetworkRebuildBatch: %v", err)
+	}
+	if recorder.rebuildCalls != 1 ||
+		recorder.rebuildMode != NetworkWriteDuplicateSafeInsertOnly {
+		t.Fatalf(
+			"Stage 4 rebuild delegate = calls=%d mode=%q",
+			recorder.rebuildCalls,
+			recorder.rebuildMode,
+		)
+	}
+	assertPostgresReceipt(t, receipt, CommitDurable, 1, 1)
+
 	adapter.batchWriter = &postgresTargetWriterRecorder{}
 	receipt, err = adapter.WriteStage4NetworkBatch(
 		context.Background(),
@@ -547,6 +698,8 @@ type postgresStage4NetworkTestTransaction struct {
 	cancelProof    context.CancelFunc
 	discarded      bool
 	copyCalls      int
+	copyTargets    [][]string
+	copyErr        error
 }
 
 func (transaction *postgresStage4NetworkTestTransaction) ReadStage4PostgresRetainedShape(
@@ -593,7 +746,7 @@ func postgresStage4NetworkValidShape() postgresCatalogTableShape {
 
 func (transaction *postgresStage4NetworkTestTransaction) CopyRows(
 	_ context.Context,
-	_ []string,
+	table []string,
 	_ []string,
 	rows [][]any,
 ) (int64, error) {
@@ -602,7 +755,11 @@ func (transaction *postgresStage4NetworkTestTransaction) CopyRows(
 		"write-copy",
 	)
 	transaction.copyCalls++
-	return int64(len(rows)), nil
+	transaction.copyTargets = append(
+		transaction.copyTargets,
+		append([]string(nil), table...),
+	)
+	return int64(len(rows)), transaction.copyErr
 }
 
 func (transaction *postgresStage4NetworkTestTransaction) Exec(
@@ -731,7 +888,26 @@ func (*postgresStage4NetworkTestRows) Close() error {
 }
 
 type postgresStage4NetworkTargetWriterRecorder struct {
-	stage4Calls int
+	stage4Calls  int
+	rebuildCalls int
+	rebuildMode  NetworkWriteMode
+}
+
+func (writer *postgresStage4NetworkTargetWriterRecorder) WriteStage4NetworkRebuildBatch(
+	_ context.Context,
+	_ schema.Table,
+	_ []string,
+	mode NetworkWriteMode,
+	rows [][]any,
+) (WriteReceipt, error) {
+	writer.rebuildCalls++
+	writer.rebuildMode = mode
+	attempted := int64(len(rows))
+	return WriteReceipt{
+		Certainty:     CommitDurable,
+		AttemptedRows: attempted,
+		CommittedRows: attempted,
+	}, nil
 }
 
 func (*postgresStage4NetworkTargetWriterRecorder) WriteBatch(

@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/johndauphine/dmtx/internal/config"
@@ -31,8 +32,11 @@ const (
 )
 
 // RuntimeTuningLimits are immutable engine/workload safety evidence. Values
-// are resolved before transfer; the runtime controller never probes the host,
-// rewrites configuration, or guesses a missing protocol ceiling.
+// are resolved before transfer; the runtime controller never probes the host
+// or rewrites configuration. A zero protocol field means the target adapter
+// has no authenticated preflight protocol ceiling. In that case the controller
+// retains independently proven memory/row bounds and can only establish a
+// tighter protocol ceiling from a typed target protocol failure.
 type RuntimeTuningLimits struct {
 	ProtocolMaxChunkRows         int
 	ProtocolMaxChunkBytes        int64
@@ -41,6 +45,15 @@ type RuntimeTuningLimits struct {
 	ExpectedColumnCount          int
 	HistoryLimit                 int
 	GrowthAfterHealthyBoundaries uint64
+}
+
+// RuntimeTuningOptions controls only the controller's live adjustment cadence.
+// The immutable transfer intent remains in EffectiveTransferPlan.  Now is
+// deliberately injectable so interval admission is deterministic in tests; a
+// production controller uses time.Now's monotonic component.
+type RuntimeTuningOptions struct {
+	Interval time.Duration
+	Now      func() time.Time
 }
 
 // RuntimeTuningProvenance distinguishes immutable configuration provenance
@@ -88,6 +101,7 @@ const (
 	RuntimeReasonInsufficientEvidence RuntimeTuningReason = "insufficient_evidence"
 	RuntimeReasonHeadroomUnavailable  RuntimeTuningReason = "headroom_unavailable"
 	RuntimeReasonHealthyObservation   RuntimeTuningReason = "healthy_observation"
+	RuntimeReasonIntervalGate         RuntimeTuningReason = "interval_gate"
 	RuntimeReasonPinnedCeiling        RuntimeTuningReason = "pinned_ceiling"
 	RuntimeReasonEffectiveCeiling     RuntimeTuningReason = "effective_ceiling"
 )
@@ -177,6 +191,7 @@ type RuntimeTuningSnapshot struct {
 	Intent                config.EffectiveTransferPlan
 	Effective             RuntimeTuningValues
 	InitializationReasons []RuntimeTuningReason
+	Interval              time.Duration
 	HasBoundary           bool
 	LastBoundary          RuntimeTuningBoundary
 	AppliedBoundaries     uint64
@@ -216,6 +231,11 @@ type RuntimeTuningController struct {
 	lastBudgetPeak          int64
 	rangeProgress           map[uint64]runtimeRangeProgress
 	protocolFailureChunkCap int
+
+	interval               time.Duration
+	now                    func() time.Time
+	hasEligibleAdjustment  bool
+	lastEligibleAdjustment time.Time
 }
 
 // NewRuntimeTuningController validates and copies immutable pre-run intent.
@@ -226,13 +246,40 @@ func NewRuntimeTuningController(
 	plan config.EffectiveTransferPlan,
 	limits RuntimeTuningLimits,
 ) (*RuntimeTuningController, error) {
+	return NewRuntimeTuningControllerWithOptions(
+		plan,
+		limits,
+		RuntimeTuningOptions{},
+	)
+}
+
+// NewRuntimeTuningControllerWithOptions constructs a bounded controller with
+// an optional interval gate for non-safety adjustment.  Every completed chunk
+// still contributes ordered evidence; only growth and other non-safety
+// decisions wait for the gate.  Safety reductions are never interval-gated.
+func NewRuntimeTuningControllerWithOptions(
+	plan config.EffectiveTransferPlan,
+	limits RuntimeTuningLimits,
+	options RuntimeTuningOptions,
+) (*RuntimeTuningController, error) {
 	if err := validateRuntimeTuningPlan(plan, limits); err != nil {
 		return nil, err
+	}
+	if options.Interval < 0 {
+		return nil, fmt.Errorf(
+			"%w: runtime tuning interval must not be negative",
+			ErrInvalidRuntimeTuningPlan,
+		)
+	}
+	if options.Interval > 0 && options.Now == nil {
+		options.Now = time.Now
 	}
 	controller := &RuntimeTuningController{
 		intent:        plan,
 		limits:        limits,
 		rangeProgress: make(map[uint64]runtimeRangeProgress),
+		interval:      options.Interval,
+		now:           options.Now,
 		values: RuntimeTuningValues{
 			ChunkRows:   newRuntimeTuningValue(plan.ChunkRows),
 			Writers:     newRuntimeTuningValue(plan.Writers),
@@ -258,48 +305,73 @@ func (controller *RuntimeTuningController) ApplyChunkBoundary(
 	ctx context.Context,
 	observation RuntimeTuningObservation,
 ) (RuntimeTuningSnapshot, error) {
+	snapshot, _, err := controller.ApplyChunkBoundaryDecision(ctx, observation)
+	return snapshot, err
+}
+
+// ApplyChunkBoundaryDecision applies one observation and returns the exact
+// decision alongside the resulting snapshot. The network core uses this form
+// when a full local-state backend durably records each adjustment before any
+// subsequent transfer work can begin. ApplyChunkBoundary preserves the
+// original status-only API for callers that do not retain durable history.
+func (controller *RuntimeTuningController) ApplyChunkBoundaryDecision(
+	ctx context.Context,
+	observation RuntimeTuningObservation,
+) (RuntimeTuningSnapshot, RuntimeTuningDecision, error) {
 	if controller == nil {
-		return RuntimeTuningSnapshot{}, fmt.Errorf(
+		return RuntimeTuningSnapshot{}, RuntimeTuningDecision{}, fmt.Errorf(
 			"%w: nil controller",
 			ErrInvalidRuntimeTuningPlan,
 		)
 	}
 	if ctx == nil {
-		return RuntimeTuningSnapshot{}, fmt.Errorf(
+		return RuntimeTuningSnapshot{}, RuntimeTuningDecision{}, fmt.Errorf(
 			"%w: nil context",
 			ErrInvalidRuntimeObservation,
 		)
 	}
 	if err := ctx.Err(); err != nil {
-		return RuntimeTuningSnapshot{}, err
+		return RuntimeTuningSnapshot{}, RuntimeTuningDecision{}, err
 	}
 
 	controller.mu.Lock()
 	defer controller.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return RuntimeTuningSnapshot{}, err
+		return RuntimeTuningSnapshot{}, RuntimeTuningDecision{}, err
 	}
 	if controller.hasObservation &&
 		observation.Boundary.Ordinal ==
 			controller.lastObservation.Boundary.Ordinal {
 		if reflect.DeepEqual(observation, controller.lastObservation) {
-			return controller.snapshotLocked(), nil
+			if len(controller.history) == 0 {
+				return RuntimeTuningSnapshot{}, RuntimeTuningDecision{}, fmt.Errorf(
+					"%w: runtime-tuning observation lacks retained decision evidence",
+					ErrInvalidRuntimeTuningPlan,
+				)
+			}
+			return controller.snapshotLocked(),
+				cloneRuntimeTuningDecision(
+					controller.history[len(controller.history)-1],
+				), nil
 		}
-		return RuntimeTuningSnapshot{}, fmt.Errorf(
+		return RuntimeTuningSnapshot{}, RuntimeTuningDecision{}, fmt.Errorf(
 			"%w: boundary ordinal %d conflicts with prior evidence",
 			ErrNonMonotonicRuntimeObservation,
 			observation.Boundary.Ordinal,
 		)
 	}
 	if err := controller.validateObservationLocked(observation); err != nil {
-		return RuntimeTuningSnapshot{}, err
+		return RuntimeTuningSnapshot{}, RuntimeTuningDecision{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return RuntimeTuningSnapshot{}, err
+		return RuntimeTuningSnapshot{}, RuntimeTuningDecision{}, err
 	}
 
 	before := controller.values
-	reasons := controller.applyObservationLocked(observation)
+	reasons, err := controller.applyObservationLocked(observation)
+	if err != nil {
+		return RuntimeTuningSnapshot{}, RuntimeTuningDecision{}, err
+	}
 	decision := RuntimeTuningDecision{
 		Boundary: observation.Boundary,
 		Before:   before,
@@ -308,7 +380,7 @@ func (controller *RuntimeTuningController) ApplyChunkBoundary(
 	}
 	controller.appendDecisionLocked(decision)
 	controller.commitObservationLocked(observation)
-	return controller.snapshotLocked(), nil
+	return controller.snapshotLocked(), cloneRuntimeTuningDecision(decision), nil
 }
 
 // Snapshot returns an atomic copy of immutable intent and live effective
@@ -413,8 +485,8 @@ func validateRuntimeTuningPlan(
 			ErrInvalidRuntimeTuningPlan,
 		)
 	}
-	if limits.ProtocolMaxChunkRows <= 0 ||
-		limits.ProtocolMaxChunkBytes <= 0 ||
+	if limits.ProtocolMaxChunkRows < 0 ||
+		limits.ProtocolMaxChunkBytes < 0 ||
 		limits.SafetyRowWidthUpperBound <= 0 ||
 		limits.PlannedRanges == 0 ||
 		limits.PlannedRanges > maximumRuntimeTuningRanges ||
@@ -434,8 +506,9 @@ func validateRuntimeTuningPlan(
 			ErrInvalidRuntimeTuningPlan,
 		)
 	}
-	if limits.SafetyRowWidthUpperBound >
-		limits.ProtocolMaxChunkBytes {
+	if limits.ProtocolMaxChunkBytes > 0 &&
+		limits.SafetyRowWidthUpperBound >
+			limits.ProtocolMaxChunkBytes {
 		return fmt.Errorf(
 			"%w: one conservatively bounded row exceeds protocol bytes",
 			ErrInvalidRuntimeTuningPlan,
@@ -534,7 +607,8 @@ func (controller *RuntimeTuningController) applyInitialSafetyCeilings() {
 	)
 	if controller.values.ChunkRows.Value > chunkCap {
 		controller.setSafetyValue(&controller.values.ChunkRows, chunkCap)
-		if chunkCap == protocolCap {
+		if chunkCap == protocolCap &&
+			controller.hasAuthenticatedProtocolCeiling() {
 			controller.addInitializationReason(
 				RuntimeReasonProtocolCeiling,
 			)
@@ -832,7 +906,7 @@ func (controller *RuntimeTuningController) validateRowWidthLocked(
 
 func (controller *RuntimeTuningController) applyObservationLocked(
 	observation RuntimeTuningObservation,
-) []RuntimeTuningReason {
+) ([]RuntimeTuningReason, error) {
 	reasons := make([]RuntimeTuningReason, 0, 4)
 	safetySignal := false
 	if observation.MemoryPressure {
@@ -895,21 +969,31 @@ func (controller *RuntimeTuningController) applyObservationLocked(
 
 	if safetySignal {
 		controller.healthyBoundaries = 0
-		return reasons
+		return reasons, nil
 	}
 	if !controller.growthEvidenceComplete(observation) {
 		controller.healthyBoundaries = 0
 		return appendRuntimeReason(
 			reasons,
 			RuntimeReasonInsufficientEvidence,
-		)
+		), nil
 	}
 	if !controller.hasGrowthHeadroom(observation) {
 		controller.healthyBoundaries = 0
 		return appendRuntimeReason(
 			reasons,
 			RuntimeReasonHeadroomUnavailable,
-		)
+		), nil
+	}
+	boundaryTime, err := controller.boundaryTimeLocked()
+	if err != nil {
+		return nil, err
+	}
+	if !controller.nonSafetyAdjustmentEligibleLocked(boundaryTime) {
+		return appendRuntimeReason(
+			reasons,
+			RuntimeReasonIntervalGate,
+		), nil
 	}
 	if controller.healthyBoundaries <
 		controller.limits.GrowthAfterHealthyBoundaries {
@@ -920,7 +1004,7 @@ func (controller *RuntimeTuningController) applyObservationLocked(
 		return appendRuntimeReason(
 			reasons,
 			RuntimeReasonHealthyObservation,
-		)
+		), nil
 	}
 
 	grew, pinned, ceiling := controller.growWithEvidence(observation)
@@ -930,7 +1014,7 @@ func (controller *RuntimeTuningController) applyObservationLocked(
 			RuntimeReasonEvidenceGrowth,
 		)
 		controller.healthyBoundaries = 0
-		return reasons
+		return reasons, nil
 	}
 	if pinned {
 		reasons = appendRuntimeReason(
@@ -947,7 +1031,55 @@ func (controller *RuntimeTuningController) applyObservationLocked(
 	if len(reasons) == 0 {
 		reasons = append(reasons, RuntimeReasonHealthyObservation)
 	}
-	return reasons
+	return reasons, nil
+}
+
+// boundaryTimeLocked obtains a monotonic boundary time only when interval
+// gating is enabled.  The core calls this after validating the immutable
+// boundary evidence, so a clock cannot authorize malformed work.
+func (controller *RuntimeTuningController) boundaryTimeLocked() (time.Time, error) {
+	if controller.interval == 0 {
+		return time.Time{}, nil
+	}
+	if controller.now == nil {
+		return time.Time{}, fmt.Errorf(
+			"%w: interval clock is unavailable",
+			ErrInvalidRuntimeTuningPlan,
+		)
+	}
+	value := controller.now()
+	if value.IsZero() {
+		return time.Time{}, fmt.Errorf(
+			"%w: interval clock returned zero time",
+			ErrInvalidRuntimeObservation,
+		)
+	}
+	if controller.hasEligibleAdjustment &&
+		value.Before(controller.lastEligibleAdjustment) {
+		return time.Time{}, fmt.Errorf(
+			"%w: interval clock regressed",
+			ErrNonMonotonicRuntimeObservation,
+		)
+	}
+	return value, nil
+}
+
+func (controller *RuntimeTuningController) nonSafetyAdjustmentEligibleLocked(
+	boundaryTime time.Time,
+) bool {
+	if controller.interval == 0 {
+		return true
+	}
+	if !controller.hasEligibleAdjustment {
+		controller.hasEligibleAdjustment = true
+		controller.lastEligibleAdjustment = boundaryTime
+		return true
+	}
+	if boundaryTime.Sub(controller.lastEligibleAdjustment) < controller.interval {
+		return false
+	}
+	controller.lastEligibleAdjustment = boundaryTime
+	return true
 }
 
 func (controller *RuntimeTuningController) reduceHalf(
@@ -984,7 +1116,8 @@ func (controller *RuntimeTuningController) enforceLiveSafetyCeilings(
 	chunkCap := minRuntimeInt(protocolCap, memoryCap)
 	if controller.values.ChunkRows.Value > chunkCap {
 		controller.setSafetyValue(&controller.values.ChunkRows, chunkCap)
-		if protocolCap == chunkCap {
+		if protocolCap == chunkCap &&
+			controller.hasAuthenticatedProtocolCeiling() {
 			*reasons = appendRuntimeReason(
 				*reasons,
 				RuntimeReasonProtocolCeiling,
@@ -1145,17 +1278,23 @@ func (controller *RuntimeTuningController) protocolChunkCeiling(
 	if rowWidth <= 0 {
 		return 0
 	}
-	byteRows := controller.limits.ProtocolMaxChunkBytes / rowWidth
-	if byteRows < 1 {
-		return 0
+	ceiling := config.MaxTransferChunkRows
+	if controller.limits.ProtocolMaxChunkRows > 0 {
+		ceiling = minRuntimeInt(
+			ceiling,
+			controller.limits.ProtocolMaxChunkRows,
+		)
 	}
-	if byteRows > int64(math.MaxInt) {
-		byteRows = int64(math.MaxInt)
+	if controller.limits.ProtocolMaxChunkBytes > 0 {
+		byteRows := controller.limits.ProtocolMaxChunkBytes / rowWidth
+		if byteRows < 1 {
+			return 0
+		}
+		if byteRows > int64(math.MaxInt) {
+			byteRows = int64(math.MaxInt)
+		}
+		ceiling = minRuntimeInt(ceiling, int(byteRows))
 	}
-	ceiling := minRuntimeInt(
-		controller.limits.ProtocolMaxChunkRows,
-		int(byteRows),
-	)
 	if controller.protocolFailureChunkCap > 0 {
 		ceiling = minRuntimeInt(
 			ceiling,
@@ -1163,6 +1302,12 @@ func (controller *RuntimeTuningController) protocolChunkCeiling(
 		)
 	}
 	return ceiling
+}
+
+func (controller *RuntimeTuningController) hasAuthenticatedProtocolCeiling() bool {
+	return controller.limits.ProtocolMaxChunkRows > 0 ||
+		controller.limits.ProtocolMaxChunkBytes > 0 ||
+		controller.protocolFailureChunkCap > 0
 }
 
 func (controller *RuntimeTuningController) memoryChunkCeiling(
@@ -1223,6 +1368,7 @@ func (controller *RuntimeTuningController) snapshotLocked() RuntimeTuningSnapsho
 	result := RuntimeTuningSnapshot{
 		Intent:    controller.intent,
 		Effective: controller.values,
+		Interval:  controller.interval,
 		InitializationReasons: append(
 			[]RuntimeTuningReason(nil),
 			controller.initializationReasons...,
@@ -1240,18 +1386,31 @@ func (controller *RuntimeTuningController) snapshotLocked() RuntimeTuningSnapsho
 	return result
 }
 
+func cloneRuntimeTuningSnapshot(
+	value RuntimeTuningSnapshot,
+) RuntimeTuningSnapshot {
+	value.InitializationReasons = append(
+		[]RuntimeTuningReason(nil),
+		value.InitializationReasons...,
+	)
+	return value
+}
+
 func cloneRuntimeTuningHistory(
 	history []RuntimeTuningDecision,
 ) []RuntimeTuningDecision {
 	result := make([]RuntimeTuningDecision, len(history))
 	for index, decision := range history {
-		result[index] = decision
-		result[index].Reasons = append(
-			[]RuntimeTuningReason(nil),
-			decision.Reasons...,
-		)
+		result[index] = cloneRuntimeTuningDecision(decision)
 	}
 	return result
+}
+
+func cloneRuntimeTuningDecision(
+	decision RuntimeTuningDecision,
+) RuntimeTuningDecision {
+	decision.Reasons = append([]RuntimeTuningReason(nil), decision.Reasons...)
+	return decision
 }
 
 func runtimeRangeIdentity(boundary RuntimeTuningBoundary) string {

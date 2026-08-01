@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -660,6 +662,82 @@ func TestAdapterResumeSameEngineFailsClosedWithoutLiveIdentity(
 	}
 	if containsResumeEvent(events, "source_list") {
 		t.Fatalf("unverified same-engine route reached discovery: %v", events)
+	}
+}
+
+func TestRequireDistinctLiveSQLiteDatabasesRejectsPhysicalAliases(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	sourcePath := filepath.Join(directory, "source.db")
+	createSQLiteSourceTestDatabase(
+		t,
+		sourcePath,
+		`CREATE TABLE items (id INTEGER PRIMARY KEY); INSERT INTO items VALUES (1)`,
+	)
+	distinctPath := filepath.Join(directory, "target.db")
+	createSQLiteSourceTestDatabase(
+		t,
+		distinctPath,
+		`CREATE TABLE items (id INTEGER PRIMARY KEY); INSERT INTO items VALUES (2)`,
+	)
+	symlinkPath := filepath.Join(directory, "source-symlink.db")
+	if err := os.Symlink(sourcePath, symlinkPath); err != nil {
+		t.Fatalf("create SQLite source symlink: %v", err)
+	}
+	hardLinkPath := filepath.Join(directory, "source-hardlink.db")
+	if err := os.Link(sourcePath, hardLinkPath); err != nil {
+		t.Fatalf("create SQLite source hard link: %v", err)
+	}
+
+	for _, test := range []struct {
+		name       string
+		targetPath string
+		wantReject bool
+	}{
+		{name: "same path", targetPath: sourcePath, wantReject: true},
+		{name: "symlink alias", targetPath: symlinkPath, wantReject: true},
+		{name: "hard-link alias", targetPath: hardLinkPath, wantReject: true},
+		{name: "distinct file", targetPath: distinctPath},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rawSource, err := openSQLiteSourceAdapter(
+				ctx,
+				config.Endpoint{Type: "sqlite", Database: sourcePath},
+			)
+			if err != nil {
+				t.Fatalf("open source: %v", err)
+			}
+			source := rawSource.(*sqliteSourceAdapter)
+			t.Cleanup(func() {
+				if closeErr := source.Close(); closeErr != nil {
+					t.Errorf("close source: %v", closeErr)
+				}
+			})
+			rawTarget, err := openSQLiteTargetAdapter(
+				ctx,
+				config.Endpoint{Type: "sqlite", Database: test.targetPath},
+			)
+			if err != nil {
+				t.Fatalf("open target: %v", err)
+			}
+			target := rawTarget.(*sqliteTargetAdapter)
+			t.Cleanup(func() {
+				if closeErr := target.Close(); closeErr != nil {
+					t.Errorf("close target: %v", closeErr)
+				}
+			})
+
+			err = requireDistinctLiveSQLiteDatabases(ctx, source, target)
+			if test.wantReject {
+				if err == nil || !strings.Contains(err.Error(), "requires distinct") {
+					t.Fatalf("alias guard error = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("distinct databases rejected: %v", err)
+			}
+		})
 	}
 }
 

@@ -49,7 +49,20 @@ func (*stage4AdapterEvolutionTarget) Engine() string {
 
 func (*stage4AdapterEvolutionTarget) stage4NetworkIdempotentUpsertTarget() {}
 
+func (*stage4AdapterEvolutionTarget) stage4NetworkDuplicateSafeRebuildTarget() {}
+
 func (target *stage4AdapterEvolutionTarget) PreflightStage4NetworkReplayIsolation(
+	_ context.Context,
+	tables []schema.Table,
+) error {
+	target.isolationTables = append(
+		target.isolationTables,
+		cloneTargetSchemaEvolutionTables(tables),
+	)
+	return nil
+}
+
+func (target *stage4AdapterEvolutionTarget) PreflightStage4NetworkRebuild(
 	_ context.Context,
 	tables []schema.Table,
 ) error {
@@ -145,6 +158,59 @@ func (target *stage4AdapterEvolutionTarget) WriteStage4NetworkBatch(
 		committed++
 	}
 	target.rows += int(committed)
+	return WriteReceipt{
+		Certainty:     CommitDurable,
+		AttemptedRows: int64(len(rows)),
+		CommittedRows: int64(len(rows)),
+	}, nil
+}
+
+func (target *stage4AdapterEvolutionTarget) WriteStage4NetworkRebuildBatch(
+	_ context.Context,
+	table schema.Table,
+	_ []string,
+	mode NetworkWriteMode,
+	rows [][]any,
+) (WriteReceipt, error) {
+	if mode != NetworkWriteFreshInsert &&
+		mode != NetworkWriteDuplicateSafeInsertOnly {
+		return WriteReceipt{
+			Certainty:     CommitNotCommitted,
+			AttemptedRows: int64(len(rows)),
+		}, fmt.Errorf("unsupported rebuild write mode %q", mode)
+	}
+	*target.events = append(*target.events, "target_write")
+	target.writeTables = append(
+		target.writeTables,
+		cloneStage4RichTable(table),
+	)
+	if target.keys == nil {
+		target.keys = make(map[string]struct{})
+	}
+	next := make(map[string]struct{}, len(target.keys)+len(rows))
+	for key := range target.keys {
+		next[key] = struct{}{}
+	}
+	committed := 0
+	for _, row := range rows {
+		if len(row) == 0 {
+			continue
+		}
+		key := fmt.Sprintf("%T:%v", row[0], row[0])
+		if _, exists := next[key]; exists {
+			if mode == NetworkWriteFreshInsert {
+				return WriteReceipt{
+					Certainty:     CommitNotCommitted,
+					AttemptedRows: int64(len(rows)),
+				}, fmt.Errorf("fresh rebuild primary-key conflict for %s", table.Name)
+			}
+			continue
+		}
+		next[key] = struct{}{}
+		committed++
+	}
+	target.keys = next
+	target.rows += committed
 	return WriteReceipt{
 		Certainty:     CommitDurable,
 		AttemptedRows: int64(len(rows)),

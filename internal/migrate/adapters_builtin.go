@@ -14,7 +14,7 @@ import "github.com/johndauphine/dmtx/internal/engine"
 // explicitly certified. SQLite and SQL Server compose through their shared
 // conservative contracts; unsupported SQLite storage and comparison shapes
 // remain fail-closed. SQL Server's SQLite target is likewise certified for its
-// conservative drop/recreate contract. SQLite composes with the pinned
+// conservative upsert and drop/recreate contract. SQLite composes with the pinned
 // ClickHouse 24.8 target under its strict rebuild-only contract.
 // ClickHouse 24.8 also composes with a distinct ClickHouse Atomic database for
 // the narrow same-engine rebuild shape whose ordering metadata is explicitly

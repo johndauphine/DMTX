@@ -32,6 +32,14 @@ type Backend interface {
 	AcknowledgeConfigOverride(string, string, string) error
 }
 
+// TerminalOutcomeBackend records a truthful non-resumable terminal attempt
+// without reclassifying a cancellation or partial result as an operator
+// abandonment. It is optional so legacy backends cannot silently claim the
+// stronger outcome contract.
+type TerminalOutcomeBackend interface {
+	UpdateNonResumableOutcome(string, Outcome, string, time.Time) error
+}
+
 var (
 	_ Backend = SQLiteStore{}
 	_ Backend = YAMLStore{}

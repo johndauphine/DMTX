@@ -7,6 +7,43 @@ import (
 	"time"
 )
 
+func TestFenceBackendAdvertisesOptionalStage4CapabilitiesOnlyWhenUnderlyingSupportsThem(
+	t *testing.T,
+) {
+	raw := YAMLStore{Path: filepath.Join(t.TempDir(), "state.yaml")}
+	masked := stage4AggregateWithoutRebuildRecovery{
+		Backend:                raw,
+		RangeBackend:           raw,
+		Stage4Backend:          raw,
+		Stage4AggregateBackend: raw,
+	}
+	fencedMasked := FenceBackend(masked, nil)
+	if _, ok := fencedMasked.(Stage4AggregateBackend); !ok {
+		t.Fatal("fenced aggregate backend lost aggregate capability")
+	}
+	if _, ok := fencedMasked.(Stage4RebuildRecoveryBackend); ok {
+		t.Fatal("fenced aggregate backend invented rebuild recovery capability")
+	}
+	if _, ok := fencedMasked.(Stage4DeleteJournalReadinessBackend); ok {
+		t.Fatal("fenced aggregate backend invented delete-journal readiness capability")
+	}
+
+	fencedRaw := FenceBackend(raw, nil)
+	if _, ok := fencedRaw.(Stage4RebuildRecoveryBackend); !ok {
+		t.Fatal("fenced YAML backend lost rebuild recovery capability")
+	}
+	if _, ok := fencedRaw.(Stage4DeleteJournalReadinessBackend); !ok {
+		t.Fatal("fenced YAML backend lost delete-journal readiness capability")
+	}
+}
+
+type stage4AggregateWithoutRebuildRecovery struct {
+	Backend
+	RangeBackend
+	Stage4Backend
+	Stage4AggregateBackend
+}
+
 func TestFencedBackendsRejectEveryOldGenerationMutationAfterTakeover(t *testing.T) {
 	for _, stateKind := range []string{"sqlite", "yaml"} {
 		t.Run(stateKind, func(t *testing.T) {

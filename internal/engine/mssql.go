@@ -192,6 +192,32 @@ func InspectSQLServerTableWithQueryer(
 	)
 }
 
+// InspectSQLServerMigrationSnapshotTableWithQueryer discovers an immutable
+// table shape through a verified SQL Server database snapshot. Unlike an
+// ordinary source connection, a snapshot is necessarily read-only and is
+// admitted only when its catalog proves a real source-database relationship.
+func InspectSQLServerMigrationSnapshotTableWithQueryer(
+	ctx context.Context,
+	queryer SQLServerCatalogQueryer,
+	namespace string,
+	name string,
+) (schema.Table, error) {
+	if queryer == nil {
+		return schema.Table{}, fmt.Errorf(
+			"inspect SQL Server migration snapshot table %s.%s: catalog queryer is required",
+			namespace,
+			name,
+		)
+	}
+	if namespace == "" {
+		namespace = "dbo"
+	}
+	if err := VerifySQLServer2022MigrationSnapshotSource(ctx, queryer); err != nil {
+		return schema.Table{}, err
+	}
+	return inspectSQLServer2022Table(ctx, queryer, namespace, name, false)
+}
+
 // InspectSQLServerTargetTableWithQueryer applies the same full table-shape
 // discovery while accepting primary-key clustering and sort direction as
 // target-only physical choices. Those choices do not change MERGE key

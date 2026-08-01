@@ -16,9 +16,14 @@ type mysqlTargetAdapter struct {
 	batchWriter                   mysqlBatchWriter
 	flavor                        engine.MySQLServerFlavor
 	namespace                     string
+	workloadIdentity              string
 	destructiveAcknowledged       bool
 	normalizeSQLiteSourceValues   bool
 	validateSQLServerSourceValues bool
+	// deleteCommit is nil in production. It keeps commit-acknowledgement
+	// recovery coverage on the pinned native connection rather than a mock
+	// transaction wrapper.
+	deleteCommit func(context.Context, *sql.Conn) (sql.Result, error)
 }
 
 func (adapter *mysqlTargetAdapter) mySQLDatabaseHandle() *sql.DB {
@@ -54,6 +59,10 @@ func openMySQLTargetAdapter(
 	if err := validateMySQLTargetEndpoint(endpoint); err != nil {
 		return nil, err
 	}
+	workloadIdentity, err := config.NetworkEndpointWorkloadIdentity(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("identify MySQL target workload: %w", err)
+	}
 	resolved, err := resolvedEndpoint(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("resolve target: %w", err)
@@ -80,10 +89,11 @@ func openMySQLTargetAdapter(
 		)
 	}
 	return &mysqlTargetAdapter{
-		database:    database,
-		batchWriter: newMySQLNativeWriterForFlavor(database, flavor),
-		flavor:      flavor,
-		namespace:   resolved.Database,
+		database:         database,
+		batchWriter:      newMySQLNativeWriterForFlavor(database, flavor),
+		flavor:           flavor,
+		namespace:        resolved.Database,
+		workloadIdentity: workloadIdentity,
 	}, nil
 }
 
@@ -327,6 +337,73 @@ func (adapter *mysqlTargetAdapter) WriteStage4NetworkBatch(
 		ctx,
 		table,
 		columns,
+		rows,
+	)
+}
+
+// WriteStage4NetworkRebuildBatch preserves source normalization at the target
+// boundary while requiring the native writer's strict-fresh versus
+// duplicate-safe insert-only replay contract.
+func (adapter *mysqlTargetAdapter) WriteStage4NetworkRebuildBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	mode NetworkWriteMode,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	if adapter == nil {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf("MySQL Stage 4 rebuild target adapter is not configured"),
+			)
+	}
+	writer, ok := adapter.batchWriter.(mysqlStage4NetworkRebuildBatchWriter)
+	if !ok || isNilInterface(writer) {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"MySQL Stage 4 rebuild batch writer is not configured",
+				),
+			)
+	}
+	if adapter.normalizeSQLiteSourceValues {
+		normalized, err := normalizeSQLiteMySQLBatch(
+			table,
+			columns,
+			rows,
+		)
+		if err != nil {
+			return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, err
+		}
+		rows = normalized
+	}
+	if adapter.validateSQLServerSourceValues {
+		if err := validateMySQLTargetSQLServerBatchValues(
+			table,
+			columns,
+			rows,
+		); err != nil {
+			return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, err
+		}
+	}
+	return writer.WriteStage4NetworkRebuildBatch(
+		ctx,
+		table,
+		columns,
+		mode,
 		rows,
 	)
 }

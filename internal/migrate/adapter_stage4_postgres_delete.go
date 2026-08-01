@@ -39,6 +39,35 @@ type postgresDeleteTargetCapability struct {
 	authority postgresDeleteCatalogAuthority
 }
 
+// newStage4DeleteReconciliationCapabilities is the explicit route capability
+// seam.  A route reaches the generic reconciliation core only after both its
+// source snapshot reader and target-side atomic receipt writer have been
+// admitted.  Do not turn this into an engine-name allowlist: a new cell must
+// add its own catalog, key-domain, and commit-acknowledgement proof here.
+func newStage4DeleteReconciliationCapabilities(
+	ctx context.Context,
+	source sourceAdapter,
+	target targetAdapter,
+	sourceTable schema.Table,
+	targetTable schema.Table,
+) (postgresDeleteReconciliationCapabilities, error) {
+	if isNilInterface(source) || isNilInterface(target) {
+		return postgresDeleteReconciliationCapabilities{}, fmt.Errorf("delete reconciliation requires live source and target adapters")
+	}
+	switch {
+	case source.Engine() == "postgres" && target.Engine() == "postgres":
+		return newPostgresDeleteReconciliationCapabilities(ctx, source, target, sourceTable, targetTable)
+	case source.Engine() == "sqlite" && target.Engine() == "sqlite":
+		return newSQLiteDeleteReconciliationCapabilities(ctx, source, target, sourceTable, targetTable)
+	case source.Engine() == "mysql" && target.Engine() == "mysql":
+		return newMySQLDeleteReconciliationCapabilities(ctx, source, target, sourceTable, targetTable)
+	case source.Engine() == "mssql" && target.Engine() == "mssql":
+		return newSQLServerDeleteReconciliationCapabilities(ctx, source, target, sourceTable, targetTable)
+	default:
+		return postgresDeleteReconciliationCapabilities{}, fmt.Errorf("Stage 4 delete reconciliation route %s-to-%s has no certified source-key reader and target atomic receipt journal", source.Engine(), target.Engine())
+	}
+}
+
 func newPostgresDeleteReconciliationCapabilities(
 	ctx context.Context,
 	source sourceAdapter,

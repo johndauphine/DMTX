@@ -268,6 +268,73 @@ func TestValidateMySQLRetainedTableShapeReportsFirstMismatch(t *testing.T) {
 	}
 }
 
+func TestValidateMySQLRetainedTableShapeNormalizesSerializedModifierFreeArguments(
+	t *testing.T,
+) {
+	// Schema snapshots deliberately canonicalize an omitted declaration's
+	// arguments as an empty array. Native MySQL discovery represents that same
+	// modifier-free declaration with nil. Exercise the durable
+	// serialization/materialization path before retained-table preflight so a
+	// future comparison change cannot reintroduce the composed evolution
+	// mismatch between those equivalent representations.
+	planned := schema.Table{
+		Schema: "target_db",
+		Name:   "events",
+		Columns: []schema.Column{
+			{
+				Name:               "id",
+				Type:               "bigint",
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 1,
+				DeclaredType:       &schema.DeclaredType{Base: "bigint"},
+			},
+			{
+				Name:         "payload",
+				Type:         "varchar",
+				DeclaredType: &schema.DeclaredType{Base: "varchar", Arguments: []int{16}},
+			},
+		},
+	}
+	snapshot, err := schema.NewSchemaSnapshot([]schema.Table{planned})
+	if err != nil {
+		t.Fatalf("snapshot planned table: %v", err)
+	}
+	encoded, err := snapshot.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("encode planned snapshot: %v", err)
+	}
+	durable, err := schema.ParseSchemaSnapshot(encoded)
+	if err != nil {
+		t.Fatalf("parse planned snapshot: %v", err)
+	}
+	rehydrated, err := schema.MaterializeSchemaSnapshot(durable)
+	if err != nil {
+		t.Fatalf("materialize planned snapshot: %v", err)
+	}
+	if len(rehydrated) != 1 || rehydrated[0].Columns[0].DeclaredType == nil {
+		t.Fatalf("rehydrated table = %#v, want one declared id column", rehydrated)
+	}
+	if rehydrated[0].Columns[0].DeclaredType.Arguments == nil {
+		t.Fatal("durable modifier-free declaration did not rehydrate as empty arguments")
+	}
+
+	// planned keeps the native-catalog representation (nil arguments), while
+	// rehydrated carries the durable representation (empty arguments).
+	if err := validateMySQLRetainedTableShape(rehydrated[0], planned); err != nil {
+		t.Fatalf("equivalent modifier-free arguments were rejected: %v", err)
+	}
+
+	actual := planned
+	actual.Columns = append([]schema.Column(nil), planned.Columns...)
+	changed := *actual.Columns[1].DeclaredType
+	changed.Arguments = []int{17}
+	actual.Columns[1].DeclaredType = &changed
+	if err := validateMySQLRetainedTableShape(rehydrated[0], actual); err == nil ||
+		!strings.Contains(err.Error(), "column 2 (payload)") {
+		t.Fatalf("real modifier change error = %v", err)
+	}
+}
+
 func TestValidateMySQLRetainedTableShapeAcceptsRebasedOwnerRelativeForeignKey(
 	t *testing.T,
 ) {

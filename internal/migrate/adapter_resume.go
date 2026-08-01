@@ -2,7 +2,11 @@ package migrate
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 
 	"github.com/johndauphine/dmtx/internal/config"
@@ -17,11 +21,10 @@ import (
 // requires exact target equality. Incomplete upsert tables are replayed from
 // the beginning so the target adapter's idempotent upsert contract is the only
 // row-level recovery primitive required by this first network-resume
-// implementation.
-//
-// Drop/recreate resume remains fail-closed: safely resuming a rebuild requires
-// a duplicate-safe table-rebuild replay protocol rather than the upsert replay
-// used here.
+// implementation. A Stage 4 drop/recreate run uses a separate set-wide
+// recovery protocol: it only replays a durable issued/checkpoint range through
+// the duplicate-safe rebuild writer, and otherwise reruns the whole rebuild
+// set before its first transfer.
 func ExecuteResume(
 	ctx context.Context,
 	cfg config.Config,
@@ -55,16 +58,10 @@ func executeResumeWithRegistry(
 	if err != nil {
 		return Result{}, err
 	}
-	if mode != "upsert" {
-		return Result{}, NewTransferError(
-			ErrorClassState,
-			fmt.Errorf(
-				"composed-adapter resume does not support target mode %q; drop/recreate resume requires a duplicate-safe rebuild replay protocol",
-				mode,
-			),
-		)
-	}
-	if route.override != nil {
+	if route.override != nil && !stage4SQLiteCompatibilityRouteRequiresComposition(
+		cfg,
+		route,
+	) {
 		return Result{}, NewTransferError(
 			ErrorClassState,
 			fmt.Errorf(
@@ -97,6 +94,15 @@ func executeResumeWithRegistry(
 	)
 	if err != nil {
 		return Result{}, err
+	}
+	if mode != "upsert" && !stage4.enabled {
+		return Result{}, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"composed-adapter resume requires a duplicate-safe rebuild replay protocol for target mode %q; no Stage 4 rebuild context is available",
+				mode,
+			),
+		)
 	}
 
 	if err := checkAdapterResumeContext(
@@ -171,6 +177,7 @@ func executeResumeWithRegistry(
 		taskObserver,
 		source,
 		target,
+		mode,
 		stage4,
 	)
 }
@@ -194,6 +201,8 @@ func requireDistinctLiveAdapterDatabases(
 		return requireDistinctLiveSQLServerDatabases(ctx, source, target)
 	case "clickhouse":
 		return requireDistinctLiveClickHouseDatabases(ctx, source, target)
+	case "sqlite":
+		return requireDistinctLiveSQLiteDatabases(ctx, source, target)
 	default:
 		return fmt.Errorf(
 			"%s-to-%s resume cannot verify distinct live source and target databases",
@@ -201,6 +210,95 @@ func requireDistinctLiveAdapterDatabases(
 			targetEngine,
 		)
 	}
+}
+
+func requireDistinctLiveSQLiteDatabases(
+	ctx context.Context,
+	source sourceAdapter,
+	target targetAdapter,
+) error {
+	sourceSQLite, sourceOK := source.(*sqliteSourceAdapter)
+	targetSQLite, targetOK := target.(*sqliteTargetAdapter)
+	if !sourceOK || !targetOK || sourceSQLite == nil ||
+		targetSQLite == nil || sourceSQLite.database == nil ||
+		targetSQLite.database == nil {
+		return fmt.Errorf(
+			"SQLite-to-SQLite cannot verify distinct live source and target databases",
+		)
+	}
+	sourceIdentity, err := readSQLiteDatabaseIdentity(ctx, sourceSQLite.database)
+	if err != nil {
+		return fmt.Errorf("identify live SQLite source: %w", err)
+	}
+	targetIdentity, err := readSQLiteDatabaseIdentity(ctx, targetSQLite.database)
+	if err != nil {
+		return fmt.Errorf("identify live SQLite target: %w", err)
+	}
+	if sourceIdentity.canonicalPath == targetIdentity.canonicalPath ||
+		os.SameFile(sourceIdentity.fileInfo, targetIdentity.fileInfo) {
+		return fmt.Errorf(
+			"SQLite-to-SQLite requires distinct live source and target databases",
+		)
+	}
+	return nil
+}
+
+func readSQLiteDatabaseIdentity(
+	ctx context.Context,
+	database *sql.DB,
+) (sqliteDatabaseIdentity, error) {
+	if database == nil {
+		return sqliteDatabaseIdentity{}, errors.New("SQLite database handle is required")
+	}
+	rows, err := database.QueryContext(ctx, "PRAGMA database_list")
+	if err != nil {
+		return sqliteDatabaseIdentity{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sequence int
+		var name, path string
+		if err := rows.Scan(&sequence, &name, &path); err != nil {
+			return sqliteDatabaseIdentity{}, err
+		}
+		if name != "main" {
+			continue
+		}
+		if path == "" {
+			return sqliteDatabaseIdentity{}, errors.New("SQLite main database has no file identity")
+		}
+		canonical, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return sqliteDatabaseIdentity{}, err
+		}
+		canonical = filepath.Clean(canonical)
+		info, err := os.Stat(canonical)
+		if err != nil {
+			return sqliteDatabaseIdentity{}, err
+		}
+		if !info.Mode().IsRegular() {
+			return sqliteDatabaseIdentity{}, fmt.Errorf(
+				"SQLite main database identity %q is not a regular file",
+				canonical,
+			)
+		}
+		return sqliteDatabaseIdentity{
+			canonicalPath: canonical,
+			fileInfo:      info,
+		}, nil
+	}
+	if err := rows.Err(); err != nil {
+		return sqliteDatabaseIdentity{}, err
+	}
+	return sqliteDatabaseIdentity{}, errors.New("SQLite main database identity is unavailable")
+}
+
+// sqliteDatabaseIdentity proves both the canonical source path and its
+// underlying filesystem object. Canonical paths reject ordinary aliases while
+// FileInfo lets the resume guard reject hard-link aliases as well.
+type sqliteDatabaseIdentity struct {
+	canonicalPath string
+	fileInfo      os.FileInfo
 }
 
 func resumeWithAdapters(
@@ -212,7 +310,10 @@ func resumeWithAdapters(
 	source sourceAdapter,
 	target targetAdapter,
 ) (Result, error) {
-	const mode = "upsert"
+	mode, err := normalizeAdapterTargetMode(cfg.Migration.TargetMode)
+	if err != nil {
+		return Result{}, err
+	}
 
 	stage4, err := resolveStage4AdapterAdmission(
 		cfg,
@@ -230,6 +331,7 @@ func resumeWithAdapters(
 		taskObserver,
 		source,
 		target,
+		mode,
 		stage4,
 	)
 }
@@ -242,10 +344,12 @@ func resumeWithAdaptersAdmission(
 	taskObserver TableSetObserver,
 	source sourceAdapter,
 	target targetAdapter,
+	mode string,
 	stage4 stage4AdapterAdmission,
 ) (Result, error) {
-	const mode = "upsert"
-
+	if err := requireStage4UpsertMergeComposition(cfg, stage4.enabled); err != nil {
+		return Result{}, err
+	}
 	if stage4.enabled {
 		return resumeWithStage4Adapters(
 			ctx,
@@ -255,7 +359,17 @@ func resumeWithAdaptersAdmission(
 			taskObserver,
 			source,
 			target,
+			mode,
 			stage4.run,
+		)
+	}
+	if mode != "upsert" {
+		return Result{}, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"composed-adapter resume requires a duplicate-safe rebuild replay protocol for target mode %q; no Stage 4 rebuild context is available",
+				mode,
+			),
 		)
 	}
 

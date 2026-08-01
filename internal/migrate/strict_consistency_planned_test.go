@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -241,6 +242,302 @@ func TestBeginPlannedStrictConsistencyPlannerFailureClosesEpoch(
 			backend.evidence,
 		)
 	}
+}
+
+// TestBeginPlannedSQLServerMigrationRecoversSnapshotCreatedBeforeOwner proves
+// the narrow crash recovery path: a deterministic SQL Server database snapshot
+// may survive CREATE DATABASE SNAPSHOT before the core can Save its owner. A
+// resume is allowed to reopen that one source instant, bind the same finalized
+// topology/attempt, and then persist the missing owner; it cannot request a
+// replacement snapshot.
+func TestBeginPlannedSQLServerMigrationRecoversSnapshotCreatedBeforeOwner(
+	t *testing.T,
+) {
+	const (
+		runID    = "mssql-pre-owner-crash"
+		topology = "surviving-snapshot-topology"
+	)
+	task := state.TaskKey{
+		Type: stage4AdapterNetworkTaskType, Schema: "dbo", Table: "items",
+	}
+	reference := sqlServerMigrationSnapshotName(runID, "source_db")
+	epoch := sqlServerMigrationSnapshotEpoch(reference)
+	at := strictCoreTime()
+	backend := &strictCoreFakeState{}
+	session := &strictCoreFakeSession{capture: StrictConsistencyCapture{
+		MigrationEpochID:           epoch,
+		MigrationSnapshotReference: reference,
+		MigrationCapturedAt:        at,
+		Tables: []StrictConsistencyTableCapture{{
+			Task:                task,
+			SnapshotReference:   reference,
+			ExactSourceRowCount: 9,
+			CapturedAt:          at,
+		}},
+	}}
+	opener := &plannedStrictTestOpener{session: session}
+	attemptID, err := BuildStrictConsistencyAttemptID(task, topology, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, err := BeginPlannedStrictConsistency(
+		context.Background(),
+		PlannedStrictConsistencyRequest{
+			RunID:        runID,
+			SourceEngine: StrictConsistencyMSSQL,
+			Scope:        state.StrictSnapshotMigration,
+			Resume:       true,
+			ProcessEpoch: "recovery-process",
+			State:        backend,
+			Tasks:        []state.TaskKey{task},
+		},
+		opener,
+		func(
+			_ context.Context,
+			_ StrictConsistencySession,
+			capture StrictConsistencyCapture,
+		) ([]StrictConsistencyTable, error) {
+			if capture.MigrationSnapshotReference != reference ||
+				capture.MigrationEpochID != epoch {
+				t.Fatalf("recovered snapshot capture = %#v", capture)
+			}
+			backend.tasks = []state.WorkTask{{
+				RunID: runID, Key: task, Status: "running", TopologyHash: topology,
+			}}
+			return []StrictConsistencyTable{{
+				Task: task, AttemptID: attemptID, WorkTopologyHash: topology,
+			}}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opener.request.RequiredMigrationSnapshot != nil ||
+		!opener.request.ReopenUnownedMigrationSnapshot {
+		t.Fatalf("pre-owner recovery request = %#v", opener.request)
+	}
+	owner, found := execution.MigrationSnapshot()
+	if !found || owner.RunID != runID || owner.EpochID != epoch ||
+		owner.SnapshotReference != reference ||
+		owner.ProcessEpoch != "recovery-process" {
+		t.Fatalf("recovered durable owner = %#v found=%v", owner, found)
+	}
+	evidence := execution.Evidence()
+	if len(evidence) != 1 || evidence[0].AttemptID != attemptID ||
+		evidence[0].SnapshotReference != reference {
+		t.Fatalf("recovered strict evidence = %#v", evidence)
+	}
+	if err := execution.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPlannedSQLServerMigrationSnapshotResumabilityOutcomes(t *testing.T) {
+	const (
+		runID    = "mssql-graceful-outcome"
+		topology = "mssql-graceful-topology"
+	)
+	task := state.TaskKey{
+		Type: stage4AdapterNetworkTaskType, Schema: "dbo", Table: "items",
+	}
+	reference := sqlServerMigrationSnapshotName(runID, "source_db")
+	capture := StrictConsistencyCapture{
+		MigrationEpochID:           sqlServerMigrationSnapshotEpoch(reference),
+		MigrationSnapshotReference: reference,
+		MigrationCapturedAt:        strictCoreTime(),
+		Tables: []StrictConsistencyTableCapture{{
+			Task: task, SnapshotReference: reference, ExactSourceRowCount: 3,
+			CapturedAt: strictCoreTime(),
+		}},
+	}
+	attemptID, err := BuildStrictConsistencyAttemptID(task, topology, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := func(backend *strictCoreFakeState) func(
+		context.Context,
+		StrictConsistencySession,
+		StrictConsistencyCapture,
+	) ([]StrictConsistencyTable, error) {
+		return func(
+			_ context.Context,
+			_ StrictConsistencySession,
+			_ StrictConsistencyCapture,
+		) ([]StrictConsistencyTable, error) {
+			backend.tasks = []state.WorkTask{{
+				RunID: runID, Key: task, Status: "running", TopologyHash: topology,
+			}}
+			return []StrictConsistencyTable{{
+				Task: task, AttemptID: attemptID, WorkTopologyHash: topology,
+			}}, nil
+		}
+	}
+
+	t.Run("graceful-transfer-failure-releases-and-forbids-resume", func(t *testing.T) {
+		backend := &strictCoreFakeState{}
+		session := &strictMigrationSnapshotResumeTestSession{
+			strictCoreFakeSession: strictCoreFakeSession{capture: capture},
+		}
+		execution, err := BeginPlannedStrictConsistency(
+			context.Background(),
+			PlannedStrictConsistencyRequest{
+				RunID: runID, SourceEngine: StrictConsistencyMSSQL,
+				Scope: state.StrictSnapshotMigration, ProcessEpoch: "initial-process",
+				State: backend, Tasks: []state.TaskKey{task},
+			},
+			&plannedStrictTestOpener{session: session},
+			plan(backend),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transferErr := errors.New("target writer failed")
+		err = execution.Run(context.Background(), func(context.Context, StrictConsistencySession) error {
+			return transferErr
+		})
+		if !errors.Is(err, transferErr) ||
+			!errors.Is(err, ErrSQLServerMigrationSnapshotNotResumable) {
+			t.Fatalf("graceful SQL Server migration failure = %v", err)
+		}
+		closeCalls, _, _ := session.closeSnapshot()
+		if closeCalls != 1 || !session.released {
+			t.Fatalf("graceful SQL Server migration close calls=%d released=%t", closeCalls, session.released)
+		}
+	})
+
+	t.Run("graceful-cancellation-releases-and-forbids-resume", func(t *testing.T) {
+		backend := &strictCoreFakeState{}
+		session := &strictMigrationSnapshotResumeTestSession{
+			strictCoreFakeSession: strictCoreFakeSession{capture: capture},
+		}
+		execution, err := BeginPlannedStrictConsistency(
+			context.Background(),
+			PlannedStrictConsistencyRequest{
+				RunID: runID + "-cancel", SourceEngine: StrictConsistencyMSSQL,
+				Scope: state.StrictSnapshotMigration, ProcessEpoch: "initial-process",
+				State: backend, Tasks: []state.TaskKey{task},
+			},
+			&plannedStrictTestOpener{session: session},
+			func(
+				_ context.Context,
+				_ StrictConsistencySession,
+				_ StrictConsistencyCapture,
+			) ([]StrictConsistencyTable, error) {
+				backend.tasks = []state.WorkTask{{
+					RunID: runID + "-cancel", Key: task, Status: "running", TopologyHash: topology,
+				}}
+				return []StrictConsistencyTable{{
+					Task: task, AttemptID: attemptID, WorkTopologyHash: topology,
+				}}, nil
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = execution.Run(context.Background(), func(context.Context, StrictConsistencySession) error {
+			return context.Canceled
+		})
+		if !errors.Is(err, context.Canceled) ||
+			!errors.Is(err, ErrSQLServerMigrationSnapshotNotResumable) ||
+			!session.released {
+			t.Fatalf("graceful SQL Server migration cancellation = %v released=%t", err, session.released)
+		}
+	})
+
+	t.Run("hard-stop-owner-remains-resumable-and-reopens-exact-snapshot", func(t *testing.T) {
+		backend := &strictCoreFakeState{}
+		firstSession := &strictMigrationSnapshotResumeTestSession{
+			strictCoreFakeSession: strictCoreFakeSession{capture: capture},
+			resumeAvailable:       true,
+		}
+		execution, err := BeginPlannedStrictConsistency(
+			context.Background(),
+			PlannedStrictConsistencyRequest{
+				RunID: runID, SourceEngine: StrictConsistencyMSSQL,
+				Scope: state.StrictSnapshotMigration, ProcessEpoch: "original-process",
+				State: backend, Tasks: []state.TaskKey{task},
+			},
+			&plannedStrictTestOpener{session: firstSession},
+			plan(backend),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		owner, found := execution.MigrationSnapshot()
+		if !found {
+			t.Fatal("initial SQL Server migration has no durable owner")
+		}
+		backend.latest, backend.latestFound = owner, true
+		resumedCapture := capture
+		resumedSession := &strictMigrationSnapshotResumeTestSession{
+			strictCoreFakeSession: strictCoreFakeSession{capture: resumedCapture},
+			resumeAvailable:       true,
+		}
+		resumed := &plannedStrictTestOpener{session: resumedSession}
+		resumedExecution, err := BeginPlannedStrictConsistency(
+			context.Background(),
+			PlannedStrictConsistencyRequest{
+				RunID: runID, SourceEngine: StrictConsistencyMSSQL,
+				Scope: state.StrictSnapshotMigration, Resume: true,
+				ProcessEpoch: "resume-process", State: backend, Tasks: []state.TaskKey{task},
+			},
+			resumed,
+			plan(backend),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resumed.request.RequiredMigrationSnapshot == nil ||
+			*resumed.request.RequiredMigrationSnapshot != owner {
+			t.Fatalf("hard-stop resume owner = %#v, want %#v", resumed.request.RequiredMigrationSnapshot, owner)
+		}
+		if err := resumedExecution.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("missing-required-snapshot-forbids-further-resume", func(t *testing.T) {
+		backend := &strictCoreFakeState{}
+		owner := state.StrictMigrationSnapshot{
+			RunID: runID, EpochID: capture.MigrationEpochID, SourceEngine: "mssql",
+			SnapshotReference: capture.MigrationSnapshotReference,
+			ProcessEpoch:      "original-process", CapturedAt: capture.MigrationCapturedAt,
+		}
+		backend.latest, backend.latestFound = owner, true
+		opener := &plannedStrictTestOpener{err: fmt.Errorf("%w: test fault", errSQLServerMigrationSnapshotMissing)}
+		_, err := BeginPlannedStrictConsistency(
+			context.Background(),
+			PlannedStrictConsistencyRequest{
+				RunID: runID, SourceEngine: StrictConsistencyMSSQL,
+				Scope: state.StrictSnapshotMigration, Resume: true,
+				ProcessEpoch: "resume-process", State: backend, Tasks: []state.TaskKey{task},
+			},
+			opener,
+			plan(backend),
+		)
+		if !errors.Is(err, ErrSQLServerMigrationSnapshotNotResumable) {
+			t.Fatalf("missing SQL Server migration snapshot resume error = %v", err)
+		}
+		if opener.request.RequiredMigrationSnapshot == nil ||
+			*opener.request.RequiredMigrationSnapshot != owner {
+			t.Fatalf("missing snapshot resume owner = %#v, want %#v", opener.request.RequiredMigrationSnapshot, owner)
+		}
+	})
+}
+
+type strictMigrationSnapshotResumeTestSession struct {
+	strictCoreFakeSession
+	resumeAvailable bool
+	released        bool
+}
+
+func (session *strictMigrationSnapshotResumeTestSession) Close(ctx context.Context) error {
+	session.released = true
+	return session.strictCoreFakeSession.Close(ctx)
+}
+
+func (session *strictMigrationSnapshotResumeTestSession) StrictMigrationSnapshotResumeAvailable() bool {
+	return session.resumeAvailable
 }
 
 func TestBeginPlannedStrictConsistencyEvidenceFailureClosesEpoch(

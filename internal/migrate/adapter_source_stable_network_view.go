@@ -135,7 +135,11 @@ func (view *adapterRetainedStableRelationalView) InspectTable(
 		}
 		return inspected, nil
 	case "mssql":
-		inspected, err := engine.InspectSQLServerTableWithQueryer(
+		inspect := engine.InspectSQLServerTableWithQueryer
+		if view.sqlServerSnapshot {
+			inspect = engine.InspectSQLServerMigrationSnapshotTableWithQueryer
+		}
+		inspected, err := inspect(
 			ctx,
 			view.view,
 			view.source.namespace,

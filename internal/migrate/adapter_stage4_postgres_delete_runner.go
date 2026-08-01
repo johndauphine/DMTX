@@ -16,16 +16,18 @@ import (
 
 const stage4AdapterPostgresDeleteAttemptVersion = 1
 
-// stage4AdapterPostgresDeletePrepared is the PostgreSQL-only bridge from
-// completed network table work to the engine-neutral delete reconciliation
-// core. Construction is read-only: it authenticates every source/target key
-// relation before the surrounding lifecycle is permitted to mutate either
-// schema or data.
+// stage4AdapterPostgresDeletePrepared is the bridge from completed network
+// table work to the engine-neutral delete reconciliation core. Construction is
+// read-only and binds immutable work identity. Table-scoped target authority is
+// activated only after target schema evolution has finished, while the private
+// journal has its separate read-only precheckpoint admission.
 type stage4AdapterPostgresDeletePrepared struct {
 	run           Stage4RunContext
 	policy        config.DeletePolicy
 	maxBatchBytes int64
 	protector     adapterTargetMutationProtector
+	source        sourceAdapter
+	target        targetAdapter
 	entries       []stage4AdapterPostgresDeleteEntry
 	now           func() time.Time
 }
@@ -54,8 +56,10 @@ type stage4AdapterPostgresDeleteResult struct {
 }
 
 // prepareStage4AdapterPostgresDeleteComposition performs no target mutation
-// and writes no durable state. In particular, the PostgreSQL capability
-// constructor performs catalog/privilege/journal admission reads only.
+// and writes no durable state. Its table-scoped target capability is deferred
+// until schema evolution has made the admitted target table available. The
+// target-private journal remains independently preflighted before checkpointing
+// by the readiness protocol.
 func prepareStage4AdapterPostgresDeleteComposition(
 	ctx context.Context,
 	cfg config.Config,
@@ -115,44 +119,118 @@ func prepareStage4AdapterPostgresDeleteComposition(
 		}
 	}
 
+	entries := make([]stage4AdapterPostgresDeleteEntry, len(prepared.plans))
+	for index, plan := range prepared.plans {
+		entries[index] = stage4AdapterPostgresDeleteEntry{
+			planIndex: index,
+			source:    cloneStage4RichTable(plan.source),
+			target:    cloneStage4RichTable(plan.target),
+		}
+	}
+	return &stage4AdapterPostgresDeletePrepared{
+		run:           prepared.run,
+		policy:        cfg.Migration.Deletes,
+		maxBatchBytes: maxBatchBytes,
+		protector:     mutationProtector,
+		source:        source,
+		target:        target,
+		entries:       entries,
+		now:           func() time.Time { return time.Now().UTC() },
+	}, nil
+}
+
+// activateStage4AdapterPostgresDeleteComposition binds every target table's
+// delete authority after schema evolution and the post-evolution table
+// preflight. It remains read-only: the caller still must persist readiness
+// before PrepareTables, row writes, or deletes become reachable.
+func activateStage4AdapterPostgresDeleteComposition(
+	ctx context.Context,
+	prepared stage4AdapterPrepared,
+) error {
+	composition := prepared.deletes
+	if composition == nil {
+		return nil
+	}
+	if ctx == nil {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 PostgreSQL delete activation context is required"),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if isNilInterface(composition.source) ||
+		isNilInterface(composition.target) {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 PostgreSQL delete composition lacks live source or target activation authority"),
+		)
+	}
+	if len(composition.entries) != len(prepared.plans) {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 PostgreSQL delete composition differs from its admitted table plan"),
+		)
+	}
 	entries := make(
 		[]stage4AdapterPostgresDeleteEntry,
-		len(prepared.plans),
+		len(composition.entries),
 	)
-	for index, plan := range prepared.plans {
-		capabilities, capabilityErr :=
-			newPostgresDeleteReconciliationCapabilities(
-				ctx,
-				source,
-				target,
-				plan.source,
-				plan.target,
+	for index, admitted := range composition.entries {
+		plan := prepared.plans[index]
+		if admitted.planIndex != index ||
+			admitted.source.Schema != plan.source.Schema ||
+			admitted.source.Name != plan.source.Name ||
+			admitted.target.Schema != plan.target.Schema ||
+			admitted.target.Name != plan.target.Name {
+			return NewTransferError(
+				ErrorClassState,
+				fmt.Errorf("Stage 4 PostgreSQL delete entry %d differs from the admitted table plan", index),
 			)
-		if capabilityErr != nil {
-			return nil, NewTransferError(
+		}
+		capabilities, err := newStage4DeleteReconciliationCapabilities(
+			ctx,
+			composition.source,
+			composition.target,
+			admitted.source,
+			admitted.target,
+		)
+		if err != nil {
+			return NewTransferError(
 				ErrorClassPolicy,
 				fmt.Errorf(
-					"preflight Stage 4 PostgreSQL delete reconciliation for table %s: %w",
-					plan.source.Name,
-					capabilityErr,
+					"activate Stage 4 PostgreSQL delete reconciliation for evolved table %s: %w",
+					admitted.source.Name,
+					err,
 				),
 			)
 		}
+		if isNilInterface(capabilities.source) ||
+			isNilInterface(capabilities.target) ||
+			isNilInterface(capabilities.canonicalizer) {
+			return NewTransferError(
+				ErrorClassState,
+				fmt.Errorf("activate Stage 4 PostgreSQL delete reconciliation for evolved table %s returned incomplete authority", admitted.source.Name),
+			)
+		}
 		entry := stage4AdapterPostgresDeleteEntry{
-			planIndex:    index,
-			source:       cloneStage4RichTable(plan.source),
-			target:       cloneStage4RichTable(plan.target),
+			planIndex:    admitted.planIndex,
+			source:       cloneStage4RichTable(admitted.source),
+			target:       cloneStage4RichTable(admitted.target),
 			capabilities: capabilities,
 		}
+		sourceTable := cloneStage4RichTable(entry.source)
+		targetTable := cloneStage4RichTable(entry.target)
 		entry.currentAuthority = func(
 			ctx context.Context,
 		) (deleteKeyCanonicalizer, error) {
-			current, err := newPostgresDeleteReconciliationCapabilities(
+			current, err := newStage4DeleteReconciliationCapabilities(
 				ctx,
-				source,
-				target,
-				entry.source,
-				entry.target,
+				composition.source,
+				composition.target,
+				sourceTable,
+				targetTable,
 			)
 			if err != nil {
 				return nil, err
@@ -166,14 +244,25 @@ func prepareStage4AdapterPostgresDeleteComposition(
 		}
 		entries[index] = entry
 	}
-	return &stage4AdapterPostgresDeletePrepared{
-		run:           prepared.run,
-		policy:        cfg.Migration.Deletes,
-		maxBatchBytes: maxBatchBytes,
-		protector:     mutationProtector,
-		entries:       entries,
-		now:           func() time.Time { return time.Now().UTC() },
-	}, nil
+	composition.entries = entries
+	return nil
+}
+
+func stage4AdapterPostgresDeleteAuthorityActivated(
+	composition *stage4AdapterPostgresDeletePrepared,
+) bool {
+	if composition == nil || len(composition.entries) == 0 {
+		return false
+	}
+	for _, entry := range composition.entries {
+		if isNilInterface(entry.capabilities.source) ||
+			isNilInterface(entry.capabilities.target) ||
+			isNilInterface(entry.capabilities.canonicalizer) ||
+			entry.currentAuthority == nil {
+			return false
+		}
+	}
+	return true
 }
 
 // requireStage4AdapterPostgresDeleteComposition is the pure, fail-closed
@@ -186,11 +275,14 @@ func requireStage4AdapterPostgresDeleteComposition(
 	targetEngine string,
 	prepared stage4AdapterPrepared,
 ) error {
-	if sourceEngine != "postgres" || targetEngine != "postgres" {
+	if !(sourceEngine == "postgres" && targetEngine == "postgres") &&
+		!(sourceEngine == "sqlite" && targetEngine == "sqlite") &&
+		!(sourceEngine == "mysql" && targetEngine == "mysql") &&
+		!(sourceEngine == "mssql" && targetEngine == "mssql") {
 		return NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
-				"Stage 4 delete reconciliation route %s-to-%s is not certified; only postgres-to-postgres is admitted",
+				"Stage 4 delete reconciliation route %s-to-%s is not certified; it lacks a complete source-key and target atomic-receipt capability",
 				sourceEngine,
 				targetEngine,
 			),
@@ -206,23 +298,36 @@ func requireStage4AdapterPostgresDeleteComposition(
 			fmt.Errorf("Stage 4 PostgreSQL delete reconciliation requires target mode upsert"),
 		)
 	}
-	if cfg.Migration.StrictConsistency {
+	if cfg.Migration.StrictConsistency &&
+		(sourceEngine != "mssql" || targetEngine != "mssql") {
 		return NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf("Stage 4 PostgreSQL delete reconciliation is not yet composed with strict consistency"),
 		)
 	}
-	if len(cfg.Migration.DateUpdatedColumns) != 0 ||
-		prepared.incremental != nil {
-		return NewTransferError(
-			ErrorClassPolicy,
-			fmt.Errorf("Stage 4 PostgreSQL delete reconciliation currently requires full-table, non-incremental work"),
+	if cfg.Migration.StrictConsistency {
+		scope, scopeErr := stage4SQLServerStrictScope(
+			cfg.Migration.StrictConsistencyScope,
 		)
+		if scopeErr != nil {
+			return scopeErr
+		}
+		if scope != state.StrictSnapshotTable &&
+			scope != state.StrictSnapshotMigration {
+			return NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf("SQL Server strict delete reconciliation has an unsupported strict scope"),
+			)
+		}
 	}
-	if prepared.evolution != nil && !prepared.evolution.plan.Complete() {
+	incrementalDelete := len(cfg.Migration.DateUpdatedColumns) != 0 ||
+		prepared.incremental != nil
+	if incrementalDelete &&
+		!(sourceEngine == "sqlite" && targetEngine == "sqlite" &&
+			prepared.incremental != nil) {
 		return NewTransferError(
 			ErrorClassPolicy,
-			fmt.Errorf("Stage 4 PostgreSQL delete reconciliation requires target schema evolution to be complete before any delete pass"),
+			fmt.Errorf("Stage 4 delete reconciliation with date-based incremental transfer requires the SQLite-to-SQLite retained-source composition"),
 		)
 	}
 	if err := validateStage4AdapterPostgresDeletePolicy(
@@ -292,8 +397,19 @@ func validateStage4AdapterPostgresDeleteWork(
 		work.task.Table != plan.source.Name {
 		return fmt.Errorf("network work is not the exact unpartitioned source-table task")
 	}
-	if work.strategy != stage4AdapterCopyStrategy ||
-		!validNetworkFactToken(work.topology) {
+	if !validNetworkFactToken(work.topology) {
+		return fmt.Errorf("network work lacks its exact strategy or topology identity")
+	}
+	switch work.strategy {
+	case stage4AdapterCopyStrategy:
+	case stage4AdapterIncrementalStrategy:
+		if len(work.ranges) != 1 ||
+			work.ranges[0].ID != stage4AdapterIncrementalRangeID ||
+			work.ranges[0].Strategy != stage4AdapterIncrementalStrategy ||
+			work.ranges[0].TopologyHash != work.topology {
+			return fmt.Errorf("incremental delete work lacks its exact upper-fence range identity")
+		}
+	default:
 		return fmt.Errorf("network work lacks its exact strategy or topology identity")
 	}
 	return nil
@@ -384,6 +500,12 @@ func (composition *stage4AdapterPostgresDeletePrepared) requestFor(
 		admitted.target.Schema != entry.target.Schema ||
 		admitted.target.Name != entry.target.Name {
 		return deleteReconciler{}, deleteReconcileRequest{}, fmt.Errorf("Stage 4 PostgreSQL delete entry differs from the admitted plan")
+	}
+	if isNilInterface(admitted.capabilities.source) ||
+		isNilInterface(admitted.capabilities.target) ||
+		isNilInterface(admitted.capabilities.canonicalizer) ||
+		admitted.currentAuthority == nil {
+		return deleteReconciler{}, deleteReconcileRequest{}, fmt.Errorf("Stage 4 PostgreSQL delete table authority is unavailable before post-evolution activation")
 	}
 	if composition.run.RunID == "" ||
 		stage4BackendIsNil(composition.run.Backend) ||
@@ -844,6 +966,20 @@ func (composition *stage4AdapterPostgresDeletePrepared) authenticateFinalWork(
 			return fmt.Errorf("Stage 4 PostgreSQL delete final-work plan index is invalid")
 		}
 		work := bound[entry.planIndex]
+		if work.strategy == stage4AdapterIncrementalStrategy {
+			if err := authenticateStage4AdapterIncrementalDeleteWork(
+				composition,
+				inventory,
+				work,
+			); err != nil {
+				return fmt.Errorf(
+					"authenticate Stage 4 PostgreSQL incremental delete table %s final work: %w",
+					work.task.Table,
+					err,
+				)
+			}
+			continue
+		}
 		task, durableRanges, found, err := exactStage4AdapterWork(
 			inventory,
 			work,
@@ -928,6 +1064,55 @@ func (composition *stage4AdapterPostgresDeletePrepared) authenticateFinalWork(
 				)
 			}
 		}
+	}
+	return nil
+}
+
+// authenticateStage4AdapterIncrementalDeleteWork intentionally does not use
+// networkRestoreFromState. Incremental windows are completed atomically with
+// their persisted upper fence, not through the ordinary pagination frontier
+// protocol; demanding an artificial primary-key frontier would reject valid
+// completed window evidence. The caller separately authenticates that exact
+// incremental attempt before this delete pass starts.
+func authenticateStage4AdapterIncrementalDeleteWork(
+	composition *stage4AdapterPostgresDeletePrepared,
+	inventory stage4WorkInventory,
+	work stage4AdapterWork,
+) error {
+	if composition == nil || work.strategy != stage4AdapterIncrementalStrategy ||
+		len(work.ranges) != 1 {
+		return fmt.Errorf("incremental delete work identity is incomplete")
+	}
+	task, found := inventory.tasks[work.task]
+	if !found {
+		return fmt.Errorf("incremental delete work has no durable task")
+	}
+	ranges := inventory.ranges[work.task]
+	if len(ranges) != 1 ||
+		!stage4AdapterRangeTopologyEqual(work.ranges[0], ranges[0]) {
+		return fmt.Errorf("incremental delete work has an unsafe range set")
+	}
+	workRange := ranges[0]
+	if task.RunID != composition.run.RunID || task.Key != work.task ||
+		task.Strategy != work.strategy || task.TopologyHash != work.topology ||
+		task.Status != "completed" || task.Error != "" ||
+		task.StartedAt.IsZero() || task.UpdatedAt.IsZero() ||
+		task.CompletedAt.IsZero() || !task.UpdatedAt.Equal(task.CompletedAt) ||
+		task.CompletedAt.Before(task.StartedAt) {
+		return fmt.Errorf("incremental delete work has unauthenticated durable task completion")
+	}
+	if workRange.RunID != composition.run.RunID ||
+		workRange.Task != work.task ||
+		workRange.Strategy != work.strategy ||
+		workRange.TopologyHash != work.topology ||
+		workRange.Status != "completed" || workRange.Error != "" ||
+		len(workRange.Pending) != 0 || workRange.SequenceOffset != 0 ||
+		workRange.RowsDone < 0 || workRange.CompletedAt.IsZero() ||
+		workRange.UpdatedAt.IsZero() ||
+		!workRange.UpdatedAt.Equal(workRange.CompletedAt) ||
+		workRange.CompletedAt.Before(task.StartedAt) ||
+		workRange.CompletedAt.After(task.CompletedAt) {
+		return fmt.Errorf("incremental delete work range is not durably complete")
 	}
 	return nil
 }

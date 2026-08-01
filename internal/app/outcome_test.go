@@ -78,6 +78,25 @@ func TestMigrationAttemptDisposition(t *testing.T) {
 			err:  errors.New("preflight failed"), allow: true,
 			outcome: state.Failed, resumable: true, exitCode: TransferError, suffix: "failed",
 		},
+		{
+			name:   "released strict snapshot partial is non-resumable",
+			result: migrate.Result{Rows: 1},
+			err: errors.Join(
+				errors.New("writer failed"),
+				migrate.ErrSQLServerMigrationSnapshotNotResumable,
+			),
+			allow:   true,
+			outcome: state.Partial, resumable: false, exitCode: TransferError, suffix: "partial_snapshot_released",
+		},
+		{
+			name: "released strict snapshot cancellation is non-resumable",
+			err: errors.Join(
+				context.Canceled,
+				migrate.ErrSQLServerMigrationSnapshotNotResumable,
+			),
+			allow:   true,
+			outcome: state.Cancelled, resumable: false, exitCode: Cancelled, suffix: "cancelled_snapshot_released",
+		},
 	}
 
 	for _, test := range tests {

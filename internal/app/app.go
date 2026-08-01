@@ -98,11 +98,39 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "dry run: %v\n", err)
 			return ConfigurationError
 		}
+		if plan.Admission != nil && plan.Admission.Supported {
+			applyDryRunSchemaDriftState(cfg, statePath, &plan)
+		}
+		if plan.Deletes != nil &&
+			cfg.Migration.Deletes.Mode == config.DeleteModeReconcile {
+			if stateErr := applyDryRunDeleteDueState(
+				cfg,
+				statePath,
+				&plan,
+				time.Now().UTC(),
+			); stateErr != nil {
+				plan.Proceed = false
+				plan.Deletes.StateError =
+					"durable delete due-state could not be inspected read-only"
+			}
+			migrate.ApplyDryRunDeleteCandidateImpact(
+				context.Background(),
+				cfg,
+				&plan,
+			)
+		}
 		if err := json.NewEncoder(stdout).Encode(plan); err != nil {
 			fmt.Fprintf(stderr, "write dry run: %v\n", err)
 			return FileError
 		}
+		if !plan.Proceed {
+			return ConfigurationError
+		}
 		return Success
+	}
+	if err := config.ValidateBoundedStage4Settings(cfg.Migration); err != nil {
+		fmt.Fprintf(stderr, "configuration: %v\n", err)
+		return ConfigurationError
 	}
 	configHash, err := config.Hash(cfg)
 	if err != nil {
@@ -218,7 +246,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "record migration outcome: %v\n", stateErr)
 			return StateError
 		}
-		if auditErr := appendAudit(configPath, runID, "run_"+disposition.auditSuffix); auditErr != nil {
+		if auditErr := appendAttemptTerminalAudit(
+			configPath,
+			runID,
+			"run",
+			result,
+			disposition,
+			err,
+		); auditErr != nil {
 			fmt.Fprintf(stderr, "%v\n", auditErr)
 			return StateError
 		}
@@ -285,6 +320,197 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return FileError
 	}
 	return Success
+}
+
+// applyDryRunSchemaDriftState reads only the latest successful aggregate
+// source-schema sentinel for this exact workload. Dry-run must not create a
+// run merely to use stateful selection, and a state-read uncertainty must be a
+// structured non-proceed plan rather than a silently absent baseline.
+func applyDryRunSchemaDriftState(
+	cfg config.Config,
+	statePath string,
+	plan *migrate.Plan,
+) {
+	baseline := migrate.DryRunSchemaBaseline{}
+	sourceIdentity, sourceErr := endpointWorkloadIdentity(cfg.Source)
+	targetIdentity, targetErr := endpointWorkloadIdentity(cfg.Target)
+	if sourceErr != nil || targetErr != nil {
+		baseline.Error = "durable schema baseline scope could not be resolved"
+		migrate.ApplyDryRunSchemaDrift(plan, cfg, baseline)
+		return
+	}
+	record, found, err := state.ReadOnlyLatestSuccessfulSchemaSnapshot(
+		statePath,
+		state.SchemaSnapshotReadScope{
+			SourceIdentity: sourceIdentity,
+			TargetIdentity: targetIdentity,
+			Task: state.TaskKey{
+				Type:  "schema-contract",
+				Table: "aggregate-source-schema",
+			},
+		},
+	)
+	if err != nil {
+		baseline.Error =
+			"durable schema baseline could not be inspected read-only"
+		migrate.ApplyDryRunSchemaDrift(plan, cfg, baseline)
+		return
+	}
+	baseline = migrate.DryRunSchemaBaseline{
+		Found:         found,
+		CanonicalJSON: record.CanonicalJSON,
+		Digest:        record.Digest,
+	}
+	migrate.ApplyDryRunSchemaDrift(plan, cfg, baseline)
+}
+
+// applyDryRunDeleteDueState exposes due state only after matching every record
+// to the exact canonical source, target, and Stage 4 table task. A state file
+// often contains unrelated migration histories; its newest completed record
+// must never influence another workload's delete schedule.
+func applyDryRunDeleteDueState(
+	cfg config.Config,
+	statePath string,
+	plan *migrate.Plan,
+	now time.Time,
+) error {
+	if plan == nil || plan.Deletes == nil {
+		return errors.New("dry-run delete plan is unavailable")
+	}
+	sourceIdentity, err := endpointWorkloadIdentity(cfg.Source)
+	if err != nil {
+		return fmt.Errorf("source workload identity: %w", err)
+	}
+	targetIdentity, err := endpointWorkloadIdentity(cfg.Target)
+	if err != nil {
+		return fmt.Errorf("target workload identity: %w", err)
+	}
+	tasks, err := dryRunDeleteTasks(cfg, plan.Tables)
+	if err != nil {
+		return err
+	}
+	plan.Deletes.Tables = make([]migrate.PlannedDeleteTable, len(tasks))
+	for index, task := range tasks {
+		plan.Deletes.Tables[index] = migrate.PlannedDeleteTable{
+			Schema: task.Schema,
+			Table:  task.Table,
+		}
+	}
+	if len(tasks) == 0 {
+		plan.Deletes.DueStateKnown = true
+		plan.Deletes.Due = false
+		plan.Deletes.DueReason = "no selected tables require reconciliation"
+		plan.Deletes.DueStateScope =
+			"per selected source/target/network-table-copy workload"
+		return nil
+	}
+	evidence, err := state.ReadOnlyLatestSuccessfulDeleteReconciliations(
+		statePath,
+		state.DeleteReconciliationReadScope{
+			SourceIdentity: sourceIdentity,
+			TargetIdentity: targetIdentity,
+			Tasks:          tasks,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if len(evidence) != len(tasks) {
+		return errors.New("read-only delete due-state returned an incomplete task scope")
+	}
+	deleteTables := make([]migrate.PlannedDeleteTable, len(evidence))
+	anyDue := false
+	for index, item := range evidence {
+		facts, dueErr := migrate.EvaluateDeleteReconciliationDue(
+			now,
+			cfg.Migration.Deletes.Reconcile.Interval,
+			item.Record,
+			item.Found,
+		)
+		if dueErr != nil {
+			return fmt.Errorf(
+				"durable delete due-state for %s.%s: %w",
+				item.Task.Schema,
+				item.Task.Table,
+				dueErr,
+			)
+		}
+		deleteTables[index] = migrate.PlannedDeleteTable{
+			Schema:           item.Task.Schema,
+			Table:            item.Task.Table,
+			DueStateKnown:    true,
+			Due:              facts.Due,
+			LastSuccessfulAt: facts.LastSuccessfulAt,
+			NextDueAt:        facts.NextDueAt,
+			DueReason:        facts.Reason,
+		}
+		anyDue = anyDue || facts.Due
+	}
+	plan.Deletes.Tables = deleteTables
+	plan.Deletes.DueStateKnown = true
+	plan.Deletes.Due = anyDue
+	plan.Deletes.DueStateScope =
+		"per selected source/target/network-table-copy workload"
+	if len(deleteTables) == 1 {
+		plan.Deletes.LastSuccessfulAt = deleteTables[0].LastSuccessfulAt
+		plan.Deletes.NextDueAt = deleteTables[0].NextDueAt
+		plan.Deletes.DueReason = deleteTables[0].DueReason
+	} else if anyDue {
+		plan.Deletes.DueReason =
+			"one or more selected table reconciliations are due"
+	} else {
+		plan.Deletes.DueReason =
+			"all selected table reconciliations are not due"
+	}
+	return nil
+}
+
+func dryRunDeleteTasks(
+	cfg config.Config,
+	tables []migrate.PlannedTable,
+) ([]state.TaskKey, error) {
+	engine, err := config.CanonicalEngine(cfg.Source.Type)
+	if err != nil {
+		return nil, err
+	}
+	namespace := cfg.Source.Schema
+	switch engine {
+	case "postgres":
+		if namespace == "" {
+			namespace = "public"
+		}
+	case "mssql":
+		if namespace == "" {
+			namespace = "dbo"
+		}
+	case "mysql", "mariadb":
+		if namespace == "" {
+			namespace = cfg.Source.Database
+		}
+	case "sqlite":
+		namespace = ""
+	default:
+		return nil, fmt.Errorf(
+			"source engine %q has no documented delete-reconciliation task scope",
+			engine,
+		)
+	}
+	tasks := make([]state.TaskKey, len(tables))
+	for index, table := range tables {
+		tasks[index] = state.TaskKey{
+			Type:   "network-table-copy",
+			Schema: namespace,
+			Table:  table.Name,
+		}
+		if err := tasks[index].Validate(); err != nil {
+			return nil, fmt.Errorf(
+				"build delete-reconciliation task for %s: %w",
+				table.Name,
+				err,
+			)
+		}
+	}
+	return tasks, nil
 }
 
 func migrationExitCode(err error) int {

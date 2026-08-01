@@ -14,21 +14,96 @@ func projectSQLServerTargetTable(
 	sourceEngine string,
 	source schema.Table,
 ) (schema.Table, error) {
+	var target schema.Table
+	var err error
 	switch sourceEngine {
 	case "mssql":
-		return cloneSQLServerTargetTable(source), nil
+		target = cloneSQLServerTargetTable(source)
 	case "postgres":
-		return projectPostgresTableForSQLServer(source)
+		target, err = projectPostgresTableForSQLServer(source)
 	case "mysql":
-		return projectMySQLTableForSQLServer(source)
+		target, err = projectMySQLTableForSQLServer(source)
 	case "sqlite":
-		return projectSQLiteTableForSQLServer(source)
+		target, err = projectSQLiteTableForSQLServer(source)
 	default:
 		return schema.Table{}, fmt.Errorf(
 			"SQL Server target does not support source engine %q",
 			sourceEngine,
 		)
 	}
+	if err != nil {
+		return schema.Table{}, err
+	}
+	if err := canonicalizeSQLServerTargetChecks(&target); err != nil {
+		return schema.Table{}, err
+	}
+	if err := canonicalizeSQLServerTargetForeignKeys(&target); err != nil {
+		return schema.Table{}, err
+	}
+	return target, nil
+}
+
+// canonicalizeSQLServerTargetChecks freezes a portable CHECK in exactly the
+// AST form returned by SQL Server's catalog after DMTX renders it. SQL Server
+// always brackets identifiers, so retaining a source spelling such as id > 0
+// would otherwise make an immediately reread post-DDL catalog look like mixed
+// drift despite identical CHECK semantics.
+func canonicalizeSQLServerTargetChecks(table *schema.Table) error {
+	if table == nil {
+		return fmt.Errorf("SQL Server target CHECK canonicalization table is nil")
+	}
+	for index := range table.Checks {
+		rendered, err := schema.RenderPortableCheckForSQLServer(
+			table.Checks[index].Expression,
+			table.Columns,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"canonicalize SQL Server target CHECK %s.%s: %w",
+				table.Name,
+				table.Checks[index].Name,
+				err,
+			)
+		}
+		expression, err := schema.ParseSQLServerCatalogCheck(
+			rendered,
+			table.Columns,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"parse planned SQL Server target CHECK %s.%s: %w",
+				table.Name,
+				table.Checks[index].Name,
+				err,
+			)
+		}
+		table.Checks[index].Expression = expression
+	}
+	return nil
+}
+
+// canonicalizeSQLServerTargetForeignKeys freezes the SQL Server catalog's
+// only supported MATCH spelling. SQL Server implements SIMPLE semantics and
+// reports that canonical form even when a portable source model uses NONE.
+func canonicalizeSQLServerTargetForeignKeys(table *schema.Table) error {
+	if table == nil {
+		return fmt.Errorf("SQL Server target foreign-key canonicalization table is nil")
+	}
+	for index := range table.ForeignKeys {
+		foreignKey := &table.ForeignKeys[index]
+		switch strings.ToUpper(strings.TrimSpace(foreignKey.Match)) {
+		case "", "NONE", "SIMPLE":
+			foreignKey.Match = "SIMPLE"
+		default:
+			return fmt.Errorf(
+				"canonicalize SQL Server target foreign key %s.%s: unsupported MATCH %q",
+				table.Name,
+				foreignKey.Name,
+				foreignKey.Match,
+			)
+		}
+	}
+	return nil
 }
 
 func cloneSQLServerTargetTable(source schema.Table) schema.Table {

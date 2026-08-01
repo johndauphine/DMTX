@@ -41,9 +41,10 @@ func (*NetworkWriteProtocolLimitError) Error() string {
 }
 
 const (
-	maximumNetworkFrontierBytes = 64 << 10
-	maximumNetworkFactToken     = 128
-	maximumNetworkRetries       = 1 << 16
+	maximumNetworkFrontierBytes       = 64 << 10
+	maximumNetworkFactToken           = 128
+	maximumNetworkRetries             = 1 << 16
+	maximumNetworkCheckpointFrequency = config.MaxTransferChunkRows
 )
 
 // NetworkReplayMode is an adapter capability promise. Rebuild routes must
@@ -172,19 +173,43 @@ type NetworkTransferCallbacks struct {
 	Checkpoint   func(context.Context, NetworkRangeCheckpoint) error
 }
 
+// RuntimeTuningDecisionSink durably records one controller decision before the
+// transfer can proceed to subsequent work. It receives only bounded,
+// credential-free controller facts; source frontiers, row values, and driver
+// errors remain outside this surface.
+type RuntimeTuningDecisionSink interface {
+	PersistRuntimeTuningDecision(
+		context.Context,
+		RuntimeTuningSnapshot,
+		RuntimeTuningDecision,
+	) error
+}
+
 // NetworkTransferPlan is immutable input for one migration-wide transfer.
 // RuntimeTuning may be nil when runtime adjustment is disabled. When present,
 // its immutable intent and range/row-width evidence must match this plan.
 type NetworkTransferPlan struct {
-	SourceEngine  string
-	TargetEngine  string
-	Resources     config.EffectiveTransferPlan
-	RetryPolicy   RetryPolicy
-	ReplayMode    NetworkReplayMode
-	Ranges        []NetworkRangePlan
-	Restores      []NetworkRangeRestore
-	RuntimeTuning *RuntimeTuningController
-	RowWidth      RuntimeRowWidthEvidence
+	SourceEngine string
+	TargetEngine string
+	Resources    config.EffectiveTransferPlan
+	RetryPolicy  RetryPolicy
+	ReplayMode   NetworkReplayMode
+	// UpsertMergeRows is an immutable write-only ceiling for an admitted
+	// idempotent-upsert route. It deliberately does not affect source page
+	// requests or issued-page identities: one issued page may be acknowledged
+	// through several contiguous durable write prefixes. Zero preserves the
+	// legacy one-write-per-live-source-page behavior.
+	UpsertMergeRows int
+	// CheckpointFrequency is the number of contiguous durable write
+	// acknowledgements per range between periodic state checkpoints. Zero
+	// preserves the legacy immediate-on-ack cadence. A final range checkpoint
+	// is always synchronous regardless of this value.
+	CheckpointFrequency int
+	Ranges              []NetworkRangePlan
+	Restores            []NetworkRangeRestore
+	RuntimeTuning       *RuntimeTuningController
+	RuntimeTuningSink   RuntimeTuningDecisionSink
+	RowWidth            RuntimeRowWidthEvidence
 }
 
 // NetworkPaginationFact is stable, bounded, and contains no frontier or row
@@ -228,14 +253,15 @@ type NetworkTransferResult struct {
 }
 
 type networkRangeState struct {
-	plan     NetworkRangePlan
-	restore  NetworkRangeRestore
-	tracker  *ContiguousAckTracker
-	baseRows int64
-	safeRows int64
-	frontier []byte
-	complete bool
-	turn     networkSequenceTurn
+	plan                  NetworkRangePlan
+	restore               NetworkRangeRestore
+	tracker               *ContiguousAckTracker
+	baseRows              int64
+	safeRows              int64
+	frontier              []byte
+	pendingCheckpointAcks int
+	complete              bool
+	turn                  networkSequenceTurn
 }
 
 type networkSequenceTurn struct {
@@ -432,6 +458,7 @@ type networkTuningRangeProgress struct {
 type networkTuningCoordinator struct {
 	mu         sync.Mutex
 	controller *RuntimeTuningController
+	sink       RuntimeTuningDecisionSink
 	rowWidth   RuntimeRowWidthEvidence
 	resources  config.EffectiveTransferPlan
 	ranges     uint64
@@ -544,14 +571,27 @@ func (coordinator *networkTuningCoordinator) observe(
 		queueDepth >= effective.BufferDepth.Value
 	observation.ConnectionPressure =
 		openConnections >= coordinator.resources.ConnectionLimit.Value
-	if _, err := coordinator.controller.ApplyChunkBoundary(
+	snapshot, decision, err := coordinator.controller.ApplyChunkBoundaryDecision(
 		ctx,
 		observation,
-	); err != nil {
+	)
+	if err != nil {
 		return NewTransferError(
 			ErrorClassState,
 			fmt.Errorf("apply runtime tuning boundary: %w", err),
 		)
+	}
+	if coordinator.sink != nil {
+		if err := coordinator.sink.PersistRuntimeTuningDecision(
+			ctx,
+			snapshot,
+			decision,
+		); err != nil {
+			return NewTransferError(
+				ErrorClassState,
+				fmt.Errorf("persist runtime tuning decision: %w", err),
+			)
+		}
 	}
 	return nil
 }
@@ -598,8 +638,13 @@ func RunResumableNetworkTransfer(
 		activity:   &networkActivity{},
 		retryFacts: &networkRetryFacts{},
 	}
+	runtimeTuningSink := plan.RuntimeTuningSink
+	if isNilInterface(runtimeTuningSink) {
+		runtimeTuningSink = nil
+	}
 	runtime.tuning = &networkTuningCoordinator{
 		controller: plan.RuntimeTuning,
+		sink:       runtimeTuningSink,
 		rowWidth:   plan.RowWidth,
 		resources:  plan.Resources,
 		ranges:     uint64(len(states)),
@@ -766,6 +811,20 @@ func validateNetworkTransferPlan(
 			ErrInvalidNetworkTransferPlan,
 		)
 	}
+	if plan.CheckpointFrequency < 0 ||
+		plan.CheckpointFrequency > maximumNetworkCheckpointFrequency {
+		return nil, fmt.Errorf(
+			"%w: checkpoint frequency is invalid or unbounded",
+			ErrInvalidNetworkTransferPlan,
+		)
+	}
+	if plan.UpsertMergeRows < 0 ||
+		plan.UpsertMergeRows > config.MaxTransferChunkRows {
+		return nil, fmt.Errorf(
+			"%w: upsert merge size is invalid or unbounded",
+			ErrInvalidNetworkTransferPlan,
+		)
+	}
 	resources := plan.Resources
 	if resources.TargetMode != "drop_recreate" &&
 		resources.TargetMode != "upsert" ||
@@ -834,6 +893,14 @@ func validateNetworkTransferPlan(
 				ErrInvalidNetworkTransferPlan,
 			)
 		}
+	}
+	if plan.UpsertMergeRows > 0 &&
+		(plan.ReplayMode != NetworkReplayIdempotentUpsert ||
+			plan.UpsertMergeRows > resources.ChunkRows.Value) {
+		return nil, fmt.Errorf(
+			"%w: upsert merge size is incompatible with the admitted replay resources",
+			ErrInvalidNetworkTransferPlan,
+		)
 	}
 	if len(plan.Ranges) == 0 ||
 		uint64(len(plan.Ranges)) > maximumRuntimeTuningRanges {
@@ -916,6 +983,12 @@ func validateNetworkTransferPlan(
 			restore.RowsDone + restore.SequenceOffset
 	}
 
+	if plan.RuntimeTuning == nil && !isNilInterface(plan.RuntimeTuningSink) {
+		return nil, fmt.Errorf(
+			"%w: runtime-tuning history sink requires a controller",
+			ErrInvalidNetworkTransferPlan,
+		)
+	}
 	if plan.RuntimeTuning != nil {
 		snapshot := plan.RuntimeTuning.Snapshot()
 		if snapshot.Intent != resources ||
@@ -1197,6 +1270,18 @@ func (runtime *networkTransferRuntime) liveChunkRows() int {
 	}
 	return runtime.plan.RuntimeTuning.
 		Snapshot().Effective.ChunkRows.Value
+}
+
+// liveWriteChunkRows applies an immutable explicit merge ceiling only at the
+// target write boundary. Source pagination continues to use liveChunkRows so
+// issued pages, source snapshots, and durable replay identities are unchanged.
+func (runtime *networkTransferRuntime) liveWriteChunkRows() int {
+	rows := runtime.liveChunkRows()
+	if runtime.plan.UpsertMergeRows > 0 &&
+		runtime.plan.UpsertMergeRows < rows {
+		return runtime.plan.UpsertMergeRows
+	}
+	return rows
 }
 
 func (runtime *networkTransferRuntime) liveWriterLimit() int {
@@ -1558,7 +1643,7 @@ func (runtime *networkTransferRuntime) writeChunk(
 			return err
 		}
 		remaining := len(chunk.page.Rows) - int(offset)
-		attemptRows := runtime.liveChunkRows()
+		attemptRows := runtime.liveWriteChunkRows()
 		if attemptRows > remaining {
 			attemptRows = remaining
 		}
@@ -1695,7 +1780,7 @@ func (runtime *networkTransferRuntime) writeChunk(
 					err,
 				)
 			}
-			if err := runtime.checkpointChunk(
+			if err := runtime.checkpointAcknowledgedChunk(
 				ctx,
 				chunk,
 				frontier,
@@ -1916,6 +2001,37 @@ func (runtime *networkTransferRuntime) checkpointChunk(
 	}
 	chunk.state.safeRows = frontier.Rows
 	chunk.state.frontier = cloneNetworkBytes(frontierBytes)
+	chunk.state.pendingCheckpointAcks = 0
+	return nil
+}
+
+// checkpointAcknowledgedChunk applies the configured periodic cadence only
+// after ContiguousAckTracker has established the safe range frontier. Deferred
+// acknowledgements still advance the in-memory logical frontier so subsequent
+// issued pages cannot overlap; they do not change safeRows or durable state.
+// On a crash, their already-recorded issued chunks replay through the existing
+// idempotent/duplicate-safe route rather than being mistaken for checkpointed
+// progress.
+func (runtime *networkTransferRuntime) checkpointAcknowledgedChunk(
+	ctx context.Context,
+	chunk *networkBufferedChunk,
+	frontier AckFrontier,
+) error {
+	if runtime.plan.CheckpointFrequency == 0 {
+		return runtime.checkpointChunk(ctx, chunk, frontier)
+	}
+	chunk.state.pendingCheckpointAcks++
+	if chunk.state.pendingCheckpointAcks >=
+		runtime.plan.CheckpointFrequency {
+		return runtime.checkpointChunk(ctx, chunk, frontier)
+	}
+	// A partial prefix has no new typed end frontier. For a complete chunk,
+	// preserve its end frontier locally so the next issued sequence proves it
+	// extends the same logical source position even though persistence waits for
+	// the next cadence boundary.
+	if frontier.NextSequence > chunk.issued.Sequence {
+		chunk.state.frontier = cloneNetworkBytes(chunk.issued.EndFrontier)
+	}
 	return nil
 }
 
@@ -1962,6 +2078,7 @@ func (runtime *networkTransferRuntime) completeRange(
 		)
 	}
 	state.safeRows = frontier.Rows
+	state.pendingCheckpointAcks = 0
 	state.complete = true
 	return nil
 }

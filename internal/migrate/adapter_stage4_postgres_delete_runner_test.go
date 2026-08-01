@@ -22,13 +22,13 @@ func TestStage4PostgresDeleteCompositionAdmissionIsExact(t *testing.T) {
 			mutate: func(_ *config.Config, _ *stage4AdapterPrepared, source, _ *string) {
 				*source = "mysql"
 			},
-			want: "only postgres-to-postgres",
+			want: "atomic-receipt capability",
 		},
 		"mysql target": {
 			mutate: func(_ *config.Config, _ *stage4AdapterPrepared, _, target *string) {
 				*target = "mysql"
 			},
-			want: "only postgres-to-postgres",
+			want: "atomic-receipt capability",
 		},
 		"drop recreate": {
 			mutate: func(cfg *config.Config, _ *stage4AdapterPrepared, _, _ *string) {
@@ -52,15 +52,15 @@ func TestStage4PostgresDeleteCompositionAdmissionIsExact(t *testing.T) {
 			mutate: func(cfg *config.Config, _ *stage4AdapterPrepared, _, _ *string) {
 				cfg.Migration.DateUpdatedColumns = []string{"updated_at"}
 			},
-			want: "full-table, non-incremental",
+			want: "requires the SQLite-to-SQLite retained-source composition",
 		},
 		"incremental prepared state": {
 			mutate: func(_ *config.Config, prepared *stage4AdapterPrepared, _, _ *string) {
 				prepared.incremental = &stage4AdapterIncrementalPrepared{}
 			},
-			want: "full-table, non-incremental",
+			want: "requires the SQLite-to-SQLite retained-source composition",
 		},
-		"pending evolution": {
+		"pending evolution is deferred": {
 			mutate: func(_ *config.Config, prepared *stage4AdapterPrepared, _, _ *string) {
 				prepared.evolution = &stage4AdapterTargetSchemaEvolution{
 					plan: TargetSchemaEvolutionPlan{
@@ -73,7 +73,9 @@ func TestStage4PostgresDeleteCompositionAdmissionIsExact(t *testing.T) {
 					},
 				}
 			},
-			want: "evolution to be complete",
+			// Table authority is activated only after this plan has been applied
+			// and exactly reverified. Admission itself remains read-only.
+			want: "",
 		},
 		"delete mode off": {
 			mutate: func(cfg *config.Config, _ *stage4AdapterPrepared, _, _ *string) {
@@ -106,6 +108,12 @@ func TestStage4PostgresDeleteCompositionAdmissionIsExact(t *testing.T) {
 				target,
 				prepared,
 			)
+			if test.want == "" {
+				if err != nil {
+					t.Fatalf("admission error = %v; want success", err)
+				}
+				return
+			}
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("admission error = %v; want %q", err, test.want)
 			}
@@ -320,6 +328,11 @@ func TestStage4PostgresDeleteRequestUsesExactRunAuthorities(t *testing.T) {
 		target:    prepared.plans[0].target,
 		capabilities: postgresDeleteReconciliationCapabilities{
 			source: source, target: target, canonicalizer: canonicalizer,
+		},
+		currentAuthority: func(
+			context.Context,
+		) (deleteKeyCanonicalizer, error) {
+			return canonicalizer, nil
 		},
 	}
 	composition := &stage4AdapterPostgresDeletePrepared{

@@ -60,6 +60,136 @@ func TestSQLiteStage4NetworkWriterOrdersReservationProofWriteAndCommit(
 	)
 }
 
+func TestSQLiteStage4NetworkRebuildWriterReplayPreservesEarlierRows(
+	t *testing.T,
+) {
+	database := openSQLiteStage4NetworkTestDatabase(t)
+	if _, err := database.Exec(`
+		CREATE TABLE "parents" (
+			"id" INTEGER NOT NULL PRIMARY KEY,
+			"code" TEXT NOT NULL
+		);
+		INSERT INTO "parents" ("id", "code") VALUES (1, 'original');
+	`); err != nil {
+		t.Fatalf("create rebuild replay fixture: %v", err)
+	}
+	writer := newSQLiteStage4NetworkWriter(database)
+	planned := sqliteStage4NetworkPlannedTable(t, database, "parents")
+	receipt, err := writer.WriteStage4NetworkRebuildBatch(
+		context.Background(),
+		planned,
+		[]string{"id", "code"},
+		NetworkWriteDuplicateSafeInsertOnly,
+		[][]any{{int64(1), "replayed"}, {int64(2), "new"}},
+	)
+	if err != nil {
+		t.Fatalf("WriteStage4NetworkRebuildBatch: %v", err)
+	}
+	assertSQLiteStage4NetworkReceipt(
+		t,
+		receipt,
+		CommitDurable,
+		2,
+		2,
+	)
+	var existing, inserted string
+	if err := database.QueryRow(
+		`SELECT "code" FROM "parents" WHERE "id" = 1`,
+	).Scan(&existing); err != nil {
+		t.Fatalf("read replayed parent: %v", err)
+	}
+	if err := database.QueryRow(
+		`SELECT "code" FROM "parents" WHERE "id" = 2`,
+	).Scan(&inserted); err != nil {
+		t.Fatalf("read inserted parent: %v", err)
+	}
+	if existing != "original" || inserted != "new" {
+		t.Fatalf(
+			"rebuild replay rows = existing=%q inserted=%q",
+			existing,
+			inserted,
+		)
+	}
+}
+
+func TestSQLiteStage4NetworkRebuildWriterFreshConflictFailsWithoutCommit(
+	t *testing.T,
+) {
+	database := openSQLiteStage4NetworkTestDatabase(t)
+	if _, err := database.Exec(`
+		CREATE TABLE "parents" (
+			"id" INTEGER NOT NULL PRIMARY KEY,
+			"code" TEXT NOT NULL
+		);
+		INSERT INTO "parents" ("id", "code") VALUES (1, 'external');
+	`); err != nil {
+		t.Fatalf("create fresh conflict fixture: %v", err)
+	}
+	writer := newSQLiteStage4NetworkWriter(database)
+	planned := sqliteStage4NetworkPlannedTable(t, database, "parents")
+	receipt, err := writer.WriteStage4NetworkRebuildBatch(
+		context.Background(),
+		planned,
+		[]string{"id", "code"},
+		NetworkWriteFreshInsert,
+		[][]any{{int64(1), "source"}, {int64(2), "must-roll-back"}},
+	)
+	if err == nil {
+		t.Fatal("fresh rebuild conflict succeeded")
+	}
+	assertSQLiteStage4NetworkReceipt(t, receipt, CommitNotCommitted, 2, 0)
+	var code string
+	if err := database.QueryRow(
+		`SELECT "code" FROM "parents" WHERE "id" = 1`,
+	).Scan(&code); err != nil {
+		t.Fatalf("read conflicting row: %v", err)
+	}
+	if code != "external" {
+		t.Fatalf("fresh conflict altered target row = %q", code)
+	}
+	var rows int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM "parents"`).Scan(&rows); err != nil {
+		t.Fatalf("count fresh conflict rows: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("fresh conflict reported partial commit: %d rows", rows)
+	}
+}
+
+func TestSQLiteStage4NetworkRebuildWriterFreshInsertCompletes(
+	t *testing.T,
+) {
+	database := openSQLiteStage4NetworkTestDatabase(t)
+	if _, err := database.Exec(`
+		CREATE TABLE "parents" (
+			"id" INTEGER NOT NULL PRIMARY KEY,
+			"code" TEXT NOT NULL
+		);
+	`); err != nil {
+		t.Fatalf("create fresh insert fixture: %v", err)
+	}
+	writer := newSQLiteStage4NetworkWriter(database)
+	planned := sqliteStage4NetworkPlannedTable(t, database, "parents")
+	receipt, err := writer.WriteStage4NetworkRebuildBatch(
+		context.Background(),
+		planned,
+		[]string{"id", "code"},
+		NetworkWriteFreshInsert,
+		[][]any{{int64(1), "one"}, {int64(2), "two"}},
+	)
+	if err != nil {
+		t.Fatalf("fresh rebuild insert: %v", err)
+	}
+	assertSQLiteStage4NetworkReceipt(t, receipt, CommitDurable, 2, 2)
+	var rows int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM "parents"`).Scan(&rows); err != nil {
+		t.Fatalf("count fresh rows: %v", err)
+	}
+	if rows != 2 {
+		t.Fatalf("fresh rebuild rows = %d", rows)
+	}
+}
+
 func TestSQLiteStage4NetworkWriterRollsBackWithoutWriteOnReservationOrProofFailure(
 	t *testing.T,
 ) {
@@ -754,6 +884,30 @@ func (transaction *sqliteStage4NetworkTestTransaction) WriteUpsert(
 		transaction.operations,
 		"write",
 	)
+	transaction.writeCalls++
+	transaction.rows = clonePostgresNativeTestRows(rows)
+	return transaction.writeErr
+}
+
+func (transaction *sqliteStage4NetworkTestTransaction) WriteDuplicateSafeInsertOnly(
+	_ context.Context,
+	_ schema.Table,
+	_ []string,
+	rows [][]any,
+) error {
+	transaction.operations = append(transaction.operations, "rebuild-write")
+	transaction.writeCalls++
+	transaction.rows = clonePostgresNativeTestRows(rows)
+	return transaction.writeErr
+}
+
+func (transaction *sqliteStage4NetworkTestTransaction) WriteFreshInsert(
+	_ context.Context,
+	_ schema.Table,
+	_ []string,
+	rows [][]any,
+) error {
+	transaction.operations = append(transaction.operations, "rebuild-fresh-write")
 	transaction.writeCalls++
 	transaction.rows = clonePostgresNativeTestRows(rows)
 	return transaction.writeErr

@@ -1212,14 +1212,8 @@ func evolutionIdentifiersMayAlias(left, right string) bool {
 
 func validateEvolutionTarget(target Dialect) error {
 	switch target {
-	case Postgres, SQLServer, MySQL:
+	case Postgres, SQLServer, MySQL, SQLite:
 		return nil
-	case SQLite:
-		return evolutionPolicy(
-			"render column evolution",
-			"deterministic in-place evolution is unsupported",
-			string(target),
-		)
 	case ClickHouse:
 		return evolutionPolicy(
 			"render column evolution",
@@ -1237,7 +1231,7 @@ func validateEvolutionTarget(target Dialect) error {
 
 func validateEvolutionTargetTable(target Dialect, table Table) error {
 	switch target {
-	case Postgres, MySQL:
+	case Postgres, MySQL, SQLite:
 		_, err := CreateTable(target, table)
 		return err
 	case SQLServer:

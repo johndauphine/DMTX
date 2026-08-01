@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -124,13 +125,60 @@ func FenceBackend(backend Backend, guard *LeaseGuard) Backend {
 		stage4:  stage4,
 		guard:   guard,
 	}
-	aggregate, ok := backend.(Stage4AggregateBackend)
-	if !ok {
+	aggregate, aggregateOK := backend.(Stage4AggregateBackend)
+	readiness, readinessOK := backend.(Stage4DeleteJournalReadinessBackend)
+	if readinessOK && stage4DeleteJournalReadinessBackendIsNil(readiness) {
+		readinessOK = false
+	}
+	if !aggregateOK {
+		if readinessOK {
+			return &fencedDeleteJournalReadinessBackend{
+				fencedBackend: fenced,
+				readiness:     readiness,
+			}
+		}
 		return fenced
 	}
-	return &fencedAggregateBackend{
+	fencedAggregate := &fencedAggregateBackend{
 		fencedBackend: fenced,
 		aggregate:     aggregate,
+	}
+	recovery, ok := backend.(Stage4RebuildRecoveryBackend)
+	if !ok {
+		if readinessOK {
+			return &fencedAggregateDeleteJournalReadinessBackend{
+				fencedAggregateBackend: fencedAggregate,
+				readiness:              readiness,
+			}
+		}
+		return fencedAggregate
+	}
+	fencedRebuild := &fencedRebuildAggregateBackend{
+		fencedAggregateBackend: fencedAggregate,
+		recovery:               recovery,
+	}
+	if readinessOK {
+		return &fencedRebuildAggregateDeleteJournalReadinessBackend{
+			fencedRebuildAggregateBackend: fencedRebuild,
+			readiness:                     readiness,
+		}
+	}
+	return fencedRebuild
+}
+
+func stage4DeleteJournalReadinessBackendIsNil(
+	backend Stage4DeleteJournalReadinessBackend,
+) bool {
+	if backend == nil {
+		return true
+	}
+	value := reflect.ValueOf(backend)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
 	}
 }
 
@@ -147,6 +195,33 @@ type fencedBackend struct {
 type fencedAggregateBackend struct {
 	*fencedBackend
 	aggregate Stage4AggregateBackend
+}
+
+// fencedRebuildAggregateBackend is returned only when the wrapped backend
+// really implements terminal rebuild recovery. Keeping the methods off the
+// ordinary aggregate wrapper prevents a capability type assertion from
+// succeeding merely because fencing was applied.
+type fencedRebuildAggregateBackend struct {
+	*fencedAggregateBackend
+	recovery Stage4RebuildRecoveryBackend
+}
+
+// fencedDeleteJournalReadinessBackend is returned only when the wrapped
+// backend actually advertises durable delete-journal readiness. The optional
+// capability remains absent from ordinary fenced backends.
+type fencedDeleteJournalReadinessBackend struct {
+	*fencedBackend
+	readiness Stage4DeleteJournalReadinessBackend
+}
+
+type fencedAggregateDeleteJournalReadinessBackend struct {
+	*fencedAggregateBackend
+	readiness Stage4DeleteJournalReadinessBackend
+}
+
+type fencedRebuildAggregateDeleteJournalReadinessBackend struct {
+	*fencedRebuildAggregateBackend
+	readiness Stage4DeleteJournalReadinessBackend
 }
 
 func (backend *fencedAggregateBackend) EnsureStage4TableInventory(
@@ -183,6 +258,141 @@ func (backend *fencedAggregateBackend) LoadStage4TableCompletions(
 	runID string,
 ) ([]Stage4TableCompletionReceipt, error) {
 	return backend.aggregate.LoadStage4TableCompletions(runID)
+}
+
+func (backend *fencedRebuildAggregateBackend) SaveStage4RebuildReady(
+	ready Stage4RebuildReady,
+) error {
+	return backend.protectRun(ready.RunID, func() error {
+		return backend.recovery.SaveStage4RebuildReady(ready)
+	})
+}
+
+func (backend *fencedRebuildAggregateBackend) EnsureStage4RebuildFinalization(
+	finalization Stage4RebuildFinalization,
+) (Stage4RebuildFinalizationReceipt, bool, error) {
+	var receipt Stage4RebuildFinalizationReceipt
+	var created bool
+	err := backend.protectRun(finalization.RunID, func() error {
+		var err error
+		receipt, created, err = backend.recovery.EnsureStage4RebuildFinalization(
+			finalization,
+		)
+		return err
+	})
+	return receipt, created, err
+}
+
+func (backend *fencedRebuildAggregateBackend) LoadStage4RebuildFinalization(
+	runID string,
+	phase Stage4RebuildFinalizationPhase,
+) (Stage4RebuildFinalizationReceipt, bool, error) {
+	return backend.recovery.LoadStage4RebuildFinalization(runID, phase)
+}
+
+func (backend *fencedRebuildAggregateBackend) LoadStage4RebuildReady(
+	runID string,
+) (Stage4RebuildReadyReceipt, bool, error) {
+	return backend.recovery.LoadStage4RebuildReady(runID)
+}
+
+func (backend *fencedDeleteJournalReadinessBackend) SaveStage4DeleteJournalReadiness(
+	ready Stage4DeleteJournalReadiness,
+) error {
+	return backend.protectRun(ready.RunID, func() error {
+		return backend.readiness.SaveStage4DeleteJournalReadiness(ready)
+	})
+}
+
+func (backend *fencedDeleteJournalReadinessBackend) EnsureStage4DeleteJournalReadiness(
+	ready Stage4DeleteJournalReadiness,
+) (Stage4DeleteJournalReadinessReceipt, bool, error) {
+	var receipt Stage4DeleteJournalReadinessReceipt
+	var created bool
+	err := backend.protectRun(ready.RunID, func() error {
+		var err error
+		receipt, created, err = backend.readiness.EnsureStage4DeleteJournalReadiness(ready)
+		return err
+	})
+	return receipt, created, err
+}
+
+func (backend *fencedDeleteJournalReadinessBackend) LoadStage4DeleteJournalReadiness(
+	runID string,
+) (Stage4DeleteJournalReadinessReceipt, bool, error) {
+	return backend.readiness.LoadStage4DeleteJournalReadiness(runID)
+}
+
+func (backend *fencedDeleteJournalReadinessBackend) ValidateStage4DeleteJournalReadinessBoundary(
+	boundary Stage4DeleteJournalReadinessBoundary,
+) error {
+	return backend.readiness.ValidateStage4DeleteJournalReadinessBoundary(boundary)
+}
+
+func (backend *fencedAggregateDeleteJournalReadinessBackend) SaveStage4DeleteJournalReadiness(
+	ready Stage4DeleteJournalReadiness,
+) error {
+	return backend.protectRun(ready.RunID, func() error {
+		return backend.readiness.SaveStage4DeleteJournalReadiness(ready)
+	})
+}
+
+func (backend *fencedAggregateDeleteJournalReadinessBackend) EnsureStage4DeleteJournalReadiness(
+	ready Stage4DeleteJournalReadiness,
+) (Stage4DeleteJournalReadinessReceipt, bool, error) {
+	var receipt Stage4DeleteJournalReadinessReceipt
+	var created bool
+	err := backend.protectRun(ready.RunID, func() error {
+		var err error
+		receipt, created, err = backend.readiness.EnsureStage4DeleteJournalReadiness(ready)
+		return err
+	})
+	return receipt, created, err
+}
+
+func (backend *fencedAggregateDeleteJournalReadinessBackend) LoadStage4DeleteJournalReadiness(
+	runID string,
+) (Stage4DeleteJournalReadinessReceipt, bool, error) {
+	return backend.readiness.LoadStage4DeleteJournalReadiness(runID)
+}
+
+func (backend *fencedAggregateDeleteJournalReadinessBackend) ValidateStage4DeleteJournalReadinessBoundary(
+	boundary Stage4DeleteJournalReadinessBoundary,
+) error {
+	return backend.readiness.ValidateStage4DeleteJournalReadinessBoundary(boundary)
+}
+
+func (backend *fencedRebuildAggregateDeleteJournalReadinessBackend) SaveStage4DeleteJournalReadiness(
+	ready Stage4DeleteJournalReadiness,
+) error {
+	return backend.protectRun(ready.RunID, func() error {
+		return backend.readiness.SaveStage4DeleteJournalReadiness(ready)
+	})
+}
+
+func (backend *fencedRebuildAggregateDeleteJournalReadinessBackend) EnsureStage4DeleteJournalReadiness(
+	ready Stage4DeleteJournalReadiness,
+) (Stage4DeleteJournalReadinessReceipt, bool, error) {
+	var receipt Stage4DeleteJournalReadinessReceipt
+	var created bool
+	err := backend.protectRun(ready.RunID, func() error {
+		var err error
+		receipt, created, err = backend.readiness.EnsureStage4DeleteJournalReadiness(ready)
+		return err
+	})
+	return receipt, created, err
+}
+
+func (backend *fencedRebuildAggregateDeleteJournalReadinessBackend) LoadStage4DeleteJournalReadiness(
+	runID string,
+) (Stage4DeleteJournalReadinessReceipt, bool, error) {
+	return backend.readiness.LoadStage4DeleteJournalReadiness(runID)
+}
+
+func (backend *fencedRebuildAggregateDeleteJournalReadinessBackend) ValidateStage4DeleteJournalReadinessBoundary(
+	boundary Stage4DeleteJournalReadinessBoundary,
+) error {
+	return backend.readiness.ValidateStage4DeleteJournalReadinessBoundary(boundary)
 }
 
 func (backend *fencedBackend) protect(operation func() error) error {
@@ -281,6 +491,15 @@ func (backend *fencedBackend) UpdateFailure(runID, reason string, endedAt time.T
 func (backend *fencedBackend) UpdateRecoverableOutcome(runID string, outcome Outcome, reason string, endedAt time.Time) error {
 	return backend.protectRun(runID, func() error {
 		return backend.backend.UpdateRecoverableOutcome(runID, outcome, reason, endedAt)
+	})
+}
+func (backend *fencedBackend) UpdateNonResumableOutcome(runID string, outcome Outcome, reason string, endedAt time.Time) error {
+	terminal, ok := backend.backend.(TerminalOutcomeBackend)
+	if !ok {
+		return fmt.Errorf("non-resumable terminal outcome backend is unavailable")
+	}
+	return backend.protectRun(runID, func() error {
+		return terminal.UpdateNonResumableOutcome(runID, outcome, reason, endedAt)
 	})
 }
 func (backend *fencedBackend) AbandonRun(runID, reason string, endedAt time.Time) error {
@@ -574,6 +793,27 @@ func (backend *fencedBackend) LoadLatestStrictMigrationSnapshot(
 	}
 	return stage4.LoadLatestStrictMigrationSnapshot(runID)
 }
+func (backend *fencedBackend) SaveStrictMigrationCleanupIntent(
+	intent StrictMigrationCleanupIntent,
+) error {
+	return backend.protectRun(intent.RunID, func() error {
+		cleanup, ok := backend.backend.(StrictMigrationCleanupBackend)
+		if !ok || cleanup == nil {
+			return fmt.Errorf("strict migration cleanup receipt backend is unavailable")
+		}
+		return cleanup.SaveStrictMigrationCleanupIntent(intent)
+	})
+}
+func (backend *fencedBackend) LoadStrictMigrationCleanupIntent(
+	runID string,
+	epochID string,
+) (StrictMigrationCleanupIntent, bool, error) {
+	cleanup, ok := backend.backend.(StrictMigrationCleanupBackend)
+	if !ok || cleanup == nil {
+		return StrictMigrationCleanupIntent{}, false, fmt.Errorf("strict migration cleanup receipt backend is unavailable")
+	}
+	return cleanup.LoadStrictMigrationCleanupIntent(runID, epochID)
+}
 func (backend *fencedBackend) SaveStrictSnapshotEvidence(evidence StrictSnapshotEvidence) error {
 	return backend.protectRun(evidence.RunID, func() error {
 		stage4, err := backend.stage4Backend()
@@ -596,12 +836,42 @@ func (backend *fencedBackend) LoadStrictSnapshotEvidence(
 }
 
 var (
-	_ Backend       = (*fencedBackend)(nil)
-	_ RangeBackend  = (*fencedBackend)(nil)
-	_ Stage4Backend = (*fencedBackend)(nil)
+	_ Backend                       = (*fencedBackend)(nil)
+	_ RangeBackend                  = (*fencedBackend)(nil)
+	_ Stage4Backend                 = (*fencedBackend)(nil)
+	_ StrictMigrationCleanupBackend = (*fencedBackend)(nil)
 
-	_ Backend                = (*fencedAggregateBackend)(nil)
-	_ RangeBackend           = (*fencedAggregateBackend)(nil)
-	_ Stage4Backend          = (*fencedAggregateBackend)(nil)
-	_ Stage4AggregateBackend = (*fencedAggregateBackend)(nil)
+	_ Backend                       = (*fencedAggregateBackend)(nil)
+	_ RangeBackend                  = (*fencedAggregateBackend)(nil)
+	_ Stage4Backend                 = (*fencedAggregateBackend)(nil)
+	_ Stage4AggregateBackend        = (*fencedAggregateBackend)(nil)
+	_ StrictMigrationCleanupBackend = (*fencedAggregateBackend)(nil)
+
+	_ Backend                       = (*fencedRebuildAggregateBackend)(nil)
+	_ RangeBackend                  = (*fencedRebuildAggregateBackend)(nil)
+	_ Stage4Backend                 = (*fencedRebuildAggregateBackend)(nil)
+	_ Stage4AggregateBackend        = (*fencedRebuildAggregateBackend)(nil)
+	_ Stage4RebuildRecoveryBackend  = (*fencedRebuildAggregateBackend)(nil)
+	_ StrictMigrationCleanupBackend = (*fencedRebuildAggregateBackend)(nil)
+
+	_ Backend                             = (*fencedDeleteJournalReadinessBackend)(nil)
+	_ RangeBackend                        = (*fencedDeleteJournalReadinessBackend)(nil)
+	_ Stage4Backend                       = (*fencedDeleteJournalReadinessBackend)(nil)
+	_ Stage4DeleteJournalReadinessBackend = (*fencedDeleteJournalReadinessBackend)(nil)
+	_ StrictMigrationCleanupBackend       = (*fencedDeleteJournalReadinessBackend)(nil)
+
+	_ Backend                             = (*fencedAggregateDeleteJournalReadinessBackend)(nil)
+	_ RangeBackend                        = (*fencedAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4Backend                       = (*fencedAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4AggregateBackend              = (*fencedAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4DeleteJournalReadinessBackend = (*fencedAggregateDeleteJournalReadinessBackend)(nil)
+	_ StrictMigrationCleanupBackend       = (*fencedAggregateDeleteJournalReadinessBackend)(nil)
+
+	_ Backend                             = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
+	_ RangeBackend                        = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4Backend                       = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4AggregateBackend              = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4RebuildRecoveryBackend        = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4DeleteJournalReadinessBackend = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
+	_ StrictMigrationCleanupBackend       = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
 )

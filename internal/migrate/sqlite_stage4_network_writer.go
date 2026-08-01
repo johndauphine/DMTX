@@ -20,6 +20,19 @@ type sqliteStage4NetworkBatchWriter interface {
 	) (WriteReceipt, error)
 }
 
+// sqliteStage4NetworkRebuildBatchWriter is intentionally separate from the
+// upsert writer so a target cannot accidentally advertise duplicate-safe
+// rebuild replay merely by implementing the ordinary Stage 4 upsert path.
+type sqliteStage4NetworkRebuildBatchWriter interface {
+	WriteStage4NetworkRebuildBatch(
+		context.Context,
+		schema.Table,
+		[]string,
+		NetworkWriteMode,
+		[][]any,
+	) (WriteReceipt, error)
+}
+
 type sqliteStage4NetworkConnectionProvider interface {
 	WithConnection(
 		context.Context,
@@ -51,6 +64,21 @@ type sqliteStage4NetworkTransaction interface {
 	Rollback(context.Context) error
 }
 
+type sqliteStage4NetworkRebuildTransaction interface {
+	WriteFreshInsert(
+		context.Context,
+		schema.Table,
+		[]string,
+		[][]any,
+	) error
+	WriteDuplicateSafeInsertOnly(
+		context.Context,
+		schema.Table,
+		[]string,
+		[][]any,
+	) error
+}
+
 type sqliteStage4NetworkWriter struct {
 	connections sqliteStage4NetworkConnectionProvider
 }
@@ -71,6 +99,42 @@ func (writer *sqliteStage4NetworkWriter) WriteStage4NetworkBatch(
 	columns []string,
 	rows [][]any,
 ) (WriteReceipt, error) {
+	return writer.writeStage4NetworkBatch(
+		ctx,
+		table,
+		columns,
+		rows,
+		NetworkWriteIdempotentUpsert,
+	)
+}
+
+// WriteStage4NetworkRebuildBatch is the bounded rebuild counterpart to the
+// upsert page writer. Fresh writes use a strict INSERT so an external primary
+// key conflict stops the migration. Only a durable issued-page replay may use
+// the insert-only primary-key conflict handler.
+func (writer *sqliteStage4NetworkWriter) WriteStage4NetworkRebuildBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	mode NetworkWriteMode,
+	rows [][]any,
+) (WriteReceipt, error) {
+	return writer.writeStage4NetworkBatch(
+		ctx,
+		table,
+		columns,
+		rows,
+		mode,
+	)
+}
+
+func (writer *sqliteStage4NetworkWriter) writeStage4NetworkBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+	mode NetworkWriteMode,
+) (WriteReceipt, error) {
 	attempted := int64(len(rows))
 	notCommitted := WriteReceipt{
 		Certainty:     CommitNotCommitted,
@@ -82,6 +146,19 @@ func (writer *sqliteStage4NetworkWriter) WriteStage4NetworkBatch(
 		rows,
 	); err != nil {
 		return notCommitted, err
+	}
+	switch mode {
+	case NetworkWriteIdempotentUpsert,
+		NetworkWriteFreshInsert,
+		NetworkWriteDuplicateSafeInsertOnly:
+	default:
+		return notCommitted, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"SQLite Stage 4 network write received unsupported mode %q",
+				mode,
+			),
+		)
 	}
 	if len(rows) == 0 {
 		return WriteReceipt{Certainty: CommitDurable}, nil
@@ -174,12 +251,44 @@ func (writer *sqliteStage4NetworkWriter) WriteStage4NetworkBatch(
 					proofErr,
 				)
 			}
-			if writeErr := transaction.WriteUpsert(
-				ctx,
-				table,
-				columns,
-				rows,
-			); writeErr != nil {
+			var writeErr error
+			switch mode {
+			case NetworkWriteIdempotentUpsert:
+				writeErr = transaction.WriteUpsert(
+					ctx,
+					table,
+					columns,
+					rows,
+				)
+			case NetworkWriteFreshInsert,
+				NetworkWriteDuplicateSafeInsertOnly:
+				rebuildTransaction, ok := transaction.(sqliteStage4NetworkRebuildTransaction)
+				if !ok || rebuildTransaction == nil {
+					return NewTransferError(
+						ErrorClassState,
+						fmt.Errorf(
+							"SQLite Stage 4 rebuild transaction is not configured for table %s",
+							table.Name,
+						),
+					)
+				}
+				if mode == NetworkWriteFreshInsert {
+					writeErr = rebuildTransaction.WriteFreshInsert(
+						ctx,
+						table,
+						columns,
+						rows,
+					)
+				} else {
+					writeErr = rebuildTransaction.WriteDuplicateSafeInsertOnly(
+						ctx,
+						table,
+						columns,
+						rows,
+					)
+				}
+			}
+			if writeErr != nil {
 				return fmt.Errorf(
 					"write SQLite Stage 4 network page for %s: %w",
 					table.Name,
@@ -443,6 +552,68 @@ func (transaction sqliteStage4SQLTransaction) WriteUpsert(
 			ctx,
 			values...,
 		); err != nil {
+			return err
+		}
+	}
+	if err := statement.Close(); err != nil {
+		return err
+	}
+	closed = true
+	return nil
+}
+
+func (transaction sqliteStage4SQLTransaction) WriteDuplicateSafeInsertOnly(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) error {
+	statement, err := transaction.connection.PrepareContext(
+		ctx,
+		writeStatement(table, columns, sqliteInsertOnlyReplayMode),
+	)
+	if err != nil {
+		return err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = statement.Close()
+		}
+	}()
+	for _, values := range rows {
+		if _, err := statement.ExecContext(ctx, values...); err != nil {
+			return err
+		}
+	}
+	if err := statement.Close(); err != nil {
+		return err
+	}
+	closed = true
+	return nil
+}
+
+func (transaction sqliteStage4SQLTransaction) WriteFreshInsert(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) error {
+	statement, err := transaction.connection.PrepareContext(
+		ctx,
+		writeStatement(table, columns, "drop_recreate"),
+	)
+	if err != nil {
+		return err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = statement.Close()
+		}
+	}()
+	for _, values := range rows {
+		if _, err := statement.ExecContext(ctx, values...); err != nil {
 			return err
 		}
 	}

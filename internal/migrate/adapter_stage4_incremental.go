@@ -22,11 +22,15 @@ const (
 )
 
 type stage4AdapterIncrementalPrepared struct {
-	source    incrementalSourceAdapter
-	target    adapterStage4NetworkUpsertTarget
-	validator adapterStage4IncrementalValidationTarget
-	aggregate state.Stage4AggregateBackend
-	tables    []stage4AdapterIncrementalTable
+	source                             incrementalSourceAdapter
+	target                             adapterStage4NetworkUpsertTarget
+	validator                          adapterStage4IncrementalValidationTarget
+	aggregate                          state.Stage4AggregateBackend
+	validation                         *stage4AdapterIncrementalValidationEvidence
+	validationPrimaryKeyEqualityProofs map[stage4RichTableKey]string
+	deletes                            *stage4AdapterSQLiteIncrementalDeletePrepared
+	tables                             []stage4AdapterIncrementalTable
+	upsertMergeRows                    int
 }
 
 type stage4AdapterIncrementalTable struct {
@@ -41,10 +45,11 @@ type stage4AdapterIncrementalProgress struct {
 	nextSequence uint64
 }
 
-// prepareStage4AdapterIncremental is deliberately narrow. PostgreSQL-to-
-// PostgreSQL is the first composed production route; every other engine pair
-// remains closed until its source fence and target replay contracts have an
-// equivalent live certification.
+// prepareStage4AdapterIncremental admits only relational/SQLite sources and
+// targets with an explicit bounded-window writer and exact target-value
+// validation. The shared incremental state machine owns the immutable upper
+// fence and full-window replay; target-specific admission must finish before
+// it creates ordinary table work or permits any target mutation.
 func prepareStage4AdapterIncremental(
 	ctx context.Context,
 	cfg config.Config,
@@ -63,23 +68,34 @@ func prepareStage4AdapterIncremental(
 			),
 		)
 	}
-	if source.Engine() != "postgres" || target.Engine() != "postgres" {
+	if !stage4AdapterIncrementalSourceEngine(source.Engine()) {
 		return nil, nil, NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
-				"Stage 4 date-based incremental route %s-to-%s is not certified; only postgres-to-postgres is currently admitted",
+				"Stage 4 date-based incremental source engine %q is not certified",
 				source.Engine(),
+			),
+		)
+	}
+	if !stage4AdapterIncrementalTargetEngine(target.Engine()) {
+		return nil, nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 date-based incremental target engine %q is not certified",
 				target.Engine(),
 			),
 		)
 	}
-	switch cfg.Migration.Validation.Mode {
-	case "", config.ValidationCountOnly:
-	default:
+	validationPlan, validationErr := BuildValidationPlan(
+		cfg.Migration.Validation.Mode,
+	)
+	if validationErr != nil {
 		return nil, nil, NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
-				"Stage 4 date-based incremental postgres-to-postgres currently requires count_only validation",
+				"Stage 4 date-based incremental validation mode %q is unsupported: %w",
+				cfg.Migration.Validation.Mode,
+				validationErr,
 			),
 		)
 	}
@@ -92,7 +108,8 @@ func prepareStage4AdapterIncremental(
 		return nil, nil, NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
-				"Stage 4 PostgreSQL target has no certified idempotent incremental upsert path",
+				"Stage 4 target engine %q has no certified idempotent incremental upsert path",
+				target.Engine(),
 			),
 		)
 	}
@@ -101,7 +118,8 @@ func prepareStage4AdapterIncremental(
 		return nil, nil, NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
-				"Stage 4 PostgreSQL target has no certified exact incremental window validation path",
+				"Stage 4 target engine %q has no certified exact incremental window validation path",
+				target.Engine(),
 			),
 		)
 	}
@@ -122,6 +140,44 @@ func prepareStage4AdapterIncremental(
 			),
 		)
 	}
+	validationPrimaryKeyEqualityProofs := make(
+		map[stage4RichTableKey]string,
+		len(prepared.plans),
+	)
+	for _, adapterPlan := range prepared.plans {
+		_, _, proof, proofErr := adapterValidationCrossEqualityProof(
+			source.Engine(),
+			target.Engine(),
+			adapterPlan,
+		)
+		if proofErr != nil {
+			return nil, nil, NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"admit Stage 4 incremental primary-key equality for %s-to-%s table %s: %w",
+					source.Engine(),
+					target.Engine(),
+					adapterPlan.source.Name,
+					proofErr,
+				),
+			)
+		}
+		key := stage4RichTableKey{
+			schema: adapterPlan.source.Schema,
+			table:  adapterPlan.source.Name,
+		}
+		if _, exists := validationPrimaryKeyEqualityProofs[key]; exists {
+			return nil, nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"Stage 4 incremental primary-key equality inventory duplicates table (%q, %q)",
+					key.schema,
+					key.table,
+				),
+			)
+		}
+		validationPrimaryKeyEqualityProofs[key] = proof
+	}
 	existingTargets, err := stage4AdapterExistingEvolutionTargetTables(
 		prepared.evolution,
 		prepared.targetTables,
@@ -136,13 +192,69 @@ func prepareStage4AdapterIncremental(
 	); err != nil {
 		return nil, nil, err
 	}
+	if err := preflightStage4IncrementalUpsert(
+		ctx,
+		upsertTarget,
+		existingTargets,
+	); err != nil {
+		return nil, nil, err
+	}
+	upsertMergeRows := 0
+	mergeRequested, mergeRequestErr := stage4AdapterUpsertMergeRequested(
+		cfg.Migration,
+	)
+	if mergeRequestErr != nil {
+		return nil, nil, mergeRequestErr
+	}
+	if mergeRequested {
+		resources, resourceErr := stage4AdapterNetworkResources(
+			ctx,
+			cfg,
+			source.Engine(),
+			upsertTarget.Engine(),
+			nil,
+		)
+		if resourceErr != nil {
+			return nil, nil, resourceErr
+		}
+		resourceRows := stage4MinimumUpsertMergeRows(
+			resources.ChunkRows.Value,
+			sqliteWriteBatchSize,
+		)
+		upsertMergeRows, mergeRequestErr =
+			stage4AdapterExplicitUpsertMergeRows(
+				ctx,
+				cfg.Migration,
+				prepared.mode,
+				upsertTarget,
+				resourceRows,
+			)
+		if mergeRequestErr != nil {
+			return nil, nil, mergeRequestErr
+		}
+	}
+	validationEvidence, err := newStage4AdapterIncrementalValidationEvidence(
+		validationPlan.Mode,
+		prepared.plans,
+		target,
+		prepared.run.SpoolDirectory,
+	)
+	if err != nil {
+		return nil, nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf("admit Stage 4 incremental validation evidence: %w", err),
+		)
+	}
 
 	result := &stage4AdapterIncrementalPrepared{
-		source:    incrementalSource,
-		target:    upsertTarget,
-		validator: validator,
-		aggregate: aggregate,
-		tables:    make([]stage4AdapterIncrementalTable, len(prepared.plans)),
+		source:                             incrementalSource,
+		target:                             upsertTarget,
+		validator:                          validator,
+		aggregate:                          aggregate,
+		validation:                         validationEvidence,
+		validationPrimaryKeyEqualityProofs: validationPrimaryKeyEqualityProofs,
+		tables:                             make([]stage4AdapterIncrementalTable, len(prepared.plans)),
+		upsertMergeRows:                    upsertMergeRows,
 	}
 	work := make([]stage4AdapterWork, len(prepared.work))
 	for index, adapterPlan := range prepared.plans {
@@ -197,6 +309,24 @@ func prepareStage4AdapterIncremental(
 		}
 	}
 	return result, work, nil
+}
+
+func stage4AdapterIncrementalSourceEngine(engine string) bool {
+	switch engine {
+	case "postgres", "mssql", "mysql", "sqlite":
+		return true
+	default:
+		return false
+	}
+}
+
+func stage4AdapterIncrementalTargetEngine(engine string) bool {
+	switch engine {
+	case "postgres", "mssql", "mysql", "sqlite":
+		return true
+	default:
+		return false
+	}
 }
 
 func nilStage4AggregateBackend(backend state.Stage4AggregateBackend) bool {
@@ -271,13 +401,45 @@ func migrateWithStage4IncrementalAdapters(
 	prepared stage4AdapterPrepared,
 	resume bool,
 	completed map[string]int,
-) (Result, error) {
+) (result Result, resultErr error) {
 	incremental := prepared.incremental
 	if incremental == nil {
 		return Result{}, NewTransferError(
 			ErrorClassState,
 			fmt.Errorf("Stage 4 incremental execution is unavailable"),
 		)
+	}
+	if incremental.validation == nil {
+		return Result{}, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 incremental validation evidence is unavailable"),
+		)
+	}
+	defer func() {
+		cleanupErr := incremental.validation.Close()
+		if cleanupErr == nil {
+			return
+		}
+		cleanupErr = NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("cleanup Stage 4 incremental validation evidence: %w", cleanupErr),
+		)
+		if resultErr == nil {
+			result.Validated = false
+			resultErr = cleanupErr
+			return
+		}
+		resultErr = errors.Join(resultErr, cleanupErr)
+	}()
+	// A resumed completed transfer may not construct a new source-key delete
+	// plan without its original retained view.  This is state-only and belongs
+	// ahead of schema staging, ordinary checkpoints, or private journal DDL.
+	if err := preflightStage4AdapterSQLiteIncrementalDeleteResume(
+		ctx,
+		prepared,
+		resume,
+	); err != nil {
+		return Result{}, err
 	}
 	if err := stageStage4SchemaGateSnapshots(
 		ctx,
@@ -324,7 +486,6 @@ func migrateWithStage4IncrementalAdapters(
 			return resultForValidatedAdapterCheckpoints(completed), err
 		}
 	}
-
 	for _, table := range incremental.tables {
 		name := prepared.plans[table.planIndex].source.Name
 		if rows, complete := completed[name]; complete {
@@ -347,28 +508,6 @@ func migrateWithStage4IncrementalAdapters(
 		}
 	}
 
-	// Arm every selected timestamp table before applying schema evolution,
-	// preparing a target table, or writing a row. An active attempt is reused
-	// verbatim on resume, so its upper fence can never move forward.
-	for _, table := range incremental.tables {
-		name := prepared.plans[table.planIndex].source.Name
-		if _, complete := completed[name]; complete {
-			continue
-		}
-		if _, err := ExecuteIncrementalTable(
-			ctx,
-			stage4AdapterIncrementalRequest(
-				prepared,
-				table,
-				true,
-				nil,
-				nil,
-			),
-		); err != nil {
-			return resultForValidatedAdapterCheckpoints(completed), err
-		}
-	}
-
 	if err := applyStage4AdapterTargetSchema(
 		ctx,
 		observer,
@@ -381,6 +520,23 @@ func migrateWithStage4IncrementalAdapters(
 	if err := preflightStage4AdapterDesiredTargetAfterEvolution(
 		ctx,
 		target,
+		prepared,
+	); err != nil {
+		return resultForValidatedAdapterCheckpoints(completed), err
+	}
+	// Delete authority is intentionally bound only after target evolution has
+	// made the exact target table shape available.  This remains before any
+	// incremental PrepareTables or row write, so an unsupported SQLite delete
+	// capability cannot be discovered after data mutation.
+	if err := activateStage4AdapterPostgresDeleteComposition(ctx, prepared); err != nil {
+		return resultForValidatedAdapterCheckpoints(completed), err
+	}
+	// Private delete-journal DDL follows schema application and exact table
+	// authority activation, but still precedes any incremental attempt, target
+	// PrepareTables call, or row write.
+	if err := ensureStage4AdapterDeleteJournalReadiness(
+		ctx,
+		observer,
 		prepared,
 	); err != nil {
 		return resultForValidatedAdapterCheckpoints(completed), err
@@ -400,7 +556,30 @@ func migrateWithStage4IncrementalAdapters(
 		return resultForValidatedAdapterCheckpoints(completed), err
 	}
 
-	result := resultForValidatedAdapterCheckpoints(completed)
+	// Arm every selected timestamp table only after target schema authority,
+	// delete activation, and private-journal readiness are durable. An active
+	// attempt is reused verbatim on resume, so its upper fence can never move
+	// forward after this point.
+	for _, table := range incremental.tables {
+		name := prepared.plans[table.planIndex].source.Name
+		if _, complete := completed[name]; complete {
+			continue
+		}
+		if _, err := ExecuteIncrementalTable(
+			ctx,
+			stage4AdapterIncrementalRequest(
+				prepared,
+				table,
+				true,
+				nil,
+				nil,
+			),
+		); err != nil {
+			return resultForValidatedAdapterCheckpoints(completed), err
+		}
+	}
+
+	result = resultForValidatedAdapterCheckpoints(completed)
 	for _, table := range incremental.tables {
 		adapterPlan := prepared.plans[table.planIndex]
 		if _, complete := completed[adapterPlan.source.Name]; complete {
@@ -486,7 +665,14 @@ func migrateWithStage4IncrementalAdapters(
 		result.Tables++
 		result.Rows += progress.rows
 	}
-	if err := validateStage4AdapterRun(
+	if err := reconcileStage4AdapterSQLiteIncrementalDeletes(
+		ctx,
+		&prepared,
+		resume,
+	); err != nil {
+		return result, err
+	}
+	if err := validateStage4AdapterIncrementalRun(
 		ctx,
 		cfg,
 		source,
@@ -502,6 +688,68 @@ func migrateWithStage4IncrementalAdapters(
 	// publication fail closed on already-terminal sentinels.
 	result.Validated = true
 	return result, nil
+}
+
+// validateStage4AdapterIncrementalRun executes the inclusive §12 validation
+// plan over the exact transfer attempt, not over a later live whole-source
+// read. The per-batch target proof is complete-key/full-row canonical equality;
+// the evidence probe aggregates source count, NULL, and deterministic
+// PK-sample facts, then re-queries the actual target through the private exact
+// transferred-key spool. It admits neither post-attempt source rows nor
+// target-only upsert rows into the final validation scope.
+func validateStage4AdapterIncrementalRun(
+	ctx context.Context,
+	cfg config.Config,
+	source sourceAdapter,
+	target targetAdapter,
+	prepared stage4AdapterPrepared,
+) error {
+	if prepared.incremental == nil || prepared.incremental.validation == nil {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 incremental validation evidence is unavailable"),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	specs, err := stage4AdapterValidationTableSpecs(prepared)
+	if err != nil {
+		return err
+	}
+	report, err := RunValidationCore(
+		ctx,
+		ValidationCoreOptions{
+			Mode:                   cfg.Migration.Validation.Mode,
+			TargetMode:             prepared.mode,
+			FailOnMismatch:         cfg.Migration.Validation.FailOnMismatch,
+			FailOnTimeout:          cfg.Migration.Validation.FailOnTimeout,
+			FailOnEstimateMismatch: cfg.Migration.Validation.FailOnEstimateMismatch,
+			ExactCountTimeout:      30 * time.Second,
+			TableTimeout:           2 * time.Minute,
+			TableConcurrency:       stage4ValidationConcurrency(len(specs)),
+			SampleLimit:            stage4AdapterIncrementalValidationSampleLimit,
+		},
+		specs,
+		prepared.incremental.validation,
+	)
+	if err != nil {
+		return fmt.Errorf("run Stage 4 incremental validation core: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !report.Passed {
+		return NewTransferError(
+			ErrorClassValidation,
+			fmt.Errorf(
+				"Stage 4 incremental post-window validation failed for route %s-to-%s",
+				source.Engine(),
+				target.Engine(),
+			),
+		)
+	}
+	return nil
 }
 
 func stage4AdapterIncrementalInventory(
@@ -882,6 +1130,21 @@ func validateCompletedStage4AdapterIncrementalRead(
 				),
 			)
 		}
+		if err := prepared.incremental.validation.RecordExactBatch(
+			ctx,
+			adapterPlan.source,
+			adapterPlan.columns,
+			batch,
+		); err != nil {
+			return NewTransferError(
+				ErrorClassValidation,
+				fmt.Errorf(
+					"record exact completed Stage 4 incremental validation evidence for %s: %w",
+					adapterPlan.source.Name,
+					err,
+				),
+			)
+		}
 		if len(batch) > math.MaxInt-total {
 			return NewTransferError(
 				ErrorClassState,
@@ -1216,9 +1479,116 @@ func writeStage4AdapterIncrementalBatch(
 			),
 		)
 	}
+	for offset := 0; offset < len(rows); {
+		limit := stage4AdapterIncrementalWriteLimit(prepared.incremental, len(rows)-offset)
+		if limit < 1 {
+			return NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"Stage 4 incremental upsert merge limit is invalid for %s",
+					adapterPlan.source.Name,
+				),
+			)
+		}
+		end := offset + limit
+		if err := writeStage4AdapterIncrementalFragment(
+			ctx,
+			observer,
+			prepared.incremental,
+			adapterPlan,
+			rows[offset:end],
+		); err != nil {
+			return err
+		}
+		offset = end
+	}
+	if err := prepared.incremental.validator.ValidateStage4IncrementalBatch(
+		ctx,
+		adapterPlan.target,
+		adapterPlan.columns,
+		rows,
+	); err != nil {
+		return NewTransferError(
+			ErrorClassValidation,
+			fmt.Errorf(
+				"validate exact Stage 4 incremental target values for %s before advancing durable progress: %w",
+				adapterPlan.source.Name,
+				err,
+			),
+		)
+	}
+	if err := prepared.incremental.validation.RecordExactBatch(
+		ctx,
+		adapterPlan.source,
+		adapterPlan.columns,
+		rows,
+	); err != nil {
+		return NewTransferError(
+			ErrorClassValidation,
+			fmt.Errorf(
+				"record exact Stage 4 incremental validation evidence for %s: %w",
+				adapterPlan.source.Name,
+				err,
+			),
+		)
+	}
+	if _, err := prepared.run.Backend.AcknowledgeRange(
+		state.RangeAcknowledgement{
+			RunID:        prepared.run.RunID,
+			Task:         table.work.task,
+			RangeID:      stage4AdapterIncrementalRangeID,
+			TopologyHash: table.work.topology,
+			Sequence:     sequence,
+			ChunkRows:    chunkRows,
+			DurableRows:  chunkRows,
+			At:           time.Now().UTC(),
+		},
+	); err != nil {
+		return incrementalPostTransferStateError(
+			"acknowledge durable incremental batch; resume must reset and replay the full stored window",
+			err,
+		)
+	}
+	return nil
+}
+
+// stage4AdapterIncrementalWriteLimit splits only a durable target operation;
+// the caller retains one immutable full-window intent and acknowledges it only
+// after every fragment has committed and the original window is validated.
+func stage4AdapterIncrementalWriteLimit(
+	incremental *stage4AdapterIncrementalPrepared,
+	remaining int,
+) int {
+	if remaining < 1 {
+		return 0
+	}
+	if incremental == nil || incremental.upsertMergeRows == 0 ||
+		incremental.upsertMergeRows >= remaining {
+		return remaining
+	}
+	if incremental.upsertMergeRows < 0 {
+		return 0
+	}
+	return incremental.upsertMergeRows
+}
+
+func writeStage4AdapterIncrementalFragment(
+	ctx context.Context,
+	observer TableObserver,
+	incremental *stage4AdapterIncrementalPrepared,
+	adapterPlan adapterTablePlan,
+	rows [][]any,
+) error {
+	if incremental == nil || isNilInterface(incremental.target) {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 incremental upsert target is unavailable"),
+		)
+	}
+	attempted := int64(len(rows))
 	receipt := WriteReceipt{
 		Certainty:     CommitNotCommitted,
-		AttemptedRows: chunkRows,
+		AttemptedRows: attempted,
 	}
 	_, writeErr := protectAdapterTargetMutationOnce(
 		ctx,
@@ -1226,13 +1596,12 @@ func writeStage4AdapterIncrementalBatch(
 		"write Stage 4 incremental batch "+adapterPlan.source.Name,
 		func() error {
 			var err error
-			receipt, err =
-				prepared.incremental.target.WriteStage4NetworkBatch(
-					ctx,
-					adapterPlan.target,
-					adapterPlan.columns,
-					rows,
-				)
+			receipt, err = incremental.target.WriteStage4NetworkBatch(
+				ctx,
+				adapterPlan.target,
+				adapterPlan.columns,
+				rows,
+			)
 			return err
 		},
 	)
@@ -1275,46 +1644,14 @@ func writeStage4AdapterIncrementalBatch(
 	}
 	if receipt.Certainty != CommitDurable ||
 		receipt.AttemptOffset != 0 ||
-		receipt.AttemptedRows != chunkRows ||
-		receipt.CommittedRows != chunkRows {
+		receipt.AttemptedRows != attempted ||
+		receipt.CommittedRows != attempted {
 		return NewTransferError(
 			ErrorClassState,
 			fmt.Errorf(
-				"Stage 4 incremental target did not durably commit the complete batch for %s",
+				"Stage 4 incremental target did not durably commit the complete bounded write for %s",
 				adapterPlan.source.Name,
 			),
-		)
-	}
-	if err := prepared.incremental.validator.ValidateStage4IncrementalBatch(
-		ctx,
-		adapterPlan.target,
-		adapterPlan.columns,
-		rows,
-	); err != nil {
-		return NewTransferError(
-			ErrorClassValidation,
-			fmt.Errorf(
-				"validate exact Stage 4 incremental target values for %s before advancing durable progress: %w",
-				adapterPlan.source.Name,
-				err,
-			),
-		)
-	}
-	if _, err := prepared.run.Backend.AcknowledgeRange(
-		state.RangeAcknowledgement{
-			RunID:        prepared.run.RunID,
-			Task:         table.work.task,
-			RangeID:      stage4AdapterIncrementalRangeID,
-			TopologyHash: table.work.topology,
-			Sequence:     sequence,
-			ChunkRows:    chunkRows,
-			DurableRows:  chunkRows,
-			At:           time.Now().UTC(),
-		},
-	); err != nil {
-		return incrementalPostTransferStateError(
-			"acknowledge durable incremental batch; resume must reset and replay the full stored window",
-			err,
 		)
 	}
 	return nil

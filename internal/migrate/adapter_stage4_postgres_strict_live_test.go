@@ -646,6 +646,7 @@ func TestStage4PostgresStrictResumeUsesNewEpochAndReplaysLiveTLS(
 		resumeObserver,
 		source,
 		target,
+		"upsert",
 		run,
 	)
 	if err != nil {
@@ -1068,6 +1069,7 @@ func TestStage4PostgresStrictMixedCompletedResumeLiveTLS(
 				resumeObserver,
 				source,
 				target,
+				"upsert",
 				run,
 			)
 			if err != nil {
@@ -1189,6 +1191,7 @@ func TestStage4PostgresStrictMixedCompletedResumeLiveTLS(
 				allCompletedObserver,
 				source,
 				target,
+				"upsert",
 				run,
 			)
 			if err != nil {

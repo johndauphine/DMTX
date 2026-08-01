@@ -37,6 +37,16 @@ type mysqlStage4NetworkBatchWriter interface {
 	) (WriteReceipt, error)
 }
 
+type mysqlStage4NetworkRebuildBatchWriter interface {
+	WriteStage4NetworkRebuildBatch(
+		context.Context,
+		schema.Table,
+		[]string,
+		NetworkWriteMode,
+		[][]any,
+	) (WriteReceipt, error)
+}
+
 type mysqlTransactionProvider interface {
 	Begin(context.Context) (mysqlBatchTransaction, error)
 }
@@ -286,47 +296,155 @@ func (writer *mysqlNativeWriter) WriteStage4NetworkBatch(
 		"upsert",
 		rows,
 		writeStatement,
-		func(
-			ctx context.Context,
-			transaction mysqlBatchTransaction,
-		) error {
-			stage4Transaction, ok :=
-				transaction.(mysqlStage4NetworkBatchTransaction)
-			if !ok || isNilInterface(stage4Transaction) {
-				return NewTransferError(
-					ErrorClassState,
-					fmt.Errorf(
-						"write MySQL Stage 4 network table %s: transaction has no replay-isolation fence",
-						table.Name,
-					),
-				)
-			}
-			if err := stage4Transaction.
-				AcquireStage4NetworkReplayFence(
-					ctx,
-					table,
-				); err != nil {
-				return newMySQLSafeOperationError(
-					"acquire MySQL Stage 4 network replay fence for",
-					table.Name,
-					err,
-				)
-			}
-			if err := stage4Transaction.
-				PreflightStage4NetworkReplayIsolation(
-					ctx,
-					table,
-					writer.flavor,
-				); err != nil {
-				return fmt.Errorf(
-					"prove MySQL Stage 4 network replay isolation for table %s: %w",
-					table.Name,
-					err,
-				)
-			}
-			return nil
-		},
+		writer.stage4NetworkGuard(table),
 	)
+}
+
+// WriteStage4NetworkRebuildBatch keeps the initial empty-target insert strict
+// while allowing an issued page to be replayed without updating any row. The
+// replay statement is scoped to a complete primary-key match; a collision on
+// another UNIQUE key deliberately fails instead of being ignored or updated.
+func (writer *mysqlNativeWriter) WriteStage4NetworkRebuildBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	mode NetworkWriteMode,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	notCommitted := WriteReceipt{
+		Certainty:     CommitNotCommitted,
+		AttemptedRows: attempted,
+	}
+	if mode != NetworkWriteFreshInsert &&
+		mode != NetworkWriteDuplicateSafeInsertOnly {
+		return notCommitted, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"MySQL Stage 4 rebuild writer received unsupported mode %q",
+				mode,
+			),
+		)
+	}
+	// Every page can become an issued replay, so admission to either mode
+	// requires the complete primary key even though the fresh SQL is strict.
+	if err := validateMySQLWriteShape(table, columns, "upsert"); err != nil {
+		return notCommitted, err
+	}
+	for index, row := range rows {
+		if len(row) != len(columns) {
+			return notCommitted, fmt.Errorf(
+				"write MySQL table %s: row %d has %d values for %d columns",
+				table.Name,
+				index,
+				len(row),
+				len(columns),
+			)
+		}
+	}
+	if len(rows) == 0 {
+		return WriteReceipt{Certainty: CommitDurable}, nil
+	}
+	if writer == nil || writer.transactions == nil {
+		return notCommitted, fmt.Errorf(
+			"write MySQL table %s: transaction provider is not configured",
+			table.Name,
+		)
+	}
+
+	affectedMode := "drop_recreate"
+	writeStatement, err := mySQLNativeWriteStatementForFlavor(
+		table,
+		columns,
+		"drop_recreate",
+		writer.flavor,
+	)
+	if mode == NetworkWriteDuplicateSafeInsertOnly {
+		affectedMode = "upsert"
+		writeStatement, err = mySQLNativeInsertOnlyStatementForFlavor(
+			table,
+			columns,
+			writer.flavor,
+		)
+	}
+	if err != nil {
+		return notCommitted, err
+	}
+
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.writeMySQLStrictBatchWithGuard(
+		ctx,
+		table,
+		affectedMode,
+		rows,
+		writeStatement,
+		writer.stage4RebuildNetworkGuard(table),
+	)
+}
+
+func (writer *mysqlNativeWriter) stage4NetworkGuard(
+	table schema.Table,
+) func(context.Context, mysqlBatchTransaction) error {
+	return writer.stage4NetworkGuardForProof(table, table)
+}
+
+// stage4RebuildNetworkGuard keeps the page transaction's fence on the full
+// immutable table identity while proving the load-time catalog shape. The
+// final table's secondary objects do not exist until the set-wide finalizer;
+// requiring them here would reject every correctly prepared FK graph before
+// its first transfer page.
+func (writer *mysqlNativeWriter) stage4RebuildNetworkGuard(
+	table schema.Table,
+) func(context.Context, mysqlBatchTransaction) error {
+	return writer.stage4NetworkGuardForProof(
+		table,
+		stage4RebuildPreFinalizeTable(table),
+	)
+}
+
+func (writer *mysqlNativeWriter) stage4NetworkGuardForProof(
+	fenceTable schema.Table,
+	proofTable schema.Table,
+) func(context.Context, mysqlBatchTransaction) error {
+	return func(
+		ctx context.Context,
+		transaction mysqlBatchTransaction,
+	) error {
+		stage4Transaction, ok :=
+			transaction.(mysqlStage4NetworkBatchTransaction)
+		if !ok || isNilInterface(stage4Transaction) {
+			return NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"write MySQL Stage 4 network table %s: transaction has no replay-isolation fence",
+					fenceTable.Name,
+				),
+			)
+		}
+		if err := stage4Transaction.AcquireStage4NetworkReplayFence(
+			ctx,
+			fenceTable,
+		); err != nil {
+			return newMySQLSafeOperationError(
+				"acquire MySQL Stage 4 network replay fence for",
+				fenceTable.Name,
+				err,
+			)
+		}
+		if err := stage4Transaction.PreflightStage4NetworkReplayIsolation(
+			ctx,
+			proofTable,
+			writer.flavor,
+		); err != nil {
+			return fmt.Errorf(
+				"prove MySQL Stage 4 network replay isolation for table %s: %w",
+				fenceTable.Name,
+				err,
+			)
+		}
+		return nil
+	}
 }
 
 func (writer *mysqlNativeWriter) writeMySQLStrictBatch(
@@ -747,6 +865,81 @@ func mySQLNativeMariaDBWriteStatement(
 	}
 	return statement + " ON DUPLICATE KEY UPDATE " +
 		strings.Join(updates, ", ")
+}
+
+func mySQLNativeInsertOnlyStatementForFlavor(
+	table schema.Table,
+	columns []string,
+	flavor engine.MySQLServerFlavor,
+) (string, error) {
+	switch flavor {
+	case engine.MySQLServerFlavorOracle80:
+		return mySQLNativeInsertOnlyStatement(table, columns), nil
+	case engine.MySQLServerFlavorMariaDB1011:
+		return mySQLNativeMariaDBInsertOnlyStatement(
+			table,
+			columns,
+		), nil
+	default:
+		return "", fmt.Errorf(
+			"write MySQL table %s: unsupported target server flavor",
+			table.Name,
+		)
+	}
+}
+
+func mySQLNativeInsertOnlyStatement(
+	table schema.Table,
+	columns []string,
+) string {
+	statement := "INSERT INTO " +
+		mySQLQualified(table.Schema, table.Name) +
+		" (" + mySQLQuotedColumns(columns) + ") VALUES (" +
+		placeholders(len(columns)) + ")"
+	keys := primaryKeyColumns(table)
+	incoming := "dmtx_new"
+	if strings.EqualFold(table.Name, incoming) {
+		incoming = "dmtx_incoming"
+	}
+	keyMatches := make([]string, len(keys))
+	for index, key := range keys {
+		keyMatches[index] = mySQLIdentifier(table.Name) + "." +
+			mySQLIdentifier(key) + " <=> " +
+			mySQLIdentifier(incoming) + "." +
+			mySQLIdentifier(key)
+	}
+	guardKey := keys[0]
+	return statement + " AS " + mySQLIdentifier(incoming) +
+		" ON DUPLICATE KEY UPDATE " +
+		mySQLIdentifier(guardKey) + " = IF(" +
+		strings.Join(keyMatches, " AND ") + ", " +
+		mySQLIdentifier(table.Name) + "." +
+		mySQLIdentifier(guardKey) + ", " +
+		"JSON_EXTRACT('dmtx-invalid-json', '$'))"
+}
+
+func mySQLNativeMariaDBInsertOnlyStatement(
+	table schema.Table,
+	columns []string,
+) string {
+	statement := "INSERT INTO " +
+		mySQLQualified(table.Schema, table.Name) +
+		" (" + mySQLQuotedColumns(columns) + ") VALUES (" +
+		placeholders(len(columns)) + ")"
+	keys := primaryKeyColumns(table)
+	keyMatches := make([]string, len(keys))
+	for index, key := range keys {
+		keyMatches[index] = mySQLIdentifier(table.Name) + "." +
+			mySQLIdentifier(key) + " <=> VALUES(" +
+			mySQLIdentifier(key) + ")"
+	}
+	guardKey := keys[0]
+	return statement + " ON DUPLICATE KEY UPDATE " +
+		mySQLIdentifier(guardKey) + " = IF(" +
+		strings.Join(keyMatches, " AND ") + ", " +
+		mySQLIdentifier(table.Name) + "." +
+		mySQLIdentifier(guardKey) + ", " +
+		"JSON_EXTRACT('dmtx-invalid-json', '$'))"
 }
 
 type mysqlSQLTransactionProvider struct {

@@ -109,6 +109,12 @@ type StrictConsistencyOpenRequest struct {
 	ProcessEpoch              string
 	Tables                    []StrictConsistencyTable
 	RequiredMigrationSnapshot *state.StrictMigrationSnapshot
+	// ReopenUnownedMigrationSnapshot is a narrowly-scoped crash recovery
+	// allowance for a SQL Server planned migration snapshot created before
+	// the core could persist its owner record. It authorizes reopening only
+	// the deterministic source-bound snapshot; it never permits creating a
+	// replacement source instant during resume.
+	ReopenUnownedMigrationSnapshot bool
 }
 
 // PlannedStrictConsistencyRequest is the two-phase stable-view request used
@@ -137,6 +143,15 @@ type PlannedStrictConsistencyOpenRequest struct {
 	Resume       bool
 	ProcessEpoch string
 	Tasks        []state.TaskKey
+	// RequiredMigrationSnapshot is set only for SQL Server migration resume.
+	// The opener must reopen this exact durable database snapshot rather than
+	// create a new source instant.
+	RequiredMigrationSnapshot *state.StrictMigrationSnapshot
+	// ReopenUnownedMigrationSnapshot is set only for SQL Server migration
+	// resume when no owner record exists. It covers the narrow crash window
+	// after CREATE DATABASE SNAPSHOT and before owner persistence; the opener
+	// must reopen the deterministic source-bound snapshot or fail closed.
+	ReopenUnownedMigrationSnapshot bool
 }
 
 // PlannedStrictConsistencyOpener opens an engine-owned stable view without
@@ -201,6 +216,14 @@ type StrictConsistencyOpener interface {
 type StrictConsistencySession interface {
 	CaptureSameViewEvidence(context.Context) (StrictConsistencyCapture, error)
 	Close(context.Context) error
+}
+
+// strictMigrationSnapshotResumeReporter is implemented only by the SQL Server
+// migration-snapshot session. It distinguishes a graceful failure that has
+// released its source authority from the narrow preserved/cleanup-receipt
+// paths that remain safe to resume.
+type strictMigrationSnapshotResumeReporter interface {
+	StrictMigrationSnapshotResumeAvailable() bool
 }
 
 // StrictConsistencyExecution is returned only after every selected table has
@@ -279,6 +302,10 @@ func (execution *StrictConsistencyExecution) Run(
 		resultErr = joinStrictConsistencyCleanup(
 			resultErr,
 			execution.Close(ctx),
+		)
+		resultErr = markSQLServerMigrationSnapshotNotResumable(
+			execution.session,
+			resultErr,
 		)
 	}()
 
@@ -500,6 +527,12 @@ func BeginStrictConsistency(
 			)
 		}
 		primary := NewTransferError(ErrorClassPermanent, err)
+		primary = markMissingSQLServerMigrationSnapshotResume(
+			normalized.SourceEngine,
+			normalized.Scope,
+			normalized.Resume,
+			primary,
+		)
 		if !isNilInterface(session) {
 			return nil, closeStrictConsistencyAfterFailure(
 				ctx,
@@ -707,6 +740,8 @@ func BeginPlannedStrictConsistency(
 
 	var latest state.StrictMigrationSnapshot
 	var latestFound bool
+	var requiredOwner *state.StrictMigrationSnapshot
+	resumeUnownedSnapshot := false
 	if normalized.Scope == state.StrictSnapshotMigration {
 		latest, latestFound, err = normalized.State.
 			LoadLatestStrictMigrationSnapshot(normalized.RunID)
@@ -752,6 +787,27 @@ func BeginPlannedStrictConsistency(
 				)
 			}
 		}
+		if normalized.SourceEngine == StrictConsistencyMSSQL &&
+			normalized.Resume {
+			if !latestFound {
+				// The snapshot is created before SaveStrictMigrationSnapshot.
+				// A hard process stop in that tiny interval leaves an authenticated,
+				// deterministic SQL Server snapshot but no state owner. Permit only
+				// its exact reopening; the source opener refuses to create a new one.
+				resumeUnownedSnapshot = true
+			} else {
+				if normalized.ProcessEpoch == latest.ProcessEpoch {
+					return nil, NewTransferError(
+						ErrorClassPolicy,
+						errors.New(
+							"SQL Server migration resume requires a fresh coordinator process epoch",
+						),
+					)
+				}
+				copyOwner := latest
+				requiredOwner = &copyOwner
+			}
+		}
 	}
 
 	session, err := opener.OpenPlannedStrictConsistency(
@@ -766,10 +822,18 @@ func BeginPlannedStrictConsistency(
 				[]state.TaskKey(nil),
 				normalized.Tasks...,
 			),
+			RequiredMigrationSnapshot:      requiredOwner,
+			ReopenUnownedMigrationSnapshot: resumeUnownedSnapshot,
 		},
 	)
 	if err != nil {
 		primary := NewTransferError(ErrorClassPermanent, err)
+		primary = markMissingSQLServerMigrationSnapshotResume(
+			normalized.SourceEngine,
+			normalized.Scope,
+			normalized.Resume,
+			primary,
+		)
 		if !isNilInterface(session) {
 			return nil, closeStrictConsistencyAfterFailure(
 				ctx,
@@ -825,6 +889,22 @@ func BeginPlannedStrictConsistency(
 				ErrorClassPermanent,
 				errors.New(
 					"PostgreSQL migration resume must open a new exported snapshot epoch and reference",
+				),
+			),
+		)
+	}
+	if normalized.SourceEngine == StrictConsistencyMSSQL &&
+		normalized.Scope == state.StrictSnapshotMigration &&
+		normalized.Resume && latestFound &&
+		(capture.MigrationEpochID != latest.EpochID ||
+			capture.MigrationSnapshotReference != latest.SnapshotReference) {
+		return nil, closeStrictConsistencyAfterFailure(
+			ctx,
+			session,
+			NewTransferError(
+				ErrorClassPermanent,
+				errors.New(
+					"SQL Server migration resume did not reopen the required durable database snapshot",
 				),
 			),
 		)
@@ -901,7 +981,7 @@ func BeginPlannedStrictConsistency(
 	evidence, owner, err := buildStrictConsistencyEvidence(
 		finalRequest,
 		capture,
-		nil,
+		requiredOwner,
 	)
 	if err != nil {
 		return nil, closeStrictConsistencyAfterFailure(
@@ -1022,7 +1102,11 @@ func normalizePlannedStrictConsistencyRequest(
 	if err != nil {
 		return PlannedStrictConsistencyRequest{}, err
 	}
-	if engine != StrictConsistencyPostgres {
+	if engine != StrictConsistencyPostgres &&
+		engine != StrictConsistencyMSSQL &&
+		engine != StrictConsistencyMySQL &&
+		engine != StrictConsistencyMariaDB &&
+		engine != StrictConsistencySQLite {
 		return PlannedStrictConsistencyRequest{}, fmt.Errorf(
 			"planned strict consistency is not certified for source engine %q",
 			engine,
@@ -1056,12 +1140,20 @@ func normalizePlannedStrictConsistencyRequest(
 				err,
 			)
 		}
+		requiresSchema := engine != StrictConsistencySQLite
 		if task.Type != stage4AdapterNetworkTaskType ||
-			task.Schema == "" || task.Partition != "" {
+			(requiresSchema && task.Schema == "") ||
+			(!requiresSchema && task.Schema != "") ||
+			task.Partition != "" {
+			schemaRequirement := "an explicit schema"
+			if !requiresSchema {
+				schemaRequirement = "no source schema"
+			}
 			return PlannedStrictConsistencyRequest{}, fmt.Errorf(
-				"planned strict consistency task %d requires one unpartitioned %s task with an explicit schema",
+				"planned strict consistency task %d requires one unpartitioned %s task with %s",
 				index,
 				stage4AdapterNetworkTaskType,
+				schemaRequirement,
 			)
 		}
 		if _, duplicate := seen[task]; duplicate {
@@ -1929,12 +2021,40 @@ func closeStrictConsistencyAfterFailure(
 ) error {
 	cleanupErr := closeStrictConsistencySession(ctx, session)
 	if cleanupErr == nil {
-		return primary
+		return markSQLServerMigrationSnapshotNotResumable(session, primary)
 	}
-	return joinStrictConsistencyCleanup(
+	return markSQLServerMigrationSnapshotNotResumable(session, joinStrictConsistencyCleanup(
 		primary,
 		fmt.Errorf("release strict source snapshot after failure: %w", cleanupErr),
-	)
+	))
+}
+
+func markSQLServerMigrationSnapshotNotResumable(
+	session StrictConsistencySession,
+	err error,
+) error {
+	if err == nil || errors.Is(err, ErrSQLServerMigrationSnapshotNotResumable) {
+		return err
+	}
+	reporter, ok := session.(strictMigrationSnapshotResumeReporter)
+	if !ok || reporter.StrictMigrationSnapshotResumeAvailable() {
+		return err
+	}
+	return errors.Join(err, ErrSQLServerMigrationSnapshotNotResumable)
+}
+
+func markMissingSQLServerMigrationSnapshotResume(
+	source StrictConsistencyEngine,
+	scope state.StrictSnapshotScope,
+	resume bool,
+	err error,
+) error {
+	if source != StrictConsistencyMSSQL ||
+		scope != state.StrictSnapshotMigration || !resume ||
+		!errors.Is(err, errSQLServerMigrationSnapshotMissing) {
+		return err
+	}
+	return errors.Join(err, ErrSQLServerMigrationSnapshotNotResumable)
 }
 
 // joinStrictConsistencyCleanup keeps a cleanup deadline operationally visible

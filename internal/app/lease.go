@@ -192,7 +192,7 @@ func endpointWorkloadIdentity(endpoint config.Endpoint) (string, error) {
 		}
 		return sqlitePathLeaseIdentity(canonicalPath)
 	}
-	return networkEndpointIdentity(endpoint, false)
+	return config.NetworkEndpointWorkloadIdentity(endpoint)
 }
 
 func networkEndpointIdentity(

@@ -81,15 +81,31 @@ func resolveStage4AdapterAdmission(
 }
 
 func requireStage4AdapterConfigurationSeams(cfg config.Config) error {
-	if cfg.Migration.RuntimeTuning {
-		return NewTransferError(
-			ErrorClassPolicy,
-			fmt.Errorf(
-				"Stage 4 runtime tuning requires a composed adapter chunk-boundary tuning seam",
-			),
-		)
+	if err := config.ValidateBoundedStage4Settings(cfg.Migration); err != nil {
+		return NewTransferError(ErrorClassPolicy, err)
+	}
+	if err := requireStage4LargeTableThresholdComposition(cfg); err != nil {
+		return err
+	}
+	if err := requireStage4CheckpointFrequencyComposition(cfg); err != nil {
+		return err
 	}
 	if len(cfg.Migration.DateUpdatedColumns) != 0 {
+		// Incremental execution owns a different bounded runner and does not
+		// yet feed committed batch boundaries into RuntimeTuningController.
+		// A generated compatibility default remains explicitly disclosed as
+		// inactive on its result. Any operator-requested tuning input must fail
+		// here, before endpoints/checkpoints, rather than being silently ignored.
+		// In particular, an explicit interval is tuning intent even when the
+		// runtime_tuning boolean was generated as its compatibility default.
+		if stage4IncrementalRuntimeTuningExplicitlyRequested(cfg.Migration) {
+			return NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 runtime tuning is not yet composed with date-based incremental transfer; omit migration.runtime_tuning_interval and set migration.runtime_tuning: false for that route",
+				),
+			)
+		}
 		mode, err := normalizeAdapterTargetMode(
 			cfg.Migration.TargetMode,
 		)
@@ -127,15 +143,19 @@ func requireStage4AdapterConfigurationSeams(cfg config.Config) error {
 			cfg.Target.Type,
 		)
 		if sourceErr != nil || targetErr != nil ||
-			sourceEngine != "postgres" || targetEngine != "postgres" {
+			!((sourceEngine == "postgres" && targetEngine == "postgres") ||
+				(sourceEngine == "sqlite" && targetEngine == "sqlite") ||
+				(sourceEngine == "mysql" && targetEngine == "mysql") ||
+				(sourceEngine == "mssql" && targetEngine == "mssql")) {
 			return NewTransferError(
 				ErrorClassPolicy,
 				fmt.Errorf(
-					"Stage 4 delete reconciliation is currently certified only for PostgreSQL-to-PostgreSQL",
+					"Stage 4 delete reconciliation is currently certified only for PostgreSQL-to-PostgreSQL, SQLite-to-SQLite, live same-flavor MySQL 8.0-to-MySQL 8.0 or MariaDB 10.11-to-MariaDB 10.11, and SQL Server 2022-to-SQL Server 2022",
 				),
 			)
 		}
-		if cfg.Migration.StrictConsistency {
+		if cfg.Migration.StrictConsistency &&
+			!(sourceEngine == "mssql" && targetEngine == "mssql") {
 			return NewTransferError(
 				ErrorClassPolicy,
 				fmt.Errorf(
@@ -143,11 +163,12 @@ func requireStage4AdapterConfigurationSeams(cfg config.Config) error {
 				),
 			)
 		}
-		if len(cfg.Migration.DateUpdatedColumns) != 0 {
+		if len(cfg.Migration.DateUpdatedColumns) != 0 &&
+			!(sourceEngine == "sqlite" && targetEngine == "sqlite") {
 			return NewTransferError(
 				ErrorClassPolicy,
 				fmt.Errorf(
-					"Stage 4 PostgreSQL delete reconciliation is certified for full-table work, not incremental windows",
+					"Stage 4 delete reconciliation with date-based incremental transfer is certified only for SQLite-to-SQLite retained-source windows",
 				),
 			)
 		}
@@ -183,6 +204,52 @@ func requireStage4AdapterConfigurationSeams(cfg config.Config) error {
 		)
 	}
 	return nil
+}
+
+func stage4RuntimeTuningExplicitlyRequested(
+	migration config.Migration,
+) bool {
+	provenance, found := migration.SettingProvenance("runtime_tuning")
+	return found && provenance == config.ProvenanceRequested &&
+		migration.RuntimeTuning
+}
+
+// stage4RuntimeTuningIntervalExplicitlyRequested deliberately does not
+// inspect the runtime_tuning boolean. An explicit interval has no meaning
+// without a boundary consumer, so it remains operator tuning intent even
+// when runtime_tuning was generated true or explicitly disabled.
+func stage4RuntimeTuningIntervalExplicitlyRequested(
+	migration config.Migration,
+) bool {
+	provenance, found := migration.SettingProvenance(
+		"runtime_tuning_interval",
+	)
+	return found && provenance == config.ProvenanceRequested
+}
+
+func stage4IncrementalRuntimeTuningExplicitlyRequested(
+	migration config.Migration,
+) bool {
+	return stage4RuntimeTuningExplicitlyRequested(migration) ||
+		stage4RuntimeTuningIntervalExplicitlyRequested(migration)
+}
+
+func stage4GeneratedIncrementalRuntimeTuningReport(
+	migration config.Migration,
+) *RuntimeTuningReport {
+	if !migration.RuntimeTuning ||
+		stage4IncrementalRuntimeTuningExplicitlyRequested(migration) {
+		return nil
+	}
+	provenance, found := migration.SettingProvenance("runtime_tuning")
+	if !found || provenance != config.ProvenanceDerived {
+		return nil
+	}
+	return &RuntimeTuningReport{
+		Enabled: false,
+		Reason:  "generated runtime_tuning default is inactive for date-based incremental transfer; explicit enable is refused until the incremental boundary controller is composed",
+		Tables:  []RuntimeTuningTableReport{},
+	}
 }
 
 // adapterStage4ValidationProbeProvider is the explicit route seam for
@@ -240,6 +307,7 @@ type stage4AdapterPrepared struct {
 	evolution                          *stage4AdapterTargetSchemaEvolution
 	incremental                        *stage4AdapterIncrementalPrepared
 	deletes                            *stage4AdapterPostgresDeletePrepared
+	deleteJournalReadiness             *stage4AdapterDeleteJournalReadinessCapability
 	deleteReconciliationStrict         map[stage4RichTableKey]bool
 }
 
@@ -263,7 +331,7 @@ func migrateWithStage4Adapters(
 	if _, err := requireStage4TableSetObserver(observer); err != nil {
 		return Result{}, err
 	}
-	if err := requireStage4PostgresStrictRoute(
+	if err := requireStage4StrictRoute(
 		cfg,
 		source,
 		target,
@@ -284,7 +352,7 @@ func migrateWithStage4Adapters(
 		return Result{}, err
 	}
 	if prepared.incremental != nil {
-		return migrateWithStage4IncrementalAdapters(
+		result, runErr := migrateWithStage4IncrementalAdapters(
 			ctx,
 			cfg,
 			observer,
@@ -294,64 +362,99 @@ func migrateWithStage4Adapters(
 			false,
 			nil,
 		)
+		if result.RuntimeTuning == nil {
+			result.RuntimeTuning =
+				stage4GeneratedIncrementalRuntimeTuningReport(
+					cfg.Migration,
+				)
+		}
+		return result, runErr
 	}
-	var networkExecution *stage4AdapterNetworkExecution
-	if mode == "upsert" {
-		var networkOptions []stage4AdapterNetworkAdmissionOption
-		if cfg.Migration.StrictConsistency {
-			networkOptions = append(
-				networkOptions,
-				withStage4StrictSnapshotComposition(),
-			)
-		}
-		if prepared.deletes != nil {
-			networkOptions = append(
-				networkOptions,
-				withStage4DeleteReconciliationComposition(),
-			)
-		}
-		networkExecution, err = admitStage4AdapterNetworkTransfer(
-			ctx,
-			cfg,
-			observer,
-			source,
-			target,
-			prepared,
-			nil,
-			networkOptions...,
+	var networkOptions []stage4AdapterNetworkAdmissionOption
+	if cfg.Migration.StrictConsistency {
+		networkOptions = append(
+			networkOptions,
+			withStage4StrictSnapshotComposition(),
 		)
-		if err != nil {
-			return Result{}, err
-		}
+	}
+	if prepared.deletes != nil {
+		networkOptions = append(
+			networkOptions,
+			withStage4DeleteReconciliationComposition(),
+		)
+	}
+	networkExecution, err := admitStage4AdapterNetworkTransfer(
+		ctx,
+		cfg,
+		observer,
+		source,
+		target,
+		prepared,
+		nil,
+		networkOptions...,
+	)
+	if err != nil {
+		return Result{}, err
 	}
 	if cfg.Migration.StrictConsistency {
-		return migrateWithStage4PostgresStrictAdapters(
-			ctx,
-			cfg,
-			observer,
-			source,
-			target,
-			prepared,
-			networkExecution,
-			false,
-			nil,
+		var (
+			result Result
+			runErr error
 		)
+		switch source.Engine() {
+		case "postgres":
+			result, runErr = migrateWithStage4PostgresStrictAdapters(
+				ctx,
+				cfg,
+				observer,
+				source,
+				target,
+				prepared,
+				networkExecution,
+				false,
+				nil,
+			)
+		case "mssql":
+			result, runErr = migrateWithStage4SQLServerStrictAdapters(
+				ctx,
+				cfg,
+				observer,
+				source,
+				target,
+				prepared,
+				networkExecution,
+				false,
+				nil,
+			)
+		case "mysql":
+			result, runErr = migrateWithStage4MySQLStrictAdapters(
+				ctx, cfg, observer, source, target, prepared,
+				networkExecution, false, nil,
+			)
+		case "sqlite":
+			result, runErr = migrateWithStage4SQLiteStrictAdapters(
+				ctx, cfg, observer, source, target, prepared,
+				networkExecution, false, nil,
+			)
+		default:
+			return Result{}, NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 strict consistency has no composed runner for source engine %q",
+					source.Engine(),
+				),
+			)
+		}
+		attachStage4AdapterRuntimeTuningReport(&result, networkExecution)
+		return result, runErr
 	}
-	if networkExecution != nil {
+	if networkExecution != nil && networkExecution.deferred {
 		if err := checkpointStage4AdapterStableNetworkWork(
 			ctx,
 			observer,
 			networkExecution,
 			false,
 			nil,
-		); err != nil {
-			return Result{}, err
-		}
-		if err := prevalidateStage4AdapterPostgresDeleteCompletedTargets(
-			ctx,
-			target,
-			prepared,
-			networkExecution,
 		); err != nil {
 			return Result{}, err
 		}
@@ -367,6 +470,27 @@ func migrateWithStage4Adapters(
 		if err := preflightStage4AdapterDesiredTargetAfterEvolution(
 			ctx,
 			target,
+			prepared,
+		); err != nil {
+			return Result{}, err
+		}
+		if err := activateStage4AdapterPostgresDeleteComposition(
+			ctx,
+			prepared,
+		); err != nil {
+			return Result{}, err
+		}
+		if err := prevalidateStage4AdapterPostgresDeleteCompletedTargets(
+			ctx,
+			target,
+			prepared,
+			networkExecution,
+		); err != nil {
+			return Result{}, err
+		}
+		if err := ensureStage4AdapterDeleteJournalReadiness(
+			ctx,
+			observer,
 			prepared,
 		); err != nil {
 			return Result{}, err
@@ -398,11 +522,9 @@ func migrateWithStage4Adapters(
 		if err != nil {
 			return result, err
 		}
-		if err := completeStage4SchemaGateSentinels(
+		if err := completeStage4AdapterTerminalSchemaGateSentinels(
 			ctx,
-			prepared.run,
-			prepared.gate,
-			prepared.evolution,
+			prepared,
 		); err != nil {
 			return result, err
 		}
@@ -432,6 +554,19 @@ func migrateWithStage4Adapters(
 	); err != nil {
 		return Result{}, err
 	}
+	if err := activateStage4AdapterPostgresDeleteComposition(
+		ctx,
+		prepared,
+	); err != nil {
+		return Result{}, err
+	}
+	if err := ensureStage4AdapterDeleteJournalReadiness(
+		ctx,
+		observer,
+		prepared,
+	); err != nil {
+		return Result{}, err
+	}
 	if networkExecution != nil {
 		if err := bindStage4AdapterNetworkRestoresAndValidate(
 			ctx,
@@ -442,6 +577,7 @@ func migrateWithStage4Adapters(
 		}
 	}
 
+	networkTransferStarted := false
 	if _, err := protectAdapterTargetMutationOnce(
 		ctx,
 		observer,
@@ -477,12 +613,18 @@ func migrateWithStage4Adapters(
 				)
 			}
 		}
+		networkTransferStarted = true
 		copiedRows, err = runStage4AdapterNetworkTransfer(
 			ctx,
 			observer,
 			networkExecution,
 		)
 		if err != nil {
+			if resetErr := resetStage4AdapterUnpublishedNetworkWork(
+				networkExecution,
+			); resetErr != nil {
+				err = errors.Join(err, resetErr)
+			}
 			return Result{}, err
 		}
 	} else {
@@ -534,6 +676,13 @@ func migrateWithStage4Adapters(
 			)
 		},
 	); err != nil {
+		if networkTransferStarted {
+			if resetErr := resetStage4AdapterUnpublishedNetworkWork(
+				networkExecution,
+			); resetErr != nil {
+				err = errors.Join(err, resetErr)
+			}
+		}
 		return Result{}, err
 	}
 	if err := validateStage4AdapterRun(
@@ -543,6 +692,13 @@ func migrateWithStage4Adapters(
 		target,
 		prepared,
 	); err != nil {
+		if networkTransferStarted {
+			if resetErr := resetStage4AdapterUnpublishedNetworkWork(
+				networkExecution,
+			); resetErr != nil {
+				err = errors.Join(err, resetErr)
+			}
+		}
 		return Result{}, err
 	}
 
@@ -578,11 +734,9 @@ func migrateWithStage4Adapters(
 	); err != nil {
 		return result, err
 	}
-	if err := completeStage4SchemaGateSentinels(
+	if err := completeStage4AdapterTerminalSchemaGateSentinels(
 		ctx,
-		prepared.run,
-		prepared.gate,
-		prepared.evolution,
+		prepared,
 	); err != nil {
 		return result, err
 	}
@@ -691,18 +845,23 @@ func checkpointStage4AdapterStableNetworkWork(
 						),
 					)
 				}
-				strict, err := authenticateStage4AdapterPostgresDeleteTerminal(
-					ctx,
-					execution.prepared.deletes,
-					planIndex,
-					bound.work,
-				)
-				if err != nil {
-					return err
-				}
 				bound.ordinaryCompleted = true
-				bound.terminalAuthenticated = true
-				bound.terminalStrict = strict
+				if stage4AdapterPostgresDeleteAuthorityActivated(
+					execution.prepared.deletes,
+				) {
+					strict, err :=
+						authenticateStage4AdapterPostgresDeleteTerminal(
+							ctx,
+							execution.prepared.deletes,
+							planIndex,
+							bound.work,
+						)
+					if err != nil {
+						return err
+					}
+					bound.terminalAuthenticated = true
+					bound.terminalStrict = strict
+				}
 				if err := execution.bindStage4AdapterPostgresDeleteTransferredTable(
 					planIndex,
 					bound,
@@ -722,7 +881,10 @@ func checkpointStage4AdapterStableNetworkWork(
 				return err
 			}
 			if found {
-				if bound.taskCompleted {
+				if bound.taskCompleted &&
+					stage4AdapterPostgresDeleteAuthorityActivated(
+						execution.prepared.deletes,
+					) {
 					strict, err := authenticateStage4AdapterPostgresDeleteTerminal(
 						ctx,
 						execution.prepared.deletes,
@@ -818,13 +980,18 @@ func checkpointStage4AdapterFreshStableNetworkWork(
 	); err != nil {
 		return err
 	}
-	for _, tableExecution := range planned {
+	for planIndex, tableExecution := range planned {
 		if err := tableExecution.resetOrEnsurePlan(ctx, false); err != nil {
 			return err
 		}
 		if err := tableExecution.bindRestoresAndValidate(ctx); err != nil {
 			return err
 		}
+		// Keep the bound plan separate from prepared.work. The latter is the
+		// immutable seed for reopening a stable source and recomputing this exact
+		// topology; replacing it with the derived topology would rehash it on the
+		// next open and falsely look like an unsafe replan.
+		execution.recordBoundWork(planIndex, tableExecution.work)
 	}
 	return ctx.Err()
 }
@@ -838,9 +1005,40 @@ func publishStage4AdapterNetworkInventory(
 	execution *stage4AdapterNetworkExecution,
 	planned []*stage4AdapterNetworkTableExecution,
 ) error {
+	work := make([]stage4AdapterWork, len(planned))
+	for index, tableExecution := range planned {
+		if tableExecution == nil {
+			return NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"Stage 4 network table inventory is missing planned work for %s",
+					execution.prepared.plans[index].source.Name,
+				),
+			)
+		}
+		work[index] = cloneStage4AdapterNetworkWork(tableExecution.work)
+	}
+	return publishStage4AdapterNetworkWorkInventory(ctx, execution, work)
+}
+
+// publishStage4AdapterNetworkWorkInventory persists an already recomputed
+// immutable work set. Recovery uses this form only when the absence of every
+// ordinary/table checkpoint proves the original fresh checkpoint sequence
+// stopped before PrepareTables could run.
+func publishStage4AdapterNetworkWorkInventory(
+	ctx context.Context,
+	execution *stage4AdapterNetworkExecution,
+	work []stage4AdapterWork,
+) error {
 	aggregate, ok := execution.prepared.run.Backend.(state.Stage4AggregateBackend)
 	if !ok || nilStage4AggregateBackend(aggregate) {
 		return nil
+	}
+	if len(work) != len(execution.prepared.plans) {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 network table inventory is incomplete"),
+		)
 	}
 	// The inventory binds itself to the validated source schema, so that
 	// snapshot must already be durable. Staging is idempotent; the target
@@ -860,24 +1058,24 @@ func publishStage4AdapterNetworkInventory(
 		SchemaSnapshotDigest: execution.prepared.gate.PendingSnapshot.Digest,
 		Tables: make(
 			[]state.Stage4TableInventoryEntry,
-			len(planned),
+			len(work),
 		),
 	}
-	for index, tableExecution := range planned {
+	for index, item := range work {
 		ranges := make(
 			[]state.Stage4InventoryRange,
-			len(tableExecution.work.ranges),
+			len(item.ranges),
 		)
-		for rangeIndex, workRange := range tableExecution.work.ranges {
+		for rangeIndex, workRange := range item.ranges {
 			ranges[rangeIndex] = state.Stage4InventoryRange{
 				ID: workRange.ID,
 			}
 		}
 		inventory.Tables[index] = state.Stage4TableInventoryEntry{
-			Table:        tableExecution.work.task.Table,
-			Task:         tableExecution.work.task,
-			Strategy:     tableExecution.work.strategy,
-			TopologyHash: tableExecution.work.topology,
+			Table:        item.task.Table,
+			Task:         item.task,
+			Strategy:     item.strategy,
+			TopologyHash: item.topology,
 			Ranges:       ranges,
 		}
 	}
@@ -973,6 +1171,22 @@ func runStage4AdapterStableNetworkTables(
 	resume bool,
 	completed map[string]int,
 ) (result Result, resultErr error) {
+	defer func() {
+		attachStage4AdapterRuntimeTuningReport(&result, execution)
+	}()
+	if prepared.mode == "drop_recreate" {
+		result, resultErr = runStage4AdapterStableNetworkRebuildTables(
+			ctx,
+			cfg,
+			observer,
+			target,
+			prepared,
+			execution,
+			resume,
+			completed,
+		)
+		return result, resultErr
+	}
 	for planIndex, plan := range prepared.plans {
 		if rows, complete := completed[plan.source.Name]; complete {
 			if err := execution.advanceCompletedTable(
@@ -1011,6 +1225,81 @@ func runStage4AdapterStableNetworkTables(
 		result.Rows += copied
 	}
 	return result, nil
+}
+
+// resetStage4AdapterUnpublishedNetworkWork clears durable page completion
+// facts when a target has not passed validation and finalization. A restart
+// must replay from the first page, not mistake a partially validated target
+// for completed work. The admitted network writer owns replay safety, so this
+// reset is conservative for both upsert and rebuild paths.
+func resetStage4AdapterUnpublishedNetworkWork(
+	execution *stage4AdapterNetworkExecution,
+) error {
+	if execution == nil {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("reset unpublished Stage 4 network work: execution is unavailable"),
+		)
+	}
+	work, err := execution.snapshotBoundWork()
+	if err != nil {
+		return err
+	}
+	for _, work := range work {
+		task := state.WorkTask{
+			RunID:        execution.prepared.run.RunID,
+			Key:          work.task,
+			Strategy:     work.strategy,
+			TopologyHash: work.topology,
+			StartedAt:    time.Now().UTC(),
+		}
+		ranges := make([]state.RangeState, len(work.ranges))
+		for index := range work.ranges {
+			ranges[index] = cloneInitialNetworkStateRange(work.ranges[index])
+		}
+		if err := execution.prepared.run.Backend.ResetWorkPlan(task, ranges); err != nil {
+			return NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"reset unpublished Stage 4 network work for %s: %w",
+					work.task.Table,
+					err,
+				),
+			)
+		}
+	}
+	return nil
+}
+
+// runStage4AdapterStableNetworkRebuildTableData transfers one table after the
+// full target set has been recreated. Set-wide finalization occurs before
+// validation, matching the public lifecycle; completion remains deferred until
+// both phases succeed.
+func runStage4AdapterStableNetworkRebuildTableData(
+	ctx context.Context,
+	observer TableObserver,
+	execution *stage4AdapterNetworkTableExecution,
+) (_ int, resultErr error) {
+	if execution == nil {
+		return 0, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 stable rebuild table execution is unavailable"),
+		)
+	}
+	defer func() {
+		if closeErr := execution.Close(); closeErr != nil {
+			if resultErr == nil {
+				resultErr = closeErr
+			} else {
+				resultErr = errors.Join(resultErr, closeErr)
+			}
+		}
+	}()
+	copied, err := execution.run(ctx, observer)
+	if err != nil {
+		return 0, err
+	}
+	return copied, nil
 }
 
 func runStage4AdapterStableNetworkTable(
@@ -1175,10 +1464,9 @@ func resumeWithStage4Adapters(
 	taskObserver TableSetObserver,
 	source sourceAdapter,
 	target targetAdapter,
+	mode string,
 	run Stage4RunContext,
 ) (Result, error) {
-	const mode = "upsert"
-
 	if _, err := requireStage4TableSetObserver(observer); err != nil {
 		return Result{}, err
 	}
@@ -1190,7 +1478,7 @@ func resumeWithStage4Adapters(
 			),
 		)
 	}
-	if err := requireStage4PostgresStrictRoute(
+	if err := requireStage4StrictRoute(
 		cfg,
 		source,
 		target,
@@ -1210,6 +1498,88 @@ func resumeWithStage4Adapters(
 	if err != nil {
 		return Result{}, err
 	}
+	if mode == "drop_recreate" {
+		if prepared.incremental != nil || prepared.deletes != nil ||
+			cfg.Migration.StrictConsistency {
+			return Result{}, NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 drop_recreate resume cannot compose incremental, delete reconciliation, or strict consistency work",
+				),
+			)
+		}
+		networkExecution, err := admitStage4AdapterNetworkTransfer(
+			ctx,
+			cfg,
+			observer,
+			source,
+			target,
+			prepared,
+			nil,
+		)
+		if err != nil {
+			return Result{}, err
+		}
+		rebuildCompleted := make(map[string]int, len(completed))
+		for table, checkpoint := range completed {
+			rebuildCompleted[table] = checkpoint.Rows
+		}
+		if err := completeStage4AdapterNetworkRebuildCheckpointPrefix(
+			ctx,
+			observer,
+			networkExecution,
+			rebuildCompleted,
+		); err != nil {
+			return Result{}, err
+		}
+		// Staging the schema gate is a state-only operation for a rebuild; the
+		// target set itself is recreated only after durable recovery admission.
+		if err := applyStage4AdapterTargetSchema(
+			ctx,
+			observer,
+			prepared.run,
+			prepared.gate,
+			prepared.evolution,
+		); err != nil {
+			return Result{}, err
+		}
+		if err := preflightStage4AdapterDesiredTargetAfterEvolution(
+			ctx,
+			target,
+			prepared,
+		); err != nil {
+			return Result{}, err
+		}
+		if err := ensureStage4AdapterDeleteJournalReadiness(
+			ctx,
+			observer,
+			prepared,
+		); err != nil {
+			return Result{}, err
+		}
+		result, err := runStage4AdapterStableNetworkRebuildTables(
+			ctx,
+			cfg,
+			observer,
+			target,
+			prepared,
+			networkExecution,
+			true,
+			rebuildCompleted,
+		)
+		attachStage4AdapterRuntimeTuningReport(&result, networkExecution)
+		if err != nil {
+			return result, err
+		}
+		if err := completeStage4AdapterTerminalSchemaGateSentinels(
+			ctx,
+			prepared,
+		); err != nil {
+			return result, err
+		}
+		result.Validated = true
+		return result, nil
+	}
 	validated, err := validateCompletedStage4NetworkTableCheckpoints(
 		ctx,
 		target,
@@ -1221,7 +1591,7 @@ func resumeWithStage4Adapters(
 		return Result{}, err
 	}
 	if prepared.incremental != nil {
-		return migrateWithStage4IncrementalAdapters(
+		result, runErr := migrateWithStage4IncrementalAdapters(
 			ctx,
 			cfg,
 			observer,
@@ -1231,6 +1601,13 @@ func resumeWithStage4Adapters(
 			true,
 			validated,
 		)
+		if result.RuntimeTuning == nil {
+			result.RuntimeTuning =
+				stage4GeneratedIncrementalRuntimeTuningReport(
+					cfg.Migration,
+				)
+		}
+		return result, runErr
 	}
 	// Static route, target, dependency, replay, and resource admission precedes
 	// BeforeTables and every per-table durable reset/ensure operation.
@@ -1261,17 +1638,56 @@ func resumeWithStage4Adapters(
 		return resultForValidatedAdapterCheckpoints(validated), err
 	}
 	if cfg.Migration.StrictConsistency {
-		return migrateWithStage4PostgresStrictAdapters(
-			ctx,
-			cfg,
-			observer,
-			source,
-			target,
-			prepared,
-			networkExecution,
-			true,
-			validated,
+		var (
+			result Result
+			runErr error
 		)
+		switch source.Engine() {
+		case "postgres":
+			result, runErr = migrateWithStage4PostgresStrictAdapters(
+				ctx,
+				cfg,
+				observer,
+				source,
+				target,
+				prepared,
+				networkExecution,
+				true,
+				validated,
+			)
+		case "mssql":
+			result, runErr = migrateWithStage4SQLServerStrictAdapters(
+				ctx,
+				cfg,
+				observer,
+				source,
+				target,
+				prepared,
+				networkExecution,
+				true,
+				validated,
+			)
+		case "mysql":
+			result, runErr = migrateWithStage4MySQLStrictAdapters(
+				ctx, cfg, observer, source, target, prepared,
+				networkExecution, true, validated,
+			)
+		case "sqlite":
+			result, runErr = migrateWithStage4SQLiteStrictAdapters(
+				ctx, cfg, observer, source, target, prepared,
+				networkExecution, true, validated,
+			)
+		default:
+			return resultForValidatedAdapterCheckpoints(validated), NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 strict consistency has no composed runner for source engine %q",
+					source.Engine(),
+				),
+			)
+		}
+		attachStage4AdapterRuntimeTuningReport(&result, networkExecution)
+		return result, runErr
 	}
 	if err := networkExecution.prevalidateCompletedTables(
 		ctx,
@@ -1288,14 +1704,6 @@ func resumeWithStage4Adapters(
 	); err != nil {
 		return resultForValidatedAdapterCheckpoints(validated), err
 	}
-	if err := prevalidateStage4AdapterPostgresDeleteCompletedTargets(
-		ctx,
-		target,
-		prepared,
-		networkExecution,
-	); err != nil {
-		return resultForValidatedAdapterCheckpoints(validated), err
-	}
 	if err := applyStage4AdapterTargetSchema(
 		ctx,
 		observer,
@@ -1308,6 +1716,27 @@ func resumeWithStage4Adapters(
 	if err := preflightStage4AdapterDesiredTargetAfterEvolution(
 		ctx,
 		target,
+		prepared,
+	); err != nil {
+		return resultForValidatedAdapterCheckpoints(validated), err
+	}
+	if err := activateStage4AdapterPostgresDeleteComposition(
+		ctx,
+		prepared,
+	); err != nil {
+		return resultForValidatedAdapterCheckpoints(validated), err
+	}
+	if err := prevalidateStage4AdapterPostgresDeleteCompletedTargets(
+		ctx,
+		target,
+		prepared,
+		networkExecution,
+	); err != nil {
+		return resultForValidatedAdapterCheckpoints(validated), err
+	}
+	if err := ensureStage4AdapterDeleteJournalReadiness(
+		ctx,
+		observer,
 		prepared,
 	); err != nil {
 		return resultForValidatedAdapterCheckpoints(validated), err
@@ -1339,11 +1768,9 @@ func resumeWithStage4Adapters(
 	if err != nil {
 		return result, err
 	}
-	if err := completeStage4SchemaGateSentinels(
+	if err := completeStage4AdapterTerminalSchemaGateSentinels(
 		ctx,
-		prepared.run,
-		prepared.gate,
-		prepared.evolution,
+		prepared,
 	); err != nil {
 		return result, err
 	}
@@ -1643,25 +2070,27 @@ func prepareStage4AdapterRun(
 			)
 		}
 	}
-	result.validation, err = stage4AdapterValidationProbe(
-		cfg,
-		observer,
-		source,
-		target,
-		plans,
-	)
-	if err != nil {
-		return result, err
-	}
-	result.validationPrimaryKeyEqualityProofs, err =
-		prepareStage4AdapterValidationPrimaryKeyEqualityProofs(
-			cfg.Migration.Validation.Mode,
-			mode,
-			result.validation,
-			gate.ValidationTables,
+	if len(cfg.Migration.DateUpdatedColumns) == 0 {
+		result.validation, err = stage4AdapterValidationProbe(
+			cfg,
+			observer,
+			source,
+			target,
+			plans,
 		)
-	if err != nil {
-		return result, err
+		if err != nil {
+			return result, err
+		}
+		result.validationPrimaryKeyEqualityProofs, err =
+			prepareStage4AdapterValidationPrimaryKeyEqualityProofs(
+				cfg.Migration.Validation.Mode,
+				mode,
+				result.validation,
+				gate.ValidationTables,
+			)
+		if err != nil {
+			return result, err
+		}
 	}
 	result.work, err = buildStage4AdapterWork(
 		configDigest,
@@ -1670,6 +2099,19 @@ func prepareStage4AdapterRun(
 	)
 	if err != nil {
 		return result, err
+	}
+	if len(cfg.Migration.DateUpdatedColumns) != 0 {
+		result.incremental, result.work, err =
+			prepareStage4AdapterIncremental(
+				ctx,
+				cfg,
+				source,
+				target,
+				result,
+			)
+		if err != nil {
+			return result, err
+		}
 	}
 	if cfg.Migration.Deletes.Mode == config.DeleteModeReconcile {
 		result.deletes, err =
@@ -1684,27 +2126,37 @@ func prepareStage4AdapterRun(
 		if err != nil {
 			return result, err
 		}
-	}
-	if len(cfg.Migration.DateUpdatedColumns) != 0 {
-		result.incremental, result.work, err =
-			prepareStage4AdapterIncremental(
+		if result.incremental != nil {
+			if err := prepareStage4AdapterSQLiteIncrementalDeleteComposition(
 				ctx,
 				cfg,
 				source,
 				target,
-				result,
+				&result,
+			); err != nil {
+				return result, err
+			}
+		}
+		result.deleteJournalReadiness, err =
+			admitStage4AdapterDeleteJournalReadinessForRun(
+				ctx,
+				observer,
+				result.run,
+				target,
 			)
 		if err != nil {
 			return result, err
 		}
+	}
+	if result.incremental != nil {
 		return result, nil
 	}
-	if mode == "upsert" &&
-		stage4AdapterNetworkRelationalEngine(source.Engine()) {
+	if stage4AdapterNetworkRelationalEngine(source.Engine()) {
 		// Relational network pagination, retained width, and durable ranges are
 		// intentionally deferred until the runner owns one table-scoped stable
-		// source view. Global preparation remains read-only and connection
-		// bounded.
+		// source view. Rebuild uses the same deferred inventory so every selected
+		// target can be prepared as one destructive set before the first page.
+		// Global preparation remains read-only and connection bounded.
 		return result, nil
 	}
 	result.work, err = bindStage4AdapterPagination(
@@ -2163,11 +2615,22 @@ func stage4AdapterExistingEvolutionTargetTables(
 	if evolution == nil {
 		return cloneTargetSchemaEvolutionTables(desired), nil
 	}
+	// PreflightTargetSchemaEvolution has already authenticated the exact live
+	// catalog prefix. A process can fail after target DDL commits but before the
+	// immediate post-apply reverify/state completion; on resume that prefix is
+	// final, not the original prior. Use it for retained-table preflight so an
+	// already-committed immutable evolution is not rejected as a shape drift.
+	// The same rule handles a target dialect whose durable plan can expose an
+	// authenticated nonzero partial prefix.
+	existingTables := evolution.prior
+	if evolution.plan.valid() {
+		existingTables = evolution.plan.states[evolution.plan.AppliedPrefix()]
+	}
 	prior := make(
 		map[targetSchemaEvolutionTableKey]schema.Table,
-		len(evolution.prior),
+		len(existingTables),
 	)
-	for _, table := range evolution.prior {
+	for _, table := range existingTables {
 		key := targetSchemaEvolutionTableKey{
 			schema: table.Schema,
 			table:  table.Name,
@@ -2375,6 +2838,13 @@ func requireStage4AdapterSeams(
 				target.Engine(),
 			),
 		)
+	}
+	// Date-based incremental validation is admitted and executed through its
+	// attempt-bound evidence probe. It must not construct the ordinary
+	// whole-table validation probe, which would observe a later live source
+	// state rather than the immutable transferred window.
+	if len(cfg.Migration.DateUpdatedColumns) != 0 {
+		return nil
 	}
 	validationMode := cfg.Migration.Validation.Mode
 	if validationMode == "" ||
@@ -2802,6 +3272,19 @@ func stage4AdapterValidationTableSpecs(
 		0,
 		len(prepared.gate.ValidationTables),
 	)
+	primaryKeyEqualityProofs := prepared.validationPrimaryKeyEqualityProofs
+	if prepared.incremental != nil {
+		primaryKeyEqualityProofs =
+			prepared.incremental.validationPrimaryKeyEqualityProofs
+		if primaryKeyEqualityProofs == nil {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"prepared Stage 4 incremental primary-key equality proof inventory is unavailable",
+				),
+			)
+		}
+	}
 	for _, table := range prepared.gate.ValidationTables {
 		if _, ok := plans[stage4RichTableKey{
 			schema: table.Schema,
@@ -2818,9 +3301,9 @@ func stage4AdapterValidationTableSpecs(
 		}
 		var primaryKeyEqualityProof string
 		if prepared.mode == "upsert" &&
-			prepared.validationPrimaryKeyEqualityProofs != nil {
+			primaryKeyEqualityProofs != nil {
 			primaryKeyEqualityProof =
-				prepared.validationPrimaryKeyEqualityProofs[stage4RichTableKey{
+				primaryKeyEqualityProofs[stage4RichTableKey{
 					schema: table.Schema,
 					table:  table.Name,
 				}]
@@ -3507,6 +3990,45 @@ func stageStage4SchemaGateSnapshots(
 		}
 	}
 	return ctx.Err()
+}
+
+// completeStage4AdapterTerminalSchemaGateSentinels leaves schema sentinels
+// running for every route that has already published immutable aggregate table
+// inventory. PublishStage4RunCompletion owns their one terminal timestamp and
+// atomically records it with the successful run outcome. A backend without
+// aggregate support, or a legacy route that never published inventory, keeps
+// the older direct-completion path.
+func completeStage4AdapterTerminalSchemaGateSentinels(
+	ctx context.Context,
+	prepared stage4AdapterPrepared,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	aggregate, ok := prepared.run.Backend.(state.Stage4AggregateBackend)
+	if ok && !nilStage4AggregateBackend(aggregate) {
+		_, found, err := aggregate.LoadStage4TableInventory(
+			prepared.run.RunID,
+		)
+		if err != nil {
+			return NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"read Stage 4 table inventory before terminal sentinel completion: %w",
+					err,
+				),
+			)
+		}
+		if found {
+			return nil
+		}
+	}
+	return completeStage4SchemaGateSentinels(
+		ctx,
+		prepared.run,
+		prepared.gate,
+		prepared.evolution,
+	)
 }
 
 func completeStage4SchemaGateSentinels(

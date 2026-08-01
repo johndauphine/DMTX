@@ -800,6 +800,76 @@ func (store YAMLStore) LoadLatestStrictMigrationSnapshot(
 	return snapshot, found, err
 }
 
+func (store YAMLStore) SaveStrictMigrationCleanupIntent(
+	intent StrictMigrationCleanupIntent,
+) error {
+	intent, err := normalizeStrictMigrationCleanupIntent(intent)
+	if err != nil {
+		return err
+	}
+	return store.update(func(document *yamlStateDocument) error {
+		run, err := requireYAMLRun(*document, intent.RunID)
+		if err != nil {
+			return err
+		}
+		if err := requireStrictRunSourceEngine(run, intent.SourceEngine); err != nil {
+			return err
+		}
+		var owner StrictMigrationSnapshot
+		ownerFound := false
+		for _, candidate := range document.StrictMigrationSnapshots {
+			if candidate.RunID == intent.RunID && candidate.EpochID == intent.EpochID {
+				owner, ownerFound = candidate, true
+				break
+			}
+		}
+		if !ownerFound {
+			return fmt.Errorf("%w: strict migration snapshot cleanup owner %q", ErrUnknownWork, intent.EpochID)
+		}
+		if owner.RunID != intent.RunID || owner.SourceEngine != intent.SourceEngine ||
+			owner.SnapshotReference != intent.SnapshotReference ||
+			owner.ProcessEpoch != intent.ProcessEpoch ||
+			!owner.CapturedAt.Equal(intent.CapturedAt) {
+			return fmt.Errorf("%w: strict migration cleanup intent differs from durable owner", ErrImmutableEvidence)
+		}
+		for _, existing := range document.StrictMigrationCleanupIntents {
+			if existing.RunID != intent.RunID || existing.EpochID != intent.EpochID {
+				continue
+			}
+			if reflect.DeepEqual(existing, intent) {
+				return nil
+			}
+			return fmt.Errorf("%w: strict migration cleanup intent", ErrImmutableEvidence)
+		}
+		document.StrictMigrationCleanupIntents = append(
+			document.StrictMigrationCleanupIntents,
+			intent,
+		)
+		return nil
+	})
+}
+
+func (store YAMLStore) LoadStrictMigrationCleanupIntent(
+	runID string,
+	epochID string,
+) (StrictMigrationCleanupIntent, bool, error) {
+	var intent StrictMigrationCleanupIntent
+	var found bool
+	err := store.read(func(document yamlStateDocument) error {
+		if _, err := requireYAMLRun(document, runID); err != nil {
+			return err
+		}
+		for _, candidate := range document.StrictMigrationCleanupIntents {
+			if candidate.RunID == runID && candidate.EpochID == epochID {
+				intent, found = candidate, true
+				return nil
+			}
+		}
+		return nil
+	})
+	return intent, found, err
+}
+
 func (store YAMLStore) SaveStrictSnapshotEvidence(evidence StrictSnapshotEvidence) error {
 	evidence, err := normalizeStrictSnapshotEvidence(evidence)
 	if err != nil {

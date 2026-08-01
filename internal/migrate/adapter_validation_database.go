@@ -16,12 +16,16 @@ import (
 )
 
 const (
-	adapterValidationPostgres = "postgres"
-	adapterValidationSQLite   = "sqlite"
+	adapterValidationPostgres  = "postgres"
+	adapterValidationSQLServer = "mssql"
+	adapterValidationMySQL     = "mysql"
+	adapterValidationSQLite    = "sqlite"
 
-	adapterValidationPostgresParameterLimit = 65535
-	adapterValidationSQLiteParameterLimit   = 900
-	adapterValidationMaximumKeyBatch        = 256
+	adapterValidationPostgresParameterLimit  = 65535
+	adapterValidationSQLServerParameterLimit = 2100
+	adapterValidationMySQLParameterLimit     = 65535
+	adapterValidationSQLiteParameterLimit    = 900
+	adapterValidationMaximumKeyBatch         = 256
 )
 
 // adapterStage4ValidationEqualityProofProvider exposes the exact proof digest
@@ -100,7 +104,7 @@ func (adapter *relationalSourceAdapter) Stage4ValidationProbe(
 			"database-backed validation source differs from its provider",
 		)
 	}
-	if adapter.spec.engine != adapterValidationPostgres {
+	if !adapterValidationRelationalEngine(adapter.spec.engine) {
 		return nil, fmt.Errorf(
 			"database-backed deep validation for source engine %q is not certified",
 			adapter.spec.engine,
@@ -108,10 +112,10 @@ func (adapter *relationalSourceAdapter) Stage4ValidationProbe(
 	}
 	return newAdapterDatabaseValidationProbe(
 		adapterValidationSQLEndpoint{
-			engine: adapterValidationPostgres, namespace: adapter.namespace,
+			engine: adapter.spec.engine, namespace: adapter.namespace,
 			queryer:        adapter.database,
 			database:       adapter.database,
-			parameterLimit: adapterValidationPostgresParameterLimit,
+			parameterLimit: adapterValidationParameterLimit(adapter.spec.engine),
 		},
 		target,
 		plans,
@@ -133,8 +137,8 @@ func (view *adapterRetainedStableRelationalView) Stage4ValidationProbe(
 			"stable validation view differs from the route source",
 		)
 	}
-	if view.source.spec.engine != adapterValidationPostgres ||
-		view.view.retainedStableViewEngine() != adapterValidationPostgres {
+	if !adapterValidationRelationalEngine(view.source.spec.engine) ||
+		view.view.retainedStableViewEngine() != view.source.spec.engine {
 		return nil, fmt.Errorf(
 			"stable database-backed deep validation for source engine %q is not certified",
 			view.source.spec.engine,
@@ -151,11 +155,11 @@ func (view *adapterRetainedStableRelationalView) Stage4ValidationProbe(
 	}
 	return newAdapterDatabaseValidationProbe(
 		adapterValidationSQLEndpoint{
-			engine:         adapterValidationPostgres,
+			engine:         view.source.spec.engine,
 			namespace:      view.source.namespace,
 			queryer:        view.view,
 			database:       view.source.database,
-			parameterLimit: adapterValidationPostgresParameterLimit,
+			parameterLimit: adapterValidationParameterLimit(view.source.spec.engine),
 		},
 		target,
 		plans,
@@ -199,16 +203,6 @@ func newAdapterDatabaseValidationProbe(
 	target, err := adapterValidationTargetEndpoint(targetAdapter)
 	if err != nil {
 		return nil, err
-	}
-	if source.engine != target.engine {
-		return nil, NewTransferError(
-			ErrorClassPolicy,
-			fmt.Errorf(
-				"deep validation route %s-to-%s lacks a certified cross-engine primary-key and value domain",
-				source.engine,
-				target.engine,
-			),
-		)
 	}
 	result := &adapterDatabaseValidationProbe{
 		source: source,
@@ -270,7 +264,7 @@ func newAdapterDatabaseValidationProbe(
 func validateAdapterValidationEndpoint(
 	endpoint adapterValidationSQLEndpoint,
 ) error {
-	if endpoint.engine != adapterValidationPostgres &&
+	if !adapterValidationRelationalEngine(endpoint.engine) &&
 		endpoint.engine != adapterValidationSQLite {
 		return fmt.Errorf(
 			"engine %q is not certified",
@@ -287,9 +281,9 @@ func validateAdapterValidationEndpoint(
 		endpoint.namespace != "" {
 		return errors.New("SQLite namespace must be empty")
 	}
-	if endpoint.engine == adapterValidationPostgres &&
+	if endpoint.engine != adapterValidationSQLite &&
 		strings.TrimSpace(endpoint.namespace) == "" {
-		return errors.New("PostgreSQL namespace is required")
+		return fmt.Errorf("%s namespace is required", endpoint.engine)
 	}
 	return nil
 }
@@ -320,6 +314,28 @@ func adapterValidationTargetEndpoint(
 			engine: adapterValidationSQLite, queryer: typed.database,
 			database:       typed.database,
 			parameterLimit: adapterValidationSQLiteParameterLimit,
+		}, nil
+	case *mysqlTargetAdapter:
+		if typed == nil || typed.database == nil {
+			return adapterValidationSQLEndpoint{}, errors.New(
+				"database-backed validation requires an open MySQL target",
+			)
+		}
+		return adapterValidationSQLEndpoint{
+			engine: adapterValidationMySQL, namespace: typed.namespace,
+			queryer: typed.database, database: typed.database,
+			parameterLimit: adapterValidationMySQLParameterLimit,
+		}, nil
+	case *sqlServerTargetAdapter:
+		if typed == nil || typed.database == nil {
+			return adapterValidationSQLEndpoint{}, errors.New(
+				"database-backed validation requires an open SQL Server target",
+			)
+		}
+		return adapterValidationSQLEndpoint{
+			engine: adapterValidationSQLServer, namespace: typed.namespace,
+			queryer: typed.database, database: typed.database,
+			parameterLimit: adapterValidationSQLServerParameterLimit,
 		}, nil
 	default:
 		engine := ""
@@ -565,8 +581,9 @@ func (probe *adapterDatabaseValidationProbe) SampleSourceRows(
 	); err != nil {
 		return nil, err
 	}
-	primaryKey, _, _, err := adapterValidationEqualityProof(
+	primaryKey, _, _, err := adapterValidationCrossEqualityProof(
 		probe.source.engine,
+		probe.target.engine,
 		plan,
 	)
 	if err != nil {
@@ -579,12 +596,12 @@ func (probe *adapterDatabaseValidationProbe) SampleSourceRows(
 	if err != nil {
 		return nil, err
 	}
-	query := "SELECT " + adapterValidationQuotedColumns(
+	query := adapterValidationSampleQuery(
 		probe.source,
-		projection,
-	) + " FROM " + probe.source.qualified(plan.source) +
-		" ORDER BY " + order +
-		" LIMIT " + probe.source.placeholder(1)
+		adapterValidationQuotedColumns(probe.source, projection),
+		probe.source.qualified(plan.source),
+		order,
+	)
 	if err := probe.sourceGate.acquire(ctx); err != nil {
 		return nil, err
 	}
@@ -630,8 +647,9 @@ func (probe *adapterDatabaseValidationProbe) SampleTargetRows(
 	); err != nil {
 		return nil, err
 	}
-	_, targetPrimaryKey, _, err := adapterValidationEqualityProof(
+	_, targetPrimaryKey, _, err := adapterValidationCrossEqualityProof(
 		probe.source.engine,
+		probe.target.engine,
 		plan,
 	)
 	if err != nil {
@@ -720,8 +738,9 @@ func (probe *adapterDatabaseValidationProbe) Stage4ValidationPrimaryKeyEqualityP
 	if err != nil {
 		return "", err
 	}
-	_, _, digest, err := adapterValidationEqualityProof(
+	_, _, digest, err := adapterValidationCrossEqualityProof(
 		probe.source.engine,
+		probe.target.engine,
 		plan,
 	)
 	return digest, err
@@ -734,8 +753,9 @@ func (probe *adapterDatabaseValidationProbe) scopedTargetNullCounts(
 	scope ValidationNullScope,
 ) (ValidationNullCountEvidence, error) {
 	sourcePrimaryKey, targetPrimaryKey, expectedDigest, err :=
-		adapterValidationEqualityProof(
+		adapterValidationCrossEqualityProof(
 			probe.source.engine,
+			probe.target.engine,
 			plan,
 		)
 	if err != nil {
@@ -996,6 +1016,20 @@ func adapterValidationEqualityProof(
 	engineName string,
 	plan adapterTablePlan,
 ) ([]schema.Column, []schema.Column, string, error) {
+	return adapterValidationCrossEqualityProof(engineName, engineName, plan)
+}
+
+// adapterValidationCrossEqualityProof certifies only primary-key domains whose
+// equality, ordering, driver scan representation, and parameter binding are
+// deliberately shared by both endpoint dialects. Text is excluded even when
+// type names match: a collation is a database contract, not a portable key
+// equality proof. Values outside the key remain eligible for typed canonical
+// sample comparison.
+func adapterValidationCrossEqualityProof(
+	sourceEngine string,
+	targetEngine string,
+	plan adapterTablePlan,
+) ([]schema.Column, []schema.Column, string, error) {
 	sourcePrimaryKey, err := adapterValidationPrimaryKey(
 		plan.source,
 	)
@@ -1029,13 +1063,14 @@ func adapterValidationEqualityProof(
 	}
 	wire := struct {
 		Version      int
-		Engine       string
+		SourceEngine string
+		TargetEngine string
 		SourceSchema string
 		TargetSchema string
 		Table        string
 		Columns      []proofColumn
 	}{
-		Version: 1, Engine: engineName,
+		Version: 2, SourceEngine: sourceEngine, TargetEngine: targetEngine,
 		SourceSchema: plan.source.Schema,
 		TargetSchema: plan.target.Schema,
 		Table:        plan.source.Name,
@@ -1060,24 +1095,17 @@ func adapterValidationEqualityProof(
 		if err != nil {
 			return nil, nil, "", err
 		}
-		if !sameAdapterValidationKeyType(
-			sourceColumn.Type,
-			targetColumn.Type,
-		) {
-			return nil, nil, "", fmt.Errorf(
-				"source and target validation primary-key column %s types differ",
-				sourceColumn.Name,
-			)
-		}
 		if sourceKind != targetKind ||
-			!adapterValidationKeyKindCertified(
-				engineName,
+			!adapterValidationCrossKeyKindCertified(
+				sourceEngine,
+				targetEngine,
 				sourceKind,
 			) {
 			return nil, nil, "", fmt.Errorf(
-				"validation primary-key column %s lacks a certified %s equality and ordering domain",
+				"validation primary-key column %s lacks a certified %s-to-%s equality and ordering domain; text/collation keys require an explicit portable collation proof",
 				sourceColumn.Name,
-				engineName,
+				sourceEngine,
+				targetEngine,
 			)
 		}
 		wire.Columns[index] = proofColumn{
@@ -1101,6 +1129,21 @@ func adapterValidationEqualityProof(
 		hex.EncodeToString(digest[:]), nil
 }
 
+func adapterValidationCrossKeyKindCertified(
+	sourceEngine, targetEngine string,
+	kind validationValueKind,
+) bool {
+	if sourceEngine == targetEngine {
+		return adapterValidationKeyKindCertified(sourceEngine, kind)
+	}
+	// Mixed-dialect key binds are intentionally narrower than same-engine
+	// validation. These two domains retain both ordering and database/sql
+	// parameter semantics across the currently certified relational drivers.
+	return (kind == validationBoolean || kind == validationInteger) &&
+		adapterValidationKeyKindCertified(sourceEngine, kind) &&
+		adapterValidationKeyKindCertified(targetEngine, kind)
+}
+
 func adapterValidationKeyKindCertified(
 	engineName string,
 	kind validationValueKind,
@@ -1118,22 +1161,12 @@ func adapterValidationKeyKindCertified(
 			validationUUID:
 			return true
 		}
+	case adapterValidationSQLServer, adapterValidationMySQL:
+		return kind == validationBoolean || kind == validationInteger
 	case adapterValidationSQLite:
-		return kind == validationInteger ||
-			kind == validationBytes
+		return kind == validationInteger || kind == validationBytes
 	}
 	return false
-}
-
-func sameAdapterValidationKeyType(left string, right string) bool {
-	normalize := func(value string) string {
-		return strings.ToLower(strings.Join(
-			strings.Fields(value),
-			" ",
-		))
-	}
-	return normalize(left) != "" &&
-		normalize(left) == normalize(right)
 }
 
 func adapterValidationPrimaryKey(
@@ -1538,16 +1571,63 @@ func (endpoint adapterValidationSQLEndpoint) qualified(
 func (endpoint adapterValidationSQLEndpoint) quote(
 	identifier string,
 ) string {
-	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
+	switch endpoint.engine {
+	case adapterValidationMySQL:
+		return "`" + strings.ReplaceAll(identifier, "`", "``") + "`"
+	case adapterValidationSQLServer:
+		return "[" + strings.ReplaceAll(identifier, "]", "]]") + "]"
+	default:
+		return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
+	}
 }
 
 func (endpoint adapterValidationSQLEndpoint) placeholder(
 	position int,
 ) string {
-	if endpoint.engine == adapterValidationPostgres {
+	switch endpoint.engine {
+	case adapterValidationPostgres:
 		return fmt.Sprintf("$%d", position)
+	case adapterValidationSQLServer:
+		return fmt.Sprintf("@p%d", position)
+	default:
+		return "?"
 	}
-	return "?"
+}
+
+func adapterValidationRelationalEngine(engine string) bool {
+	switch engine {
+	case adapterValidationPostgres, adapterValidationSQLServer, adapterValidationMySQL:
+		return true
+	default:
+		return false
+	}
+}
+
+func adapterValidationParameterLimit(engine string) int {
+	switch engine {
+	case adapterValidationPostgres:
+		return adapterValidationPostgresParameterLimit
+	case adapterValidationSQLServer:
+		return adapterValidationSQLServerParameterLimit
+	case adapterValidationMySQL:
+		return adapterValidationMySQLParameterLimit
+	case adapterValidationSQLite:
+		return adapterValidationSQLiteParameterLimit
+	default:
+		return 0
+	}
+}
+
+func adapterValidationSampleQuery(
+	endpoint adapterValidationSQLEndpoint,
+	projection, relation, order string,
+) string {
+	if endpoint.engine == adapterValidationSQLServer {
+		return "SELECT TOP (" + endpoint.placeholder(1) + ") " +
+			projection + " FROM " + relation + " ORDER BY " + order
+	}
+	return "SELECT " + projection + " FROM " + relation +
+		" ORDER BY " + order + " LIMIT " + endpoint.placeholder(1)
 }
 
 func isNilAdapterValidationQueryer(

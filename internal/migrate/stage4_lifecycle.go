@@ -1168,7 +1168,10 @@ func parseStage4TargetShapeEvidence(
 			"target-shape reservation evidence is not canonical",
 		)
 	}
-	priorTables, err := schema.MaterializeSchemaSnapshot(prior)
+	priorTables, err := stage4MaterializeTargetShapeSnapshot(
+		prior,
+		result.TargetEngine,
+	)
 	if err != nil {
 		return result, fmt.Errorf(
 			"materialize target-shape evidence prior catalog: %w",
@@ -1184,7 +1187,10 @@ func parseStage4TargetShapeEvidence(
 			err,
 		)
 	}
-	targetTables, err := schema.MaterializeSchemaSnapshot(current)
+	targetTables, err := stage4MaterializeTargetShapeSnapshot(
+		current,
+		result.TargetEngine,
+	)
 	if err != nil {
 		return result, fmt.Errorf(
 			"materialize target-shape evidence current catalog: %w",
@@ -1757,7 +1763,10 @@ func cloneStage4RichTable(value schema.Table) schema.Table {
 			result.ForeignKeys[index] = cloneStage4RichForeignKey(item)
 		}
 	}
-	result.Checks = append([]schema.CheckConstraint(nil), value.Checks...)
+	if value.Checks != nil {
+		result.Checks = make([]schema.CheckConstraint, len(value.Checks))
+		copy(result.Checks, value.Checks)
+	}
 	return result
 }
 

@@ -106,7 +106,7 @@ func TestRunRejectsStrictConsistencyBeforeStateCreation(t *testing.T) {
 	}
 	if !strings.Contains(
 		errors.String(),
-		`Stage 4 strict consistency scope "table" is certified only for PostgreSQL-to-PostgreSQL upsert`,
+		`Stage 4 strict consistency scope "table" has no certified source/target composition`,
 	) {
 		t.Fatalf("stderr = %q", errors.String())
 	}

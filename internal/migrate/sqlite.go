@@ -17,9 +17,10 @@ import (
 )
 
 type Result struct {
-	Tables    int  `json:"tables"`
-	Rows      int  `json:"rows"`
-	Validated bool `json:"validated"`
+	Tables        int                  `json:"tables"`
+	Rows          int                  `json:"rows"`
+	Validated     bool                 `json:"validated"`
+	RuntimeTuning *RuntimeTuningReport `json:"runtime_tuning,omitempty"`
 }
 
 const sqliteWriteBatchSize = 500
@@ -36,6 +37,16 @@ type TableObserver interface {
 // source compatible.
 type TableSetObserver interface {
 	BeforeTables(context.Context, []string) error
+}
+
+// Stage4TablePublicationObserver observes a table only after the composed
+// Stage 4 aggregate transaction has durably published its ordinary checkpoint,
+// structured work, and range evidence. It is deliberately separate from
+// TableObserver.AfterTable: the latter owns the ordinary checkpoint on legacy
+// routes, while calling it again after aggregate completion would attempt a
+// second, non-idempotent state mutation.
+type Stage4TablePublicationObserver interface {
+	AfterStage4TablePublication(context.Context, string, int) error
 }
 
 // PageObserver records target-acknowledged page frontiers. It is optional so
@@ -90,6 +101,9 @@ func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer
 }
 
 func sqliteToSQLiteLegacyWithObserver(ctx context.Context, cfg config.Config, observer TableObserver) (Result, error) {
+	if err := requireStage4UpsertMergeComposition(cfg, false); err != nil {
+		return Result{}, err
+	}
 	if cfg.Source.Type != "sqlite" || cfg.Target.Type != "sqlite" {
 		return Result{}, fmt.Errorf("SQLite first pass requires source.type and target.type to be sqlite")
 	}
@@ -169,7 +183,7 @@ func selectedTables(names []string, cfg config.Config) ([]string, error) {
 }
 
 func userTables(ctx context.Context, database *sql.DB) ([]string, error) {
-	rows, err := database.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+	rows, err := database.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND lower(name) <> 'dmtx_internal_delete_batch_receipts' ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("list source tables: %w", err)
 	}
@@ -885,6 +899,12 @@ func countRows(ctx context.Context, database *sql.DB, name string) (int, error) 
 	return count, err
 }
 func inspectTable(ctx context.Context, database *sql.DB, name string) (schema.Table, []string, error) {
+	if strings.EqualFold(name, sqliteDeleteJournalTable) {
+		return schema.Table{}, nil, fmt.Errorf(
+			"SQLite table %s is private DMTX delete receipt state and is not a migratable source table",
+			sqliteDeleteJournalTable,
+		)
+	}
 	return inspectSQLiteSchema(ctx, database, name)
 }
 func quote(name string) string { return `"` + strings.ReplaceAll(name, `"`, `""`) + `"` }

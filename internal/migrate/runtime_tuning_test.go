@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/johndauphine/dmtx/internal/config"
 )
@@ -146,6 +147,188 @@ func TestRuntimeTuningPressureAndWriteErrorsReduceOnlyAtBoundaries(
 		controller.History()[2],
 		RuntimeReasonProtocolWriteError,
 	)
+}
+
+func TestRuntimeTuningIntervalGatesGrowthButNeverSafetyReduction(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	plan := runtimeTuningTestPlan()
+	plan.ChunkRows.Value = 64
+	plan.Writers.Value = 2
+	plan.QueueDepth.Value = 2
+	limits := runtimeTuningTestLimits()
+	limits.GrowthAfterHealthyBoundaries = 2
+	start := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	now := start
+	clockCalls := 0
+	controller, err := NewRuntimeTuningControllerWithOptions(
+		plan,
+		limits,
+		RuntimeTuningOptions{
+			Interval: 10 * time.Second,
+			Now: func() time.Time {
+				clockCalls++
+				return now
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := newRuntimeObservationBuilder(plan, limits)
+
+	pressure := builder.next(controller)
+	pressure.MemoryPressure = true
+	afterPressure, err := controller.ApplyChunkBoundary(
+		context.Background(),
+		pressure,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clockCalls != 0 ||
+		afterPressure.Effective.ChunkRows.Value != 32 {
+		t.Fatalf(
+			"safety reduction clockCalls=%d values=%#v",
+			clockCalls,
+			afterPressure.Effective,
+		)
+	}
+	assertRuntimeDecisionReasons(
+		t,
+		controller.History()[0],
+		RuntimeReasonMemoryPressure,
+	)
+
+	now = now.Add(time.Second)
+	firstHealthy := builder.next(controller)
+	afterHealthy, err := controller.ApplyChunkBoundary(
+		context.Background(),
+		firstHealthy,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterHealthy.Effective.ChunkRows.Value != 32 ||
+		afterHealthy.HealthyBoundaries != 1 {
+		t.Fatalf("first eligible observation = %#v", afterHealthy)
+	}
+
+	now = now.Add(time.Second)
+	gated := builder.next(controller)
+	afterGated, err := controller.ApplyChunkBoundary(
+		context.Background(),
+		gated,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterGated.Effective.ChunkRows.Value != 32 ||
+		afterGated.HealthyBoundaries != 1 {
+		t.Fatalf(
+			"interval-gated boundary discarded eligible health: %#v",
+			afterGated,
+		)
+	}
+	assertRuntimeDecisionReasons(
+		t,
+		controller.History()[2],
+		RuntimeReasonIntervalGate,
+	)
+
+	now = now.Add(time.Second)
+	secondGated := builder.next(controller)
+	afterSecondGated, err := controller.ApplyChunkBoundary(
+		context.Background(),
+		secondGated,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterSecondGated.Effective.ChunkRows.Value != 32 ||
+		afterSecondGated.HealthyBoundaries != 1 {
+		t.Fatalf(
+			"second interval-gated boundary discarded eligible health: %#v",
+			afterSecondGated,
+		)
+	}
+	assertRuntimeDecisionReasons(
+		t,
+		controller.History()[3],
+		RuntimeReasonIntervalGate,
+	)
+
+	now = start.Add(11 * time.Second)
+	eligible := builder.next(controller)
+	afterEligible, err := controller.ApplyChunkBoundary(
+		context.Background(),
+		eligible,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterEligible.Effective.ChunkRows.Value != 64 {
+		t.Fatalf("elapsed interval did not permit growth: %#v", afterEligible.Effective)
+	}
+	if afterEligible.Interval != 10*time.Second {
+		t.Fatalf("runtime tuning interval = %s", afterEligible.Interval)
+	}
+
+	now = now.Add(time.Second)
+	secondPressure := builder.next(controller)
+	secondPressure.WriteOutcome = RuntimeWriteRetryableError
+	afterSecondPressure, err := controller.ApplyChunkBoundary(
+		context.Background(),
+		secondPressure,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterSecondPressure.Effective.ChunkRows.Value != 32 ||
+		afterSecondPressure.HealthyBoundaries != 0 {
+		t.Fatalf(
+			"write-error reduction = %#v",
+			afterSecondPressure,
+		)
+	}
+}
+
+func TestRuntimeTuningIntervalClockFailureDoesNotBlockSafetyReduction(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	plan := runtimeTuningTestPlan()
+	limits := runtimeTuningTestLimits()
+	controller, err := NewRuntimeTuningControllerWithOptions(
+		plan,
+		limits,
+		RuntimeTuningOptions{
+			Interval: time.Second,
+			Now:      func() time.Time { return time.Time{} },
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := newRuntimeObservationBuilder(plan, limits)
+	pressure := builder.next(controller)
+	pressure.MemoryPressure = true
+	if _, err := controller.ApplyChunkBoundary(
+		context.Background(),
+		pressure,
+	); err != nil {
+		t.Fatalf("safety reduction was interval-gated: %v", err)
+	}
+	healthy := builder.next(controller)
+	if _, err := controller.ApplyChunkBoundary(
+		context.Background(),
+		healthy,
+	); !errors.Is(err, ErrInvalidRuntimeObservation) {
+		t.Fatalf("healthy boundary error = %v", err)
+	}
 }
 
 func TestRuntimeTuningSafetyReductionOverridesPinsButRecoveryNeverExceedsThem(

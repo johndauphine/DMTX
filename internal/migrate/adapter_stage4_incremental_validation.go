@@ -22,6 +22,11 @@ type adapterStage4IncrementalValidationTarget interface {
 	) error
 }
 
+var _ adapterStage4IncrementalValidationTarget = (*postgresTargetAdapter)(nil)
+var _ adapterStage4IncrementalValidationTarget = (*sqlServerTargetAdapter)(nil)
+var _ adapterStage4IncrementalValidationTarget = (*mysqlTargetAdapter)(nil)
+var _ adapterStage4IncrementalValidationTarget = (*sqliteTargetAdapter)(nil)
+
 func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 	ctx context.Context,
 	table schema.Table,
@@ -29,15 +34,126 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 	sourceRows [][]any,
 ) error {
 	if adapter == nil || adapter.database == nil {
-		return NewTransferError(
-			ErrorClassState,
-			fmt.Errorf(
-				"PostgreSQL incremental validation target is not configured",
-			),
-		)
+		return stage4IncrementalValidationTargetUnavailable("PostgreSQL")
 	}
+	return validateStage4IncrementalSQLTarget(
+		ctx,
+		adapter,
+		"PostgreSQL",
+		table,
+		projection,
+		sourceRows,
+	)
+}
+
+func (adapter *sqlServerTargetAdapter) ValidateStage4IncrementalBatch(
+	ctx context.Context,
+	table schema.Table,
+	projection []string,
+	sourceRows [][]any,
+) error {
+	if adapter == nil || adapter.database == nil {
+		return stage4IncrementalValidationTargetUnavailable("SQL Server")
+	}
+	return validateStage4IncrementalSQLTarget(
+		ctx,
+		adapter,
+		"SQL Server",
+		table,
+		projection,
+		sourceRows,
+	)
+}
+
+func (adapter *mysqlTargetAdapter) ValidateStage4IncrementalBatch(
+	ctx context.Context,
+	table schema.Table,
+	projection []string,
+	sourceRows [][]any,
+) error {
+	if adapter == nil || adapter.database == nil {
+		return stage4IncrementalValidationTargetUnavailable("MySQL")
+	}
+	return validateStage4IncrementalSQLTarget(
+		ctx,
+		adapter,
+		"MySQL",
+		table,
+		projection,
+		sourceRows,
+	)
+}
+
+func (adapter *sqliteTargetAdapter) ValidateStage4IncrementalBatch(
+	ctx context.Context,
+	table schema.Table,
+	projection []string,
+	sourceRows [][]any,
+) error {
+	if adapter == nil || adapter.database == nil {
+		return stage4IncrementalValidationTargetUnavailable("SQLite")
+	}
+	return validateStage4IncrementalSQLTarget(
+		ctx,
+		adapter,
+		"SQLite",
+		table,
+		projection,
+		sourceRows,
+	)
+}
+
+func stage4IncrementalValidationTargetUnavailable(engine string) error {
+	return NewTransferError(
+		ErrorClassState,
+		fmt.Errorf("%s incremental validation target is not configured", engine),
+	)
+}
+
+// validateStage4IncrementalSQLTarget is deliberately endpoint-generic. The
+// four relational/SQLite target adapters only supply their configured query
+// endpoint; key construction, identifier quoting, placeholder binding, and
+// canonical comparison remain shared with the database validation probe.
+func validateStage4IncrementalSQLTarget(
+	ctx context.Context,
+	target targetAdapter,
+	label string,
+	table schema.Table,
+	projection []string,
+	sourceRows [][]any,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	endpoint, err := adapterValidationTargetEndpoint(target)
+	if err != nil {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("resolve %s incremental validation target: %w", label, err),
+		)
+	}
+	if endpoint.engine == adapterValidationSQLite {
+		if table.Schema != "" {
+			return NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"admit %s incremental validation table: SQLite target table %s has schema %q",
+					label,
+					table.Name,
+					table.Schema,
+				),
+			)
+		}
+	} else if table.Schema != endpoint.namespace {
+		return NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"admit %s incremental validation table: planned schema %q differs from target namespace %q",
+				label,
+				table.Schema,
+				endpoint.namespace,
+			),
+		)
 	}
 	descriptor, err := validateValidationCoreProjection(
 		table,
@@ -48,7 +164,8 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 		return NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
-				"admit PostgreSQL incremental validation projection: %w",
+				"admit %s incremental validation projection: %w",
+				label,
 				err,
 			),
 		)
@@ -61,7 +178,8 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 		return NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
-				"admit PostgreSQL incremental validation primary key: %w",
+				"admit %s incremental validation primary key: %w",
+				label,
 				err,
 			),
 		)
@@ -71,7 +189,8 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 		return NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
-				"map PostgreSQL incremental validation primary key: %w",
+				"map %s incremental validation primary key: %w",
+				label,
 				err,
 			),
 		)
@@ -91,7 +210,8 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 				return NewTransferError(
 					ErrorClassState,
 					fmt.Errorf(
-						"PostgreSQL incremental source batch has an incomplete primary key",
+						"%s incremental source batch has an incomplete primary key",
+						label,
 					),
 				)
 			}
@@ -111,7 +231,8 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 		return NewTransferError(
 			ErrorClassValidation,
 			fmt.Errorf(
-				"canonicalize PostgreSQL incremental source batch: %w",
+				"canonicalize %s incremental source batch: %w",
+				label,
 				err,
 			),
 		)
@@ -120,7 +241,7 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 		return NewTransferError(
 			ErrorClassValidation,
 			errors.New(
-				"PostgreSQL incremental source batch contains duplicate complete primary keys",
+				label+" incremental source batch contains duplicate complete primary keys",
 			),
 		)
 	}
@@ -132,17 +253,11 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 		return NewTransferError(
 			ErrorClassValidation,
 			fmt.Errorf(
-				"canonicalize PostgreSQL incremental validation keys: %w",
+				"canonicalize %s incremental validation keys: %w",
+				label,
 				err,
 			),
 		)
-	}
-	endpoint := adapterValidationSQLEndpoint{
-		engine:         adapterValidationPostgres,
-		namespace:      table.Schema,
-		queryer:        adapter.database,
-		database:       adapter.database,
-		parameterLimit: adapterValidationPostgresParameterLimit,
 	}
 	batchSize, err := adapterValidationKeyBatchSize(
 		endpoint.parameterLimit,
@@ -171,7 +286,8 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 			return NewTransferError(
 				ErrorClassPolicy,
 				fmt.Errorf(
-					"build PostgreSQL incremental validation key predicate: %w",
+					"build %s incremental validation key predicate: %w",
+					label,
 					predicateErr,
 				),
 			)
@@ -181,14 +297,15 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 			projection,
 		) + " FROM " + endpoint.qualified(table) +
 			" WHERE " + predicate
-		rows, queryErr := adapter.database.QueryContext(
+		rows, queryErr := endpoint.queryer.QueryContext(
 			ctx,
 			query,
 			arguments...,
 		)
 		if queryErr != nil {
 			return fmt.Errorf(
-				"fetch PostgreSQL incremental target rows for table %s failed with error type %T",
+				"fetch %s incremental target rows for table %s failed with error type %T",
+				label,
 				table.Name,
 				queryErr,
 			)
@@ -197,7 +314,7 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 			rows,
 			len(projection),
 			end-offset,
-			"PostgreSQL incremental target validation",
+			label+" incremental target validation",
 		)
 		if scanErr != nil {
 			return scanErr
@@ -214,7 +331,8 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 		return NewTransferError(
 			ErrorClassValidation,
 			fmt.Errorf(
-				"validate PostgreSQL incremental target key set: %w",
+				"validate %s incremental target key set: %w",
+				label,
 				err,
 			),
 		)
@@ -229,7 +347,8 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 		return NewTransferError(
 			ErrorClassValidation,
 			fmt.Errorf(
-				"canonicalize PostgreSQL incremental target batch: %w",
+				"canonicalize %s incremental target batch: %w",
+				label,
 				err,
 			),
 		)
@@ -241,7 +360,7 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 			return NewTransferError(
 				ErrorClassValidation,
 				errors.New(
-					"PostgreSQL incremental target returned a duplicate complete primary key",
+					label+" incremental target returned a duplicate complete primary key",
 				),
 			)
 		}
@@ -251,7 +370,8 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 		return NewTransferError(
 			ErrorClassValidation,
 			fmt.Errorf(
-				"PostgreSQL incremental target returned %d rows for %d exact source keys",
+				"%s incremental target returned %d rows for %d exact source keys",
+				label,
 				len(targetByKey),
 				len(canonicalSource),
 			),
@@ -263,7 +383,8 @@ func (adapter *postgresTargetAdapter) ValidateStage4IncrementalBatch(
 			return NewTransferError(
 				ErrorClassValidation,
 				fmt.Errorf(
-					"PostgreSQL incremental target row differs for a transferred complete primary key",
+					"%s incremental target row differs for a transferred complete primary key",
+					label,
 				),
 			)
 		}

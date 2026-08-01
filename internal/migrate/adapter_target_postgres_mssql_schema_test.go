@@ -86,7 +86,7 @@ func TestProjectSQLServerTableForPostgresPreservesSafeShape(t *testing.T) {
 	}{
 		{typ: "bigint"},
 		{
-			typ: "text",
+			typ: "varchar",
 			declaration: &schema.DeclaredType{
 				Base:      "varchar",
 				Arguments: []int{80},
@@ -94,7 +94,7 @@ func TestProjectSQLServerTableForPostgresPreservesSafeShape(t *testing.T) {
 		},
 		{typ: "bytea"},
 		{
-			typ: "datetime",
+			typ: "timestamp",
 			declaration: &schema.DeclaredType{
 				Base:      "timestamp",
 				Arguments: []int{6},
@@ -107,7 +107,7 @@ func TestProjectSQLServerTableForPostgresPreservesSafeShape(t *testing.T) {
 			},
 		},
 		{
-			typ: "datetime",
+			typ: "timestamp",
 			declaration: &schema.DeclaredType{
 				Base:      "timestamp",
 				Arguments: []int{0},

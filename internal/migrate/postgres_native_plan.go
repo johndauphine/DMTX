@@ -153,3 +153,17 @@ func postgresMergeStageStatement(
 	return statement + " DO UPDATE SET " +
 		strings.Join(updates, ", "), true, nil
 }
+
+func postgresInsertOnlyStageStatement(
+	table schema.Table,
+	columns []string,
+	stage string,
+) string {
+	return "INSERT INTO " +
+		postgresQualified(table.Schema, table.Name) +
+		" (" + quotedColumns(columns) + ") SELECT " +
+		quotedColumns(columns) + " FROM " +
+		postgresQualified("pg_temp", stage) +
+		" WHERE true ON CONFLICT (" +
+		quotedColumns(primaryKeyColumns(table)) + ") DO NOTHING"
+}

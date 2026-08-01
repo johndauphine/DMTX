@@ -255,11 +255,30 @@ func requireStage4PostgresStrictRoute(
 		isNilInterface(source) ||
 		isNilInterface(target) ||
 		source.Engine() != "postgres" ||
-		target.Engine() != "postgres" {
+		!stage4AdapterNetworkRelationalEngine(target.Engine()) {
 		return NewTransferError(
 			ErrorClassPolicy,
 			errors.New(
-				"Stage 4 strict consistency is certified only for PostgreSQL-to-PostgreSQL upsert",
+				"Stage 4 PostgreSQL strict consistency requires an upsert route to a certified relational or SQLite target",
+			),
+		)
+	}
+	if relational, ok := source.(*relationalSourceAdapter); !ok ||
+		relational == nil || relational.database == nil {
+		return NewTransferError(
+			ErrorClassPolicy,
+			errors.New(
+				"PostgreSQL strict composition requires the production relational source adapter",
+			),
+		)
+	}
+	if upsertTarget, ok := target.(adapterStage4NetworkUpsertTarget); !ok ||
+		isNilInterface(upsertTarget) {
+		return NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 PostgreSQL strict target engine %q has no certified idempotent network upsert path",
+				target.Engine(),
 			),
 		)
 	}
@@ -287,11 +306,11 @@ func migrateWithStage4PostgresStrictAdapters(
 	}
 	if prepared.mode != "upsert" ||
 		source.Engine() != "postgres" ||
-		target.Engine() != "postgres" {
+		!stage4AdapterNetworkRelationalEngine(target.Engine()) {
 		return Result{}, NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
-				"Stage 4 strict network composition is certified only for PostgreSQL-to-PostgreSQL upsert",
+				"Stage 4 PostgreSQL strict network composition requires an upsert route to a certified relational or SQLite target",
 			),
 		)
 	}
@@ -309,14 +328,6 @@ func migrateWithStage4PostgresStrictAdapters(
 			ErrorClassPolicy,
 			errors.New(
 				"PostgreSQL strict composition requires the production relational source adapter",
-			),
-		)
-	}
-	if _, ok := target.(*postgresTargetAdapter); !ok {
-		return Result{}, NewTransferError(
-			ErrorClassPolicy,
-			errors.New(
-				"PostgreSQL strict composition requires the production PostgreSQL target adapter",
 			),
 		)
 	}

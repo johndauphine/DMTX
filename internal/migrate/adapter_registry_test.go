@@ -383,7 +383,7 @@ func TestStrictConsistencyPrecedesAdapterConstruction(t *testing.T) {
 	}{
 		{name: "default table", enabled: true, want: `scope "table"`},
 		{name: "explicit table", enabled: true, scope: "table", want: `scope "table"`},
-		{name: "migration", enabled: true, scope: "migration", want: `scope "migration"`},
+		{name: "migration", enabled: true, scope: "migration", want: "SQLite strict consistency supports table scope only"},
 		{name: "unknown enabled", enabled: true, scope: "process", want: `invalid strict_consistency_scope "process"`},
 		{name: "unknown disabled", scope: "process", want: `invalid strict_consistency_scope "process"`},
 	}
@@ -416,7 +416,7 @@ func TestStrictConsistencyPrecedesAdapterConstruction(t *testing.T) {
 	}
 }
 
-func TestBuiltInRoutesRejectUncertifiedStrictConsistencyScopes(t *testing.T) {
+func TestBuiltInRoutesEnforceCertifiedStrictConsistencyScopes(t *testing.T) {
 	pairs := make([]adapterPair, 0, len(builtInAdapters.certified))
 	for pair := range builtInAdapters.certified {
 		pairs = append(pairs, pair)
@@ -443,19 +443,32 @@ func TestBuiltInRoutesRejectUncertifiedStrictConsistencyScopes(t *testing.T) {
 							"target",
 						),
 						Migration: config.Migration{
+							TargetMode:             "upsert",
 							StrictConsistency:      true,
 							StrictConsistencyScope: scope,
 						},
 					})
+					certified := certifiedStrictConsistencyComposition(
+						pair.source,
+						pair.target,
+						"upsert",
+					) && !((pair.source == "mysql" || pair.source == "sqlite") && scope == "migration")
+					if certified {
+						if err != nil {
+							t.Fatalf(
+								"ValidateMigration(%s-to-%s, %s) rejected certified strict route: %v",
+								pair.source,
+								pair.target,
+								scope,
+								err,
+							)
+						}
+						return
+					}
 					if err == nil ||
-						!strings.Contains(
-							err.Error(),
-							"certified only for PostgreSQL-to-PostgreSQL upsert",
-						) ||
-						!strings.Contains(
-							err.Error(),
-							`scope "`+scope+`"`,
-						) {
+						!strings.Contains(err.Error(), "strict consistency") ||
+						(pair.source != "mysql" && pair.source != "sqlite" &&
+							!strings.Contains(err.Error(), `scope "`+scope+`"`)) {
 						t.Fatalf(
 							"ValidateMigration(%s-to-%s, %s) error = %v",
 							pair.source,

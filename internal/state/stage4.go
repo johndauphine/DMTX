@@ -61,9 +61,20 @@ type Stage4Backend interface {
 	LoadStrictSnapshotEvidence(string, TaskKey, string) (StrictSnapshotEvidence, bool, error)
 }
 
+// StrictMigrationCleanupBackend is an optional, additive durable receipt used
+// only by the SQL Server migration-scope database-snapshot composition. It is
+// intentionally separate from Stage4Backend so third-party Stage 4 backends do
+// not silently claim they can authorize destructive snapshot cleanup.
+type StrictMigrationCleanupBackend interface {
+	SaveStrictMigrationCleanupIntent(StrictMigrationCleanupIntent) error
+	LoadStrictMigrationCleanupIntent(string, string) (StrictMigrationCleanupIntent, bool, error)
+}
+
 var (
-	_ Stage4Backend = SQLiteStore{}
-	_ Stage4Backend = YAMLStore{}
+	_ Stage4Backend                 = SQLiteStore{}
+	_ Stage4Backend                 = YAMLStore{}
+	_ StrictMigrationCleanupBackend = SQLiteStore{}
+	_ StrictMigrationCleanupBackend = YAMLStore{}
 )
 
 // SchemaSnapshot is the deterministic canonical schema observed for one
@@ -324,6 +335,21 @@ type StrictMigrationSnapshot struct {
 	SnapshotReference string    `json:"snapshot_reference" yaml:"snapshot_reference"`
 	ProcessEpoch      string    `json:"process_epoch" yaml:"process_epoch"`
 	CapturedAt        time.Time `json:"captured_at" yaml:"captured_at"`
+}
+
+// StrictMigrationCleanupIntent is persisted after all strict migration work
+// and schema sentinels are durable but before SQL Server drops its database
+// snapshot. It turns the non-transactional DROP into an idempotent operation:
+// an all-work-complete resume may accept an absent snapshot only when this
+// exact immutable receipt exists.
+type StrictMigrationCleanupIntent struct {
+	RunID             string    `json:"run_id" yaml:"run_id"`
+	EpochID           string    `json:"epoch_id" yaml:"epoch_id"`
+	SourceEngine      string    `json:"source_engine" yaml:"source_engine"`
+	SnapshotReference string    `json:"snapshot_reference" yaml:"snapshot_reference"`
+	ProcessEpoch      string    `json:"process_epoch" yaml:"process_epoch"`
+	CapturedAt        time.Time `json:"captured_at" yaml:"captured_at"`
+	IntentAt          time.Time `json:"intent_at" yaml:"intent_at"`
 }
 
 // StrictSnapshotEvidence is the immutable source-view evidence used by resume
@@ -1281,6 +1307,44 @@ func normalizeStrictMigrationSnapshot(snapshot StrictMigrationSnapshot) (StrictM
 	snapshot.SourceEngine = engine
 	snapshot.CapturedAt = snapshot.CapturedAt.UTC()
 	return snapshot, nil
+}
+
+func normalizeStrictMigrationCleanupIntent(
+	intent StrictMigrationCleanupIntent,
+) (StrictMigrationCleanupIntent, error) {
+	owner, err := normalizeStrictMigrationSnapshot(StrictMigrationSnapshot{
+		RunID:             intent.RunID,
+		EpochID:           intent.EpochID,
+		SourceEngine:      intent.SourceEngine,
+		SnapshotReference: intent.SnapshotReference,
+		ProcessEpoch:      intent.ProcessEpoch,
+		CapturedAt:        intent.CapturedAt,
+	})
+	if err != nil {
+		return StrictMigrationCleanupIntent{}, fmt.Errorf(
+			"strict migration cleanup intent: %w",
+			err,
+		)
+	}
+	if owner.SourceEngine != "mssql" {
+		return StrictMigrationCleanupIntent{}, fmt.Errorf(
+			"strict migration cleanup intent is supported only for SQL Server snapshots",
+		)
+	}
+	if intent.IntentAt.IsZero() {
+		return StrictMigrationCleanupIntent{}, fmt.Errorf(
+			"strict migration cleanup intent time is required",
+		)
+	}
+	return StrictMigrationCleanupIntent{
+		RunID:             owner.RunID,
+		EpochID:           owner.EpochID,
+		SourceEngine:      owner.SourceEngine,
+		SnapshotReference: owner.SnapshotReference,
+		ProcessEpoch:      owner.ProcessEpoch,
+		CapturedAt:        owner.CapturedAt,
+		IntentAt:          intent.IntentAt.UTC(),
+	}, nil
 }
 
 func normalizeStrictSnapshotEvidence(evidence StrictSnapshotEvidence) (StrictSnapshotEvidence, error) {

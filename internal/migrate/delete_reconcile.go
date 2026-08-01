@@ -180,6 +180,16 @@ type deleteDueFacts struct {
 	NextDueAt        *time.Time
 }
 
+// DeleteReconciliationDueFacts is the read-only scheduling evidence exposed
+// to dry-run callers. It is computed by the same due-state function used by
+// the mutating reconciliation runner.
+type DeleteReconciliationDueFacts struct {
+	Due              bool
+	Reason           string
+	LastSuccessfulAt *time.Time
+	NextDueAt        *time.Time
+}
+
 type deleteReconcileOutcome struct {
 	Record                state.DeleteReconciliation
 	DueFacts              deleteDueFacts
@@ -262,6 +272,26 @@ func deleteReconciliationDue(
 			nextDueAt.Format(time.RFC3339Nano)
 	}
 	return facts, nil
+}
+
+// EvaluateDeleteReconciliationDue keeps dry-run scheduling facts on the exact
+// production path without opening or mutating a state backend.
+func EvaluateDeleteReconciliationDue(
+	now time.Time,
+	interval time.Duration,
+	last state.DeleteReconciliation,
+	found bool,
+) (DeleteReconciliationDueFacts, error) {
+	facts, err := deleteReconciliationDue(now, interval, last, found)
+	if err != nil {
+		return DeleteReconciliationDueFacts{}, err
+	}
+	return DeleteReconciliationDueFacts{
+		Due:              facts.Due,
+		Reason:           facts.Reason,
+		LastSuccessfulAt: facts.LastSuccessfulAt,
+		NextDueAt:        facts.NextDueAt,
+	}, nil
 }
 
 func validateDeleteReconcileRequest(

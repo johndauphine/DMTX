@@ -58,6 +58,12 @@ type adapterRetainedStableRelationalView struct {
 	paginationPlans   map[string]PaginationPlan
 	tableScope        *adapterStableTableIdentity
 	tableCatalog      *schema.Table
+	// sqlServerStrict is set only by the SQL Server strict-session bridges.
+	// It prevents a normal table-stable transaction from being mistaken for a
+	// retained strict authority when an operation (such as delete
+	// reconciliation) must stay inside the durable strict epoch.
+	sqlServerStrict   bool
+	sqlServerSnapshot bool
 }
 
 type adapterStableTableIdentity struct {

@@ -136,6 +136,7 @@ func TestStage4AdapterNetworkWriterRequiresIdempotentModeAndRebasesReceipt(
 		context.Background(),
 		target,
 		execution.ranges,
+		execution.plan.ReplayMode,
 		request,
 	)
 	if err != nil {
@@ -153,9 +154,91 @@ func TestStage4AdapterNetworkWriterRequiresIdempotentModeAndRebasesReceipt(
 		context.Background(),
 		target,
 		execution.ranges,
+		execution.plan.ReplayMode,
 		request,
 	); err == nil || len(target.snapshotWrites()) != before {
 		t.Fatalf("fresh mode error=%v writes=%#v", err, target.snapshotWrites())
+	}
+}
+
+func TestStage4AdapterNetworkRebuildUsesDuplicateSafeWriterForFreshAndReplay(
+	t *testing.T,
+) {
+	run := newNetworkStateTestRun(t, "sqlite", "stage4-network-rebuild")
+	prepared := stage4NetworkRunnerTestPrepared(t, run, []int{1})
+	prepared.mode = "drop_recreate"
+	source := newStage4NetworkRunnerTestSource("postgres")
+	target := &stage4NetworkRunnerTestTarget{engine: "sqlite"}
+	cfg := stage4NetworkRunnerConfig()
+	cfg.Migration.TargetMode = "drop_recreate"
+	resources := stage4NetworkRunnerResources()
+	resources.TargetMode = "drop_recreate"
+
+	execution, err := admitStage4AdapterNetworkTransfer(
+		context.Background(),
+		cfg,
+		networkStateTestProtector{},
+		source,
+		target,
+		prepared,
+		&resources,
+	)
+	if err != nil {
+		t.Fatalf("admit rebuild network transfer: %v", err)
+	}
+	if execution.plan.ReplayMode != NetworkReplayDuplicateSafeInsertOnly {
+		t.Fatalf("rebuild replay mode = %q", execution.plan.ReplayMode)
+	}
+	request := NetworkWriteRequest{
+		Range: execution.plan.Ranges[0],
+		Rows:  stage4NetworkRunnerRows(1, 100),
+	}
+	for _, mode := range []NetworkWriteMode{
+		NetworkWriteFreshInsert,
+		NetworkWriteDuplicateSafeInsertOnly,
+	} {
+		request.Mode = mode
+		if _, err := writeStage4AdapterNetworkPage(
+			context.Background(),
+			target,
+			execution.ranges,
+			execution.plan.ReplayMode,
+			request,
+		); err != nil {
+			t.Fatalf("write rebuild mode %q: %v", mode, err)
+		}
+	}
+	writes := target.snapshotWrites()
+	if len(writes) != 2 {
+		t.Fatalf("rebuild writes = %#v", writes)
+	}
+	if writes[0].mode != string(NetworkWriteFreshInsert) ||
+		writes[1].mode != string(NetworkWriteDuplicateSafeInsertOnly) {
+		t.Fatalf("rebuild writer modes = %#v", writes)
+	}
+}
+
+func TestStage4AdapterNetworkRebuildFailsClosedWithoutDuplicateSafeWriter(
+	t *testing.T,
+) {
+	run := newNetworkStateTestRun(t, "sqlite", "stage4-network-rebuild-no-writer")
+	prepared := stage4NetworkRunnerTestPrepared(t, run, []int{1})
+	prepared.mode = "drop_recreate"
+	cfg := stage4NetworkRunnerConfig()
+	cfg.Migration.TargetMode = "drop_recreate"
+	resources := stage4NetworkRunnerResources()
+	resources.TargetMode = "drop_recreate"
+	_, err := admitStage4AdapterNetworkTransfer(
+		context.Background(),
+		cfg,
+		networkStateTestProtector{},
+		newStage4NetworkRunnerTestSource("postgres"),
+		&stage4NetworkRunnerNoReplayTarget{engine: "sqlite"},
+		prepared,
+		&resources,
+	)
+	if err == nil || !strings.Contains(err.Error(), "duplicate-safe rebuild") {
+		t.Fatalf("missing rebuild writer error = %v", err)
 	}
 }
 
@@ -600,19 +683,6 @@ func TestStage4AdapterNetworkAdmissionFailsBeforeTargetWrite(t *testing.T) {
 		)
 	}{
 		{
-			name: "rebuild",
-			mutate: func(
-				cfg *config.Config,
-				prepared *stage4AdapterPrepared,
-				_ *stage4NetworkRunnerTestSource,
-				_ *targetAdapter,
-				_ *config.EffectiveTransferPlan,
-			) {
-				cfg.Migration.TargetMode = "drop_recreate"
-				prepared.mode = "drop_recreate"
-			},
-		},
-		{
 			name: "strict consistency",
 			mutate: func(
 				cfg *config.Config,
@@ -646,18 +716,6 @@ func TestStage4AdapterNetworkAdmissionFailsBeforeTargetWrite(t *testing.T) {
 				_ *config.EffectiveTransferPlan,
 			) {
 				cfg.Migration.Deletes.Mode = config.DeleteModeReconcile
-			},
-		},
-		{
-			name: "runtime tuning",
-			mutate: func(
-				cfg *config.Config,
-				_ *stage4AdapterPrepared,
-				_ *stage4NetworkRunnerTestSource,
-				_ *targetAdapter,
-				_ *config.EffectiveTransferPlan,
-			) {
-				cfg.Migration.RuntimeTuning = true
 			},
 		},
 		{
@@ -1107,7 +1165,20 @@ type stage4NetworkRunnerTestTarget struct {
 func (*stage4NetworkRunnerTestTarget) stage4NetworkIdempotentUpsertTarget() {
 }
 
+func (*stage4NetworkRunnerTestTarget) stage4NetworkDuplicateSafeRebuildTarget() {
+}
+
 func (target *stage4NetworkRunnerTestTarget) PreflightStage4NetworkReplayIsolation(
+	context.Context,
+	[]schema.Table,
+) error {
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	target.isolationCalls++
+	return target.isolationErr
+}
+
+func (target *stage4NetworkRunnerTestTarget) PreflightStage4NetworkRebuild(
 	context.Context,
 	[]schema.Table,
 ) error {
@@ -1128,6 +1199,22 @@ func (target *stage4NetworkRunnerTestTarget) WriteStage4NetworkBatch(
 	rows [][]any,
 ) (WriteReceipt, error) {
 	return target.WriteBatch(ctx, table, columns, "upsert", rows)
+}
+
+func (target *stage4NetworkRunnerTestTarget) WriteStage4NetworkRebuildBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	mode NetworkWriteMode,
+	rows [][]any,
+) (WriteReceipt, error) {
+	return target.WriteBatch(
+		ctx,
+		table,
+		columns,
+		string(mode),
+		rows,
+	)
 }
 
 func (*stage4NetworkRunnerTestTarget) PlanTables(

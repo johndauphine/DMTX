@@ -356,7 +356,7 @@ func TestDatabaseValidationProbeFailsClosed(t *testing.T) {
 		t.Cleanup(func() {
 			_ = transaction.Rollback()
 		})
-		_, err = source.Stage4ValidationProbe(
+		contract, err := source.Stage4ValidationProbe(
 			source,
 			&postgresTargetAdapter{
 				database:  database,
@@ -371,12 +371,11 @@ func TestDatabaseValidationProbeFailsClosed(t *testing.T) {
 				columns: []string{"id", "payload", "marker"},
 			}},
 		)
-		if err == nil ||
-			!strings.Contains(
-				err.Error(),
-				"lacks a certified cross-engine",
-			) {
-			t.Fatalf("cross-engine validation error = %v", err)
+		if err != nil {
+			t.Fatalf("cross-engine numeric validation admission = %v", err)
+		}
+		if _, err := contract.(*adapterDatabaseValidationProbe).Stage4ValidationPrimaryKeyEqualityProof(table); err != nil {
+			t.Fatalf("cross-engine numeric key proof: %v", err)
 		}
 	})
 
@@ -407,9 +406,9 @@ func TestDatabaseValidationProbeFailsClosed(t *testing.T) {
 	t.Run("different key types", func(t *testing.T) {
 		sourceTable := adapterValidationSQLiteTestTable("items")
 		targetTable := adapterValidationSQLiteTestTable("items")
-		targetTable.Columns[0].Type = "bigint"
+		targetTable.Columns[0].Type = "text"
 		targetTable.Columns[0].DeclaredType = &schema.DeclaredType{
-			Base: "bigint",
+			Base: "text",
 		}
 		_, _, _, err := adapterValidationEqualityProof(
 			adapterValidationSQLite,
@@ -424,7 +423,7 @@ func TestDatabaseValidationProbeFailsClosed(t *testing.T) {
 			},
 		)
 		if err == nil ||
-			!strings.Contains(err.Error(), "types differ") {
+			!strings.Contains(err.Error(), "lacks a certified") {
 			t.Fatalf("different-key-type validation error = %v", err)
 		}
 	})
@@ -632,6 +631,117 @@ func TestAdapterValidationSQLShapeAndBounds(t *testing.T) {
 				t.Fatal("invalid target sample result was accepted")
 			}
 		})
+	}
+}
+
+func TestAdapterValidationDialectQueryShapesAndCrossDriverDomains(t *testing.T) {
+	table := schema.Table{Schema: `source]schema`, Name: `items"table`}
+	primaryKey := []schema.Column{
+		{Name: "tenant_id", Type: "bigint", PrimaryKey: true, PrimaryKeyPosition: 1},
+		{Name: "item_id", Type: "integer", PrimaryKey: true, PrimaryKeyPosition: 2},
+	}
+	for name, fixture := range map[string]struct {
+		endpoint       adapterValidationSQLEndpoint
+		qualified      string
+		placeholder    string
+		sampleFragment string
+	}{
+		"postgres": {
+			endpoint:  adapterValidationSQLEndpoint{engine: adapterValidationPostgres, parameterLimit: adapterValidationPostgresParameterLimit},
+			qualified: `"source]schema"."items""table"`, placeholder: "$1", sampleFragment: `LIMIT $1`,
+		},
+		"sqlserver": {
+			endpoint:  adapterValidationSQLEndpoint{engine: adapterValidationSQLServer, parameterLimit: adapterValidationSQLServerParameterLimit},
+			qualified: `[source]]schema].[items"table]`, placeholder: "@p1", sampleFragment: `TOP (@p1)`,
+		},
+		"mysql": {
+			endpoint:  adapterValidationSQLEndpoint{engine: adapterValidationMySQL, parameterLimit: adapterValidationMySQLParameterLimit},
+			qualified: "`source]schema`.`items\"table`", placeholder: "?", sampleFragment: `LIMIT ?`,
+		},
+		"sqlite": {
+			endpoint:  adapterValidationSQLEndpoint{engine: adapterValidationSQLite, parameterLimit: adapterValidationSQLiteParameterLimit},
+			qualified: `"items""table"`, placeholder: "?", sampleFragment: `LIMIT ?`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := fixture.endpoint.qualified(table); got != fixture.qualified {
+				t.Fatalf("qualified relation = %q, want %q", got, fixture.qualified)
+			}
+			predicate, args, err := adapterValidationKeyPredicate(
+				fixture.endpoint,
+				primaryKey,
+				[]ValidationPrimaryKey{{Values: []any{int64(1), int64(2)}}, {Values: []any{int64(3), int64(4)}}},
+			)
+			if err != nil || len(args) != 4 || !strings.Contains(predicate, fixture.placeholder) {
+				t.Fatalf("composite predicate=%q args=%#v err=%v", predicate, args, err)
+			}
+			query := adapterValidationSampleQuery(fixture.endpoint, "id", fixture.endpoint.qualified(table), "id")
+			if !strings.Contains(query, fixture.sampleFragment) {
+				t.Fatalf("sample query = %q, want %q", query, fixture.sampleFragment)
+			}
+			if batch, err := adapterValidationKeyBatchSize(fixture.endpoint.parameterLimit, len(primaryKey)); err != nil || batch < 1 || batch > adapterValidationMaximumKeyBatch {
+				t.Fatalf("key batch=%d err=%v", batch, err)
+			}
+		})
+	}
+
+	source := adapterValidationSQLiteTestTable("items")
+	target := adapterValidationSQLiteTestTable("items")
+	target.Columns[0].Type = "bigint"
+	target.Columns[0].DeclaredType = &schema.DeclaredType{Base: "bigint"}
+	if _, _, digest, err := adapterValidationCrossEqualityProof(adapterValidationSQLite, adapterValidationPostgres, adapterTablePlan{source: source, target: target, columns: []string{"id", "payload", "marker"}}); err != nil || !validValidationEqualityProofDigest(digest) {
+		t.Fatalf("integer cross-driver equality proof = %q, %v", digest, err)
+	}
+	source.Columns[0].Type = "text"
+	source.Columns[0].DeclaredType = &schema.DeclaredType{Base: "text"}
+	target.Columns[0].Type = "text"
+	target.Columns[0].DeclaredType = &schema.DeclaredType{Base: "text"}
+	if _, _, _, err := adapterValidationCrossEqualityProof(adapterValidationMySQL, adapterValidationPostgres, adapterTablePlan{source: source, target: target, columns: []string{"id", "payload", "marker"}}); err == nil || !strings.Contains(err.Error(), "collation") {
+		t.Fatalf("text collation key was accepted: %v", err)
+	}
+}
+
+func TestAdapterValidationAdmitsRelationalEndpointFamilies(t *testing.T) {
+	database := openAdapterValidationSQLiteTestDatabase(t, filepath.Join(t.TempDir(), "endpoint.db"))
+	for name, target := range map[string]targetAdapter{
+		"postgres":  &postgresTargetAdapter{database: database, namespace: "public"},
+		"sqlserver": &sqlServerTargetAdapter{database: database, namespace: "dbo"},
+		"mysql":     &mysqlTargetAdapter{database: database, namespace: "dmtx"},
+		"sqlite":    &sqliteTargetAdapter{database: database},
+	} {
+		t.Run(name, func(t *testing.T) {
+			endpoint, err := adapterValidationTargetEndpoint(target)
+			if err != nil || endpoint.engine == "" || endpoint.parameterLimit < 1 {
+				t.Fatalf("target endpoint = %#v, %v", endpoint, err)
+			}
+		})
+	}
+	for _, engine := range []string{adapterValidationPostgres, adapterValidationSQLServer, adapterValidationMySQL} {
+		t.Run("source-"+engine, func(t *testing.T) {
+			endpoint := adapterValidationSQLEndpoint{engine: engine, namespace: "scope", queryer: database, database: database, parameterLimit: adapterValidationParameterLimit(engine)}
+			if err := validateAdapterValidationEndpoint(endpoint); err != nil {
+				t.Fatalf("source endpoint %s: %v", engine, err)
+			}
+		})
+	}
+}
+
+func TestAdapterValidationSameEngineKeyDomainsRemainCertified(t *testing.T) {
+	for _, kind := range []validationValueKind{
+		validationBoolean, validationInteger, validationDecimal, validationBytes,
+		validationDate, validationTime, validationTimestamp, validationUUID,
+	} {
+		if !adapterValidationCrossKeyKindCertified(adapterValidationPostgres, adapterValidationPostgres, kind) {
+			t.Fatalf("PostgreSQL same-engine key kind %s lost certification", kind)
+		}
+	}
+	for _, kind := range []validationValueKind{validationInteger, validationBytes} {
+		if !adapterValidationCrossKeyKindCertified(adapterValidationSQLite, adapterValidationSQLite, kind) {
+			t.Fatalf("SQLite same-engine key kind %s lost certification", kind)
+		}
+	}
+	if adapterValidationCrossKeyKindCertified(adapterValidationPostgres, adapterValidationSQLServer, validationTimestamp) {
+		t.Fatal("cross-engine timestamp key was admitted without a portable bind proof")
 	}
 }
 

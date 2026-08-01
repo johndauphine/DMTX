@@ -61,6 +61,75 @@ func TestLatestRunForTargetUsesCanonicalNetworkIdentity(t *testing.T) {
 	}
 }
 
+func TestLatestRunForTargetRejectsNewerTerminalNonResumableAttempt(t *testing.T) {
+	store := state.SQLiteStore{Path: filepath.Join(t.TempDir(), "state.db")}
+	target := config.Endpoint{
+		Type: "postgresql", Host: "db.example", Database: "warehouse",
+		Schema: "public",
+	}
+	identity, err := endpointWorkloadIdentity(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now().UTC()
+	if err := store.InitializeRun(state.Run{
+		ID: "old-resumable", Source: "source", Target: "warehouse",
+		SourceEngine: "mssql", TargetIdentity: identity,
+		Outcome: state.Running, Resumable: true,
+		Reason: "in progress", StartedAt: started,
+	}, "old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateNonResumableOutcome(
+		"old-resumable",
+		state.Partial,
+		"SQL Server migration snapshot released after graceful failure",
+		started.Add(time.Second),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	selected, found, err := latestRunForTarget(store, target)
+	if err != nil || found {
+		t.Fatalf("selected = %#v, found=%v error=%v; want no resume candidate", selected, found, err)
+	}
+}
+
+func TestLatestRunForTargetKeepsDistinctEarlierResumableAttempt(t *testing.T) {
+	store := state.SQLiteStore{Path: filepath.Join(t.TempDir(), "state.db")}
+	target := config.Endpoint{
+		Type: "postgresql", Host: "db.example", Database: "warehouse",
+		Schema: "public",
+	}
+	identity, err := endpointWorkloadIdentity(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now().UTC()
+	if err := store.InitializeRun(state.Run{
+		ID: "old-resumable", Source: "source", Target: "warehouse",
+		SourceEngine: "mssql", TargetIdentity: identity,
+		Outcome: state.Failed, Resumable: true,
+		Reason: "temporary failure", StartedAt: started,
+	}, "old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InitializeRun(state.Run{
+		ID: "ignored-terminal", Source: "source", Target: "warehouse",
+		SourceEngine: "mssql", TargetIdentity: identity,
+		Outcome: state.Partial, Resumable: false,
+		Reason:    "released a distinct SQL Server migration snapshot",
+		StartedAt: started.Add(time.Second),
+	}, "terminal"); err != nil {
+		t.Fatal(err)
+	}
+
+	selected, found, err := latestRunForTarget(store, target)
+	if err != nil || !found || selected.ID != "old-resumable" {
+		t.Fatalf("selected = %#v, found=%v error=%v", selected, found, err)
+	}
+}
+
 func TestLatestRunForTargetMatchesSQLitePathToHardlinkTransition(
 	t *testing.T,
 ) {

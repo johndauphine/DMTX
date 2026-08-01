@@ -147,12 +147,9 @@ func planPostgresMySQLTableDataProbes(
 				column.Name,
 			)
 		}
-		if !strings.EqualFold(
-			strings.TrimSpace(targetColumn.Type),
-			"text",
-		) {
+		if !postgresMySQLTargetTextColumn(targetColumn) {
 			return nil, fmt.Errorf(
-				"plan MySQL source data preflight for PostgreSQL table %s: target column %s has type %q, want text",
+				"plan MySQL source data preflight for PostgreSQL table %s: target column %s has type %q, want text or varchar",
 				source.Name,
 				column.Name,
 				targetColumn.Type,
@@ -276,6 +273,19 @@ func planPostgresMySQLTableDataProbes(
 		})
 	}
 	return probes, nil
+}
+
+// postgresMySQLTargetTextColumn accepts the two PostgreSQL catalog shapes the
+// MySQL projection can deliberately produce. Both reject NUL bytes and retain
+// the same string values; CHAR is intentionally excluded because its padding
+// semantics are not part of the certified mapping.
+func postgresMySQLTargetTextColumn(column schema.Column) bool {
+	switch strings.ToLower(strings.TrimSpace(column.Type)) {
+	case "text", "varchar":
+		return true
+	default:
+		return false
+	}
 }
 
 func postgresMySQLColumnsByName(

@@ -6,9 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/schema"
 )
 
 func writeDryRunDisclosureSource(t *testing.T, path string) {
@@ -26,10 +26,10 @@ func writeDryRunDisclosureSource(t *testing.T, path string) {
 	}
 }
 
-// TestStage4DryRunDisclosesTuningAndDeletePolicy proves a dry run reports the
-// resource plan it would actually run under, with provenance, and the
-// configured delete policy — without opening the target, state, lease, or audit
-// log.
+// TestStage4DryRunDisclosesTuningAndDeletePolicy proves a supported dry run
+// reports the resource plan it would actually run under, with provenance. The
+// absent SQLite upsert target is inspected by
+// path only and rejected without creating it.
 func TestStage4DryRunDisclosesTuningAndDeletePolicy(t *testing.T) {
 	directory := t.TempDir()
 	sourcePath := filepath.Join(directory, "source.db")
@@ -40,10 +40,7 @@ func TestStage4DryRunDisclosesTuningAndDeletePolicy(t *testing.T) {
 		"source:\n  type: sqlite\n  database: " + sourcePath +
 			"\ntarget:\n  type: sqlite\n  database: " + targetPath +
 			"\nmigration:\n  target_mode: upsert\n  connection_limit: 8\n" +
-			"  workers: 6\n  reader_parallelism: 3\n  writer_parallelism: 2\n" +
-			"  deletes:\n    mode: reconcile\n    reconcile:\n" +
-			"      schedule: interval\n      interval: 30m\n" +
-			"      require_primary_key: true\n",
+			"  workers: 6\n  reader_parallelism: 3\n  writer_parallelism: 2\n",
 	))
 	if err != nil {
 		t.Fatal(err)
@@ -109,19 +106,19 @@ func TestStage4DryRunDisclosesTuningAndDeletePolicy(t *testing.T) {
 		t.Fatalf("pagination keys = %#v", pagination.Keys)
 	}
 
-	if plan.Deletes == nil {
-		t.Fatal("dry run disclosed no delete policy")
-	}
-	if plan.Deletes.Mode != string(config.DeleteModeReconcile) ||
-		plan.Deletes.Schedule != string(config.DeleteScheduleInterval) ||
-		plan.Deletes.IntervalSeconds != int64(30*time.Minute/time.Second) ||
-		!plan.Deletes.RequirePrimaryKey {
+	if plan.Deletes == nil || plan.Deletes.Mode != string(config.DeleteModeOff) {
 		t.Fatalf("delete disclosure = %#v", plan.Deletes)
 	}
-	// Due-ness depends on durable last-success evidence, which a dry run must
-	// not read. Claiming it would be worse than omitting it.
-	if plan.Deletes.DueStateKnown {
-		t.Fatal("dry run claimed delete due-state without opening state")
+	if plan.Proceed {
+		t.Fatal("dry run allowed upsert without an existing target")
+	}
+	if plan.Admission == nil || !plan.Admission.Supported ||
+		plan.Admission.Error != "" {
+		t.Fatalf("policy admission = %#v", plan.Admission)
+	}
+	if plan.Target == nil || plan.Target.Presence != PlannedTargetAbsent ||
+		plan.Target.Preflight != PlannedTargetPreflightFailed {
+		t.Fatalf("target preflight = %#v", plan.Target)
 	}
 
 	// The disclosure must not have created the target or any state artifact.
@@ -137,6 +134,225 @@ func TestStage4DryRunDisclosesTuningAndDeletePolicy(t *testing.T) {
 			t.Fatalf("dry run created %q", entry.Name())
 		}
 	}
+}
+
+func TestStage4DryRunRejectsAbsentSQLiteDropRecreateWithoutArtifacts(t *testing.T) {
+	directory := t.TempDir()
+	sourcePath := filepath.Join(directory, "source.db")
+	targetPath := filepath.Join(directory, "target.db")
+	writeDryRunDisclosureSource(t, sourcePath)
+	cfg, err := config.Parse([]byte(
+		"source:\n  type: sqlite\n  database: " + sourcePath +
+			"\ntarget:\n  type: sqlite\n  database: " + targetPath + "\n",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := DryRun(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Proceed {
+		t.Fatalf("drop/recreate dry run proceeded without target preflight: %#v", plan)
+	}
+	if plan.Target == nil ||
+		plan.Target.Presence != PlannedTargetAbsent ||
+		plan.Target.Preflight != PlannedTargetPreflightFailed ||
+		plan.Target.Error == "" ||
+		len(plan.Target.Limitations) == 0 {
+		t.Fatalf("target disclosure = %#v", plan.Target)
+	}
+	if _, err := os.Stat(targetPath); !os.IsNotExist(err) {
+		t.Fatalf("drop/recreate dry run created target: %v", err)
+	}
+}
+
+func TestStage4DryRunRunsSQLiteTargetPreflightForExistingUpsert(t *testing.T) {
+	directory := t.TempDir()
+	sourcePath := filepath.Join(directory, "source.db")
+	targetPath := filepath.Join(directory, "target.db")
+	writeDryRunDisclosureSource(t, sourcePath)
+	target, err := sql.Open("sqlite", targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.Exec(`CREATE TABLE items (id INTEGER PRIMARY KEY, payload TEXT);`); err != nil {
+		target.Close()
+		t.Fatal(err)
+	}
+	if err := target.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(
+		"source:\n  type: sqlite\n  database: " + sourcePath +
+			"\ntarget:\n  type: sqlite\n  database: " + targetPath +
+			"\nmigration:\n  target_mode: upsert\n",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := DryRun(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Proceed || plan.Target == nil ||
+		plan.Target.Presence != PlannedTargetPresent ||
+		plan.Target.Preflight != PlannedTargetPreflightPassed {
+		t.Fatalf("existing target preflight = %#v", plan.Target)
+	}
+}
+
+func TestStage4DryRunRejectsSQLiteUpsertTargetShapeMismatch(t *testing.T) {
+	directory := t.TempDir()
+	sourcePath := filepath.Join(directory, "source.db")
+	targetPath := filepath.Join(directory, "target.db")
+	writeDryRunDisclosureSource(t, sourcePath)
+	target, err := sql.Open("sqlite", targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.Exec(`CREATE TABLE items (id TEXT PRIMARY KEY, payload TEXT);`); err != nil {
+		target.Close()
+		t.Fatal(err)
+	}
+	if err := target.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse([]byte(
+		"source:\n  type: sqlite\n  database: " + sourcePath +
+			"\ntarget:\n  type: sqlite\n  database: " + targetPath +
+			"\nmigration:\n  target_mode: upsert\n",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := DryRun(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Proceed || plan.Target == nil ||
+		plan.Target.Presence != PlannedTargetPresent ||
+		plan.Target.Preflight != PlannedTargetPreflightFailed {
+		t.Fatalf("mismatched target preflight = %#v", plan.Target)
+	}
+}
+
+func TestApplyDryRunSchemaDriftDisclosesFactsAndPolicy(t *testing.T) {
+	baseline, err := schema.NewSchemaSnapshot([]schema.Table{{
+		Name: "items",
+		Columns: []schema.Column{{
+			Name: "id", Type: "integer",
+			DeclaredType: &schema.DeclaredType{Base: "integer"},
+			PrimaryKey:   true, PrimaryKeyPosition: 1,
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := schema.NewSchemaSnapshot([]schema.Table{{
+		Name: "items",
+		Columns: []schema.Column{
+			{Name: "id", Type: "integer", DeclaredType: &schema.DeclaredType{Base: "integer"}, PrimaryKey: true, PrimaryKeyPosition: 1},
+			{Name: "payload", Type: "text", DeclaredType: &schema.DeclaredType{Base: "text"}, Nullable: true},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := baseline.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := baseline.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseConfig := config.Config{Migration: config.Migration{TargetMode: "drop_recreate"}}
+	for name, mutation := range map[string]func(*config.Config){
+		"report only":   func(*config.Config) {},
+		"fail on drift": func(cfg *config.Config) { cfg.Migration.FailOnSchemaDrift = true },
+		"freeze contract": func(cfg *config.Config) {
+			cfg.Migration.SchemaContract = &config.SchemaContract{
+				Tables:   config.SchemaContractReport,
+				Columns:  config.SchemaContractFreeze,
+				DataType: config.SchemaContractReport,
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := baseConfig
+			mutation(&cfg)
+			plan := Plan{
+				Proceed: true, Admission: &PlannedAdmission{Supported: true},
+				currentSchema: current, currentSchemaReady: true,
+			}
+			ApplyDryRunSchemaDrift(&plan, cfg, DryRunSchemaBaseline{
+				Found: true, CanonicalJSON: string(canonical), Digest: digest,
+			})
+			if plan.Schema == nil || plan.Schema.Status != PlannedSchemaChanged ||
+				len(plan.Schema.Facts) == 0 ||
+				len(plan.Schema.Facts) != len(plan.Schema.Decisions) {
+				t.Fatalf("schema drift disclosure = %#v", plan.Schema)
+			}
+			columnAdded := false
+			for _, fact := range plan.Schema.Facts {
+				if fact.Object.Table == "items" && fact.Object.Column == "payload" &&
+					fact.ChangeKind == schema.SchemaDriftColumnAdded {
+					columnAdded = true
+				}
+			}
+			if !columnAdded {
+				t.Fatalf("schema drift omitted added column fact: %#v", plan.Schema.Facts)
+			}
+			switch name {
+			case "report only":
+				if plan.Schema.BlocksProceed || !plan.Proceed {
+					t.Fatalf("report policy = %#v", plan.Schema)
+				}
+				for _, decision := range plan.Schema.Decisions {
+					if decision.Action != SchemaContractReport {
+						t.Fatalf("report decision = %#v", decision)
+					}
+				}
+			default:
+				if !plan.Schema.BlocksProceed || plan.Proceed || plan.Schema.Error == "" {
+					t.Fatalf("blocking policy = %#v", plan.Schema)
+				}
+				for _, decision := range plan.Schema.Decisions {
+					if decision.Action != SchemaContractAbort {
+						t.Fatalf("blocking decision = %#v", decision)
+					}
+				}
+			}
+		})
+	}
+
+	t.Run("baseline absent", func(t *testing.T) {
+		plan := Plan{
+			Proceed: true, Admission: &PlannedAdmission{Supported: true},
+			currentSchema: current, currentSchemaReady: true,
+		}
+		ApplyDryRunSchemaDrift(&plan, baseConfig, DryRunSchemaBaseline{})
+		if plan.Schema == nil || plan.Schema.Status != PlannedSchemaBaselineAbsent ||
+			plan.Schema.BlocksProceed || !plan.Proceed || plan.Schema.CurrentDigest == "" {
+			t.Fatalf("baseline-absent schema disclosure = %#v", plan.Schema)
+		}
+	})
+
+	t.Run("unchanged", func(t *testing.T) {
+		plan := Plan{
+			Proceed: true, Admission: &PlannedAdmission{Supported: true},
+			currentSchema: baseline, currentSchemaReady: true,
+		}
+		ApplyDryRunSchemaDrift(&plan, baseConfig, DryRunSchemaBaseline{
+			Found: true, CanonicalJSON: string(canonical), Digest: digest,
+		})
+		if plan.Schema == nil || plan.Schema.Status != PlannedSchemaUnchanged ||
+			plan.Schema.BlocksProceed || !plan.Proceed ||
+			len(plan.Schema.Facts) != 0 || len(plan.Schema.Decisions) != 0 {
+			t.Fatalf("unchanged schema disclosure = %#v", plan.Schema)
+		}
+	})
 }
 
 // TestStage4DryRunTuningMatchesResolvedPlan pins the disclosure to the same

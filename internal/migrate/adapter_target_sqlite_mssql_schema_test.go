@@ -298,12 +298,13 @@ func TestSQLiteSQLServerPlanRejectsUnsafeSetAndUpsert(t *testing.T) {
 	if err != nil || len(planned) != 2 || !adapter.sqlServerRoute {
 		t.Fatalf("safe SQL Server plan = %#v, %v", planned, err)
 	}
-	if _, err := adapter.PlanTables(
+	upsert, err := adapter.PlanTables(
 		"mssql",
 		[]schema.Table{parent},
 		"upsert",
-	); err == nil || !strings.Contains(err.Error(), "target mode") {
-		t.Fatalf("upsert error = %v", err)
+	)
+	if err != nil || len(upsert) != 1 || !adapter.sqlServerRoute {
+		t.Fatalf("safe SQL Server upsert plan = %#v, %v", upsert, err)
 	}
 	if _, err := adapter.PlanTables(
 		"mssql",

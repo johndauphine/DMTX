@@ -2,12 +2,14 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/migrate"
 	_ "modernc.org/sqlite"
 )
@@ -98,16 +100,48 @@ func TestPreflightRejectsStrictConsistencyAsUnsupportedCapability(
 	assertPreflightFinding(
 		t,
 		report,
-		"engine.capability",
-		migrate.PreflightSource,
+		"policy.stage4.composed_admission",
+		migrate.PreflightTarget,
 		preflightClassFailed,
 		migrate.PreflightSeverityError,
 	)
+}
+
+func TestPreflightRejectsComposedStage4PolicyBeforeEndpointProbe(t *testing.T) {
+	directory := t.TempDir()
+	configPath := writePreflightConfig(
+		t,
+		directory,
+		"source:\n  type: sqlite\n  database: "+filepath.Join(directory, "missing-source.db")+
+			"\ntarget:\n  type: sqlite\n  database: "+filepath.Join(directory, "missing-target.db")+
+			"\nmigration:\n  target_mode: upsert\n  strict_consistency: true\n  strict_consistency_scope: migration\n",
+	)
+	var stdout, stderr bytes.Buffer
+	probed := false
+	code := preflightWithProbe(
+		[]string{"--config", configPath},
+		&stdout,
+		&stderr,
+		func(context.Context, config.Config) ([]productionPreflightFact, bool) {
+			probed = true
+			return nil, false
+		},
+	)
+	if code != ConfigurationError || probed || stderr.Len() != 0 {
+		t.Fatalf("preflight code=%d probed=%t stderr=%q", code, probed, stderr.String())
+	}
+	var report productionPreflightReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("decode report: %v: %q", err, stdout.String())
+	}
+	if report.Proceed || len(report.Findings) != 1 {
+		t.Fatalf("policy report = %#v", report)
+	}
 	assertPreflightFinding(
 		t,
 		report,
-		"consistency.strict_prerequisites",
-		migrate.PreflightSource,
+		"policy.stage4.composed_admission",
+		migrate.PreflightTarget,
 		preflightClassFailed,
 		migrate.PreflightSeverityError,
 	)

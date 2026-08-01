@@ -50,6 +50,10 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}
+	if err := config.ValidateBoundedStage4Settings(cfg.Migration); err != nil {
+		fmt.Fprintf(stderr, "configuration: %v\n", err)
+		return ConfigurationError
+	}
 	if err := migrate.ValidateMigration(cfg); err != nil {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
@@ -237,8 +241,13 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "record resume outcome: %v\n", stateErr)
 			return StateError
 		}
-		if auditErr := appendAudit(
-			configPath, run.ID, "resume_"+disposition.auditSuffix,
+		if auditErr := appendAttemptTerminalAudit(
+			configPath,
+			run.ID,
+			"resume",
+			migrate.Result{},
+			disposition,
+			err,
 		); auditErr != nil {
 			fmt.Fprintf(stderr, "%v\n", auditErr)
 			return StateError
@@ -334,7 +343,14 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "record resume outcome: %v\n", stateErr)
 			return StateError
 		}
-		if auditErr := appendAudit(configPath, run.ID, "resume_"+disposition.auditSuffix); auditErr != nil {
+		if auditErr := appendAttemptTerminalAudit(
+			configPath,
+			run.ID,
+			"resume",
+			result,
+			disposition,
+			err,
+		); auditErr != nil {
 			fmt.Fprintf(stderr, "%v\n", auditErr)
 			return StateError
 		}
@@ -480,6 +496,16 @@ func latestRunForTarget(
 			// it selectable so resume can finish any missing terminal audit
 			// or release bookkeeping without touching the data plane.
 			selected, found = run, true
+			continue
+		}
+		// A terminal non-resumable result supersedes only an older revision
+		// of the same run. In particular, a SQL Server migration-snapshot
+		// run that closed gracefully has released its physical snapshot and
+		// must not fall back to that run's earlier running row.
+		if !run.Resumable {
+			if found && selected.ID == run.ID {
+				selected, found = state.Run{}, false
+			}
 			continue
 		}
 		if run.Resumable && resumeEligibleOutcome(run.Outcome) {

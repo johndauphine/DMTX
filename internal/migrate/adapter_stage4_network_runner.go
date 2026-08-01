@@ -29,11 +29,39 @@ type adapterStage4NetworkUpsertTarget interface {
 	) (WriteReceipt, error)
 }
 
+// adapterStage4NetworkRebuildTarget is the explicit target-owned proof that a
+// rebuild page can be replayed after its durable issued-page record. Unlike an
+// ordinary fresh insert, this writer must leave an already inserted matching
+// primary-key row untouched while refusing to turn a conflicting unique-key
+// row into an update. A route without this proof must not start a destructive
+// Stage 4 transfer.
+type adapterStage4NetworkRebuildTarget interface {
+	targetAdapter
+	stage4NetworkDuplicateSafeRebuildTarget()
+	PreflightStage4NetworkRebuild(
+		context.Context,
+		[]schema.Table,
+	) error
+	WriteStage4NetworkRebuildBatch(
+		context.Context,
+		schema.Table,
+		[]string,
+		NetworkWriteMode,
+		[][]any,
+	) (WriteReceipt, error)
+}
+
 func (*postgresTargetAdapter) stage4NetworkIdempotentUpsertTarget() {}
 func (*mysqlTargetAdapter) stage4NetworkIdempotentUpsertTarget()    {}
 func (*sqlServerTargetAdapter) stage4NetworkIdempotentUpsertTarget() {
 }
 func (*sqliteTargetAdapter) stage4NetworkIdempotentUpsertTarget() {}
+
+func (*postgresTargetAdapter) stage4NetworkDuplicateSafeRebuildTarget() {}
+func (*mysqlTargetAdapter) stage4NetworkDuplicateSafeRebuildTarget()    {}
+func (*sqlServerTargetAdapter) stage4NetworkDuplicateSafeRebuildTarget() {
+}
+func (*sqliteTargetAdapter) stage4NetworkDuplicateSafeRebuildTarget() {}
 
 type stage4AdapterNetworkRange struct {
 	globalIndex uint64
@@ -59,16 +87,45 @@ type stage4AdapterNetworkExecution struct {
 	deferred    bool
 	source      sourceAdapter
 	reader      adapterNetworkRangePageSource
-	target      adapterStage4NetworkUpsertTarget
+	target      targetAdapter
 	coordinator *networkStateCoordinator
 	ranges      []stage4AdapterNetworkRange
 	plan        NetworkTransferPlan
 	waves       []stage4AdapterNetworkWave
 	tableCount  int
 	prepared    stage4AdapterPrepared
+	// boundWork contains the exact durable pagination plan for tables whose
+	// stable view has been admitted. prepared.work deliberately remains the
+	// immutable pre-pagination seed: rebinding a seed that was replaced with
+	// its own derived topology would hash a different plan on every reopen.
+	boundWork   []stage4AdapterWork
 	partitions  int
 	resources   config.EffectiveTransferPlan
 	retryPolicy RetryPolicy
+	// upsertMergeRows is zero unless an operator explicitly requested a
+	// capability-backed write-only merge ceiling. It is carried into every
+	// table-local core plan without changing source pagination.
+	upsertMergeRows int
+	// largeTableThreshold is zero for the generated compatibility default. An
+	// explicit positive value is consumed during retained-view planning before
+	// a table's durable range inventory is created.
+	largeTableThreshold int64
+	// checkpointFrequency is an explicit per-range acknowledgement cadence.
+	// Zero retains immediate-on-ack checkpoints for generated defaults.
+	checkpointFrequency int
+	runtimeTuning       bool
+	// runtimeTuningInterval is immutable config intent. Each serial table gets
+	// a fresh controller, but all controllers use this same migration setting.
+	runtimeTuningInterval time.Duration
+	// runtimeTuningReports are populated only after a controller has completed
+	// a table transfer. They are retained in immutable plan order for the
+	// credential-free Result status surface.
+	runtimeTuningReports []stage4AdapterRuntimeTuningTableReport
+	// runtimeTuningHistory retains invocation-local session IDs and receipt
+	// chains. It is populated only when the run backend resolves the optional
+	// lease-fenced SQLite history capability; YAML/current-run state remains
+	// intentionally history-free.
+	runtimeTuningHistory map[int]*stage4AdapterRuntimeTuningHistorySession
 
 	nextGlobalRange   uint64
 	finalizeWork      func(stage4AdapterWork) (stage4AdapterWork, error)
@@ -90,6 +147,12 @@ type stage4AdapterNetworkExecution struct {
 type stage4AdapterNetworkWave struct {
 	plan   NetworkTransferPlan
 	global []NetworkRangePlan
+}
+
+type stage4AdapterRuntimeTuningTableReport struct {
+	recorded    bool
+	snapshot    RuntimeTuningSnapshot
+	adjustments []RuntimeTuningDecision
 }
 
 type stage4AdapterNetworkTableExecution struct {
@@ -161,6 +224,15 @@ func admitStage4AdapterNetworkTransfer(
 		}
 		option(&options)
 	}
+	// Normal entry points already run the configuration-only gate before this
+	// admission. Keep the setting-specific check here too so direct callers
+	// cannot bypass the fail-closed incremental/strict/delete boundary.
+	if err := requireStage4CheckpointFrequencyComposition(cfg); err != nil {
+		return nil, err
+	}
+	if err := requireStage4LargeTableThresholdComposition(cfg); err != nil {
+		return nil, err
+	}
 	if err := requireStage4AdapterNetworkMode(
 		cfg,
 		prepared,
@@ -168,11 +240,43 @@ func admitStage4AdapterNetworkTransfer(
 	); err != nil {
 		return nil, err
 	}
+	checkpointFrequency, err := stage4AdapterNetworkCheckpointFrequency(
+		cfg.Migration,
+	)
+	if err != nil {
+		return nil, err
+	}
+	largeTableThreshold, err := stage4AdapterLargeTableThreshold(
+		cfg.Migration,
+	)
+	if err != nil {
+		return nil, err
+	}
 	if err := prepared.run.Validate(); err != nil {
 		return nil, NewTransferError(
 			ErrorClassState,
 			fmt.Errorf("validate Stage 4 network run context: %w", err),
 		)
+	}
+	// The compatibility path below accepts a prebound multi-table range plan
+	// and fans it into dependency waves. It has no migration-wide controller
+	// session that could preserve one ordered adjustment history across waves.
+	// Production adapters bind one stable table at a time instead, so reject an
+	// enabled controller here rather than silently leaving it inert.
+	if cfg.Migration.RuntimeTuning && prepared.network != nil {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 runtime tuning requires the deferred stable-table network path; prebound dependency waves have no composed controller session",
+			),
+		)
+	}
+	if prepared.mode == "drop_recreate" {
+		if err := admitStage4AdapterNetworkRebuildRecovery(
+			prepared.run,
+		); err != nil {
+			return nil, err
+		}
 	}
 	protector, protected := observer.(adapterTargetMutationProtector)
 	if !protected || networkMutationProtectorIsNil(protector) {
@@ -183,8 +287,52 @@ func admitStage4AdapterNetworkTransfer(
 			),
 		)
 	}
-	upsertTarget, ok := target.(adapterStage4NetworkUpsertTarget)
-	if !ok || isNilInterface(upsertTarget) {
+	var networkTarget targetAdapter
+	var rebuildTarget adapterStage4NetworkRebuildTarget
+	switch prepared.mode {
+	case "upsert":
+		upsertTarget, ok := target.(adapterStage4NetworkUpsertTarget)
+		if !ok || isNilInterface(upsertTarget) {
+			engine := ""
+			if !isNilInterface(target) {
+				engine = target.Engine()
+			}
+			return nil, NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 target engine %q has no certified idempotent network upsert path",
+					engine,
+				),
+			)
+		}
+		networkTarget = upsertTarget
+	case "drop_recreate":
+		certifiedRebuildTarget, ok := target.(adapterStage4NetworkRebuildTarget)
+		if !ok || isNilInterface(certifiedRebuildTarget) {
+			engine := ""
+			if !isNilInterface(target) {
+				engine = target.Engine()
+			}
+			return nil, NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 target engine %q has no certified duplicate-safe rebuild replay path",
+					engine,
+				),
+			)
+		}
+		rebuildTarget = certifiedRebuildTarget
+		networkTarget = certifiedRebuildTarget
+	default:
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 network runner received unsupported target mode %q",
+				prepared.mode,
+			),
+		)
+	}
+	if isNilInterface(networkTarget) {
 		engine := ""
 		if !isNilInterface(target) {
 			engine = target.Engine()
@@ -192,13 +340,13 @@ func admitStage4AdapterNetworkTransfer(
 		return nil, NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
-				"Stage 4 target engine %q has no certified idempotent network upsert path",
+				"Stage 4 target engine %q has no certified network replay path",
 				engine,
 			),
 		)
 	}
 	if source.Engine() == "clickhouse" ||
-		upsertTarget.Engine() == "clickhouse" {
+		networkTarget.Engine() == "clickhouse" {
 		return nil, NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
@@ -207,13 +355,13 @@ func admitStage4AdapterNetworkTransfer(
 		)
 	}
 	if !stage4AdapterNetworkRelationalEngine(source.Engine()) ||
-		!stage4AdapterNetworkRelationalEngine(upsertTarget.Engine()) {
+		!stage4AdapterNetworkRelationalEngine(networkTarget.Engine()) {
 		return nil, NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
 				"Stage 4 network route %s-to-%s is unsupported",
 				source.Engine(),
-				upsertTarget.Engine(),
+				networkTarget.Engine(),
 			),
 		)
 	}
@@ -236,19 +384,28 @@ func admitStage4AdapterNetworkTransfer(
 		}
 		targetTables = existingTargetTables
 	}
-	if err := preflightStage4NetworkReplayIsolation(
-		ctx,
-		upsertTarget,
-		targetTables,
-	); err != nil {
-		return nil, err
+	if prepared.mode == "drop_recreate" {
+		if err := rebuildTarget.PreflightStage4NetworkRebuild(
+			ctx,
+			targetTables,
+		); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := preflightStage4NetworkReplayIsolation(
+			ctx,
+			networkTarget,
+			targetTables,
+		); err != nil {
+			return nil, err
+		}
 	}
 
 	resources, err := stage4AdapterNetworkResources(
 		ctx,
 		cfg,
 		source.Engine(),
-		upsertTarget.Engine(),
+		networkTarget.Engine(),
 		resourceOverride,
 	)
 	if err != nil {
@@ -260,6 +417,16 @@ func admitStage4AdapterNetworkTransfer(
 		if err != nil {
 			return nil, err
 		}
+	}
+	upsertMergeRows, err := stage4AdapterExplicitUpsertMergeRows(
+		ctx,
+		cfg.Migration,
+		prepared.mode,
+		networkTarget,
+		resources.ChunkRows.Value,
+	)
+	if err != nil {
+		return nil, err
 	}
 	if err := validateStage4AdapterNetworkDependencyOrder(
 		prepared.plans,
@@ -290,15 +457,28 @@ func admitStage4AdapterNetworkTransfer(
 			)
 		}
 		return &stage4AdapterNetworkExecution{
-			deferred:    true,
-			source:      source,
-			target:      upsertTarget,
-			tableCount:  len(prepared.plans),
-			prepared:    cloneStage4AdapterNetworkPrepared(prepared),
-			partitions:  cfg.Migration.Partitions,
-			resources:   resources,
-			retryPolicy: retryPolicy,
+			deferred:              true,
+			source:                source,
+			target:                networkTarget,
+			tableCount:            len(prepared.plans),
+			prepared:              cloneStage4AdapterNetworkPrepared(prepared),
+			partitions:            cfg.Migration.Partitions,
+			resources:             resources,
+			retryPolicy:           retryPolicy,
+			upsertMergeRows:       upsertMergeRows,
+			largeTableThreshold:   largeTableThreshold,
+			checkpointFrequency:   checkpointFrequency,
+			runtimeTuning:         cfg.Migration.RuntimeTuning,
+			runtimeTuningInterval: cfg.Migration.RuntimeTuningInterval,
 		}, nil
+	}
+	if largeTableThreshold != 0 {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 large_table_threshold requires deferred table-stable network planning",
+			),
+		)
 	}
 
 	ranges, bindings, err := admitStage4AdapterNetworkInventory(
@@ -326,7 +506,7 @@ func admitStage4AdapterNetworkTransfer(
 	if len(ranges) == 0 {
 		return &stage4AdapterNetworkExecution{
 			reader:     reader,
-			target:     upsertTarget,
+			target:     networkTarget,
 			tableCount: len(prepared.plans),
 		}, nil
 	}
@@ -404,17 +584,19 @@ func admitStage4AdapterNetworkTransfer(
 	}
 	return &stage4AdapterNetworkExecution{
 		reader:      reader,
-		target:      upsertTarget,
+		target:      networkTarget,
 		coordinator: coordinator,
 		ranges:      ranges,
 		tableCount:  len(prepared.plans),
 		plan: NetworkTransferPlan{
-			SourceEngine: source.Engine(),
-			TargetEngine: upsertTarget.Engine(),
-			Resources:    resources,
-			RetryPolicy:  retryPolicy,
-			ReplayMode:   NetworkReplayIdempotentUpsert,
-			Ranges:       transferRanges,
+			SourceEngine:        source.Engine(),
+			TargetEngine:        networkTarget.Engine(),
+			Resources:           resources,
+			RetryPolicy:         retryPolicy,
+			ReplayMode:          stage4AdapterNetworkReplayMode(prepared.mode),
+			UpsertMergeRows:     upsertMergeRows,
+			CheckpointFrequency: checkpointFrequency,
+			Ranges:              transferRanges,
 		},
 	}, nil
 }
@@ -605,7 +787,8 @@ func runStage4AdapterNetworkTransfer(
 		if err != nil {
 			return nil, err
 		}
-		if result.HasRuntimeTuning ||
+		if result.HasRuntimeTuning !=
+			(wave.plan.RuntimeTuning != nil) ||
 			result.CompletedRanges != len(wave.global) ||
 			len(result.Pagination) != len(wave.global) {
 			return nil, NewTransferError(
@@ -702,6 +885,7 @@ func (execution *stage4AdapterNetworkExecution) callbacks(
 					writeCtx,
 					execution.target,
 					execution.ranges,
+					execution.plan.ReplayMode,
 					request,
 				)
 			},
@@ -793,10 +977,150 @@ func (execution *stage4AdapterNetworkExecution) openTable(
 	if err := tableExecution.bindRestoresAndValidate(ctx); err != nil {
 		return nil, err
 	}
+	// A full local SQLite state backend records the controller session before
+	// this table can reach PrepareTables. The optional sink then persists every
+	// decision at its chunk boundary; YAML intentionally retains only the
+	// bounded invocation report.
+	if err := tableExecution.bindRuntimeTuningHistory(ctx); err != nil {
+		return nil, err
+	}
+	execution.recordBoundWork(planIndex, tableExecution.work)
 	execution.mu.Lock()
 	execution.nextGlobalRange += uint64(len(tableExecution.ranges))
 	execution.mu.Unlock()
 	return tableExecution, nil
+}
+
+func (execution *stage4AdapterNetworkExecution) recordBoundWork(
+	planIndex int,
+	work stage4AdapterWork,
+) {
+	if execution == nil {
+		return
+	}
+	execution.mu.Lock()
+	defer execution.mu.Unlock()
+	if len(execution.boundWork) != len(execution.prepared.work) {
+		execution.boundWork = make(
+			[]stage4AdapterWork,
+			len(execution.prepared.work),
+		)
+	}
+	if planIndex >= 0 && planIndex < len(execution.boundWork) {
+		execution.boundWork[planIndex] = cloneStage4AdapterNetworkWork(work)
+	}
+}
+
+// recordRuntimeTuningResult captures only the controller's bounded,
+// credential-free status after the core returns, including an incomplete
+// transfer that already applied a safety decision. The result is intentionally
+// indexed by the immutable prepared plan rather than completion order, so
+// serial resume/status output stays deterministic.
+func (execution *stage4AdapterNetworkExecution) recordRuntimeTuningResult(
+	planIndex int,
+	snapshot RuntimeTuningSnapshot,
+	adjustments []RuntimeTuningDecision,
+) {
+	if execution == nil || planIndex < 0 ||
+		planIndex >= len(execution.prepared.plans) {
+		return
+	}
+	execution.mu.Lock()
+	defer execution.mu.Unlock()
+	if len(execution.runtimeTuningReports) != len(execution.prepared.plans) {
+		execution.runtimeTuningReports = make(
+			[]stage4AdapterRuntimeTuningTableReport,
+			len(execution.prepared.plans),
+		)
+	}
+	execution.runtimeTuningReports[planIndex] =
+		stage4AdapterRuntimeTuningTableReport{
+			recorded:    true,
+			snapshot:    cloneRuntimeTuningSnapshot(snapshot),
+			adjustments: cloneRuntimeTuningHistory(adjustments),
+		}
+}
+
+// runtimeTuningReport returns a new status value. It deliberately carries no
+// page frontiers, source values, driver messages, or credentials: adjustment
+// history uses only the bounded RuntimeTuningDecision identity surface.
+func (execution *stage4AdapterNetworkExecution) runtimeTuningReport() *RuntimeTuningReport {
+	if execution == nil || !execution.runtimeTuning {
+		return nil
+	}
+	execution.mu.Lock()
+	defer execution.mu.Unlock()
+	report := &RuntimeTuningReport{
+		Enabled: true,
+		Tables: make(
+			[]RuntimeTuningTableReport,
+			0,
+			len(execution.runtimeTuningReports),
+		),
+	}
+	for planIndex, entry := range execution.runtimeTuningReports {
+		if !entry.recorded {
+			continue
+		}
+		plan := execution.prepared.plans[planIndex]
+		report.Tables = append(
+			report.Tables,
+			runtimeTuningTableReport(
+				plan.source.Schema,
+				plan.source.Name,
+				entry.snapshot,
+				entry.adjustments,
+			),
+		)
+	}
+	if len(report.Tables) == 0 {
+		report.Reason = "runtime tuning was enabled, but this invocation had no uncompleted table transfer"
+	}
+	return report
+}
+
+func attachStage4AdapterRuntimeTuningReport(
+	result *Result,
+	execution *stage4AdapterNetworkExecution,
+) {
+	if result == nil || result.RuntimeTuning != nil {
+		return
+	}
+	result.RuntimeTuning = execution.runtimeTuningReport()
+}
+
+func (execution *stage4AdapterNetworkExecution) snapshotBoundWork() (
+	[]stage4AdapterWork,
+	error,
+) {
+	if execution == nil {
+		return nil, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 bounded network execution is unavailable"),
+		)
+	}
+	execution.mu.Lock()
+	defer execution.mu.Unlock()
+	if len(execution.boundWork) != len(execution.prepared.work) {
+		return nil, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf("Stage 4 bounded network work is incomplete"),
+		)
+	}
+	result := make([]stage4AdapterWork, len(execution.boundWork))
+	for index, work := range execution.boundWork {
+		if len(work.ranges) == 0 {
+			return nil, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"Stage 4 bounded network work for %s is unavailable",
+					execution.prepared.plans[index].source.Name,
+				),
+			)
+		}
+		result[index] = cloneStage4AdapterNetworkWork(work)
+	}
+	return result, nil
 }
 
 // planTableOnce plans one table under the same single-binding guard openTable
@@ -956,14 +1280,41 @@ func (execution *stage4AdapterNetworkExecution) planTable(
 		)
 	}
 
+	work := cloneStage4AdapterNetworkWork(
+		execution.prepared.work[planIndex],
+	)
+	partitions := execution.partitions
+	if execution.largeTableThreshold != 0 {
+		decision, decisionErr :=
+			stage4AdapterLargeTableDecisionForStableSource(
+				ctx,
+				stable,
+				plan.source,
+				execution.largeTableThreshold,
+				partitions,
+			)
+		if decisionErr != nil {
+			return nil, decisionErr
+		}
+		work.topology, decisionErr = stage4AdapterLargeTableTopology(
+			work.topology,
+			decision,
+		)
+		if decisionErr != nil {
+			return nil, fmt.Errorf(
+				"bind Stage 4 large-table topology for %s: %w",
+				plan.source.Name,
+				decisionErr,
+			)
+		}
+		partitions = decision.effectivePartitions
+	}
 	bound, err := bindStage4AdapterPagination(
 		ctx,
 		stable,
-		execution.partitions,
+		partitions,
 		[]stage4AdapterWork{
-			cloneStage4AdapterNetworkWork(
-				execution.prepared.work[planIndex],
-			),
+			work,
 		},
 		[]adapterTablePlan{plan},
 	)
@@ -1088,15 +1439,87 @@ func (execution *stage4AdapterNetworkExecution) planTable(
 		coordinator: coordinator,
 		global:      globalPlans,
 		corePlan: NetworkTransferPlan{
-			SourceEngine: execution.source.Engine(),
-			TargetEngine: execution.target.Engine(),
-			Resources:    resources,
-			RetryPolicy:  execution.retryPolicy,
-			ReplayMode:   NetworkReplayIdempotentUpsert,
-			Ranges:       localPlans,
+			SourceEngine:        execution.source.Engine(),
+			TargetEngine:        execution.target.Engine(),
+			Resources:           resources,
+			RetryPolicy:         execution.retryPolicy,
+			ReplayMode:          stage4AdapterNetworkReplayMode(execution.prepared.mode),
+			UpsertMergeRows:     execution.upsertMergeRows,
+			CheckpointFrequency: execution.checkpointFrequency,
+			Ranges:              localPlans,
 		},
 	}
+	if execution.runtimeTuning {
+		controller, tuningErr := newStage4AdapterTableRuntimeTuning(
+			resources,
+			evidence,
+			len(localPlans),
+			execution.runtimeTuningInterval,
+			nil,
+		)
+		if tuningErr != nil {
+			return nil, tuningErr
+		}
+		tableExecution.corePlan.RuntimeTuning = controller
+		tableExecution.corePlan.RowWidth = evidence
+	}
 	return tableExecution, nil
+}
+
+func newStage4AdapterTableRuntimeTuning(
+	resources config.EffectiveTransferPlan,
+	evidence RuntimeRowWidthEvidence,
+	ranges int,
+	interval time.Duration,
+	now func() time.Time,
+) (*RuntimeTuningController, error) {
+	if ranges < 1 || !evidence.Trustworthy ||
+		evidence.UpperBoundBytes < 1 ||
+		evidence.ExpectedColumnCount < 1 {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 runtime tuning requires complete table range and row-width evidence",
+			),
+		)
+	}
+	if interval <= 0 {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 runtime tuning requires a positive chunk-boundary interval",
+			),
+		)
+	}
+	limits := RuntimeTuningLimits{
+		// No adapter currently returns an authenticated target transport
+		// ceiling at this generic boundary. Leave protocol ceilings unknown
+		// rather than relabeling the DMTX row cap or memory budget as target
+		// protocol evidence; a typed protocol write failure can still impose
+		// a durable in-controller reduction at the next safe boundary.
+		ProtocolMaxChunkRows:         0,
+		ProtocolMaxChunkBytes:        0,
+		SafetyRowWidthUpperBound:     evidence.UpperBoundBytes,
+		PlannedRanges:                uint64(ranges),
+		ExpectedColumnCount:          evidence.ExpectedColumnCount,
+		HistoryLimit:                 128,
+		GrowthAfterHealthyBoundaries: 4,
+	}
+	controller, err := NewRuntimeTuningControllerWithOptions(
+		resources,
+		limits,
+		RuntimeTuningOptions{Interval: interval, Now: now},
+	)
+	if err != nil {
+		return nil, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"construct Stage 4 table runtime tuning controller: %w",
+				err,
+			),
+		)
+	}
+	return controller, nil
 }
 
 func stage4AdapterNetworkCatalogEqual(
@@ -1341,6 +1764,7 @@ func (execution *stage4AdapterNetworkTableExecution) callbacks(
 				writeCtx,
 				execution.parent.target,
 				execution.ranges,
+				execution.corePlan.ReplayMode,
 				request,
 			)
 		},
@@ -1406,10 +1830,22 @@ func (execution *stage4AdapterNetworkTableExecution) run(
 		execution.corePlan,
 		execution.callbacks(observer),
 	)
+	// The core returns its status snapshot even when the transfer itself
+	// failed. Capture that bounded safety evidence before propagating the
+	// failure: a protocol/write reduction is most useful precisely on an
+	// incomplete run that needs diagnosis or safe resume.
+	if result.HasRuntimeTuning && execution.corePlan.RuntimeTuning != nil {
+		execution.parent.recordRuntimeTuningResult(
+			execution.planIndex,
+			result.RuntimeTuning,
+			execution.corePlan.RuntimeTuning.History(),
+		)
+	}
 	if err != nil {
 		return 0, err
 	}
-	if result.HasRuntimeTuning ||
+	if result.HasRuntimeTuning !=
+		(execution.corePlan.RuntimeTuning != nil) ||
 		result.CompletedRanges != len(execution.ranges) ||
 		len(result.Pagination) != len(execution.ranges) {
 		return 0, NewTransferError(
@@ -2193,12 +2629,22 @@ func requireStage4AdapterNetworkMode(
 	prepared stage4AdapterPrepared,
 	options stage4AdapterNetworkAdmissionOptions,
 ) error {
-	if cfg.Migration.TargetMode != "upsert" ||
-		prepared.mode != "upsert" {
+	if cfg.Migration.TargetMode != prepared.mode {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"Stage 4 network runner target mode differs from prepared work",
+			),
+		)
+	}
+	switch prepared.mode {
+	case "upsert", "drop_recreate":
+	default:
 		return NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
-				"Stage 4 network runner currently requires target_mode upsert",
+				"Stage 4 network runner received unsupported target mode %q",
+				prepared.mode,
 			),
 		)
 	}
@@ -2260,14 +2706,6 @@ func requireStage4AdapterNetworkMode(
 			ErrorClassState,
 			fmt.Errorf(
 				"Stage 4 prepared delete reconciliation differs from network admission",
-			),
-		)
-	}
-	if cfg.Migration.RuntimeTuning {
-		return NewTransferError(
-			ErrorClassPolicy,
-			fmt.Errorf(
-				"Stage 4 runtime tuning requires a composed network chunk-boundary controller",
 			),
 		)
 	}
@@ -2376,6 +2814,13 @@ func stage4AdapterNetworkRelationalEngine(engine string) bool {
 	}
 }
 
+func stage4AdapterNetworkReplayMode(mode string) NetworkReplayMode {
+	if mode == "drop_recreate" {
+		return NetworkReplayDuplicateSafeInsertOnly
+	}
+	return NetworkReplayIdempotentUpsert
+}
+
 func stage4AdapterNetworkResources(
 	ctx context.Context,
 	cfg config.Config,
@@ -2402,11 +2847,22 @@ func stage4AdapterNetworkResources(
 	} else {
 		resources = *override
 	}
-	if resources.TargetMode != "upsert" {
+	if resources.TargetMode != cfg.Migration.TargetMode {
+		return config.EffectiveTransferPlan{}, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"Stage 4 network resources target mode differs from migration target mode",
+			),
+		)
+	}
+	switch resources.TargetMode {
+	case "upsert", "drop_recreate":
+	default:
 		return config.EffectiveTransferPlan{}, NewTransferError(
 			ErrorClassPolicy,
 			fmt.Errorf(
-				"Stage 4 network resources require target mode upsert",
+				"Stage 4 network resources received unsupported target mode %q",
+				resources.TargetMode,
 			),
 		)
 	}
@@ -3000,17 +3456,40 @@ func exactStage4AdapterNetworkRange(
 
 func writeStage4AdapterNetworkPage(
 	ctx context.Context,
-	target adapterStage4NetworkUpsertTarget,
+	target targetAdapter,
 	ranges []stage4AdapterNetworkRange,
+	replayMode NetworkReplayMode,
 	request NetworkWriteRequest,
 ) (WriteReceipt, error) {
 	failed := networkStateFailedReceipt(request)
-	if request.Mode != NetworkWriteIdempotentUpsert {
+	switch replayMode {
+	case NetworkReplayIdempotentUpsert:
+		if request.Mode != NetworkWriteIdempotentUpsert {
+			return failed, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"Stage 4 upsert network plan received incompatible write mode %q",
+					request.Mode,
+				),
+			)
+		}
+	case NetworkReplayDuplicateSafeInsertOnly:
+		if request.Mode != NetworkWriteFreshInsert &&
+			request.Mode != NetworkWriteDuplicateSafeInsertOnly {
+			return failed, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"Stage 4 rebuild network plan received incompatible write mode %q",
+					request.Mode,
+				),
+			)
+		}
+	default:
 		return failed, NewTransferError(
-			ErrorClassPolicy,
+			ErrorClassState,
 			fmt.Errorf(
-				"Stage 4 network target rejected write mode %q",
-				request.Mode,
+				"Stage 4 network plan has invalid replay mode %q",
+				replayMode,
 			),
 		)
 	}
@@ -3021,12 +3500,54 @@ func writeStage4AdapterNetworkPage(
 	if err != nil {
 		return failed, err
 	}
-	receipt, writeErr := target.WriteStage4NetworkBatch(
-		ctx,
-		binding.plan.target,
-		binding.plan.columns,
-		request.Rows,
+	var (
+		receipt  WriteReceipt
+		writeErr error
 	)
+	switch request.Mode {
+	case NetworkWriteIdempotentUpsert:
+		upsertTarget, ok := target.(adapterStage4NetworkUpsertTarget)
+		if !ok || isNilInterface(upsertTarget) {
+			return failed, NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 network target rejected idempotent upsert without a certified writer",
+				),
+			)
+		}
+		receipt, writeErr = upsertTarget.WriteStage4NetworkBatch(
+			ctx,
+			binding.plan.target,
+			binding.plan.columns,
+			request.Rows,
+		)
+	case NetworkWriteFreshInsert, NetworkWriteDuplicateSafeInsertOnly:
+		rebuildTarget, ok := target.(adapterStage4NetworkRebuildTarget)
+		if !ok || isNilInterface(rebuildTarget) {
+			return failed, NewTransferError(
+				ErrorClassPolicy,
+				fmt.Errorf(
+					"Stage 4 network target rejected rebuild write mode %q without a certified duplicate-safe writer",
+					request.Mode,
+				),
+			)
+		}
+		receipt, writeErr = rebuildTarget.WriteStage4NetworkRebuildBatch(
+			ctx,
+			binding.plan.target,
+			binding.plan.columns,
+			request.Mode,
+			request.Rows,
+		)
+	default:
+		return failed, NewTransferError(
+			ErrorClassPolicy,
+			fmt.Errorf(
+				"Stage 4 network target rejected write mode %q",
+				request.Mode,
+			),
+		)
+	}
 	if receiptErr := receipt.Validate(); receiptErr != nil ||
 		receipt.AttemptOffset != 0 ||
 		receipt.AttemptedRows != int64(len(request.Rows)) {

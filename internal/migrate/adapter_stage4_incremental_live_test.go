@@ -52,6 +52,7 @@ func TestStage4PostgresIncrementalCompositionLiveTLS(
 	if !postgresRouteLiveRequiresTLS(parsed) {
 		t.Fatal("DMTX_TEST_POSTGRES_DSN must require verified TLS")
 	}
+	caFile := stage4PostgresDeleteLiveCAFile(t, parsed.ConnString())
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
 		150*time.Second,
@@ -123,16 +124,26 @@ func TestStage4PostgresIncrementalCompositionLiveTLS(
 	})
 
 	sourceEndpoint := config.Endpoint{
-		Type:     "postgres",
-		Host:     parsed.Host,
-		Port:     int(parsed.Port),
-		Database: parsed.Database,
-		User:     parsed.User,
-		Password: parsed.Password,
-		Schema:   namespace,
+		Type:      "postgres",
+		Host:      parsed.Host,
+		Port:      int(parsed.Port),
+		Database:  parsed.Database,
+		User:      parsed.User,
+		Password:  parsed.Password,
+		Schema:    namespace,
+		SSLMode:   "verify-full",
+		TLSCAFile: caFile,
+	}
+	if sourceEndpoint.SSLMode != "verify-full" ||
+		sourceEndpoint.TLSCAFile != caFile {
+		t.Fatal("incremental source endpoint lost verified TLS authority")
 	}
 	targetEndpoint := sourceEndpoint
 	targetEndpoint.Database = targetDatabaseName
+	if targetEndpoint.SSLMode != "verify-full" ||
+		targetEndpoint.TLSCAFile != caFile {
+		t.Fatal("incremental target endpoint lost verified TLS authority")
+	}
 	targetDSN, err := engine.PostgresDSN(targetEndpoint)
 	if err != nil {
 		t.Fatal(err)
@@ -197,7 +208,10 @@ func TestStage4PostgresIncrementalCompositionLiveTLS(
 			WriterParallelism:  1,
 			MemoryCeilingBytes: 64 << 20,
 			Validation: config.ValidationPolicy{
-				Mode:                   config.ValidationCountOnly,
+				// Exercise the incremental attempt-bound final target proof through
+				// the production PostgreSQL source/target adapters: count, NULL
+				// parity, and deterministic typed samples all share this route.
+				Mode:                   config.ValidationSample,
 				FailOnMismatch:         true,
 				FailOnTimeout:          true,
 				FailOnEstimateMismatch: true,
@@ -541,3 +555,267 @@ func assertStage4IncrementalPostgresTLS(
 var _ stage4IncrementalTestState = (*stage4IncrementalLiveFailAckBackend)(nil)
 
 var _ state.Stage4AggregateBackend = (*stage4IncrementalLiveFailAckBackend)(nil)
+
+func TestStage4IncrementalComposedCrossEngineLive(t *testing.T) {
+	t.Run("sqlserver-to-postgres", func(t *testing.T) {
+		sourceDSN := os.Getenv("DMTX_TEST_MSSQL_DSN")
+		caPath := os.Getenv("DMTX_TEST_MSSQL_CA")
+		targetDSN := os.Getenv("DMTX_TEST_POSTGRES_DSN")
+		if sourceDSN == "" || caPath == "" || targetDSN == "" {
+			t.Skip("set DMTX_TEST_MSSQL_DSN, DMTX_TEST_MSSQL_CA, and DMTX_TEST_POSTGRES_DSN")
+		}
+		sourceEndpoint := sqlServerCommonFixtureEndpoint(t, sourceDSN, caPath)
+		parsedTarget, err := pgx.ParseConfig(targetDSN)
+		if err != nil || !postgresRouteLiveRequiresTLS(parsedTarget) {
+			t.Fatal("DMTX_TEST_POSTGRES_DSN must be a verified-TLS PostgreSQL DSN")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+		defer cancel()
+		sourceDatabase, err := sql.Open("sqlserver", sourceDSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = sourceDatabase.Close() })
+		targetDatabase, err := sql.Open("pgx", targetDSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = targetDatabase.Close() })
+		suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+		tableName := "dmtx_inc_ms_pg_" + suffix
+		namespace := "dmtx_inc_ms_pg_" + suffix
+		targetEndpoint := config.Endpoint{
+			Type:     "postgres",
+			Host:     parsedTarget.Host,
+			Port:     int(parsedTarget.Port),
+			Database: parsedTarget.Database,
+			User:     parsedTarget.User,
+			Password: parsedTarget.Password,
+			Schema:   namespace,
+			SSLMode:  "verify-full",
+			TLSCAFile: stage4PostgresDeleteLiveCAFile(
+				t,
+				targetDSN,
+			),
+		}
+		if _, err := sourceDatabase.ExecContext(ctx, `CREATE TABLE `+sqlServerQualified("dbo", tableName)+` (
+			[id] BIGINT NOT NULL PRIMARY KEY,
+			[payload] VARCHAR(64) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL,
+			[updated_at] DATETIME2(3) NOT NULL
+		); INSERT INTO `+sqlServerQualified("dbo", tableName)+` VALUES
+			(1, 'baseline-one', CONVERT(datetime2(3), '2026-07-30T10:00:00.000')),
+			(2, 'baseline-two', CONVERT(datetime2(3), '2026-07-30T10:00:00.000'))`); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = sourceDatabase.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+sqlServerQualified("dbo", tableName))
+		})
+		if _, err := targetDatabase.ExecContext(ctx, "CREATE SCHEMA "+postgresIdentifier(namespace)); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = targetDatabase.ExecContext(context.Background(), "DROP SCHEMA IF EXISTS "+postgresIdentifier(namespace)+" CASCADE")
+		})
+		cfg := stage4CrossEngineIncrementalConfig(sourceEndpoint, targetEndpoint, tableName)
+		runStage4CrossEngineIncrementalLive(
+			t, ctx, cfg, SQLServerToPostgresWithObserver, "dbo", tableName,
+			func(payload string, at time.Time) error {
+				_, err := sourceDatabase.ExecContext(ctx, "UPDATE "+sqlServerQualified("dbo", tableName)+" SET [payload] = @p1, [updated_at] = @p2 WHERE [id] = 1", payload, at)
+				return err
+			},
+			func() (string, error) {
+				var payload string
+				err := targetDatabase.QueryRowContext(ctx, "SELECT payload FROM "+postgresQualified(namespace, tableName)+" WHERE id = 1").Scan(&payload)
+				return payload, err
+			},
+		)
+	})
+
+	t.Run("mysql-to-sqlserver", func(t *testing.T) {
+		sourceDSN := os.Getenv("DMTX_TEST_MYSQL_DSN")
+		sourceCA := os.Getenv("DMTX_TEST_MYSQL_CA")
+		targetDSN := os.Getenv("DMTX_TEST_MSSQL_TARGET_DSN")
+		targetCA := os.Getenv("DMTX_TEST_MSSQL_CA")
+		if sourceDSN == "" || sourceCA == "" || targetDSN == "" || targetCA == "" {
+			t.Skip("set DMTX_TEST_MYSQL_DSN, DMTX_TEST_MYSQL_CA, DMTX_TEST_MSSQL_TARGET_DSN, and DMTX_TEST_MSSQL_CA")
+		}
+		registerMySQLCommonFixtureTLSNamed(t, sourceCA, "dmtx_test")
+		parsedSource := parseMySQLNativeTargetDSNForTLS(t, "incremental source", sourceDSN, "dmtx_test")
+		sourceEndpoint := mySQLSQLServerSourceEndpoint(t, parsedSource, sourceCA)
+		targetEndpoint := sqlServerCommonFixtureEndpoint(t, targetDSN, targetCA)
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+		defer cancel()
+		sourceDatabase, err := sql.Open("mysql", sourceDSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = sourceDatabase.Close() })
+		targetDatabase := openSQLServerNativeLiveDatabase(t, ctx, "incremental target", targetEndpoint)
+		tableName := "dmtx_inc_my_ms_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		if _, err := sourceDatabase.ExecContext(ctx, "CREATE TABLE "+mySQLIdentifier(tableName)+` (
+			id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) COLLATE utf8mb4_0900_bin NOT NULL,
+			updated_at DATETIME(3) NOT NULL) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sourceDatabase.ExecContext(ctx, `INSERT INTO `+mySQLIdentifier(tableName)+` VALUES
+			(1, 'baseline-one', '2026-07-30 10:00:00.000'),
+			(2, 'baseline-two', '2026-07-30 10:00:00.000')`); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = sourceDatabase.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+mySQLIdentifier(tableName))
+		})
+		cleanupSQLServerNativeTables(t, targetDatabase, tableName)
+		cfg := stage4CrossEngineIncrementalConfig(sourceEndpoint, targetEndpoint, tableName)
+		runStage4CrossEngineIncrementalLive(
+			t, ctx, cfg, MySQLToSQLServerWithObserver, parsedSource.DBName, tableName,
+			func(payload string, at time.Time) error {
+				_, err := sourceDatabase.ExecContext(ctx, "UPDATE "+mySQLIdentifier(tableName)+" SET payload = ?, updated_at = ? WHERE id = 1", payload, at)
+				return err
+			},
+			func() (string, error) {
+				var payload string
+				err := targetDatabase.QueryRowContext(ctx, "SELECT [payload] FROM "+sqlServerQualified("dbo", tableName)+" WHERE [id] = 1").Scan(&payload)
+				return payload, err
+			},
+		)
+	})
+
+	t.Run("sqlite-to-mysql", func(t *testing.T) {
+		targetDSN := os.Getenv("DMTX_TEST_MYSQL_TARGET_DSN")
+		caPath := os.Getenv("DMTX_TEST_MYSQL_CA")
+		if targetDSN == "" || caPath == "" {
+			t.Skip("set DMTX_TEST_MYSQL_TARGET_DSN and DMTX_TEST_MYSQL_CA")
+		}
+		registerMySQLCommonFixtureTLSNamed(t, caPath, "dmtx_test")
+		parsedTarget := parseMySQLNativeTargetDSNForTLS(t, "incremental target", targetDSN, "dmtx_test")
+		targetEndpoint := mysqlNativeTargetEndpoint(t, parsedTarget, caPath)
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+		defer cancel()
+		sourcePath := filepath.Join(t.TempDir(), "incremental-source.sqlite")
+		sourceDatabase, err := sql.Open("sqlite", sourcePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = sourceDatabase.Close() })
+		targetDatabase := openMySQLNativeLiveDatabase(t, ctx, "incremental target", targetDSN)
+		tableName := "dmtx_inc_sq_my_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		if _, err := sourceDatabase.ExecContext(ctx, `CREATE TABLE "`+tableName+`" (
+			id BIGINT NOT NULL, payload VARCHAR(64) NOT NULL, updated_at DATETIME(3) NOT NULL,
+			PRIMARY KEY (id));
+			INSERT INTO "`+tableName+`" VALUES
+			(1, 'baseline-one', '2026-07-30 10:00:00.000'),
+			(2, 'baseline-two', '2026-07-30 10:00:00.000')`); err != nil {
+			t.Fatal(err)
+		}
+		cleanupMySQLNativeTables(t, targetDatabase, tableName)
+		cfg := stage4CrossEngineIncrementalConfig(config.Endpoint{Type: "sqlite", Database: sourcePath}, targetEndpoint, tableName)
+		runStage4CrossEngineIncrementalLive(
+			t, ctx, cfg, SQLiteToMySQLWithObserver, "", tableName,
+			func(payload string, at time.Time) error {
+				_, err := sourceDatabase.ExecContext(ctx, `UPDATE "`+tableName+`" SET payload = ?, updated_at = ? WHERE id = 1`, payload, at.Format("2006-01-02 15:04:05.000"))
+				return err
+			},
+			func() (string, error) {
+				var payload string
+				err := targetDatabase.QueryRowContext(ctx, "SELECT payload FROM "+mySQLIdentifier(tableName)+" WHERE id = 1").Scan(&payload)
+				return payload, err
+			},
+		)
+	})
+}
+
+func stage4CrossEngineIncrementalConfig(source, target config.Endpoint, table string) config.Config {
+	return config.Config{Source: source, Target: target, Migration: config.Migration{
+		TargetMode: "upsert", IncludeTables: []string{table}, DateUpdatedColumns: []string{"updated_at"},
+		ConnectionLimit: 4, ReaderParallelism: 1, WriterParallelism: 1, MemoryCeilingBytes: 64 << 20,
+		Validation: config.ValidationPolicy{Mode: config.ValidationCountOnly, FailOnMismatch: true, FailOnTimeout: true, FailOnEstimateMismatch: true},
+	}}
+}
+
+func runStage4CrossEngineIncrementalLive(
+	t *testing.T,
+	ctx context.Context,
+	cfg config.Config,
+	run func(context.Context, config.Config, TableObserver) (Result, error),
+	schemaName string,
+	table string,
+	mutate func(string, time.Time) error,
+	readTarget func() (string, error),
+) {
+	t.Helper()
+	store := state.YAMLStore{Path: filepath.Join(t.TempDir(), "state.yaml")}
+	task := state.TaskKey{Type: stage4AdapterNetworkTaskType, Schema: schemaName, Table: table}
+	bootstrap := cfg
+	bootstrap.Migration.TargetMode = "drop_recreate"
+	bootstrap.Migration.DateUpdatedColumns = nil
+	bootstrap.Migration.DestructiveAcknowledged = true
+	if cfg.Target.Type == "postgres" {
+		bootstrapRun := "stage4-cross-incremental-bootstrap"
+		initializeStage4LifecycleRun(t, store, bootstrapRun, time.Now().Add(-time.Minute))
+		events := make([]string, 0)
+		bootstrapObserver := stage4IncrementalTestObserver{events: &events, backend: store, run: stage4LifecycleRunContext(t, store, bootstrapRun, false)}
+		if result, err := run(ctx, bootstrap, bootstrapObserver); err != nil || result != (Result{Tables: 1, Rows: 2, Validated: true}) {
+			t.Fatalf("incremental target bootstrap result=%#v err=%v", result, err)
+		}
+		completeStage4IncrementalTestRun(t, store, bootstrapRun)
+	} else if result, err := run(ctx, bootstrap, nil); err != nil || result != (Result{Tables: 1, Rows: 2, Validated: true}) {
+		t.Fatalf("incremental target bootstrap result=%#v err=%v", result, err)
+	}
+	baseline := "stage4-cross-incremental-baseline"
+	initializeStage4LifecycleRun(t, store, baseline, time.Now().Add(-time.Minute))
+	events := make([]string, 0)
+	baselineObserver := stage4IncrementalTestObserver{events: &events, backend: store, run: stage4LifecycleRunContext(t, store, baseline, false)}
+	if result, err := run(ctx, cfg, baselineObserver); err != nil || result != (Result{Tables: 1, Rows: 2, Validated: true}) {
+		t.Fatalf("incremental baseline result=%#v err=%v", result, err)
+	}
+	completeStage4IncrementalTestRun(t, store, baseline)
+	upper := time.Date(2026, 7, 30, 10, 2, 0, 0, time.UTC)
+	if err := mutate("window-value", upper); err != nil {
+		t.Fatalf("mutate source window: %v", err)
+	}
+	crash := "stage4-cross-incremental-crash"
+	failing := &stage4IncrementalLiveFailAckBackend{YAMLStore: store, failNext: true}
+	initializeStage4LifecycleRun(t, failing, crash, time.Now().Add(-time.Minute))
+	crashObserver := stage4IncrementalTestObserver{events: &events, backend: failing, run: stage4LifecycleRunContext(t, failing, crash, false)}
+	if result, err := run(ctx, cfg, crashObserver); err == nil || !strings.Contains(err.Error(), "injected Stage 4 incremental acknowledgement failure") || result != (Result{}) {
+		t.Fatalf("injected post-commit/pre-ack result=%#v err=%v", result, err)
+	}
+	active, found, err := failing.LoadActiveIncrementalAttempt(crash, task)
+	if err != nil || !found || active.Status != state.IncrementalRunning ||
+		active.CommittedWatermark != nil || active.UpperFence == nil ||
+		!active.UpperFence.Value.Equal(upper) {
+		t.Fatalf(
+			"post-ack-failure active attempt=%#v found=%t err=%v; want durable uncommitted upper fence",
+			active,
+			found,
+			err,
+		)
+	}
+	frontier, found, err := failing.LoadLatestCommittedIncrementalAttempt(crash, task)
+	if err != nil || !found || frontier.CommittedWatermark == nil ||
+		!frontier.CommittedWatermark.Value.Equal(time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC)) {
+		t.Fatalf(
+			"post-ack-failure committed frontier=%#v found=%t err=%v; want baseline watermark",
+			frontier,
+			found,
+			err,
+		)
+	}
+	if err := mutate("replayed-window-value", upper.Add(-500*time.Millisecond)); err != nil {
+		t.Fatalf("mutate source inside stored window: %v", err)
+	}
+	resumeObserver := stage4IncrementalTestObserver{events: &events, backend: failing, resume: true, run: stage4LifecycleRunContext(t, failing, crash, true)}
+	result, err := ExecuteResume(ctx, cfg, CompletedTableCheckpoints{}, resumeObserver)
+	if err != nil || result != (Result{Tables: 1, Rows: 1, Validated: true}) {
+		t.Fatalf("full-window replay result=%#v err=%v", result, err)
+	}
+	attempt, found, err := failing.LoadLatestCommittedIncrementalAttempt(crash, task)
+	if err != nil || !found || attempt.CommittedWatermark == nil || !attempt.CommittedWatermark.Value.Equal(upper) {
+		t.Fatalf("committed replay attempt=%#v found=%t err=%v", attempt, found, err)
+	}
+	payload, err := readTarget()
+	if err != nil || payload != "replayed-window-value" {
+		t.Fatalf("replayed target payload=%q err=%v", payload, err)
+	}
+}

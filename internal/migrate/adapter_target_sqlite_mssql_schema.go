@@ -36,6 +36,14 @@ func projectSQLServerTableForSQLite(
 		}
 		projected.Columns[index] = target
 	}
+	// SQLite reports its implicit index collation as BINARY. Persist the
+	// physical target spelling in the projected shape so the same source-backed
+	// target can be authenticated from an independent SQLite catalog read.
+	for index := range projected.Indexes {
+		for column := range projected.Indexes[index].Columns {
+			projected.Indexes[index].Columns[column].Collation = "BINARY"
+		}
+	}
 
 	sourceColumns := make(map[string]schema.Column, len(source.Columns))
 	for _, column := range source.Columns {
@@ -214,7 +222,7 @@ func validateSQLServerSQLiteTables(
 	objectNames := make(map[string]string)
 	for index, sourceTable := range sourceTables {
 		targetTable := targetTables[index]
-		key := strings.ToLower(targetTable.Name)
+		key := stage4SQLiteIdentifier(targetTable.Name)
 		if earlier, exists := objectNames[key]; exists {
 			return sqliteSQLServerProjectionPolicy(
 				"map SQLite object names",
@@ -227,7 +235,7 @@ func validateSQLServerSQLiteTables(
 			if index.Inline {
 				continue
 			}
-			indexKey := strings.ToLower(index.Name)
+			indexKey := stage4SQLiteIdentifier(index.Name)
 			if earlier, exists := objectNames[indexKey]; exists {
 				return sqliteSQLServerProjectionPolicy(
 					"map SQLite object names",
@@ -328,7 +336,9 @@ func projectSQLServerColumnForSQLite(
 		if sourceType != "integer" || !noArguments() {
 			return fail("map SQL Server type")
 		}
-		target.Type = "integer"
+		// SQLite retains the declared signed-width spelling. Preserve that
+		// physical catalog representation for target-shape authority.
+		target.Type = base
 		declaration(base)
 	case "bigint":
 		if sourceType != "bigint" || !noArguments() {
@@ -373,7 +383,10 @@ func projectSQLServerColumnForSQLite(
 			arguments[0] > 8_000 {
 			return fail("map SQL Server text type")
 		}
-		target.Type = "text"
+		// SQLite retains the declared VARCHAR spelling in its catalog. Keep
+		// that physical target type in durable shape authority while the
+		// source-value contract remains exact UTF-8 text.
+		target.Type = "varchar"
 		declaration(base, arguments[0])
 	case "text":
 		if sourceType != "text" || !noArguments() {
@@ -418,7 +431,8 @@ func projectSQLServerColumnForSQLite(
 			arguments[0] > 6 {
 			return fail("map SQL Server temporal type")
 		}
-		target.Type = "datetime"
+		// SQLite retains TIMESTAMP in PRAGMA table metadata.
+		target.Type = "timestamp"
 		declaration("timestamp", arguments[0])
 	case "smalldatetime":
 		if sourceType != "datetime" || !noArguments() {

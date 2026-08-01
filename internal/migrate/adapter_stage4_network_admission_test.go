@@ -194,12 +194,26 @@ func TestStage4AdapterRejectsChangedPaginationBeforeTargetMutationUntilReset(
 	if err != nil {
 		t.Fatalf("prepare initial topology: %v", err)
 	}
-	if err := ensureStage4AdapterWork(
+	initialExecution, err := admitStage4AdapterNetworkTransfer(
 		context.Background(),
-		run,
-		initial.work,
+		cfg,
+		observer,
+		source,
+		target,
+		initial,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("admit initial stable topology: %v", err)
+	}
+	if err := checkpointStage4AdapterStableNetworkWork(
+		context.Background(),
+		observer,
+		initialExecution,
+		false,
+		nil,
 	); err != nil {
-		t.Fatalf("persist initial topology: %v", err)
+		t.Fatalf("persist initial stable topology: %v", err)
 	}
 
 	source.rows = []string{"first", "second", "third"}
@@ -243,7 +257,29 @@ func TestStage4AdapterRejectsChangedPaginationBeforeTargetMutationUntilReset(
 	if len(changed.work) != 1 {
 		t.Fatalf("changed work = %#v", changed.work)
 	}
-	item := changed.work[0]
+	changedExecution, err := admitStage4AdapterNetworkTransfer(
+		context.Background(),
+		cfg,
+		observer,
+		source,
+		target,
+		changed,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("admit changed stable topology: %v", err)
+	}
+	changedTable, err := changedExecution.planTableOnce(
+		context.Background(),
+		0,
+	)
+	if err != nil {
+		t.Fatalf("plan changed stable topology: %v", err)
+	}
+	if err := changedTable.Close(); err != nil {
+		t.Fatalf("close changed stable topology: %v", err)
+	}
+	item := changedTable.work
 	if err := backend.ResetWorkPlan(
 		state.WorkTask{
 			RunID:        runID,
@@ -258,7 +294,7 @@ func TestStage4AdapterRejectsChangedPaginationBeforeTargetMutationUntilReset(
 	if err := ensureStage4AdapterWork(
 		context.Background(),
 		run,
-		changed.work,
+		[]stage4AdapterWork{item},
 	); err != nil {
 		t.Fatalf("admit explicitly reset topology: %v", err)
 	}

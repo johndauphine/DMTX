@@ -131,6 +131,60 @@ func TestMaterializeSchemaSnapshotAcceptsEmptyEvidence(t *testing.T) {
 	}
 }
 
+func TestMaterializeSchemaSnapshotForSQLiteStructurallyValidatesChecks(t *testing.T) {
+	t.Parallel()
+	check, err := ParseSQLiteCheckExpression(`"enabled" IN (0, 1)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := NewSchemaSnapshot([]Table{{
+		Name: "flags",
+		Columns: []Column{
+			{
+				Name: "id", Type: "integer", PrimaryKey: true,
+				PrimaryKeyPosition: 1,
+				DeclaredType:       &DeclaredType{Base: "integer"},
+			},
+			{
+				Name: "enabled", Type: "boolean",
+				DeclaredType: &DeclaredType{Base: "boolean"},
+			},
+		},
+		Checks: []CheckConstraint{{Expression: check}},
+	}})
+	if err != nil {
+		t.Fatalf("snapshot SQLite boolean CHECK: %v", err)
+	}
+	materialized, err := MaterializeSchemaSnapshotForDialect(snapshot, SQLite)
+	if err != nil || len(materialized) != 1 ||
+		len(materialized[0].Checks) != 1 ||
+		materialized[0].Checks[0].Expression.CanonicalSQL() !=
+			`"enabled" IN (0, 1)` {
+		t.Fatalf("materialize SQLite boolean CHECK = %#v, %v", materialized, err)
+	}
+	for _, test := range []struct {
+		name  string
+		check string
+		want  string
+	}{
+		{name: "truncated", check: `"enabled" >`, want: "parse canonical SQLite CHECK structurally"},
+		{name: "unknown column", check: `"missing" > 0`, want: "unknown source column"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			corrupt := snapshot
+			corrupt.Tables = append([]SnapshotTable(nil), snapshot.Tables...)
+			corrupt.Tables[0].Checks = append(
+				[]SnapshotCheckConstraint(nil), snapshot.Tables[0].Checks...,
+			)
+			corrupt.Tables[0].Checks[0].Expression = test.check
+			if _, err := MaterializeSchemaSnapshotForDialect(corrupt, SQLite); err == nil ||
+				!strings.Contains(err.Error(), test.want) {
+				t.Fatalf("materialize corrupt SQLite CHECK error = %v", err)
+			}
+		})
+	}
+}
+
 func TestMaterializeSchemaSnapshotRejectsMalformedEvidence(t *testing.T) {
 	t.Parallel()
 

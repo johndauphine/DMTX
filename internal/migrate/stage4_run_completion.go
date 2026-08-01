@@ -58,15 +58,59 @@ func completeStage4AdapterNetworkTable(
 	if err != nil {
 		return err
 	}
+	return publishStage4AdapterNetworkTableCompletion(
+		ctx,
+		observer,
+		aggregate,
+		completion,
+	)
+}
+
+// publishStage4AdapterNetworkTableCompletion publishes a completion that was
+// either just derived from durable ranges or read verbatim from an existing
+// aggregate receipt. The latter matters after a callback failure: rebuilding a
+// completion would choose a different CompletedAt timestamp and correctly be
+// rejected as immutable-evidence drift.
+func publishStage4AdapterNetworkTableCompletion(
+	ctx context.Context,
+	observer TableObserver,
+	aggregate state.Stage4AggregateBackend,
+	completion state.Stage4TableCompletion,
+) error {
+	if aggregate == nil {
+		return NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"Stage 4 aggregate publication is required for receipt replay",
+			),
+		)
+	}
 	if err := aggregate.CompleteStage4Table(completion); err != nil {
 		return NewTransferError(
 			ErrorClassState,
 			fmt.Errorf(
 				"atomically complete Stage 4 table %s: %w",
-				table,
+				completion.Table,
 				err,
 			),
 		)
+	}
+	if publisher, ok := observer.(Stage4TablePublicationObserver); ok &&
+		!isNilInterface(publisher) {
+		if err := publisher.AfterStage4TablePublication(
+			ctx,
+			completion.Table,
+			completion.RowsDone,
+		); err != nil {
+			return NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"observe published Stage 4 table %s: %w",
+					completion.Table,
+					err,
+				),
+			)
+		}
 	}
 	return nil
 }

@@ -47,6 +47,7 @@ func TestResumeCompatibilityHashSeparatesSafeRuntimeAndStructuralChanges(t *test
 	safe.Migration.Partitions = 3
 	safe.Migration.ReaderParallelism = 6
 	safe.Migration.ReadAhead = 5
+	safe.Migration.UpsertMergeSize = 111
 	safe.Migration.MemoryCeilingBytes = 128 << 20
 	safe.Migration.CheckpointFrequency = 1
 	safe.Migration.MaxRetries = 0

@@ -53,7 +53,66 @@ func projectMySQLTargetTable(
 	); err != nil {
 		return schema.Table{}, err
 	}
+	normalizeMySQLTargetDeclaredTypeArguments(&target)
+	if err := canonicalizeMySQLTargetChecks(&target); err != nil {
+		return schema.Table{}, err
+	}
 	return target, nil
+}
+
+// normalizeMySQLTargetDeclaredTypeArguments removes a serialization-only
+// distinction from a target-ready projection. Schema snapshots deliberately
+// canonicalize an absent argument list as an empty JSON array, while native
+// MySQL discovery returns nil for a declaration with no type modifiers. Both
+// mean the same catalog declaration (for example BIGINT), so retaining the
+// slice representation would make a schema evolution DDL it just applied fail
+// the retained-table recheck.
+func normalizeMySQLTargetDeclaredTypeArguments(table *schema.Table) {
+	if table == nil {
+		return
+	}
+	for index := range table.Columns {
+		declared := table.Columns[index].DeclaredType
+		if declared != nil && len(declared.Arguments) == 0 {
+			declared.Arguments = nil
+		}
+	}
+}
+
+// canonicalizeMySQLTargetChecks freezes a CHECK in the same portable AST form
+// returned by the exact MySQL/MariaDB catalog reader after DMTX renders and
+// installs it. Without this conversion, a syntactically equivalent source
+// expression such as `code <> ”` can differ from the catalog's quoted
+// identifier form and make a post-DDL recovery prefix appear mixed.
+func canonicalizeMySQLTargetChecks(table *schema.Table) error {
+	if table == nil {
+		return fmt.Errorf("MySQL target CHECK canonicalization table is nil")
+	}
+	for index := range table.Checks {
+		rendered, err := schema.RenderPortableCheckForMySQL(
+			table.Checks[index].Expression,
+			table.Columns,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"canonicalize MySQL target CHECK %s.%s: %w",
+				table.Name,
+				table.Checks[index].Name,
+				err,
+			)
+		}
+		expression, err := schema.ParseMySQLCatalogCheck(rendered, table.Columns)
+		if err != nil {
+			return fmt.Errorf(
+				"parse planned MySQL target CHECK %s.%s: %w",
+				table.Name,
+				table.Checks[index].Name,
+				err,
+			)
+		}
+		table.Checks[index].Expression = expression
+	}
+	return nil
 }
 
 func validateMySQLSpatialTargetProjection(

@@ -38,6 +38,9 @@ func sqliteToSQLiteLegacyResumeWithProgress(
 	progress map[string]TableProgress,
 	observer TableObserver,
 ) (Result, error) {
+	if err := requireStage4UpsertMergeComposition(cfg, false); err != nil {
+		return Result{}, err
+	}
 	if cfg.Source.Type != "sqlite" || cfg.Target.Type != "sqlite" {
 		return Result{}, fmt.Errorf("SQLite first pass requires source.type and target.type to be sqlite")
 	}

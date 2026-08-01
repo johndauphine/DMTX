@@ -27,6 +27,7 @@ type recordingAdapterSource struct {
 	stableReaderLimit int
 	beforeStableOpen  func(*recordingAdapterSource)
 	readRanges        *[]uint64
+	readSizes         *[]int
 	stableCloseErr    error
 }
 
@@ -73,6 +74,7 @@ func (source *recordingAdapterSource) openStableNetworkTableSource(
 		rows:       append([]string(nil), source.rows...),
 		ids:        append([]int64(nil), source.ids...),
 		readRanges: source.readRanges,
+		readSizes:  source.readSizes,
 	}
 	if source.tables != nil {
 		snapshot.tables = make([]schema.Table, len(source.tables))
@@ -300,6 +302,9 @@ func (source *recordingAdapterSource) ReadNetworkRangePage(
 	plannedRange PaginationRange,
 	request NetworkReadRequest,
 ) (NetworkReadPage, error) {
+	if source.readSizes != nil {
+		*source.readSizes = append(*source.readSizes, request.MaxRows)
+	}
 	if source.readRanges != nil {
 		*source.readRanges = append(
 			*source.readRanges,
@@ -450,6 +455,7 @@ type recordingAdapterTarget struct {
 	captured     [][]any
 	rowsByTable  map[string]int
 	prepared     []string
+	preparedSets [][]schema.Table
 	preflighted  []string
 	written      []string
 	planned      []string
@@ -471,7 +477,16 @@ func (target *recordingAdapterTarget) Engine() string {
 
 func (*recordingAdapterTarget) stage4NetworkIdempotentUpsertTarget() {}
 
+func (*recordingAdapterTarget) stage4NetworkDuplicateSafeRebuildTarget() {}
+
 func (target *recordingAdapterTarget) PreflightStage4NetworkReplayIsolation(
+	context.Context,
+	[]schema.Table,
+) error {
+	return target.isolationErr
+}
+
+func (target *recordingAdapterTarget) PreflightStage4NetworkRebuild(
 	context.Context,
 	[]schema.Table,
 ) error {
@@ -531,6 +546,11 @@ func (target *recordingAdapterTarget) PrepareTables(
 ) error {
 	*target.events = append(*target.events, "target_prepare")
 	target.prepared = append(target.prepared, mode)
+	set := make([]schema.Table, len(targetTables))
+	for index, table := range targetTables {
+		set[index] = cloneStage4RichTable(table)
+	}
+	target.preparedSets = append(target.preparedSets, set)
 	if target.protected != nil && !*target.protected {
 		return fmt.Errorf("prepare was not protected")
 	}
@@ -540,6 +560,14 @@ func (target *recordingAdapterTarget) PrepareTables(
 				"target schema was not cleared: %q",
 				targetTable.Schema,
 			)
+		}
+		if mode == "drop_recreate" {
+			if target.networkKeys != nil {
+				delete(target.networkKeys, targetTable.Name)
+			}
+			if target.rowsByTable != nil {
+				delete(target.rowsByTable, targetTable.Name)
+			}
 		}
 	}
 	return target.prepareErr
@@ -621,6 +649,74 @@ func (target *recordingAdapterTarget) WriteStage4NetworkBatch(
 		target.rowsByTable[table.Name] = priorRows + newRows
 	}
 	return receipt, err
+}
+
+// WriteStage4NetworkRebuildBatch models the rebuild writer contract rather
+// than merely advertising its marker: a fresh page is an atomic strict insert,
+// while a replay may preserve an already committed primary key.
+func (target *recordingAdapterTarget) WriteStage4NetworkRebuildBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	mode NetworkWriteMode,
+	rows [][]any,
+) (WriteReceipt, error) {
+	if mode != NetworkWriteFreshInsert &&
+		mode != NetworkWriteDuplicateSafeInsertOnly {
+		return WriteReceipt{
+			Certainty:     CommitNotCommitted,
+			AttemptedRows: int64(len(rows)),
+		}, fmt.Errorf("unsupported rebuild write mode %q", mode)
+	}
+	if target.networkKeys == nil {
+		target.networkKeys = make(map[string]map[string]struct{})
+	}
+	keys := target.networkKeys[table.Name]
+	if keys == nil {
+		keys = make(map[string]struct{})
+		target.networkKeys[table.Name] = keys
+	}
+	next := make(map[string]struct{}, len(keys)+len(rows))
+	for key := range keys {
+		next[key] = struct{}{}
+	}
+	newRows := 0
+	for _, row := range rows {
+		if len(row) == 0 {
+			continue
+		}
+		key := fmt.Sprintf("%T:%v", row[0], row[0])
+		if _, exists := next[key]; exists {
+			if mode == NetworkWriteFreshInsert {
+				return WriteReceipt{
+					Certainty:     CommitNotCommitted,
+					AttemptedRows: int64(len(rows)),
+				}, fmt.Errorf("fresh rebuild primary-key conflict for %s", table.Name)
+			}
+			continue
+		}
+		next[key] = struct{}{}
+		newRows++
+	}
+	priorRows := 0
+	if target.rowsByTable != nil {
+		priorRows = target.rowsByTable[table.Name]
+	}
+	receipt, err := target.WriteBatch(
+		ctx,
+		table,
+		columns,
+		string(mode),
+		rows,
+	)
+	if err != nil {
+		return receipt, err
+	}
+	target.networkKeys[table.Name] = next
+	if target.rowsByTable != nil {
+		target.rowsByTable[table.Name] = priorRows + newRows
+	}
+	return receipt, nil
 }
 
 func (target *recordingAdapterTarget) CountRows(

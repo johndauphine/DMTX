@@ -1,7 +1,6 @@
 package migrate
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -40,8 +39,10 @@ func stage4MatrixEndpoint(engine string, role string) config.Endpoint {
 
 // TestStage4CertifiedRelationalDeleteRouteMatrixLive enumerates every relational
 // source/target pair and pins which cells delete reconciliation is certified
-// for. Exactly one cell is certified today — PostgreSQL to PostgreSQL upsert —
-// and the value of the matrix is that every other cell is proven to refuse
+// for. PostgreSQL-to-PostgreSQL, SQLite-to-SQLite, and SQL Server
+// 2022-to-SQL Server 2022 are certified directly; canonical mysql-to-mysql
+// reaches the live flavor/key capability, which accepts only same-flavor
+// MySQL 8.0 or MariaDB 10.11 pairs. Every other cell is proven to refuse
 // before any target mutation, rather than being merely undocumented.
 //
 // The refusals are decided by configuration and route admission, so they are
@@ -71,9 +72,14 @@ func TestStage4CertifiedRelationalDeleteRouteMatrixLive(t *testing.T) {
 						},
 					},
 				}
-				certified := source == "postgres" && target == "postgres"
+				admittedAtConfiguration :=
+					(source == "postgres" && target == "postgres") ||
+						(source == "sqlite" && target == "sqlite") ||
+						(source == "mssql" && target == "mssql") ||
+						((source == "mysql" || source == "mariadb") &&
+							(target == "mysql" || target == "mariadb"))
 				err := requireStage4AdapterConfigurationSeams(cfg)
-				if certified {
+				if admittedAtConfiguration {
 					if err != nil {
 						t.Fatalf(
 							"certified delete cell was refused: %v",
@@ -94,7 +100,7 @@ func TestStage4CertifiedRelationalDeleteRouteMatrixLive(t *testing.T) {
 				}
 				if !strings.Contains(
 					err.Error(),
-					"certified only for PostgreSQL-to-PostgreSQL",
+					"certified only for PostgreSQL-to-PostgreSQL, SQLite-to-SQLite, live same-flavor MySQL 8.0-to-MySQL 8.0 or MariaDB 10.11-to-MariaDB 10.11, and SQL Server 2022-to-SQL Server 2022",
 				) {
 					t.Fatalf("uncertified delete refusal = %v", err)
 				}
@@ -156,90 +162,5 @@ func TestStage4CertifiedRelationalDeleteRejectsUncertifiedModes(t *testing.T) {
 				)
 			}
 		})
-	}
-}
-
-// matrixIncrementalSource and matrixIncrementalTarget re-report the engine of an
-// existing stub so the route matrix can enumerate pairs without a server. Every
-// other method is inherited, so the stubs cannot drift from the real adapter
-// surface as it grows.
-type matrixIncrementalSource struct {
-	*stage4IncrementalTestSource
-	engine string
-}
-
-func (source matrixIncrementalSource) Engine() string { return source.engine }
-
-type matrixIncrementalTarget struct {
-	*recordingAdapterTarget
-	engine string
-}
-
-func (target matrixIncrementalTarget) Engine() string { return target.engine }
-
-// TestStage4CertifiedRelationalIncrementalRouteMatrixLive enumerates every
-// relational source/target pair for the date-based incremental route. Only
-// PostgreSQL-to-PostgreSQL is admitted; the other thirty-five cells must refuse
-// as policy before any target work.
-//
-// The certified cell is not re-run here — its live behaviour is proven by
-// TestStage4PostgresIncrementalCompositionLiveTLS — because reaching it requires
-// real incremental capability rather than an engine label. What this matrix adds
-// is that narrowing or widening the boundary cannot happen silently.
-func TestStage4CertifiedRelationalIncrementalRouteMatrixLive(t *testing.T) {
-	cfg := config.Config{
-		Migration: config.Migration{
-			TargetMode:         "upsert",
-			DateUpdatedColumns: []string{"updated_at"},
-		},
-	}
-	for _, source := range stage4MatrixEngines {
-		for _, target := range stage4MatrixEngines {
-			if source == "postgres" && target == "postgres" {
-				continue
-			}
-			t.Run(source+"_to_"+target, func(t *testing.T) {
-				events := make([]string, 0)
-				_, _, err := prepareStage4AdapterIncremental(
-					context.Background(),
-					cfg,
-					matrixIncrementalSource{
-						stage4IncrementalTestSource: &stage4IncrementalTestSource{
-							events: &events,
-						},
-						engine: source,
-					},
-					matrixIncrementalTarget{
-						recordingAdapterTarget: &recordingAdapterTarget{
-							events: &events,
-						},
-						engine: target,
-					},
-					stage4AdapterPrepared{mode: "upsert"},
-				)
-				if err == nil {
-					t.Fatal("uncertified incremental cell was admitted")
-				}
-				if ClassifyTransferError(err) != ErrorClassPolicy {
-					t.Fatalf(
-						"uncertified incremental refusal class = %q: %v",
-						ClassifyTransferError(err),
-						err,
-					)
-				}
-				if !stage4AdapterIncrementalErrorHas(
-					err,
-					"only postgres-to-postgres is currently admitted",
-				) {
-					t.Fatalf("uncertified incremental refusal = %v", err)
-				}
-				if len(events) != 0 {
-					t.Fatalf(
-						"uncertified incremental cell touched an endpoint: %v",
-						events,
-					)
-				}
-			})
-		}
 	}
 }

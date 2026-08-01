@@ -152,6 +152,49 @@ func TestMySQLNativeWriteStatementForMariaDBGuardsCompletePrimaryKey(
 	}
 }
 
+func TestMySQLNativeInsertOnlyStatementsNeverUpdatePayload(
+	t *testing.T,
+) {
+	table := mysqlNativeTestTable()
+	for _, testCase := range []struct {
+		name   string
+		flavor engine.MySQLServerFlavor
+		guard  string
+	}{
+		{
+			name:   "Oracle MySQL 8",
+			flavor: engine.MySQLServerFlavorOracle80,
+			guard:  "`events`.`id` <=> `dmtx_new`.`id`",
+		},
+		{
+			name:   "MariaDB 10.11",
+			flavor: engine.MySQLServerFlavorMariaDB1011,
+			guard:  "`events`.`id` <=> VALUES(`id`)",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			statement, err := mySQLNativeInsertOnlyStatementForFlavor(
+				table,
+				[]string{"id", "payload"},
+				testCase.flavor,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(statement, testCase.guard) ||
+				!strings.Contains(statement, "ON DUPLICATE KEY UPDATE") {
+				t.Fatalf("insert-only statement lacks PK guard: %q", statement)
+			}
+			if strings.Contains(statement, "`payload` =") {
+				t.Fatalf("insert-only replay can update payload: %q", statement)
+			}
+			if strings.Contains(strings.ToUpper(statement), "INSERT IGNORE") {
+				t.Fatalf("insert-only replay uses INSERT IGNORE: %q", statement)
+			}
+		})
+	}
+}
+
 func TestMySQLNativeWriterUsesConfiguredMariaDBFlavor(t *testing.T) {
 	writer, transaction := newMySQLNativeTestWriterForFlavor(
 		engine.MySQLServerFlavorMariaDB1011,
@@ -977,6 +1020,188 @@ func TestMySQLNativeWriterStage4NetworkFencesAndProvesBeforeStrictUpsert(
 	}
 }
 
+func TestMySQLNativeWriterStage4RebuildSeparatesFreshAndReplay(
+	t *testing.T,
+) {
+	for _, flavor := range []engine.MySQLServerFlavor{
+		engine.MySQLServerFlavorOracle80,
+		engine.MySQLServerFlavorMariaDB1011,
+	} {
+		t.Run(string(flavor)+" fresh", func(t *testing.T) {
+			writer, transaction := newMySQLNativeTestWriterForFlavor(flavor)
+			transaction.statement.affected = []int64{1, 1}
+			transaction.warnings = []int64{0, 0}
+			receipt, err := writer.WriteStage4NetworkRebuildBatch(
+				context.Background(),
+				mysqlNativeTestTable(),
+				[]string{"id", "payload"},
+				NetworkWriteFreshInsert,
+				[][]any{{int64(1), "one"}, {int64(2), "two"}},
+			)
+			if err != nil {
+				t.Fatalf("fresh rebuild write: %v", err)
+			}
+			assertMySQLNativeReceipt(t, receipt, CommitDurable, 2, 2)
+			if strings.Contains(
+				transaction.statement.query,
+				"ON DUPLICATE KEY",
+			) {
+				t.Fatalf(
+					"fresh rebuild write is not strict: %q",
+					transaction.statement.query,
+				)
+			}
+			if got, want := transaction.stage4Events, []string{
+				"begin",
+				"acquire Stage 4 replay fence",
+				"prove Stage 4 replay isolation",
+				"prepare strict write",
+				"inspect warnings",
+				"inspect warnings",
+				"commit",
+			}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("fresh events = %#v, want %#v", got, want)
+			}
+		})
+
+		t.Run(string(flavor)+" replay", func(t *testing.T) {
+			writer, transaction := newMySQLNativeTestWriterForFlavor(flavor)
+			// A complete-PK duplicate is a no-op (0); a missing key inserts (1).
+			transaction.statement.affected = []int64{0, 1}
+			transaction.warnings = []int64{0, 0}
+			receipt, err := writer.WriteStage4NetworkRebuildBatch(
+				context.Background(),
+				mysqlNativeTestTable(),
+				[]string{"id", "payload"},
+				NetworkWriteDuplicateSafeInsertOnly,
+				[][]any{{int64(1), "changed"}, {int64(2), "new"}},
+			)
+			if err != nil {
+				t.Fatalf("replay rebuild write: %v", err)
+			}
+			assertMySQLNativeReceipt(t, receipt, CommitDurable, 2, 2)
+			statement := transaction.statement.query
+			if !strings.Contains(statement, "ON DUPLICATE KEY UPDATE") ||
+				strings.Contains(statement, "`payload` =") {
+				t.Fatalf("replay statement is not insert-only: %q", statement)
+			}
+		})
+	}
+}
+
+func TestMySQLNativeWriterStage4RebuildProofUsesPreFinalizeShape(
+	t *testing.T,
+) {
+	for _, flavor := range []engine.MySQLServerFlavor{
+		engine.MySQLServerFlavorOracle80,
+		engine.MySQLServerFlavorMariaDB1011,
+	} {
+		t.Run(string(flavor), func(t *testing.T) {
+			writer, transaction := newMySQLNativeTestWriterForFlavor(flavor)
+			transaction.statement.affected = []int64{1}
+			transaction.warnings = []int64{0}
+			planned := mysqlNativeTestTable()
+			planned.Indexes = []schema.Index{{
+				Name:    "events_payload_idx",
+				Columns: []schema.IndexColumn{{Name: "payload"}},
+			}}
+			planned.ForeignKeys = []schema.ForeignKey{{
+				Name: "events_parent_fk", Columns: []string{"id"},
+				ReferencedSchema: "target_db", ReferencedTable: "parents",
+				ReferencedColumns: []string{"id"},
+			}}
+			planned.Checks = []schema.CheckConstraint{{Name: "events_payload_check"}}
+
+			if _, err := writer.WriteStage4NetworkRebuildBatch(
+				context.Background(),
+				planned,
+				[]string{"id", "payload"},
+				NetworkWriteFreshInsert,
+				[][]any{{int64(1), "one"}},
+			); err != nil {
+				t.Fatalf("rebuild write: %v", err)
+			}
+			if len(transaction.stage4Table.Indexes) != 0 ||
+				len(transaction.stage4Table.ForeignKeys) != 0 ||
+				len(transaction.stage4Table.Checks) != 0 ||
+				transaction.stage4Table.Name != planned.Name ||
+				len(transaction.stage4Table.Columns) != len(planned.Columns) {
+				t.Fatalf("rebuild replay proof table = %#v", transaction.stage4Table)
+			}
+			if len(planned.Indexes) != 1 || len(planned.ForeignKeys) != 1 || len(planned.Checks) != 1 {
+				t.Fatalf("rebuild proof mutated final table plan: %#v", planned)
+			}
+		})
+	}
+}
+
+func TestMySQLNativeWriterStage4RebuildRejectsKeylessBeforeTransaction(
+	t *testing.T,
+) {
+	writer, transaction := newMySQLNativeTestWriter()
+	table := mysqlNativeTestTable()
+	table.Columns[0].PrimaryKey = false
+	table.Columns[0].PrimaryKeyPosition = 0
+	receipt, err := writer.WriteStage4NetworkRebuildBatch(
+		context.Background(),
+		table,
+		[]string{"id", "payload"},
+		NetworkWriteFreshInsert,
+		[][]any{{int64(1), "one"}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "no primary key") {
+		t.Fatalf("keyless rebuild error = %v", err)
+	}
+	assertMySQLNativeReceipt(t, receipt, CommitNotCommitted, 1, 0)
+	if transaction.begins != 0 {
+		t.Fatalf("keyless rebuild began %d transactions", transaction.begins)
+	}
+}
+
+func TestMySQLNativeWriterStage4RebuildConflictsRollBack(
+	t *testing.T,
+) {
+	for _, testCase := range []struct {
+		name string
+		mode NetworkWriteMode
+	}{
+		{name: "fresh primary-key conflict", mode: NetworkWriteFreshInsert},
+		{
+			name: "replay secondary-unique conflict",
+			mode: NetworkWriteDuplicateSafeInsertOnly,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			writer, transaction := newMySQLNativeTestWriter()
+			conflict := errors.New("duplicate conflict with sensitive values")
+			transaction.statement.errs = []error{conflict}
+			receipt, err := writer.WriteStage4NetworkRebuildBatch(
+				context.Background(),
+				mysqlNativeTestTable(),
+				[]string{"id", "payload"},
+				testCase.mode,
+				[][]any{{int64(1), "source"}},
+			)
+			if !errors.Is(err, conflict) || strings.Contains(
+				err.Error(),
+				"sensitive values",
+			) {
+				t.Fatalf("conflict error = %v", err)
+			}
+			assertMySQLNativeReceipt(
+				t,
+				receipt,
+				CommitNotCommitted,
+				1,
+				0,
+			)
+			if transaction.commits != 0 || transaction.rollbacks != 1 {
+				t.Fatalf("conflict transaction = %#v", transaction)
+			}
+		})
+	}
+}
+
 func TestMySQLNativeWriterStage4NetworkGuardFailuresRollBackBeforeWrite(
 	t *testing.T,
 ) {
@@ -1519,6 +1744,7 @@ type mysqlNativeTestStatement struct {
 	query    string
 	rows     [][]any
 	affected []int64
+	errs     []error
 	closed   bool
 }
 
@@ -1528,6 +1754,9 @@ func (statement *mysqlNativeTestStatement) Exec(
 ) (int64, error) {
 	index := len(statement.rows)
 	statement.rows = append(statement.rows, append([]any(nil), values...))
+	if index < len(statement.errs) && statement.errs[index] != nil {
+		return 0, statement.errs[index]
+	}
 	return statement.affected[index], nil
 }
 

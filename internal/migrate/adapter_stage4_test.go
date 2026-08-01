@@ -17,7 +17,9 @@ import (
 
 type stage4AdapterObserver struct {
 	recordingTableObserver
-	run Stage4RunContext
+	run                   Stage4RunContext
+	afterTableCalls       *int
+	afterPublicationCalls *int
 }
 
 // stage4AdapterObserver persists the ordinary table rows the application's own
@@ -55,6 +57,9 @@ func (observer stage4AdapterObserver) AfterTable(
 	table string,
 	rows int,
 ) error {
+	if observer.afterTableCalls != nil {
+		(*observer.afterTableCalls)++
+	}
 	if err := observer.recordingTableObserver.AfterTable(
 		ctx,
 		table,
@@ -63,6 +68,21 @@ func (observer stage4AdapterObserver) AfterTable(
 		return err
 	}
 	return stage4AdapterTestCompleteTask(observer.run, table, rows)
+}
+
+// AfterStage4TablePublication represents the observable post-validation
+// callback for aggregate-composed routes. The aggregate transaction has already
+// completed the ordinary task, so this test double records the lifecycle event
+// without issuing a second state mutation.
+func (observer stage4AdapterObserver) AfterStage4TablePublication(
+	ctx context.Context,
+	table string,
+	rows int,
+) error {
+	if observer.afterPublicationCalls != nil {
+		(*observer.afterPublicationCalls)++
+	}
+	return observer.recordingTableObserver.AfterTable(ctx, table, rows)
 }
 
 func stage4AdapterTestBackend(run Stage4RunContext) (state.Backend, bool) {
@@ -274,8 +294,12 @@ func TestStage4AdapterFreshOrdersSchemaWorkMutationAndPublication(
 		runID,
 		time.Now().Add(-time.Minute),
 	)
+	ordinaryAfterCalls := 0
+	publishedAfterCalls := 0
 	observer := stage4AdapterObserver{
 		recordingTableObserver: recordingTableObserver{events: &events},
+		afterTableCalls:        &ordinaryAfterCalls,
+		afterPublicationCalls:  &publishedAfterCalls,
 		run: stage4LifecycleRunContext(
 			t,
 			backend,
@@ -295,6 +319,13 @@ func TestStage4AdapterFreshOrdersSchemaWorkMutationAndPublication(
 	}
 	if result != (Result{Tables: 1, Rows: 2, Validated: true}) {
 		t.Fatalf("result = %#v", result)
+	}
+	if ordinaryAfterCalls != 0 || publishedAfterCalls != 1 {
+		t.Fatalf(
+			"ordinary after calls=%d published after calls=%d",
+			ordinaryAfterCalls,
+			publishedAfterCalls,
+		)
 	}
 
 	assertStage4AdapterEventBefore(
@@ -357,16 +388,16 @@ func TestStage4AdapterFreshOrdersSchemaWorkMutationAndPublication(
 		stage4SchemaGateTask,
 	)
 	if err != nil || !found {
-		t.Fatalf("published snapshot found=%v err=%v", found, err)
+		t.Fatalf("staged snapshot found=%v err=%v", found, err)
 	}
 	if snapshot.Digest == "" {
-		t.Fatal("published schema snapshot has no digest")
+		t.Fatal("staged schema snapshot has no digest")
 	}
 	tasks, ranges, err := backend.ListWork(runID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertStage4AdapterWorkCompleted(
+	assertStage4AdapterWorkRunning(
 		t,
 		tasks,
 		ranges,
@@ -394,6 +425,37 @@ func TestStage4AdapterFreshOrdersSchemaWorkMutationAndPublication(
 			latest.Outcome,
 		)
 	}
+	published, err := PublishStage4RunCompletion(
+		context.Background(),
+		observer.run,
+		"adapter aggregate route completed",
+		time.Now().UTC(),
+	)
+	if err != nil || !published {
+		t.Fatalf(
+			"publish aggregate adapter route published=%t err=%v",
+			published,
+			err,
+		)
+	}
+	tasks, ranges, err = backend.ListWork(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStage4AdapterWorkCompleted(
+		t,
+		tasks,
+		ranges,
+		stage4SchemaGateTask,
+		stage4SchemaGateRangeID,
+	)
+	latest, found, err = backend.Latest()
+	if err != nil || !found {
+		t.Fatalf("published latest run found=%v err=%v", found, err)
+	}
+	if latest.Outcome != state.Success || latest.Resumable {
+		t.Fatalf("aggregate publication run = %#v", latest)
+	}
 }
 
 func TestStage4AdapterFailsBeforeTargetPlanningWhenRequiredSeamIsMissing(
@@ -405,14 +467,6 @@ func TestStage4AdapterFailsBeforeTargetPlanningWhenRequiredSeamIsMissing(
 		wantError  string
 		targetMode string
 	}{
-		{
-			name: "runtime tuning",
-			configure: func(cfg *config.Config) {
-				cfg.Migration.RuntimeTuning = true
-			},
-			wantError:  "chunk-boundary tuning seam",
-			targetMode: "upsert",
-		},
 		{
 			name: "delete reconciliation",
 			configure: func(cfg *config.Config) {
@@ -426,7 +480,7 @@ func TestStage4AdapterFailsBeforeTargetPlanningWhenRequiredSeamIsMissing(
 			configure: func(cfg *config.Config) {
 				cfg.Migration.StrictConsistency = true
 			},
-			wantError:  "certified only for PostgreSQL-to-PostgreSQL upsert",
+			wantError:  "requires the production relational source adapter",
 			targetMode: "upsert",
 		},
 		{
@@ -559,11 +613,13 @@ func TestStage4AdapterAdmissionPrecedesEndpointConstruction(t *testing.T) {
 			want: "resume Stage 4 run context",
 		},
 		{
-			name: "runtime tuning without composed seam",
+			name: "explicit incremental runtime tuning without consumer",
 			configure: func(
 				cfg *config.Config,
 				_ *Stage4RunContext,
 			) {
+				cfg.Migration.TargetMode = "upsert"
+				cfg.Migration.DateUpdatedColumns = []string{"updated_at"}
 				cfg.Migration.RuntimeTuning = true
 			},
 			observer: func(
@@ -577,7 +633,7 @@ func TestStage4AdapterAdmissionPrecedesEndpointConstruction(t *testing.T) {
 					run: run,
 				}
 			},
-			want: "chunk-boundary tuning seam",
+			want: "not yet composed with date-based incremental",
 		},
 	}
 	for _, test := range tests {
@@ -2061,13 +2117,20 @@ func TestStage4AdapterValidationFailureNeverPublishesSchemaOrCompletion(
 		}
 	}
 	for _, workRange := range ranges {
-		if workRange.Status != "running" {
+		if workRange.Task.Type == stage4AdapterNetworkTaskType &&
+			workRange.Status != "completed" {
 			t.Fatalf(
-				"failed validation completed range %#v: %q",
+				"failed validation did not retain terminal rebuild range %#v: %q",
 				workRange.Task,
 				workRange.Status,
 			)
 		}
+	}
+	if _, ready, readyErr := backend.LoadStage4RebuildReady(runID); readyErr != nil || ready {
+		t.Fatalf("failed validation terminal readiness=%v err=%v", ready, readyErr)
+	}
+	if receipts, receiptErr := backend.LoadStage4TableCompletions(runID); receiptErr != nil || len(receipts) != 0 {
+		t.Fatalf("failed validation table receipts=%#v err=%v", receipts, receiptErr)
 	}
 }
 
@@ -2156,12 +2219,19 @@ func TestStage4AdapterCancellationAfterFinalizeCannotPublishCompletion(
 		}
 	}
 	for _, workRange := range ranges {
-		if workRange.Status != "running" {
+		if workRange.Task.Type == stage4AdapterNetworkTaskType &&
+			workRange.Status != "completed" {
 			t.Fatalf(
-				"canceled run completed range %#v",
+				"canceled run did not retain terminal rebuild range %#v",
 				workRange.Task,
 			)
 		}
+	}
+	if _, ready, readyErr := backend.LoadStage4RebuildReady(runID); readyErr != nil || ready {
+		t.Fatalf("canceled run terminal readiness=%v err=%v", ready, readyErr)
+	}
+	if receipts, receiptErr := backend.LoadStage4TableCompletions(runID); receiptErr != nil || len(receipts) != 0 {
+		t.Fatalf("canceled run table receipts=%#v err=%v", receipts, receiptErr)
 	}
 }
 
@@ -2992,6 +3062,49 @@ func assertStage4AdapterWorkCompleted(
 	if !taskFound || !rangeFound {
 		t.Fatalf(
 			"completed work %#v/%q found task=%v range=%v; tasks=%v ranges=%v",
+			key,
+			rangeID,
+			taskFound,
+			rangeFound,
+			tasks,
+			ranges,
+		)
+	}
+}
+
+func assertStage4AdapterWorkRunning(
+	t *testing.T,
+	tasks []state.WorkTask,
+	ranges []state.RangeState,
+	key state.TaskKey,
+	rangeID string,
+) {
+	t.Helper()
+	var taskFound, rangeFound bool
+	for _, task := range tasks {
+		if task.Key == key {
+			taskFound = true
+			if task.Status != "running" || !task.CompletedAt.IsZero() {
+				t.Fatalf("task %#v status = %#v", key, task)
+			}
+		}
+	}
+	for _, workRange := range ranges {
+		if workRange.Task == key && workRange.ID == rangeID {
+			rangeFound = true
+			if workRange.Status != "running" || !workRange.CompletedAt.IsZero() {
+				t.Fatalf(
+					"range %q for %#v status = %#v",
+					rangeID,
+					key,
+					workRange,
+				)
+			}
+		}
+	}
+	if !taskFound || !rangeFound {
+		t.Fatalf(
+			"running work %#v/%q found task=%v range=%v; tasks=%v ranges=%v",
 			key,
 			rangeID,
 			taskFound,

@@ -378,8 +378,9 @@ func BuildStage4TargetSchemaEvolutionProjection(
 			err,
 		)
 	}
-	durableTargetPrior, err := schema.MaterializeSchemaSnapshot(
+	durableTargetPrior, err := stage4MaterializeTargetShapeSnapshot(
 		authority.priorSnapshot,
+		targetEngine,
 	)
 	if err != nil {
 		return result, fmt.Errorf(
@@ -434,6 +435,7 @@ func BuildStage4TargetSchemaEvolutionProjection(
 		durableTargetPrior,
 		projectedPriorTables,
 		plannedCurrentTables,
+		targetEngine,
 	)
 	if err != nil {
 		return result, fmt.Errorf(
@@ -1032,6 +1034,7 @@ func mergeStage4TargetShapeAuthority(
 	authority []schema.Table,
 	sourceBackedPrior []schema.Table,
 	sourceBackedCurrent []schema.Table,
+	targetEngine string,
 ) ([]schema.Table, error) {
 	result := cloneStage4TargetSchemaProjectionTables(authority)
 	resultIndex := make(
@@ -1093,7 +1096,10 @@ func mergeStage4TargetShapeAuthority(
 			err,
 		)
 	}
-	normalized, err := schema.MaterializeSchemaSnapshot(snapshot)
+	normalized, err := stage4MaterializeTargetShapeSnapshot(
+		snapshot,
+		targetEngine,
+	)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"materialize normalized authority-backed target shape: %w",
@@ -1101,6 +1107,16 @@ func mergeStage4TargetShapeAuthority(
 		)
 	}
 	return cloneStage4TargetSchemaProjectionTables(normalized), nil
+}
+
+func stage4MaterializeTargetShapeSnapshot(
+	snapshot schema.SchemaSnapshot,
+	targetEngine string,
+) ([]schema.Table, error) {
+	if targetEngine == "sqlite" {
+		return schema.MaterializeSchemaSnapshotForDialect(snapshot, schema.SQLite)
+	}
+	return schema.MaterializeSchemaSnapshot(snapshot)
 }
 
 func stage4TargetAuthorityTableContains(

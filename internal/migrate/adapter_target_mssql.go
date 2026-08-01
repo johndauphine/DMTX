@@ -14,8 +14,14 @@ type sqlServerTargetAdapter struct {
 	database                *sql.DB
 	batchWriter             sqlServerBatchWriter
 	namespace               string
+	workloadIdentity        string
 	sourceEngine            string
 	destructiveAcknowledged bool
+	// Delete-reconciliation test seams deliberately operate on the pinned
+	// connection so commit-acknowledgement and catalog-race recovery exercises
+	// the production transaction rather than a mock transaction wrapper.
+	deleteCommit           func(context.Context, *sql.Conn) (sql.Result, error)
+	deleteAfterReservation func(context.Context, *sql.Conn) error
 }
 
 func (adapter *sqlServerTargetAdapter) sqlServerDatabaseHandle() *sql.DB {
@@ -31,11 +37,6 @@ func validateSQLServerTargetEndpoint(endpoint config.Endpoint) error {
 			"SQL Server host, database, and user are required",
 		)
 	}
-	if endpoint.Schema != "" && endpoint.Schema != "dbo" {
-		return fmt.Errorf(
-			"SQL Server target schema must be empty or dbo",
-		)
-	}
 	return nil
 }
 
@@ -45,6 +46,10 @@ func openSQLServerTargetAdapter(
 ) (targetAdapter, error) {
 	if err := validateSQLServerTargetEndpoint(endpoint); err != nil {
 		return nil, err
+	}
+	workloadIdentity, err := config.NetworkEndpointWorkloadIdentity(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("identify SQL Server target workload: %w", err)
 	}
 	resolved, err := resolvedEndpoint(endpoint)
 	if err != nil {
@@ -58,10 +63,15 @@ func openSQLServerTargetAdapter(
 	if namespace == "" {
 		namespace = "dbo"
 	}
+	if isSQLServerDeleteJournalNamespace(namespace) {
+		_ = database.Close()
+		return nil, fmt.Errorf("SQL Server target schema %q is reserved for DMTX delete receipt evidence", namespace)
+	}
 	return &sqlServerTargetAdapter{
-		database:    database,
-		batchWriter: newSQLServerNativeWriter(database),
-		namespace:   namespace,
+		database:         database,
+		batchWriter:      newSQLServerNativeWriter(database),
+		namespace:        namespace,
+		workloadIdentity: workloadIdentity,
 	}, nil
 }
 
@@ -256,6 +266,73 @@ func (adapter *sqlServerTargetAdapter) WriteStage4NetworkBatch(
 		ctx,
 		table,
 		columns,
+		rows,
+	)
+}
+
+// WriteStage4NetworkRebuildBatch keeps source normalization and target-value
+// checks identical to the ordinary adapter boundary, but delegates only to a
+// writer that distinguishes strict fresh inserts from insert-only replay.
+func (adapter *sqlServerTargetAdapter) WriteStage4NetworkRebuildBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	mode NetworkWriteMode,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	if adapter == nil {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"SQL Server Stage 4 rebuild target adapter is not configured",
+				),
+			)
+	}
+	writer, ok := adapter.batchWriter.(sqlServerStage4NetworkRebuildBatchWriter)
+	if !ok || isNilInterface(writer) {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"SQL Server Stage 4 rebuild batch writer is not configured",
+				),
+			)
+	}
+	if adapter.sourceEngine == "sqlite" {
+		normalized, err := normalizeSQLiteSQLServerBatch(
+			table,
+			columns,
+			rows,
+		)
+		if err != nil {
+			return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, err
+		}
+		rows = normalized
+	}
+	if err := validateSQLServerTargetBatchValues(
+		table,
+		columns,
+		rows,
+	); err != nil {
+		return WriteReceipt{
+			Certainty:     CommitNotCommitted,
+			AttemptedRows: attempted,
+		}, err
+	}
+	return writer.WriteStage4NetworkRebuildBatch(
+		ctx,
+		table,
+		columns,
+		mode,
 		rows,
 	)
 }

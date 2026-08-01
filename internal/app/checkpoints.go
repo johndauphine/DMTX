@@ -311,6 +311,50 @@ func (observer tableCheckpointObserver) AfterTable(_ context.Context, table stri
 	return nil
 }
 
+// AfterStage4TablePublication verifies the aggregate Stage 4 completion that
+// already atomically advanced this ordinary task. It intentionally does not
+// call CompleteTask again: the regular AfterTable hook owns that mutation on
+// legacy routes, whereas a composed route has already committed it together
+// with its structured range evidence.
+func (observer tableCheckpointObserver) AfterStage4TablePublication(
+	ctx context.Context,
+	table string,
+	rowsDone int,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tasks, err := observer.store.ListTasks(observer.runID)
+	if err != nil {
+		return stateCheckpointError(
+			"read published Stage 4 table checkpoint",
+			err,
+		)
+	}
+	for _, task := range tasks {
+		if task.Table != table {
+			continue
+		}
+		if task.Status != "completed" || task.RowsDone != rowsDone {
+			return stateCheckpointError(
+				"verify published Stage 4 table checkpoint",
+				fmt.Errorf(
+					"task %q is %s with %d rows, want completed with %d",
+					table,
+					task.Status,
+					task.RowsDone,
+					rowsDone,
+				),
+			)
+		}
+		return nil
+	}
+	return stateCheckpointError(
+		"verify published Stage 4 table checkpoint",
+		fmt.Errorf("task %q is missing", table),
+	)
+}
+
 func (observer tableCheckpointObserver) AfterIntegerKeysetPage(_ context.Context, table string, rowsDone int, watermark int64) error {
 	if err := observer.store.AdvanceIntegerKeysetTask(observer.runID, table, rowsDone, watermark); err != nil {
 		return stateCheckpointError("advance integer checkpoint", err)

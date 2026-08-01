@@ -34,6 +34,16 @@ type postgresStage4NetworkBatchWriter interface {
 	) (WriteReceipt, error)
 }
 
+type postgresStage4NetworkRebuildBatchWriter interface {
+	WriteStage4NetworkRebuildBatch(
+		context.Context,
+		schema.Table,
+		[]string,
+		NetworkWriteMode,
+		[][]any,
+	) (WriteReceipt, error)
+}
+
 // postgresSafeOperationError preserves an underlying driver error for
 // errors.Is/errors.As without including its potentially sensitive text in
 // operator output.
@@ -126,6 +136,7 @@ func (writer *postgresNativeWriter) WriteBatch(
 		mode,
 		rows,
 		false,
+		"",
 	)
 }
 
@@ -146,6 +157,50 @@ func (writer *postgresNativeWriter) WriteStage4NetworkBatch(
 		"upsert",
 		rows,
 		true,
+		"",
+	)
+}
+
+// WriteStage4NetworkRebuildBatch preserves the destructive runner's two
+// distinct write contracts. A fresh page uses strict COPY into the empty
+// target and therefore fails on every conflict. Only an issued-page replay is
+// staged and inserted with a primary-key-scoped DO NOTHING clause; secondary
+// unique conflicts still fail and no retained row is updated.
+func (writer *postgresNativeWriter) WriteStage4NetworkRebuildBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	mode NetworkWriteMode,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	notCommitted := WriteReceipt{
+		Certainty:     CommitNotCommitted,
+		AttemptedRows: attempted,
+	}
+	if mode != NetworkWriteFreshInsert &&
+		mode != NetworkWriteDuplicateSafeInsertOnly {
+		return notCommitted, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"PostgreSQL Stage 4 rebuild writer received unsupported mode %q",
+				mode,
+			),
+		)
+	}
+	// Every fresh page may become an uncertain issued-page replay, so a usable
+	// primary key is required before either mode is allowed to touch the target.
+	if err := validatePostgresWriteShape(table, columns, "upsert"); err != nil {
+		return notCommitted, err
+	}
+	return writer.writeBatch(
+		ctx,
+		table,
+		columns,
+		"drop_recreate",
+		rows,
+		true,
+		mode,
 	)
 }
 
@@ -156,6 +211,7 @@ func (writer *postgresNativeWriter) writeBatch(
 	mode string,
 	rows [][]any,
 	stage4NetworkReplay bool,
+	rebuildMode NetworkWriteMode,
 ) (WriteReceipt, error) {
 	attempted := int64(len(rows))
 	notCommitted := WriteReceipt{
@@ -277,7 +333,17 @@ func (writer *postgresNativeWriter) writeBatch(
 				}
 			}
 
-			if mode == "drop_recreate" {
+			if rebuildMode == NetworkWriteDuplicateSafeInsertOnly {
+				if insertErr := stageAndInsertOnlyPostgresRows(
+					ctx,
+					transaction,
+					table,
+					columns,
+					normalizedRows,
+				); insertErr != nil {
+					return insertErr
+				}
+			} else if mode == "drop_recreate" {
 				if copyErr := copyPostgresRows(
 					ctx,
 					transaction,
@@ -472,6 +538,57 @@ func stageAndUpsertPostgresRows(
 			"merge PostgreSQL table %s affected %d rows, expected %d",
 			table.Name,
 			merged,
+			len(rows),
+		)
+	}
+	return nil
+}
+
+func stageAndInsertOnlyPostgresRows(
+	ctx context.Context,
+	transaction postgresNativeTransaction,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) error {
+	stage := postgresStageTableName(table, columns)
+	if _, err := transaction.Exec(
+		ctx,
+		postgresCreateStageStatement(table, columns, stage),
+	); err != nil {
+		return newPostgresSafeOperationError(
+			"create PostgreSQL rebuild replay staging table for",
+			table.Name,
+			err,
+		)
+	}
+	if err := copyPostgresRows(
+		ctx,
+		transaction,
+		[]string{"pg_temp", stage},
+		columns,
+		rows,
+		"copy PostgreSQL rebuild replay staging table for",
+		table.Name,
+	); err != nil {
+		return err
+	}
+	inserted, err := transaction.Exec(
+		ctx,
+		postgresInsertOnlyStageStatement(table, columns, stage),
+	)
+	if err != nil {
+		return newPostgresSafeOperationError(
+			"insert PostgreSQL rebuild replay staging table for",
+			table.Name,
+			err,
+		)
+	}
+	if inserted < 0 || inserted > int64(len(rows)) {
+		return fmt.Errorf(
+			"replay PostgreSQL table %s inserted %d rows, expected between 0 and %d",
+			table.Name,
+			inserted,
 			len(rows),
 		)
 	}

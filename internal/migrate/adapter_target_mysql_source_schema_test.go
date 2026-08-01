@@ -140,6 +140,27 @@ func TestProjectPostgresTableForMySQLPreservesCommonShape(t *testing.T) {
 		!strings.Contains(got.Checks[1].Expression.CanonicalSQL(), "IN") {
 		t.Fatalf("projected checks = %#v", got.Checks)
 	}
+	renderedCheck, err := schema.RenderPortableCheckForMySQL(
+		check,
+		got.Columns,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedCheck, err := schema.ParseMySQLCatalogCheck(
+		renderedCheck,
+		got.Columns,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Checks[0].Expression, expectedCheck) {
+		t.Fatalf(
+			"projected MySQL check = %q, want catalog canonical %q",
+			got.Checks[0].Expression.CanonicalSQL(),
+			expectedCheck.CanonicalSQL(),
+		)
+	}
 }
 
 func TestProjectPostgresTableForMySQLNormalizesForeignKeyMatch(t *testing.T) {
@@ -169,6 +190,86 @@ func TestProjectPostgresTableForMySQLNormalizesForeignKeyMatch(t *testing.T) {
 	}
 	if got.ForeignKeys[0].Match != "NONE" {
 		t.Fatalf("foreign-key match = %q", got.ForeignKeys[0].Match)
+	}
+}
+
+func TestProjectMySQLTargetTableCanonicalizesPortableChecksForCatalogRecovery(
+	t *testing.T,
+) {
+	portable, err := schema.ParseSQLiteCheckExpression(`code <> ''`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := schema.Table{
+		Schema:         "app",
+		Name:           "items",
+		MySQLCollation: "utf8mb4_0900_bin",
+		Columns: []schema.Column{
+			{
+				Name:               "id",
+				Type:               "bigint",
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 1,
+				DeclaredType:       &schema.DeclaredType{Base: "bigint"},
+			},
+			{
+				Name:         "code",
+				Type:         "varchar",
+				Nullable:     true,
+				DeclaredType: &schema.DeclaredType{Base: "varchar", Arguments: []int{16}},
+			},
+		},
+		Checks: []schema.CheckConstraint{{
+			Name: "items_code_check", Expression: portable,
+		}},
+	}
+	projected, err := projectMySQLTargetTable(
+		"mysql",
+		source,
+		engine.MySQLServerFlavorOracle80,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := schema.RenderPortableCheckForMySQL(
+		portable,
+		projected.Columns,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := schema.ParseMySQLCatalogCheck(rendered, projected.Columns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projected.Checks) != 1 ||
+		!reflect.DeepEqual(projected.Checks[0].Expression, want) {
+		t.Fatalf(
+			"projected check = %#v, want exact MySQL catalog AST %#v",
+			projected.Checks,
+			want,
+		)
+	}
+	first := projected.Checks[0].Expression
+	if err := canonicalizeMySQLTargetChecks(&projected); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(projected.Checks[0].Expression, first) {
+		t.Fatalf(
+			"first repeated MySQL check canonicalization changed the AST: before=%#v after=%#v",
+			first,
+			projected.Checks[0].Expression,
+		)
+	}
+	if err := canonicalizeMySQLTargetChecks(&projected); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(projected.Checks[0].Expression, first) {
+		t.Fatalf(
+			"second repeated MySQL check canonicalization changed the AST: before=%#v after=%#v",
+			first,
+			projected.Checks[0].Expression,
+		)
 	}
 }
 

@@ -24,17 +24,75 @@ this refresh cites a fixture, that fixture exists in the tree today. Where a row
 still says missing, it was verified missing by name against the current test
 inventory.
 
-Two cautions on reading the refreshed rows. First, an implemented route is
-usually **one certified cell, not a family**: PostgreSQL-to-PostgreSQL upsert is
-proven where the row matrix asks for six engines. Second, non-live proof does
-not close a row whose acceptance requires TLS live evidence — but the live
-matrix **was** run on 2026-07-31 against all five TLS containers. Results, DSNs,
-and the six pre-existing failures are recorded in the live-matrix section of
-`docs/STAGE4_HANDOFF.md`.
+Two cautions on reading the refreshed rows. First, the implemented surface is
+capability-gated: an admitted engine family does not waive key, type,
+collation, native-writer, target-catalog, or validation admission. Second,
+non-live proof does not close a row whose acceptance requires TLS live and
+process-kill evidence. A historical TLS matrix run is recorded in
+`docs/STAGE4_CLOSEOUT_HANDOFF.md`, but this follow-up does not claim the live exit gate
+until it is rerun armed with `DMTX_STAGE4_LIVE_REQUIRED=1`.
 
 Where a row cites the Stage 3 route or common-fixture matrix, the exact current
 fixture names are the ones enumerated in `STAGE3_REQUIREMENTS_TESTS.md`; this
 map does not rename or weaken those baseline gates.
+
+## Current implementation checkpoint (2026-08-01)
+
+This checkpoint supersedes older single-route and "inert setting" claims in
+this map. It records bounded implementation and automated evidence; it does
+**not** declare Phase Four complete.
+
+- Keyed `upsert` and `drop_recreate` have native relational/SQLite writer and
+  replay paths for PostgreSQL, MySQL/MariaDB, SQL Server, and SQLite where the
+  target capability and source/target projection are admitted. Target-catalog
+  evolution is likewise capability-gated. SQLite now applies only deterministic
+  compatible `relax_nullability`/safe-`widen_type` actions through an atomic
+  copy/swap, preserving authenticated retained data and sequence authority;
+  unsupported object or FK shapes refuse before mutation.
+- Strict consistency composes to the same keyed-upsert target set, subject to
+  live writer/validation admission:
+
+  | Source | Table scope | Migration scope |
+  | --- | --- | --- |
+  | PostgreSQL | implemented | implemented |
+  | SQL Server | implemented | implemented, using durable database snapshots |
+  | MySQL/MariaDB | implemented | refused |
+  | SQLite | implemented | refused |
+
+  ClickHouse strict routes remain refused. `TestStage4StrictStableViewCompositionMatrix`,
+  `TestSQLServerMigrationStrictTopologySurvivesPreOwnerAndOrdinaryResume`,
+  `TestMySQLStrictConfigurationAdmitsOnlyTableScopeAndSupportedTargets`, and
+  `TestSQLiteStrictConfigurationAdmitsOnlyTableScopeAndSupportedTargets` pin
+  these boundaries.
+- Delete reconciliation is composed only for same-engine PostgreSQL,
+  MySQL 8, MariaDB 10.11, SQL Server, and SQLite keyed-upsert cells. SQLite to
+  SQLite is also the bounded date-incremental-plus-delete cell; cross-engine
+  delete remains refused. `TestStage4SQLiteIncrementalDeleteReconcilesAfterTransfer`
+  and `TestStage4IncrementalDeleteConfigurationKeepsOtherRoutesClosed` cover
+  the incremental boundary.
+- Incremental attempts retain their durable fence and validate the exact
+  transferred key scope: exact batch proof plus a final stable target read for
+  inclusive `count_only`, `null_parity`, and `sample`; `full` remains refused.
+  `TestPrepareStage4AdapterIncrementalAdmitsInclusiveDeepValidationModes`,
+  `TestStage4AdapterIncrementalSampleBindsFinalValidationToTransferredAttempt`,
+  and `TestStage4AdapterIncrementalFinalEvidenceAvoidsWidePayloadReadsOutsideSample`
+  cover the bounded evidence design.
+- Dry-run/preflight rejects configuration-only incompatibilities before either
+  endpoint opens, reads scoped YAML/SQLite state without artifacts, reports
+  schema-drift baseline/decision facts, and reports exact delete candidates only
+  when read-only key authority is established. An absent SQLite target is now a
+  structured non-proceed target-preflight result, not a skipped-preflight
+  success. See `TestStage4DryRunRejectsAbsentSQLiteDropRecreateWithoutArtifacts`,
+  `TestApplyDryRunSchemaDriftDisclosesFactsAndPolicy`, and
+  `TestRunDryRunDeleteCandidatesUseReadOnlyStateAndPreserveArtifacts`.
+- `checkpoint_frequency`, `upsert_merge_size`, and `large_table_threshold` now
+  have bounded planning/transfer consumers; runtime tuning has bounded
+  controller, persisted history, and terminal audit evidence. Explicit
+  `history_retention_days` remains a Stage 5 boundary.
+
+The armed `DMTX_STAGE4_LIVE_REQUIRED` process-kill/composed route matrix,
+unproven or deferred capability cells, cross-engine delete, and target protocol
+capability discovery remain completion gaps.
 
 ## Status vocabulary
 
@@ -52,10 +110,12 @@ map does not rename or weaken those baseline gates.
 ## Bounded implementation slices
 
 The slices are ordered by correctness dependency, not UI convenience.
-Status as of 2026-07-31: S4.1 **landed**; S4.2 **landed for certified cells**;
-S4.3 **landed for PostgreSQL**; S4.4 **landed**; S4.5 **landed for one
-certified route**; S4.6 **landed for PostgreSQL only**; S4.7 **partial**;
-S4.8 **partial**; S4.9 **blocked on the live matrix rerun**.
+Status as of 2026-08-01: S4.1-S4.2 **landed for admitted capability cells**;
+S4.3 **landed for relational/SQLite target executors**; S4.4 **landed with
+bounded deep incremental validation**; S4.5 **landed for same-engine delete
+and SQLite incremental-delete**; S4.6 **landed for the source/scope matrix
+above**; S4.7-S4.8 **substantially landed**; S4.9 **open pending the armed
+live/process-kill composed matrix**.
 
 1. **S4.1 — Configuration and durable evidence model.** Add schema-contract,
    validation, incremental, delete, and strict-consistency configuration;
@@ -96,23 +156,23 @@ S4.8 **partial**; S4.9 **blocked on the live matrix rerun**.
 | Resolve config, finite memory, engine capabilities, and state capabilities before work; then open both endpoints. | **Covered base:** `TestResolveEffectiveTransferPlanUsesFiniteCgroupV2BudgetAndCapsConcurrency`, `TestResolveEffectiveTransferPlanFailsClosedWithoutSafeFiniteEvidence`, `TestCapabilityValidationPrecedesAdapterConstruction`, and Stage 3 live route fixtures. | S4.1/S4.2: `TestStage4ConfigAndBackendCapabilitiesPrecedeConnections`; TLS live route matrix must prove the same ordering. |
 | Acquire exclusive canonical-target ownership, create and bind durable run state, then allow mutable progress. | **Covered base:** `TestNetworkLeaseIdentityNormalizesHostAndDefaultPort`, `TestSQLiteLeaseIdentityCanonicalizesAliasesAndHardlinks`, `TestSQLiteStoreRejectsSecondLiveTargetLease`, `TestFencedBackendsRejectEveryOldGenerationMutationAfterTakeover`. | S4.2: `TestStage4NetworkRunBindsLeaseBeforeProgressLive` and the two-process matrix in Section 11.4. |
 | Initialize cancellation and data-plane lifecycle hooks before mutation. | **Partial:** `TestStage2RunSIGTERMPersistsCancelledOutcome` and `TestSQLiteToSQLiteNotifiesTableCheckpointBoundaries`. | S4.8: `TestStage4CancellationInstalledBeforePreflight`; logs, metrics, traces, notifications, and their presentation remain Stage 5, with `TestLifecycleInitializesOperatorSinksBeforeMutation` reserved for that stage. |
-| Run preflight before destructive mutation; discover/filter source schema and side objects deterministically. | **Covered base:** `TestAdapterRunnerPreflightFailurePreventsTasksAndMutation`, `TestAdapterRunnerRunsDestructivePreflightBeforeCheckpointOrMutation`, `TestSelectTablesUsesDeterministicSourceOrder`, and Stage 3 source-discovery/live fixtures. | S4.8: `TestStage4StructuredPreflightPrecedesAllTargetMutation`; include schema-contract and strict prerequisites. |
+| Run preflight before destructive mutation; discover/filter source schema and side objects deterministically. | **Covered:** `TestAdapterRunnerPreflightFailurePreventsTasksAndMutation`, `TestAdapterRunnerRunsDestructivePreflightBeforeCheckpointOrMutation`, `TestSQLiteStrictSourcePreflightPrecedesCheckpointAndTargetMutation`, and deterministic source-discovery fixtures. | Armed per-engine schema/strict capability matrix. |
 | Compare the filtered schema to the latest successful deterministic snapshot and enforce policy. | **Covered; the "uncommitted primitives" note is obsolete.** `TestPrepareStage4SchemaGateSelectsLatestSuccessfulBaselineByRunOrder` and `TestPrepareStage4SchemaGateUsesLatestSuccessfulSnapshotAndPlansDrift` prove the selection and drift planning; `TestPrepareStage4SchemaGateEstablishesBaselineOnBothBackends`, `TestPrepareStage4SchemaGateWritesPlanBeforeReadsAndFailsClosed`, `TestPrepareStage4SchemaGateRejectsChangedSameRunStagedSnapshot`, and the three first-run/evolve fixtures cover the surrounding lifecycle. | Live matrix. |
-| Derive effective tuning without overwriting pinned intent. | **Covered:** `TestDeterministicTuningPreservesPinnedIntent` proves requested/derived provenance per field, pinned values surviving derivation unchanged, downward-only labelled clamping, and repeat-resolution determinism; `TestResolveEffectiveTransferPlanUserCeilingCanOnlyLowerDetectedLimit` covers the memory ceiling. Configuration rejects unsatisfiable pins outright rather than clamping them, which is stronger than this row required. | Long-lived tuning history and advisory presentation are Stage 5. |
-| Establish migration-scoped strict source epoch before partition planning or target DDL. | **Covered for PostgreSQL; the "all modes rejected" note is obsolete.** `TestBeginStrictConsistencyOrdersEvidenceBeforeExecutableState`, `TestBeginStrictConsistencyRevalidatesBeforeAuthorization`, `TestBeginPlannedStrictConsistencyBindsWorkInsideOpenEpoch`, `TestBeginPlannedStrictConsistencyRejectsWorkOutsideEpochTaskSet`, and the two epoch-closing failure fixtures. | The four remaining engines, per Section 10. |
+| Derive effective tuning without overwriting pinned intent. | **Covered:** `TestDeterministicTuningPreservesPinnedIntent` proves requested/derived provenance and repeat resolution; `TestRuntimeTuningHistoryIsBoundedOrderedAndImmutable`, `TestStage4RuntimeTuningHistorySQLiteConformance`, and `TestAppendAttemptTerminalAuditWritesRedactedRuntimeTuningBeforeOutcome` cover bounded controller/history/audit facts. | Operator presentation and `history_retention_days` remain Stage 5. |
+| Establish migration-scoped strict source epoch before partition planning or target DDL. | **Covered for PostgreSQL and SQL Server migration scope.** PostgreSQL uses exported snapshots; SQL Server uses a durable, authenticated database snapshot with cleanup/recovery authority. `TestBeginPlannedStrictConsistencyBindsWorkInsideOpenEpoch`, `TestSQLServerMigrationStrictTopologySurvivesPreOwnerAndOrdinaryResume`, and `TestCleanupCompletedStage4SQLServerMigrationSnapshotBranches` cover the durable boundary. | Armed live/process-kill composition for every admitted source/target cell. |
 | Create every durable transfer task before target drop/truncate/create. | **Covered base:** `TestTaskInitializationFailurePrecedesTargetMutation`, `TestAdapterRunnerOrdersAllTableLifecycle`, and `TestAdapterRunnerRunsDestructivePreflightBeforeCheckpointOrMutation`. | S4.2: `TestStage4NetworkTasksDurableBeforeTargetMutationLive` for every target family. |
 | Prepare by target mode, transfer bounded rows, and finalize supported sequences/indexes/FKs/checks. | **Covered base:** Stage 2 bounded SQLite tests and Stage 3 native-target lifecycle/common fixtures. | S4.2: repeat through the resumable range protocol in `TestStage4CertifiedRelationalTransferLifecycleLive`. |
-| Run due delete reconciliation after transfer and before validation. | **Covered for the certified route.** `TestStage4PostgresDeleteLifecycleOrdersGlobalPhasesAndPreservesTransferredResume` pins the global phase order, with `TestStage4PostgresDeleteCompositionLiveTLS` as the live proof. | Route matrix. |
-| Validate, then atomically finalize task/run state, snapshots, and watermarks. | **Covered:** `TestStage4AggregateCompletionConformance` proves table and run completion, replay, mismatch rejection, and failure atomicity across both backends; `TestStage4AggregateReadConformance` proves a resumed process can recover byte-identical completion evidence; `TestPublishStage4RunCompletionComposesIncrementalRoute` proves the composed lifecycle publishes sentinels and the successful run in one mutation. `TestStage4AggregateCompletionRejectsStaleLease` fences it. | Live proof only: the composed publication has no live-route coverage, and the application's published-true branch is reachable only through a PostgreSQL route. Add to the S4.9 matrix. |
+| Run due delete reconciliation after transfer and before validation. | **Covered for admitted same-engine delete routes and SQLite incremental-delete.** `TestStage4PostgresDeleteLifecycleOrdersGlobalPhasesAndPreservesTransferredResume`, `TestStage4SQLiteIncrementalDeleteReconcilesAfterTransfer`, and `TestStage4SQLiteIncrementalDeleteReplaysDurablePlanAfterTransfer` pin order and replay. | Cross-engine delete remains an explicit refusal; the armed per-route process-kill matrix is open. |
+| Validate, then atomically finalize task/run state, snapshots, and watermarks. | **Covered:** `TestStage4AggregateCompletionConformance` proves table and run completion, replay, mismatch rejection, and failure atomicity across both backends; `TestStage4AggregateReadConformance` proves a resumed process can recover byte-identical completion evidence; `TestPublishStage4RunCompletionComposesIncrementalRoute` proves the composed lifecycle publishes sentinels and the successful run in one mutation. `TestStage4AggregateCompletionRejectsStaleLease` fences it. | Live proof remains: run aggregate publication through the admitted composed route/process-kill matrix. |
 | Emit truthful outcome and release strict snapshots/leases; never report success after lease, required-write, validation, or durable-completion failure. | **Covered base/partial:** `TestMigrationAttemptDisposition`, `TestFencedBackendsRejectEveryOldGenerationMutationAfterTakeover`, and Stage 1 crash-boundary tests prove SQLite behavior. | S4.2/S4.6/S4.7: `TestStage4NetworkFailureNeverReportsSuccessLive` and `TestStrictResourceCleanupOnEveryTerminalOutcomeLive`. Summary/notification/audit presentation is Stage 5. |
 
 ### 7.2 Dry-run
 
 | Normative behavior | Current evidence | Remaining proof |
 |---|---|---|
-| Connect, run deterministic source and target preflight, discover/filter schema, report drift/policy, select pagination, and disclose tuning/provenance. | **Partial, advanced 2026-07-31.** Tuning disclosure now lands: `Plan.Tuning` reports connection limit, workers, readers, writers, queue depth, chunk rows, and memory budget, each with selection provenance, derived from the same resolver the migration uses. Proven by `TestStage4DryRunDisclosesTuningAndDeletePolicy` and `TestStage4DryRunTuningMatchesResolvedPlan`. Pagination selection now lands too: `PlannedTable.Pagination` reports strategy, key columns, partition count, and topology hash, best-effort and omitted rather than guessed when it cannot be planned. Still absent: target preflight and schema drift reporting. | S4.8: target preflight and drift/pagination disclosure, then `TestStage4DryRunNetworkRouteMatrixLive`. |
-| Estimate rows/duration only when evidence exists and show delete due/candidate state. | **Partial, advanced 2026-07-31.** Row counts now carry `rows_provenance`, always `exact` because every source path issues `COUNT(*)`; the label exists so a future cheaper path cannot start reporting estimates through a field operators already read as exact. No duration estimate is emitted, deliberately — there is no throughput evidence to derive one from. `Plan.Deletes` discloses mode, schedule, interval, and primary-key requirement, and carries `due_state_known: false` so a caller cannot present policy as due-ness. Proven by `TestStage4DryRunDisclosesTuningAndDeletePolicy`. | Estimate provenance is closed. `TestDeleteReconcileDryRunReportsDueCandidates` stays blocked on the state-access decision: due-ness needs the durable last-success time, which a dry run must not read. |
-| Never mutate target data/schema, state progress, task success, watermarks, or deletes. | **Covered base for SQLite only:** `TestRunDryRunDiscoversSQLiteWithoutMutatingTargetOrState`. | S4.8: `TestStage4DryRunHasZeroMutationAcrossCertifiedRoutesLive`. |
+| Connect, run deterministic source and target preflight, discover/filter schema, report drift/policy, select pagination, and disclose tuning/provenance. | **Covered for configuration-only admission and existing endpoints.** Pure policy rejection precedes endpoint construction; existing endpoints use read-only preflight. An absent SQLite target returns a structured `proceed: false` target-preflight finding without creating it. `TestDryRunReportsComposedStage4PolicyBeforeTargetPreflight`, `TestStage4DryRunRejectsAbsentSQLiteDropRecreateWithoutArtifacts`, and `TestApplyDryRunSchemaDriftDisclosesFactsAndPolicy` pin the behavior. | Armed route matrix and target protocol-capability discovery. |
+| Estimate rows/duration only when evidence exists and show delete due/candidate state. | **Covered with explicit limits.** Counts carry provenance and no unsupported duration. Scoped read-only YAML/SQLite evidence provides due state; exact candidate impact is emitted only after fully read-only source/target complete-PK scans, otherwise the plan names a limitation rather than inventing a count. `TestRunDryRunDeleteCandidatesUseReadOnlyStateAndPreserveArtifacts` and `TestRunDryRunDeleteCandidatesFailClosedForCorruptApplicableState` cover this path. | Route-specific live proof; unsupported or unprovable candidate cells stay `unavailable`. |
+| Never mutate target data/schema, state progress, task success, watermarks, or deletes. | **Covered for YAML and SQLite state/SQLite targets:** `TestRunDryRunRejectsAbsentSQLiteTargetWithoutMutatingArtifacts`, `TestReadOnlySchemaSnapshotReadsSQLiteWALWithoutArtifacts`, and `TestReadOnlyScopedDeleteEvidenceReadsCommittedWALWithoutArtifacts` prove no target/state artifact creation while reading applicable authority. | `TestStage4DryRunHasZeroMutationAcrossCertifiedRoutesLive` remains part of the armed matrix. |
 | AI advice is advisory and cannot replace deterministic facts. | **Stage 5 boundary.** | Stage 5 fixture: `TestAIAdviceCannotAlterDryRunFacts`. |
 
 ### 7.3 Target modes
@@ -120,12 +180,12 @@ S4.8 **partial**; S4.9 **blocked on the live matrix rerun**.
 | Normative behavior | Current evidence | Remaining proof |
 |---|---|---|
 | Rebuild rejects non-empty targets without explicit acknowledgement. | **Covered base:** `TestRunRequiresDestructiveAcknowledgementForPopulatedTarget`, target lifecycle tests for PostgreSQL/MySQL/MariaDB/SQL Server/SQLite/ClickHouse, and their live sentinels. | S4.2 regression in `TestStage4DestructiveGateSurvivesNetworkResumeLive`; resume suppression requires durable same-run evidence. |
-| Durable tasks precede drop; all selected targets drop before recreate; DDL is deterministic; partial preparation names rerun recovery. | **Covered base:** `TestTaskInitializationFailurePrecedesTargetMutation`, `TestSQLiteTargetPreparationDropsAllTablesBeforeAnyCreate`, `TestMySQLTargetPreparationUsesOneLockedDropBeforeCreates`, `TestClickHousePrepareDropsEveryTableBeforeCreatingAny`, and target live lifecycle tests. | S4.2: `TestStage4RebuildPreparationOrderingWithDurableTasksLive`. |
-| Rebuild transfers into empty tables and finalizes identity/secondary objects after data. | **Covered base:** Stage 3 native same-engine/common fixtures and `TestAdapterRunnerOrdersAllTableLifecycle`. | S4.2 crash fixture: `TestStage4RebuildFinalizeAfterResumedTransferLive`. |
-| Resume may suppress backup acknowledgement only with durable proof of the same unchanged run and owned target contents. | **Missing as a complete rule.** | S4.2: `TestRebuildResumeSuppressesAcknowledgementOnlyWithOwnedRunEvidence` and `TestRebuildResumeRechecksAcknowledgementAfterConfigOrTargetChange`. |
+| Durable tasks precede drop; all selected targets drop before recreate; DDL is deterministic; partial preparation names rerun recovery. | **Covered at runner/state level:** `TestTaskInitializationFailurePrecedesTargetMutation`, `TestStage4AdapterRebuildCompletesExactPreMutationCheckpointPrefix`, `TestStage4AdapterRebuildRerunsWholeFKSetAfterPartialPrepare`, `TestStage4AdapterRebuildRerunsWholeFKSetAfterOpenBeforeFirstWrite`, and native target lifecycle tests prove the checkpoint boundary and one set-wide prepare. | S4.2: an end-to-end live relational target matrix must prove the same ordering through real FK graphs and process interruption. |
+| Rebuild transfers into empty tables and finalizes identity/secondary objects after data. | **Covered at runner/native lifecycle level:** `TestStage4AdapterRebuildRecoversFinalizeValidationAndAggregateFaults`, the two-table FK recovery fixtures, and Stage 3 native lifecycle tests keep publication after set-wide finalize and validation. | S4.2 process-crash fixture: `TestStage4RebuildFinalizeAfterResumedTransferLive` for each admitted target. |
+| Resume may suppress backup acknowledgement only with durable proof of the same unchanged run and owned target contents. | **Partial:** `TestStage4AdapterRebuildRejectsChangedRecoveryIdentityBeforeMutation`, `TestStage4AdapterRebuildRejectsIncompleteCheckpointPrefixWithWriteAuthority`, and the rerun/replay/publication recovery fixtures prove the runner classifier. | The application/preflight gate still needs `TestRebuildResumeSuppressesAcknowledgementOnlyWithOwnedRunEvidence` and `TestRebuildResumeRechecksAcknowledgementAfterConfigOrTargetChange` against real targets. |
 | Upsert requires target capability, complete source/target PKs, and existing tables unless contract evolution creates new ones. | **Covered; the "contract-authorized creation is absent" note is obsolete.** `TestPrepareStage4SchemaGateFirstUpsertEvolveAuthorizesExactCreates` proves an evolve contract authorizes exactly the intended creates, and `TestPrepareStage4SchemaGateFirstBaselineDoesNotImplicitlyAuthorizeCreates` proves a baseline does not, with `TestStage4TargetSchemaEvolutionProjectionAcceptsExplicitFirstRunCreates` on the projection side. Retained: `TestCapabilityValidationPrecedesAdapterConstruction`, `TestAdapterRunnerRejectsMissingPrimaryKeyBeforeTargetMutation`. | Live matrix. |
 | Upsert inserts new rows, updates changed non-key values, retains target-only rows, and preserves existing sequence/index/FK/check objects. | **Covered base:** `TestUpsertUpdatesSourceColumnsWithoutReplacingTargetRow`, `TestAdapterRunnerUpsertAllowsTargetOnlyRows`, and Stage 3 retained-object/native upsert tests. | S4.2/S4.5: `TestStage4UpsertRetainedObjectsSurviveCrashResumeLive`; delete reconciliation is the only allowed target-only removal. |
-| Upsert is idempotent under retry and complete-window replay. | **Partial for SQLite:** `TestSQLiteUpsertReplaysAfterRowNumberCheckpointFailure`. Native fresh-run writer tests do not prove durable replay. | S4.2/S4.4: `TestStage4CertifiedRelationalUpsertReplayMatrixLive`. |
+| Upsert is idempotent under retry and complete-window replay. | **Covered at runner/native-writer level for admitted relational/SQLite targets:** `TestStage4AdapterRebuildReplaysIssuedRangeWithoutRedrop`, `TestPostgresStage4NetworkRebuildWriterSeparatesFreshAndReplay`, `TestSQLServerNativeWriterStage4RebuildSeparatesFreshAndReplay`, and the SQLite/MySQL writer suites separate fresh writes from issued replay. | The real composed process-kill/replay matrix remains open. |
 
 ### 7.4 Schema drift and contract
 
@@ -150,14 +210,14 @@ item is the per-engine live matrix.
 | Every decision has entity, mode, kind, object, previous/current evidence, action, and reason in stable order. | **Covered:** `TestSchemaContractDecisionFactsAreCompleteStableAndInputImmutable`, `TestStage4SchemaDecisionsPublishBeforeTargetPlanning`, `TestStage4SchemaDecisionSinkFailureStopsBeforePlanningAndMutation`, `TestStage4SchemaDriftRequiresDecisionSinkBeforeTargetPlanning`. Secret safety: `TestSchemaContractErrorDoesNotExposeEvidenceValues`. | None. |
 | Reject simultaneous `schema_contract` and deprecated `schema_evolution`; preserve compatible old form when supported. | **Covered:** the "conflicting schema names" case in `TestParseRejectsInvalidProductionSemantics`, `TestParseCanonicalizesDeprecatedProductionSettings`, `TestSchemaEvolutionRenamePreservesHashWireShape`. | None. |
 
-Required live proof was specified as `TestStage4SchemaContractTargetMatrixLive`
-with subtests for six engines. That specification predates the Stage 4
-certification boundary: only PostgreSQL and SQLite targets can reach the
-composed path under upsert, and both are now covered by
-`TestStage4SchemaContractFreezeStopsLiveDrift`,
-`TestStage4SchemaContractModesLive`, and
-`TestStage4SchemaContractSQLiteTargetLive`. One composed route exists today:
-`TestStage4AdapterPostgresSchemaEvolutionComposedRouteLiveTLS`.
+Target-catalog evolution is no longer limited to PostgreSQL and SQLite.
+PostgreSQL, MySQL/MariaDB, SQL Server, and SQLite executors are reached only
+through the composed target-capability gate. Representative real-driver routes
+exist for PostgreSQL, MySQL, and SQL Server; SQLite's WAL/resume route is
+covered by `TestStage4AdapterSQLiteTargetEvolutionComposedWAL` and
+`TestStage4AdapterSQLiteTargetEvolutionRelaxResumeWAL`. This is not a claim of
+the full source/target/type/object matrix; unsupported catalog authority remains
+a pre-mutation refusal.
 
 **First live contract enforcement landed 2026-07-31.**
 `TestStage4SchemaContractFreezeStopsLiveDrift` establishes a real baseline
@@ -189,36 +249,25 @@ Two things the live matrix surfaced that projection tests did not:
   contract-level message about unhandled drift. Worth improving; it is a
   reporting wart, not a correctness bug.
 
-`TestStage4SchemaContractSQLiteTargetLive` covers the SQLite target and found a
-genuine engine difference: **`evolve` is not available there**. The run is
-refused as policy — "Stage 4 upsert schema action add_column for table
-network_items requires a composed target-catalog evolution executor seam" —
-before any target write. So the SQLite target supports refusal modes but cannot
-apply an evolution, which is a capability boundary rather than a defect, and it
-fails closed.
-
-**The target matrix is bounded, and both cells are now covered.** For `upsert`
-mode `migrateWithStage4Adapters` always routes through
-`admitStage4AdapterNetworkTransfer`, which refuses any target lacking
-`stage4NetworkIdempotentUpsertTarget` — implemented only by
-`postgresTargetAdapter` and `sqliteTargetAdapter`. So a MySQL-family or SQL
-Server target cannot reach the Stage 4 composed path at all under upsert, and a
-contract matrix over them would be unreachable rather than merely unwritten.
-This is the same certification boundary that bounds the upsert-replay matrix;
-see Acceptance 21.5. If those engines are later admitted to the Stage 4 network
-route, the contract matrix should grow with them.
+SQLite now applies compatible `relax_nullability` and safe `widen_type` through
+a pinned, transaction-atomic copy/swap. It authenticates retained rows and
+`sqlite_sequence`, rejects incoming-FK/trigger/collision shapes it cannot
+faithfully preserve, and verifies commit-before-ack recovery. See
+`TestSQLiteTargetEvolutionCopySwapPreservesRetainedRowsAndAuthority`,
+`TestSQLiteTargetEvolutionCopySwapRejectsIncomingForeignKeysBeforeMutation`,
+and `TestSQLiteTargetEvolutionCopySwapCommitAckRecoveryAuthenticatesRetainedAuthority`.
+PostgreSQL, MySQL/MariaDB, and SQL Server retain their own catalog-plan and
+commit-classification gates; `TestStage4AdapterMySQLSchemaEvolutionComposedRouteLiveTLS`
+and `TestStage4AdapterSQLServerSchemaEvolutionComposedRouteLiveTLS` are
+representative gated routes. The full type/object and process-kill matrix is
+still open.
 
 The obstacles below cost
 several drafts to find and are what the setup pattern in those fixtures solves —
 read them before extending it:
 
-- ~~Do not use a SQLite target to prove a contract mode.~~ **This was a
-  misdiagnosis, corrected 2026-07-31.** The retained-shape preflight only fired
-  because the draft had no *successful* baseline; with a correct baseline the
-  contract decides first, and `TestStage4SchemaContractSQLiteTargetLive` proves
-  `freeze` refuses on a SQLite target with the same contract-level message as on
-  PostgreSQL. The real SQLite-target limitation is different and narrower: see
-  the evolution-seam note below.
+- SQLite copy/swap is deliberately limited to the proved safe decisions and
+  catalog shapes above; it is not a generic SQLite DDL rewriter.
 - Source and target must be different databases. The same endpoint is refused
   outright, and separate schemas within one database still resolve to a single
   endpoint.
@@ -291,13 +340,14 @@ read them before extending it:
 |---|---|---|
 | Retry recognized transient network/server/lock errors with bounded exponential backoff, cancellation, and three default retries. | **Covered.** The claim that engine-specific classifiers are absent is obsolete: `internal/migrate/engine_retry.go` implements `classifyPostgresRetry`, `classifyMySQLRetry` (also serving MariaDB), `classifySQLServerRetry`, `classifySQLiteRetry`, and `classifyClickHouseRetry`, wired into the transfer core at three call sites in `network_transfer_core.go`. `TestClassifyEngineRetryMatrix` covers all six engines by SQLSTATE or server code, alongside `TestClassifyEngineRetryRequiresSafeReplayBoundary`, `TestClassifyEngineRetryTransportBoundaries`, `TestClassifyEngineRetryUnknownCommitRejectsAllTransportEvidence`, `TestClassifyEngineRetryStructuralServerErrorBeatsJoinedTransport`, `TestClassifyEngineRetryPreservesExplicitClassAndCancellation`, `TestClassifyEngineRetryRejectsUnknownInputsAndIsDeterministic`, `TestWrapEngineRetryErrorComposesWithBoundedRetry`, plus the generic budget/backoff primitives. The six proposed per-engine fixture names were never used. | Live per-engine fault injection belongs in the S4.9 matrix. |
 | Never blindly retry conversion, DDL policy, PK, schema contract, validation, lease, or state failures. | **Covered generic primitive:** `TestRetryStopsForStableNonTransientClasses`. | S4.2/S4.3/S4.7 route composition: `TestStage4StableFailureClassesNeverRetryLive`. |
-| Possibly committed rebuild replay is insert-only and duplicate-safe by complete PK; it never updates an existing row. | **Covered only for SQLite:** `TestSQLiteIssuedReplayUsesInsertOnlyConflictIgnore`, `TestStage2SQLiteTupleKeysetWriteBeforeAckResumesExactRows`. | `TestPostgresInsertOnlyReplayLive`, `TestSQLServerInsertOnlyReplayLive`, `TestMySQLInsertOnlyReplayLive`, `TestMariaDBInsertOnlyReplayLive`; target without a safe path: `TestUnsafeReplayRequiresTableRestart`. |
+| Possibly committed rebuild replay is insert-only and duplicate-safe by complete PK; it never updates an existing row. | **Covered at native-writer level for every admitted relational target:** PostgreSQL stages/COPYs then uses PK-scoped `ON CONFLICT DO NOTHING`; MySQL and MariaDB use guarded duplicate-key no-op assignment; SQL Server stages then runs insert-only `MERGE`; SQLite uses conflict-ignore. `TestPostgresStage4RebuildFreshReplayAndConflictsLiveTLS`, `TestMySQLStage4RebuildFreshReplayAndConflictsLiveTLS`, `TestMariaDBStage4RebuildFreshReplayAndConflictsLiveTLS`, and `TestSQLServerStage4RebuildCompositePKReplayAndConflictsLiveTLS` exercise lost-ack replay, no update, fresh conflict, and secondary-UNIQUE failure on live engines. Unit tests additionally pin generated SQL and admission-before-connection. ClickHouse advertises no such capability and is rejected. | Still open: end-to-end bounded-runner/process-crash routes for PostgreSQL, MySQL/MariaDB, and SQL Server targets proving the native writer is selected from durable issued evidence and the original run completes truthfully. |
 
 ## Section 9 — Incremental sync and delete convergence
 
-**Refreshed.** A composed incremental lifecycle and a composed
-PostgreSQL delete lifecycle are both committed. The original claim that neither
-exists is obsolete. Roughly 53 incremental and 57 delete fixtures exist.
+**Current status.** Date-based incremental upsert is admitted through the
+relational/SQLite capability matrix, with full mode still refused. The exact
+attempt key scope—not a later live whole-source query—governs final deep
+validation and resume. The armed cross-route/live matrix remains open.
 
 ### 9.1 Date-based incremental upsert
 
@@ -311,79 +361,64 @@ exists is obsolete. Roughly 53 incremental and 57 delete fixtures exist.
 | Resume discards positional progress and replays the whole changed window from the lower watermark. | **Covered:** `TestAdapterIncrementalReadRejectsPositionalOrImpreciseResume` proves positional resume is rejected by construction. | None. |
 | Watermark and aggregate table success are atomic/equivalent. | **Covered:** `TestStage4IncrementalCompletionIsAtomicAcrossBackendReopen` plus the `Incremental` arm of `TestStage4AggregateCompletionConformance`. | None. |
 
-Required live proof — **five of seven now exist**:
-
-- `TestPostgresIncrementalWindowLive` — exists
-- `TestSQLServerIncrementalWindowLive` — exists
-- `TestMySQLIncrementalWindowLive` — exists
-- `TestMariaDBIncrementalWindowLive` — exists
-- `TestSQLiteIncrementalWindow` — exists
-- `TestStage4PostgresIncrementalCompositionLiveTLS` — exists, and is the only
-  composed end-to-end incremental route proof
-- `TestStage4CertifiedRelationalIncrementalRouteMatrixLive` — **missing**; the
-  per-engine window fixtures above prove the window, not the composed route for
-  every certified source/target pair
-- `TestClickHouseIncrementalRejectedBeforeMutationLive` — **missing**
+Deep incremental validation is inclusive for `count_only`, `null_parity`, and
+`sample`: per-batch canonical proof is supplemented by a final stable target
+view over the exact transferred keys. Source mutations after the upper fence do
+not redefine the attempt. `TestStage4IncrementalComposedCrossEngineLive`,
+`TestStage4AdapterIncrementalFinalEvidencePinsLaterTargetKeyBatches`, and
+`TestStage4IncrementalValidationUsesExactCompositeKeysAcrossDriverIntegers`
+are representative evidence. The full armed source/target/process-kill matrix
+and target protocol-capability discovery remain open.
 
 ### 9.2 Delete reconciliation
 
-**Scope caution.** The committed delete lifecycle certifies exactly one route:
-PostgreSQL-to-PostgreSQL, upsert, non-strict, non-incremental. Everything
-outside it is deliberately fail-closed. The rows below are covered *for that
-cell*; the route matrix remains the open acceptance item.
+**Scope caution.** Delete reconciliation is intentionally narrower than
+ordinary upsert. It is admitted only for same-engine PostgreSQL, MySQL 8,
+MariaDB 10.11, SQL Server, and SQLite keyed-upsert routes. SQLite-to-SQLite is
+also the sole date-incremental-plus-delete composition. Cross-engine delete,
+strict-plus-delete outside its separately admitted same-engine path, and every
+unproved key-equality/collation cell remain pre-mutation refusals.
 
 | Normative behavior | Current evidence | Remaining proof |
 |---|---|---|
-| Default `off` preserves target-only rows. | **Covered:** `TestAdapterRunnerUpsertAllowsTargetOnlyRows` with delete mode off, and `TestStage4PostgresDeleteCompositionAdmissionIsExact`. | Route matrix. |
-| Reconcile is upsert-only, interval-scheduled from durable last success, and requires stable PK. | **Covered:** `TestDeleteReconcileTaskAdmissionIsExact`, `TestDeleteReconcileRequiresExplicitSafeEqualityProof`, `TestStage4PostgresDeleteAttemptIDBindsOnlyStableWorkIdentity`, `TestStage4DeleteCompletionAndLatestSuccessAreFailClosed`. | Route matrix. |
+| Default `off` preserves target-only rows. | **Covered:** `TestAdapterRunnerUpsertAllowsTargetOnlyRows`, `TestStage4PostgresDeleteCompositionAdmissionIsExact`, and `TestStage4DeleteCapabilityGateKeepsUnimplementedCellsClosed`. | Armed route matrix. |
+| Reconcile is upsert-only, interval-scheduled from durable last success, and requires stable PK. | **Covered:** `TestDeleteReconcileTaskAdmissionIsExact`, `TestDeleteReconcileRequiresExplicitSafeEqualityProof`, `TestStage4PostgresDeleteAttemptIDBindsOnlyStableWorkIdentity`, and `TestStage4DeleteCompletionAndLatestSuccessAreFailClosed`. | Cross-engine cells stay refused; admitted cells need armed process-kill proof. |
 | Compare key sets and hard-delete target-only keys in bounded parameter-safe batches. | **Covered:** `TestDeleteReconcileBatchByteCeiling`, `TestDeleteReconcileLargeKeySetUsesBoundedSpoolBatches`, `TestDeleteReconcileDiskSpoolAndBoundedBatches`, `TestStage4PostgresDeleteBatchByteLimitIsBounded`, `TestDeleteReconcileDuplicateKeysFailBeforeDelete`. | Route matrix. |
-| Run after transfer/before validation and persist candidates, deleted rows, skips, reasons, completion. | **Covered:** `TestStage4PostgresDeleteLifecycleOrdersGlobalPhasesAndPreservesTransferredResume`, `TestDeleteReconcileCandidatePlanAndBatchIntentPrecedeMutation`. | Route matrix. |
+| Run after transfer/before validation and persist candidates, deleted rows, skips, reasons, completion. | **Covered:** `TestStage4PostgresDeleteLifecycleOrdersGlobalPhasesAndPreservesTransferredResume`, `TestStage4SQLiteIncrementalDeleteReconcilesAfterTransfer`, and `TestDeleteReconcileCandidatePlanAndBatchIntentPrecedeMutation`. | Armed route matrix. |
 | Distinguish not-due from ran-with-zero; incomplete work cannot advance last success. | **Covered:** `TestDeleteReconcileIncompleteNeverAdvancesLastSuccess`, `TestStage4PostgresDeleteLifecyclePropagatesCompletedAndNotDueStrictness`. | Route matrix. |
-| Dry-run reports due/candidate impact without deletion. | **Partial:** `TestDeleteReconcileDryRunHasNoDurableWrites` proves the no-mutation half. The reporting half has no fixture. | `TestDeleteReconcileDryRunReportsDueCandidates` remains missing. |
+| Dry-run reports due/candidate impact without deletion. | **Covered when authority is available:** `TestRunDryRunDeleteCandidatesUseReadOnlyStateAndPreserveArtifacts`, `TestRunDryRunDeleteCandidatesFailClosedForCorruptApplicableState`, and `TestDryRunDeleteCandidateSQLiteCapabilityUsesProductionAuthority` prove read-only due/candidate handling. | Candidate count remains unavailable, with a named limitation, whenever a full read-only key scan cannot prove it. |
 | Completed full-scope reconciliation makes count validation strict; off/not-due permits upsert target supersets. | **Covered:** `TestAdapterResumeStrictReconciliationRejectsTargetSuperset`, `TestStage4PostgresDeleteTerminalStrictnessIsAuthenticated`. | Route matrix. |
 | Crash safety: target delete and receipt survive a state-commit failure and replay exactly once. | **Covered (added since the original revision):** `TestDeleteReconcileCrashAfterTargetCommitReplaysReceipt`, `TestDeleteReconcileCrashAfterStateCommitUsesDurableFrontier`, `TestDeleteReconcileTargetErrorReceiptSurvivesStateCommitFailure`, `TestDeleteReconcileTerminalReplayCleansCrashLeftoverSpool`. | Route matrix. |
 | Spool and plan evidence cannot be tampered between plan and mutation. | **Covered (not in the original revision):** `TestDeleteReconcilePostPlanTamperFailsBeforeIntentOrMutation`, `TestDeleteReconcileSpoolTamperFailsBeforeReplayMutation`, `TestDeleteSpoolReadSnapshotPreventsCandidateTOCTOU`, `TestDeleteReconcileMalformedLoadedEvidenceFailsClosed`. | Route matrix. |
 
-Required live proof — `TestStage4PostgresDeleteCompositionLiveTLS` and
-`TestStage4PostgresDeleteCompositionCrashResumeLiveTLS` **exist** and cover the
-certified cell. Still missing:
-`TestStage4CertifiedRelationalDeleteRouteMatrixLive` and
-`TestClickHouseDeleteReconcileRejectedBeforeMutationLive`.
+Representative live proof exists for PostgreSQL and SQL Server, while MySQL and
+MariaDB have TLS journal/snapshot fixtures. `TestStage4PostgresDeleteCompositionLiveTLS`,
+`TestStage4PostgresDeleteCompositionCrashResumeLiveTLS`, and
+`TestStage4SQLServerDeleteCompositionLiveTLS` do not close the full admitted
+same-engine matrix. The armed process-kill/replay matrix remains required.
 
 ## Section 10 — Strict consistency
 
-**Refreshed.** PostgreSQL strict consistency is now composed and live-proven.
-Every other engine still rejects, which remains valid fail-closed behavior but
-does not satisfy its supported Stage 4 combination. The rejection fixture was
-renamed to `TestBuiltInRoutesRejectUncertifiedStrictConsistencyScopes`; the old
-name `TestBuiltInRoutesRejectStrictConsistencyScopes` no longer exists.
+**Implemented, capability-gated composition.** All strict routes require
+`upsert`, a certified relational/SQLite target writer and validation path, and
+preflight before checkpoint or target mutation.
 
-Epoch and evidence primitives now covered by
-`TestBeginStrictConsistencyOrdersEvidenceBeforeExecutableState`,
-`TestBeginStrictConsistencyRevalidatesBeforeAuthorization`,
-`TestBeginPlannedStrictConsistencyBindsWorkInsideOpenEpoch`,
-`TestBeginPlannedStrictConsistencyEvidenceFailureClosesEpoch`,
-`TestBeginPlannedStrictConsistencyPlannerFailureClosesEpoch`,
-`TestStage4StrictEvidenceRequiresImmutableRunSourceEngine`, and
-`TestStage4PostgresStrictWorkIdentityBindsEpochAndSnapshot`.
-
-| Source/scope contract | Required missing fixtures |
+| Source/scope | Stable-view contract and current target matrix |
 |---|---|
-| PostgreSQL table: exported MVCC snapshot shared by parallel readers, no writer blocking. | **Covered:** `TestStage4PostgresStrictComposedRouteStableEpochLiveTLS`, `TestStage4PostgresStrictParallelSourceOverlapsWithinBound`, `TestStage4PostgresStrictSnapshotOwnerStaysWithinConnectionBound`. |
-| PostgreSQL migration: one exported snapshot across tables/partitions for one process epoch. | **Covered:** `TestStage4StrictMigrationSnapshotOwnsEveryTableEvidence`, `TestStage4PostgresStrictMixedCompletedResumeLiveTLS`. |
-| SQL Server table: shared table view/lock; writes to that table wait. | **Implemented and live-proven 2026-07-31.** `SQLServerStrictConsistencyOpener` in `strict_consistency_mssql.go` holds a serializable transaction with `TABLOCK, HOLDLOCK`. `TestSQLServerStrictTableLockLive` asserts the blocking rather than tolerating it — a writer is given a short deadline and must fail to commit, then must succeed once the view closes, which is what proves the lock was both real and released. The transaction lifetime is detached from the caller's context on purpose: go-mssqldb can return `context.Canceled` without releasing `HOLDLOCK` if `database/sql` races its automatic rollback with `Close`, which would strand the table locked. |
-| SQL Server migration: one supported database snapshot; writers do not block. | `TestSQLServerStrictMigrationDatabaseSnapshotLive`. |
-| MySQL/MariaDB table: parallel InnoDB repeatable-read sessions opened under brief `LOCK TABLES`; verify engine and privilege. | **Implemented and live-proven 2026-07-31.** `MySQLStrictConsistencyOpener` in `strict_consistency_mysql.go` serves both engines: a separate lock-holder connection holds `LOCK TABLES ... READ` while each reader issues `START TRANSACTION WITH CONSISTENT SNAPSHOT`, then the lock is released. Agreement is created by timing because MySQL has no exportable snapshot handle. `TestMySQLStrictTableSnapshotLive` and `TestMariaDBStrictTableSnapshotLive` prove against real servers that a commit landing after the view opens both succeeds (the lock was released) and stays invisible (the snapshot holds). `TestMySQLStrictRejectsEngineOrLockPrivilegeLive` proves the InnoDB gate against a real MyISAM table — MyISAM accepts every statement in the protocol while providing no snapshot, so refusing it is the difference between strict consistency and the appearance of it. |
-| SQLite table: one serializable reader and no parallel source readers. | **Implemented 2026-07-31.** `SQLiteStrictConsistencyOpener` in `strict_consistency_sqlite.go`; proven by `TestSQLiteStrictTableSnapshot`, `TestSQLiteStrictRejectsParallelSourceReaders`, `TestSQLiteStrictRejectsUnsupportedRequests`, and `TestSQLiteStrictCloseIsIdempotentAndFinal`. Needs no live server, so it is fully proven now, including through the real coordinator and a real state backend: `TestSQLiteStrictComposesWithTheCoordinator` shows the same-view count reaching durable strict evidence, and `TestSQLiteStrictCoordinatorRejectsMigrationScope` shows the scope refusal arriving as a policy error before any session opens. **Contract note:** in default rollback-journal mode the read transaction blocks source writers with SQLITE_BUSY. The view is stable because writers wait. The opener deliberately does not switch the source to WAL — journal mode is a persistent property of the user database and strict consistency must not silently reconfigure the source. |
-| MySQL/SQLite migration and every ClickHouse strict scope reject before mutation. | **Covered.** `TestBuiltInRoutesRejectUncertifiedStrictConsistencyScopes` walks every certified adapter pair against both scopes through `ValidateMigration`, which runs before any connection is opened, so rejection necessarily precedes mutation; `TestStrictConsistencyPrecedesAdapterConstruction` pins the ordering. At the opener boundary `TestSQLiteStrictRejectsUnsupportedRequests` refuses SQLite migration scope directly. The proposed name `TestStrictConsistencyUnsupportedScopesBeforeMutation` was never used. |
-| Full-table strict count comes from the same view, is persisted, and controls validation; later live drift is informational. | `TestStrictSnapshotCountIsPersistedAndAuthoritativeLive`. |
-| PostgreSQL process resume opens and reports a new epoch while preserving per-table replay correctness. | **Covered:** `TestStage4PostgresStrictResumeUsesNewEpochAndReplaysLiveTLS`. |
-| SQL Server snapshot survives and is reused; missing snapshot fails closed. | `TestSQLServerStrictResumeReusesDatabaseSnapshotLive`, `TestSQLServerStrictResumeMissingSnapshotFailsClosedLive`. |
-| Owned snapshots release on success/failure/cancel; cleanup failure is visible. | `TestStrictSnapshotCleanupOnTerminalOutcomesLive`. |
-| Strict partition jobs share the same view. | `TestStrictParallelRangesShareOneSourceViewLive`. |
+| PostgreSQL table and migration | Exported snapshot; PostgreSQL, MySQL/MariaDB, SQL Server, or SQLite target. |
+| SQL Server table and migration | Lock-bound table view or durable database snapshot; PostgreSQL, MySQL/MariaDB, SQL Server, or SQLite target. |
+| MySQL/MariaDB table | InnoDB/real `LOCK TABLES` preflight and retained table view; PostgreSQL, MySQL/MariaDB, SQL Server, or SQLite target. |
+| SQLite table | One pinned transaction/one source reader; PostgreSQL, MySQL/MariaDB, SQL Server, or SQLite target. |
+| MySQL/MariaDB migration, SQLite migration, ClickHouse | Refused before mutation. |
 
-Every strict fixture must run with concurrent source writes and under
-`go test -race`; static mocks are not sufficient.
+`TestStage4PostgresStrictCrossTargetLiveTLS`,
+`TestSQLServerMigrationStrictComposedPostgresLiveTLS`,
+`TestSQLServerMigrationStrictComposedSQLiteLiveTLS`,
+`TestStage4MySQLFamilyStrictComposedPostgresLiveTLS`, and
+`TestStage4SQLiteStrictComposedPostgresLiveTLS` are representative composed
+evidence. SQL Server lifecycle tests additionally cover snapshot identity,
+cleanup intent, and resume. They do not substitute for the armed complete
+source/scope/target process-kill and concurrent-writer matrix.
 
 ## Section 11 — Durable state, ownership, and resume
 
@@ -422,7 +457,7 @@ permanently at the first terminal table evidence.
 | Task exists durably before destructive mutation. | **Covered base:** `TestTaskInitializationFailurePrecedesTargetMutation`. | Network live regression in S4.2. |
 | Unresolved periodic/final/task/watermark/run-completion write failure prevents success with state exit 6. | **Covered:** `TestStage4EveryRequiredWriteFailureReturnsStateExitSix` drives each required write to failure and proves it classifies as a state failure and maps to exit 6; `TestStage4RequiredWriteFailureOutranksTransferClassification` pins the precedence so a durable write failure is never reported as a transfer error. Retained context: `TestAdapterRunnerReturnsOnlyCompletedProgressWhenLaterCheckpointFails`, `TestSQLitePartialResultKeepsRowsAfterAggregateCheckpointFailure`, `TestMigrationAttemptDisposition`. | The run-completion write is covered by `publishStage4RunSuccess` returning a state-classified error; a live route proof belongs in the S4.9 matrix. |
 | Unknown task writes reject. | **Covered base:** `TestSQLiteStoreRequiresKnownRunningTaskForCompletion`, range backend unknown-work checks. | Add every new Stage 4 write to `TestStage4UnknownTaskWritesReject`. |
-| Periodic save may degrade only if final safe frontier supersedes it, with audit evidence. | **Missing, and deeper than a test gap.** Verified 2026-07-31: `migration.checkpoint_frequency` is parsed, defaulted to 10, range-validated, and folded into the resume compatibility hash, but no code outside `internal/config` ever reads it. There is no periodic checkpoint to supersede. Durability today comes from per-range acknowledgement, which is finer-grained than any configured frequency, so this is a truthfulness defect rather than a data-loss one: an operator who sets the value believes they are controlling cadence and nothing happens. | Decide first whether the setting should drive a real periodic save or be removed as superseded by range acknowledgement. Only then are `TestPeriodicCheckpointFailureCanBeSupersededAndAudited` and `TestPeriodicCheckpointFailureWithoutFinalSaveIsFatal` meaningful. |
+| Periodic save may degrade only if final safe frontier supersedes it, with audit evidence. | **Covered for the composed network transfer plan.** Explicit `checkpoint_frequency` controls contiguous acknowledgement cadence; `TestResumableNetworkTransferCheckpointFrequencyPersistsContiguousFrontier`, `TestResumableNetworkTransferCheckpointFrequencyStateFailureReplaysIssuedWork`, and `TestResumableNetworkTransferCheckpointFrequencyResumesFromPeriodicFrontier` pin persistence and replay. | It remains a pre-mutation refusal for incremental, strict, and delete routes until their distinct durable protocols can consume it. |
 | State failure after target commit directs repair-and-resume, not competing fresh run. | **Partial:** errors remain resumable, but remedy contract is absent. | `TestPostCommitStateFailureNamesRepairAndResume`. |
 
 ### 11.4 Exclusive target lease and fencing
@@ -452,13 +487,14 @@ permanently at the first terminal table evidence.
 | Skip completed table only with aggregate checkpoint and target-count agreement. | **Covered base:** `TestSQLiteCompletedCheckpointSkipsOnlyAfterExactAgreement`, `TestResumeReusesValidatedCompletedTable`. | Network route matrix. |
 | Restore exact incomplete topology or invalidate safely; cleanup obeys mode/pagination. | **Covered base:** range/reset and legacy ambiguity tests. | Network route matrix. |
 | Incremental resume replays full lower-watermark window. | **Covered:** `TestAdapterIncrementalReadRejectsPositionalOrImpreciseResume` proves positional resume is rejected by construction, with `TestExecuteIncrementalResumeAcceptsPriorNilWatermarkFrontier` and `TestExecuteIncrementalResumeRejectsUnexpectedAttemptOrEvidence` covering the frontier and evidence rules. | Live matrix. |
-| Possibly committed rebuild uses insert-only replay. | **Covered only for SQLite.** | S4.2 per-target replay fixtures. |
-| Resume finalizes, reconciles, validates, and completes the original run. | **Partial for SQLite without Stage 4 semantics.** | `TestStage4NetworkCrashResumeCompletesOriginalRunLive`. |
+| Possibly committed rebuild uses insert-only replay. | **Covered at runner/state and native-writer levels:** `TestStage4AdapterRebuildReplaysIssuedRangeWithoutRedrop` runs against YAML and SQLite state; the four live native-writer fixtures prove each admitted target's exact replay semantics. | S4.2 end-to-end process-crash route fixture for every admitted relational target. |
+| Resume finalizes, validates, and completes the original rebuild run without premature table publication. | **Covered non-live across both state backends:** `TestStage4AdapterRebuildRecoversFinalizeValidationAndAggregateFaults`, `TestStage4AdapterRebuildPublicationRecoveryReusesCommittedReceipt`, `TestStage4AdapterRebuildRecognizesCommittedReadyReceiptAfterWriteError`, and the pre-mutation prefix suite distinguish rerun, duplicate-safe replay, and publication-only recovery. | `TestStage4NetworkCrashResumeCompletesOriginalRunLive` (or equivalent per-target process-kill matrix) remains required. Delete reconciliation and incremental composition remain separate upsert-only rows. |
 | Hash excludes policy-only/derived fields and preserves deprecated rename wire shape. | **Covered base:** resume-hash tests. | `TestStage4ResumeHashPolicyAndDeprecatedWireShape`. |
 
-`TestResumeRejectsNetworkPairBeforeStateOrLeaseAccess` documents the current
-hard blocker: network resume is intentionally rejected and must be replaced,
-not weakened, by S4.2.
+Network resume is no longer globally rejected: bounded relational rebuild now
+has explicit rerun/replay/publication recovery. Unsupported engine/mode cells
+must still reject before state mutation, and the admitted cells still need the
+end-to-end live/process-crash matrix above.
 
 ## Section 12 — Validation
 
@@ -483,37 +519,21 @@ below were used; the implementations chose different names.
 | Findings remain structured/deterministic on failure and never leak row values. | **Covered:** `TestValidationCoreFindingsHaveStableTableOrder`, `TestValidationCoreSampleMismatchFactsDoNotLeakValues`, `TestValidationCoreFailsClosedOnIncompleteEvidence`, `TestValidationCoreRejectsNullCountsAboveAuthoritativeRows`. | None. |
 | AI hypotheses cannot change deterministic results. | **Stage 5 boundary:** `TestAIValidationTriageCannotAlterEvidence`. | Stage 5. |
 
-Required live fixtures — this is the only part of Section 12 still open. The
-deep-probe contract has two live proofs today,
-`TestPostgresDatabaseValidationProbeStableTLSLive` and
-`TestStage4AdapterPostgresStableDeepValidationComposedRouteLiveTLS`, plus
-non-live deep semantics in `TestSQLiteDatabaseValidationProbeDeepSemantics` and
-`TestDatabaseValidationProbeFailsClosed`. Still **missing**:
+The database-backed probe now supports PostgreSQL, SQL Server, MySQL/MariaDB,
+and SQLite relational endpoints, including cross-driver count, NULL-parity,
+and complete-PK sample paths. Cross-engine equality is certified only for the
+typed canonical domains and exact key/collation proof that the probe can
+establish; unsafe text/collation or unmappable types refuse. `full` remains
+explicitly rejected.
 
-- `TestSQLServerValidationModesLive`
-- `TestMySQLValidationModesLive`
-- `TestMariaDBValidationModesLive`
-- `TestStage4ValidationRouteMatrixLive` — **bounded, and the bound is narrower
-  than the name implies.** Verified live 2026-07-31: deep validation is
-  certified for PostgreSQL sources only. `adapter_validation_database.go` gates
-  it on `adapter.spec.engine != adapterValidationPostgres` and a MySQL source
-  running `null_parity` or `sample` is refused before mutation with
-  "database-backed deep validation for source engine \"mysql\" is not
-  certified". So the reachable deep-validation cell is PostgreSQL, already
-  proven by `TestStage4AdapterPostgresStableDeepValidationComposedRouteLiveTLS`;
-  every other engine runs `count_only`, which the per-engine stable-runner
-  sentinels already exercise live. A matrix of deep modes across engines would
-  be asserting a contract those engines are outside of. Note that
-  live **failure** detection is now proven by
-  `TestStage4ValidationDetectsTargetMismatchLive`, which was the sharper gap:
-  every other live fixture asserted `Validated: true`, so nothing demonstrated
-  that validation could fail against a real database at all. It deletes a target
-  row behind the tool's back and requires the reason to name the row-count
-  disagreement, not merely that something failed.
-- `TestValidationTimeoutFallbackEngineMatrixLive`
-
-ClickHouse keeps rebuild equality validation and must explicitly reject modes
-it cannot implement safely until separately admitted.
+`TestSQLServerToPostgresDatabaseValidationProbeLiveTLS`,
+`TestSQLiteToMySQLDatabaseValidationProbeLiveTLS`, and
+`TestMySQLToSQLServerDatabaseValidationProbeLiveTLS` are gated real-driver
+proofs; `TestSQLiteDatabaseValidationProbeDeepSemantics` and
+`TestDatabaseValidationProbeFailsClosed` cover the bounded/unit paths. The
+remaining gap is the armed all-pairs/type/collation/timeouts matrix, not a
+PostgreSQL-only production gate. ClickHouse retains only modes it can safely
+admit.
 
 ## Section 13 — Preflight and operational safety
 
@@ -521,7 +541,7 @@ it cannot implement safely until separately admitted.
 |---|---|---|
 | Stable findings include severity, dotted check name, side, message, remedy. | **Covered:** `TestComposeProductionPreflightReportIsStructurallyOrdered`, `TestComposeProductionPreflightReportRequiresCompleteManifest`, `TestComposeProductionPreflightReportRequiresApplicableEngineFacts`, `TestComposeProductionPreflightReportBlocksUnknownWriteAuthority`, `TestBuildProductionPreflightManifestIsStableAndConditional`, `TestBuildProductionPreflightManifestSelectsUpsertChecks`. | Live per-engine matrix below. |
 | Error aborts before mutation unless exact check/prefix/all is explicitly skipped; skip downgrades visibly without erasing evidence. | **Covered:** `TestEvaluatePreflightAppliesVisibleExactPrefixAndAllSkips`, `TestComposeProductionPreflightReportPreservesVisibleExactSkip`, `TestEvaluatePreflightOrdersFindings`, `TestEvaluatePreflightIsRaceSafeAndDoesNotMutateInputs`, `TestEvaluatePreflightEmptyEvidenceIsNonBlocking`. The three proposed names do not exist; these supersede them. | Live per-engine matrix below. |
-| Cover connection/auth, version, source read/target privileges, schema existence/access, encoding, pool headroom, strict prerequisites, disk estimate, destructive gate, and engine capability probes. | **Partial:** connection tests, Stage 3 version/privilege/catalog/destructive tests, MySQL local-infile and SQL Server hazards exist. There is no unified structured matrix, pool/disk proof, or strict prerequisite support. | `TestStage4PreflightCheckInventory`; live `TestPostgresPreflightMatrixLive`, `TestSQLServerPreflightMatrixLive`, `TestMySQLPreflightMatrixLive`, `TestMariaDBPreflightMatrixLive`, `TestSQLitePreflightMatrix`, `TestClickHousePreflightMatrixLive`. |
+| Cover connection/auth, version, source read/target privileges, schema existence/access, encoding, pool headroom, strict prerequisites, disk estimate, destructive gate, and engine capability probes. | **Partial:** route-specific connection/catalog/destructive checks and strict source preflight exist; `TestSQLiteStrictSourcePreflightPrecedesCheckpointAndTargetMutation` and the strict capability/admission suites prove no checkpoint/write before a known prerequisite. | Unified structured pool/disk/protocol-capability inventory and armed engine matrix. |
 | Documentation separately states exhaustive minimum privileges. | **Stage 5 boundary for operator documentation; deterministic privilege facts are Stage 4.** | Stage 4: `TestPreflightPrivilegeFactsMatchAdapterRequirements`; Stage 5 reviews the published privilege tables. |
 | Signal cancels work, stops new chunks, attempts final checkpoint within configurable timeout, and exits cancelled; hard kill resumes. | **Covered base/partial:** SIGTERM, cancellation, resource-release, and SQLite hard-kill tests exist. Configurable final-checkpoint timeout and network crash recovery do not. | `TestSignalStopsNewChunksAndBoundsFinalCheckpoint`, plus S4.9 process-kill matrix. |
 
@@ -560,43 +580,31 @@ it cannot implement safely until separately admitted.
 
 ## Acceptance 21.7 — Incremental and delete behavior
 
-All acceptance items are **missing** and are owned by S4.4/S4.5:
-
-- `TestIncrementalBaselineWatermarkAtomicCompletion`
-- `TestIncrementalStrictLowerBoundSkipsEqualTimestamp`
-- `TestIncrementalUnchangedRunTransfersZeroRows`
-- `TestIncrementalWithoutCandidateUsesFullUpsert`
-- `TestIncrementalResumeReplaysFullWindowBehindPrimaryKey`
-- `TestIncrementalResumeReusesImmutableUpperFence`
-- `TestDeleteReconcileHardDeleteAndPersistedCountsLive`
-- `TestDeleteOffAndNotDuePreserveTargetSupersetLive`
-- `TestDeleteReconcileDryRunReportsDueCandidates`
-
-The certified relational incremental and delete route matrices are mandatory;
-one engine-only fixture cannot close this acceptance section.
+The durable-fence, baseline, resume, and empty-window contracts are covered by
+the `TestExecuteIncremental*`, `TestStage4IncrementalCompletionIsAtomicAcrossBackendReopen`,
+and `TestStage4AdapterIncremental*` families. Same-engine delete receipts,
+replay, scheduling, and SQLite incremental-delete are covered by the
+`TestDeleteReconcile*`, `TestStage4*Delete*`, and
+`TestStage4SQLiteIncrementalDelete*` families. What remains is the armed
+source/target/process-kill matrix and every cross-engine delete cell, which is
+currently refused rather than claimed.
 
 ## Acceptance 21.8 — Strict consistency
 
-All supported-mode acceptance items are **missing**. Use the exact live
-fixtures listed in Section 10 to prove:
-
-- PostgreSQL table and migration stable views without writer blocking;
-- MySQL/MariaDB parallel repeatable-read sessions and prerequisite rejection;
-- SQL Server table writer blocking and migration snapshot non-blocking;
-- one SQLite stable reader;
-- unsupported scope rejection before mutation;
-- persisted snapshot count validation;
-- SQL Server surviving-snapshot resume/fail-closed behavior; and
-- PostgreSQL's explicit new resume epoch.
-
-The current all-routes rejection tests remain useful only as a fail-closed
-baseline until each supported cell is admitted.
+The supported source/scope/target matrix is implemented as listed in Section
+10. Unit, fault, and representative TLS tests cover PostgreSQL, SQL Server,
+MySQL/MariaDB, and SQLite stable views; SQL Server migration additionally
+covers durable snapshot recovery. Remaining acceptance work is the armed
+concurrent-writer/process-kill matrix for every admitted target cell. MySQL/
+MariaDB and SQLite migration, ClickHouse, and any missing writer/validator cell
+must remain pre-mutation refusals.
 
 ## Acceptance 21.9 — Schema contract and validation
 
-**Corrected 2026-07-31.** Every acceptance item here is covered non-live; the
-only open work is per-engine live proof. See Section 7.4 and Section 12 for the
-full fixture lists.
+**Current status.** The contract/evolution and validation primitives are
+covered non-live, with representative PostgreSQL, MySQL, SQL Server, SQLite,
+and cross-driver TLS fixtures. See Sections 7.4 and 12 for capability limits;
+the armed all-pairs/type/object live matrix remains open.
 
 - Schema add/drop/evolution/freeze/report/discard behavior: **covered** by the
   25 fixtures in `schema_contract_test.go`.
@@ -615,18 +623,18 @@ full fixture lists.
 - Upsert/reconciliation count policy: **covered** by
   `TestValidationCoreCountTargetPolicies`,
   `TestValidationCoreUsesPerTableReconciliationStrictness`.
-- NULL parity: **covered** non-live by
-  `TestValidationCoreNullParityDetectsSystematicConversion` and five upsert-scope
-  guards; the live sentinel remains open.
-- Canonical samples: **covered** by the twelve `TestCanonicalValidation*`
-  fixtures; `TestStage4SampleValidationRouteMatrixLive` remains open.
+- NULL parity: **covered** by `TestValidationCoreNullParityDetectsSystematicConversion`
+  and cross-driver live probes; remaining cells require the armed matrix.
+- Canonical samples: **covered** by the `TestCanonicalValidation*` fixtures and
+  the representative cross-driver live probes; remaining cells require the
+  armed matrix.
 - Explicit `full` rejection: **covered** by
   `TestBuildValidationPlanIsInclusiveAndRejectsFull` and the config-level
   "reserved full validation" case.
 
-Open: `TestStage4SchemaContractTargetMatrixLive`,
-`TestStage4ValidationRouteMatrixLive`,
-`TestStage4SampleValidationRouteMatrixLive`, and the NULL-parity live sentinel.
+Open: the armed composed target/type/object evolution matrix, the deep
+validation all-pairs/type/collation/timeout matrix, and their process-kill
+routes.
 
 ## Mandatory Stage 4 gates
 
@@ -666,41 +674,27 @@ resume—not merely a zero process exit.
 
 ## Remaining work to declare Stage 4 complete
 
-Added 2026-07-31. This is the closure list implied by the refreshed rows above,
-ordered by how much is left rather than by section number. Nothing here is
-started.
+Refreshed 2026-08-01. This is the closure list after the bounded composition
+slices above. It records proof still required, not formerly absent production
+paths. In particular, absent SQLite dry-run targets now fail structured
+preflight without artifacts, and the listed transfer settings are no longer
+inert.
 
 ### A. Route matrices — the largest block
 
 Every certified-cell implementation needs its family. Missing, by name:
 
-- ~~`TestStage4CertifiedRelationalIncrementalRouteMatrixLive`~~ — **closed
-  2026-07-31**: enumerates the 35 uncertified cells and proves each refuses as
-  policy without touching an endpoint; the certified cell's live behaviour is
-  proven by `TestStage4PostgresIncrementalCompositionLiveTLS`
-- ~~`TestStage4CertifiedRelationalDeleteRouteMatrixLive`~~ — **closed
-  2026-07-31**: enumerates all 36 source/target cells, proves the single
-  certified cell is admitted and the other 35 refuse as policy before mutation,
-  with `TestStage4CertifiedRelationalDeleteRejectsUncertifiedModes` pinning the
-  upsert-only and no-strict-epoch edges
+- `TestStage4CertifiedRelationalIncrementalRouteMatrixLive` — **open as an
+  armed real-route matrix** for the now-admitted relational/SQLite capability
+  cells, including post-fence source mutation and completed-window resume.
+- `TestStage4CertifiedRelationalDeleteRouteMatrixLive` — **open as an armed
+  same-engine process-kill/replay matrix**. It must retain cross-engine delete
+  refusal rather than promote it by accident.
 - `TestStage4SchemaContractTargetMatrixLive`
-- `TestStage4ValidationRouteMatrixLive` — **bounded, and the bound is narrower
-  than the name implies.** Verified live 2026-07-31: deep validation is
-  certified for PostgreSQL sources only. `adapter_validation_database.go` gates
-  it on `adapter.spec.engine != adapterValidationPostgres` and a MySQL source
-  running `null_parity` or `sample` is refused before mutation with
-  "database-backed deep validation for source engine \"mysql\" is not
-  certified". So the reachable deep-validation cell is PostgreSQL, already
-  proven by `TestStage4AdapterPostgresStableDeepValidationComposedRouteLiveTLS`;
-  every other engine runs `count_only`, which the per-engine stable-runner
-  sentinels already exercise live. A matrix of deep modes across engines would
-  be asserting a contract those engines are outside of. Note that
-  live **failure** detection is now proven by
-  `TestStage4ValidationDetectsTargetMismatchLive`, which was the sharper gap:
-  every other live fixture asserted `Validated: true`, so nothing demonstrated
-  that validation could fail against a real database at all. It deletes a target
-  row behind the tool's back and requires the reason to name the row-count
-  disagreement, not merely that something failed.
+- `TestStage4ValidationRouteMatrixLive` — **open as an armed relational/SQLite
+  all-pairs type/collation/timeout matrix.** Cross-driver probe support is
+  implemented and representative TLS cases exist; it must not be confused with
+  a complete target protocol-capability proof.
 - `TestStage4CertifiedRelationalCrashResumeMatrixLive` — the per-route matrix is
   still open, but the **both state backends** half is now satisfied for the
   network route: `TestStage4PostgresTLSToSQLiteNetworkCrashResumeLive` runs the
@@ -709,6 +703,14 @@ Every certified-cell implementation needs its family. Missing, by name:
   route on YAML. Running one route on one backend had left backend-specific
   crash bugs invisible, and the two differ genuinely: SQLite commits a
   transaction, YAML replaces a whole document.
+- `TestStage4CertifiedRelationalRebuildCrashResumeMatrixLive` — **open.** The
+  bounded runner now admits keyed PostgreSQL, MySQL/MariaDB, SQL Server, and
+  SQLite targets; native live tests prove strict fresh writes and duplicate-safe
+  replay for each target family, and YAML/SQLite state fault tests prove the
+  rerun/replay/publication classifier. The missing gate must interrupt the real
+  composed route at prepare, write-before-checkpoint, finalize, validation, and
+  publication boundaries for each target, then verify exact FK schema/rows and
+  truthful original-run completion after resume.
 - ~~`TestStage4CertifiedRelationalTransferLifecycleLive`~~ — **satisfied
   2026-07-31** by the per-engine stable-runner sentinels rather than a new
   fixture: `TestStage4MySQLStableRunnerLiveTLS`,
@@ -719,122 +721,50 @@ Every certified-cell implementation needs its family. Missing, by name:
   row count, which is what "through the resumable range protocol" requires. A
   route that transferred correctly but left durable evidence unfinished would
   formerly have passed.
-- ~~`TestStage4CertifiedRelationalUpsertReplayMatrixLive`~~ — **satisfied,
-  verified 2026-07-31.** The certified target set for Stage 4 network replay is
-  exactly PostgreSQL and SQLite, because only those two implement
-  `stage4NetworkIdempotentUpsertTarget`; every other target is refused as
-  policy. Both are live-proven by
-  `TestStage4PostgresTLSToSQLiteNetworkCrashResumeLive` (on both state
-  backends), `TestStage4PostgresTLSToSQLiteNetworkInteriorInsertReplayLive`, and
-  `TestStage4PostgresDeleteCompositionCrashResumeLiveTLS`. There is no MySQL,
-  MariaDB, or SQL Server cell to write — a matrix over them would be asserting a
-  contract those engines are explicitly outside of.
+- `TestStage4CertifiedRelationalUpsertReplayMatrixLive` — **open.** Native
+  replay is implemented for admitted PostgreSQL, MySQL/MariaDB, SQL Server, and
+  SQLite targets, but each composed target needs the armed interruption/replay
+  proof before its capability is treated as an exit-gate result.
 
-### B. Validation (Section 12) — CLOSED
+### B. Deep validation (Section 12) — IMPLEMENTED; MATRIX OPEN
 
-The mode, timeout, policy, NULL-parity, sampling, and canonical value contracts
-are implemented and covered by roughly 50 non-live fixtures. The live half is
-now complete for everything reachable:
+The relational/SQLite database probe and incremental evidence path implement
+count, NULL parity, and deterministic samples with typed canonical values and
+complete-PK authority; `full` is still refused. The remaining work is the
+armed all-pairs/type/collation/timeout and process-kill matrix, not an
+engine-family production refusal. See the representative real-driver probes in
+Section 12.
 
-- Deep validation is certified for PostgreSQL sources only, proven live by
-  `TestStage4AdapterPostgresStableDeepValidationComposedRouteLiveTLS`. Verified
-  2026-07-31 that other engines are refused before mutation, so the proposed
-  per-engine deep-mode fixtures have no reachable cells.
-- `count_only` runs live on every certified engine through the stable-runner
-  sentinels.
-- **Validation failure detection** is proven live by
-  `TestStage4ValidationDetectsTargetMismatchLive`, which was the real gap: every
-  other live fixture asserted `Validated: true`, so nothing showed validation
-  could fail against a real database at all.
+### C. Strict consistency — IMPLEMENTED; MATRIX OPEN
 
-### C. Strict consistency — COMPLETE
+Section 10's PostgreSQL and SQL Server table/migration paths plus MySQL/MariaDB
+and SQLite table paths are composed to admitted relational/SQLite targets.
+Unsupported migration scopes, ClickHouse, and absent writer/validator cells
+remain pre-mutation refusals. The open work is armed concurrent-writer,
+process-kill, recovery, and target-matrix proof—not composition admission.
 
-**SQLite is done as of 2026-07-31** and was misclassified as live-gated: it is
-an embedded engine, so its whole contract is provable without a server. That
-correction matters for planning — do not assume a block is endpoint-blocked
-just because its neighbours are.
+### D. Schema-contract modes and evolution — IMPLEMENTED; MATRIX OPEN
 
-**All five engines are done as of 2026-07-31**: PostgreSQL, SQLite, MySQL,
-MariaDB, and SQL Server, each implemented and proven against a real engine.
-ClickHouse remains correctly refused at every scope.
+PostgreSQL, MySQL/MariaDB, SQL Server, and SQLite target executors are
+capability-gated. SQLite now has the intentionally narrow safe copy/swap path,
+including WAL/recovery authority; it is no longer a blanket `evolve` refusal.
+The remaining matrix is type/object/collision/FK/protocol behavior and real
+process-kill composition, not the absence of a SQLite executor.
 
-The note below explains why four of these could not be built earlier and why
-building them against fakes would have been wrong. It is retained as the
-reasoning that produced working implementations rather than plausible ones.
+### E. Dry-run (Section 7.2) — IMPLEMENTED; ROUTE PROOF OPEN
 
-SQLite could be finished locally because it is embedded: its tests open a real
-database, so the engine itself judges whether the stable view behaves. That is
-also how the journal-mode blocking behaviour was discovered rather than assumed.
-The other three have no embedded mode. Their contracts are precisely the parts
-a fake cannot adjudicate — `LOCK TABLES` acquisition and release windows, InnoDB
-engine and privilege verification, SQL Server lock escalation and database
-snapshot semantics. An opener written against a mock would have its correctness
-*defined by the mock*, producing code that looks finished and is unverified
-exactly where it matters. Do not implement these against fakes to make the block
-look closed; implement them when a server can contradict you. Every ClickHouse scope must reject —
-already covered by `TestBuiltInRoutesRejectUncertifiedStrictConsistencyScopes`,
-which walks every certified pair and both scopes through `ValidateMigration`,
-so rejection precedes any connection. PostgreSQL remains the reference
-implementation; SQLite is the simplest worked example of the opener contract.
-
-Not yet wired: the SQLite opener implements `StrictConsistencyOpener` but no
-route selects it, and `ValidateMigration` still rejects SQLite strict. Admitting
-the route is the next step and needs the certified-pair policy updated
-deliberately, not as a side effect.
-
-### D. Schema-contract modes — CLOSED
-
-Every mode is implemented and covered non-live by 25 fixtures in
-`schema_contract_test.go`. Live enforcement is now proven too:
-`TestStage4SchemaContractFreezeStopsLiveDrift` and
-`TestStage4SchemaContractModesLive` distinguish four modes against identical
-real drift on a PostgreSQL target, and `TestStage4SchemaContractSQLiteTargetLive`
-covers the SQLite target. The target matrix is bounded — only PostgreSQL and
-SQLite targets reach the Stage 4 composed path under upsert — and both cells are
-covered.
-
-Two live-only findings are recorded in Section 7.4: `report` mode leaves the run
-failing at the write layer with a low-level column error rather than a
-contract-level message, and `evolve` is unavailable on a SQLite target because
-there is no target-catalog evolution executor (refused as policy, fails closed).
-
-### E. Dry-run (Section 7.2) — started 2026-07-31
-
-**Hazard to know before implementing target preflight.** Verified 2026-07-31 by
-probe: with `modernc.org/sqlite`, `sql.Open` is lazy and creates nothing, but
-`db.Ping()` **creates the database file**. A target preflight that connects the
-way every other code path connects would therefore create the target during a
-dry run, silently breaking the zero-mutation guarantee — and for a
-`drop_recreate` migration into a new SQLite file, a not-yet-existing target is
-the normal case, not an error. Target preflight must distinguish "target does
-not exist yet, which is fine" from "target exists but is unusable", and must not
-reach for a connection to answer the first. The regression guard already exists:
-`TestStage4DryRunDisclosesTuningAndDeletePolicy` asserts the dry run leaves the
-directory containing only the source file, so this mistake fails a test rather
-than shipping.
-
-
-Tuning disclosure with provenance and delete-policy disclosure have landed, and
-the zero-mutation guarantee is now asserted rather than assumed. Remaining:
-
-- target preflight — **decided 2026-08-01: require the target to exist.** See
-  the handoff for the Ping hazard and the test this will break.
-- schema drift reporting — unblocked 2026-08-01 by the preflight decision.
-  Verified 2026-07-31 by reading `dry_run.go`: all four planners open a source
-  and never a target, so this could not be built until target opening was
-  settled. It reads like independent work in this list; it was not.
-- ~~pagination selection disclosure~~ — **closed 2026-07-31** for SQLite sources;
-  other engines omit the field rather than guess
-- ~~estimate provenance labelling~~ — **closed 2026-07-31**; `rows_provenance` is
-  always `exact`, and no duration estimate is emitted for want of evidence
-- delete due/candidate state — **decided 2026-08-01: a read-only state open is
-  allowed.** Dry-run may read state, never write it. Implement real due/candidate
-  reporting and let `due_state_known` become true.
+Configuration rejection occurs before endpoint construction. Existing endpoints
+and state are inspected read-only; absent SQLite targets fail structured target
+preflight without creating a file. Schema drift emits scoped baseline/status/
+policy/action facts, and delete candidates are exact only when a read-only key
+scan proves them. The remaining work is protocol-capability and armed live
+route coverage; unprovable candidate impact stays explicitly unavailable.
 
 ### F. Small named gaps
 
 - ~~`TestDeterministicTuningPreservesPinnedIntent`~~ — **closed 2026-07-31**
-- `TestDeleteReconcileDryRunReportsDueCandidates` — reporting half of dry-run
+- Dry-run candidate impact is implemented only with fully read-only key
+  authority; unsupported or unprovable cells deliberately report `unavailable`.
 - ~~`TestClickHouseIncrementalRejectedBeforeMutationLive`~~ and
   ~~`TestClickHouseDeleteReconcileRejectedBeforeMutationLive`~~ — **closed
   2026-07-31**, against a live ClickHouse endpoint. Both refusals arrive one
@@ -845,54 +775,35 @@ the zero-mutation guarantee is now asserted rather than assumed. Remaining:
   hoped-for one, and also assert the table lifecycle was never entered.
 - ~~`TestTargetLeaseTwoProcessRace`, `TestDifferentCanonicalTargetsRunConcurrently`~~ — **closed 2026-07-31**
 - ~~`TestStage4EveryRequiredWriteFailureReturnsStateExitSix`~~ — **closed 2026-07-31**
-- periodic-checkpoint supersession pair (Section 11.3) — **decided 2026-08-01:
-  implement a real periodic save.** `checkpoint_frequency` gets a real consumer,
-  so there will be something to supersede and this pair becomes buildable.
+- `checkpoint_frequency` is covered for composed network transfer; it remains
+  intentionally unavailable to strict, incremental, and delete protocols.
 - ~~engine retry classifiers (Section 8.6)~~ — **already covered**; verified 2026-07-31, all six engines in `TestClassifyEngineRetryMatrix`
 - ~~`TestStage4LiveMatrixEnvironmentRequired`~~ — **closed 2026-07-31**; arm with
   `DMTX_STAGE4_LIVE_REQUIRED=1`, and it fails naming every absent endpoint
 
-### F2. Inert configuration audit
+### F2. Configuration consumer audit — refreshed 2026-08-01
 
-Added 2026-07-31. Every field below is parsed, defaulted, and validated in
-`internal/config`, and never read by any transfer, state, or lifecycle path.
-Verified by locating every non-test reference per field.
-
-| Setting | Reachable consumers | Assessment |
+| Setting | Current bounded consumer | Deliberate boundary |
 | --- | --- | --- |
-| `checkpoint_frequency` | none outside `internal/config` | Silently inert. Durability comes from per-range acknowledgement, which is finer-grained, so this is a truthfulness defect rather than data loss. `TestResumeCompatibilityHashSeparatesSafeRuntimeAndStructuralChanges` classifies it as a safe runtime change, which is the right classification for a periodic-save cadence — so here too the design intent is coherent and only the consumer is missing. Decide: drive a real periodic save, or remove as superseded. |
-| `upsert_merge_size` | none outside `internal/config` | Silently inert. Likely superseded by chunk sizing; confirm and remove, or wire it. |
-| `large_table_threshold` | none outside `internal/config`; participates in the structural resume projection | Silently inert. Its hash membership is **deliberate**, not accidental: `TestResumeCompatibilityHashSeparatesSafeRuntimeAndStructuralChanges` explicitly asserts the threshold is structural, so the design clearly intends it to drive partitioning. The gap is the missing consumer, not the hash. Do **not** "fix" this by removing it from the hash — that would cement the setting as inert. Today the observable effect is that changing it invalidates a resume while changing no behavior. |
-| `runtime_tuning_interval` | none outside `internal/config` | Consistent with Section 8.3, which already records general runtime adjustment as absent. Defensible, but the setting should reject or warn until implemented. |
-| `history_retention_days` | none outside `internal/config` | Defensibly deferred: the Stage 5 boundary assigns history retention to Stage 5. Should still not accept a value it will ignore. |
+| `checkpoint_frequency` | Composed network transfer checkpoints a contiguous acknowledged frontier at the requested cadence. | Incremental, strict, and delete refuse it before endpoints because their evidence protocols do not consume it. |
+| `upsert_merge_size` | Composed native PostgreSQL/MySQL/MariaDB/SQL Server/SQLite writers split writes at the minimum requested, resource, and native limit. | Missing native capability or legacy routing refuses before work. |
+| `large_table_threshold` | A retained table-stable exact count selects and binds deferred range topology before mutation. | Strict, incremental, delete, legacy SQLite-to-SQLite, and routes without size authority refuse it. |
+| `runtime_tuning_interval` | The bounded controller changes only at safe write boundaries; decision history is fenced/persisted where the state backend supports it and appears in terminal audit. | Prebound compatibility waves and unsupported routes refuse before mutation. |
+| `history_retention_days` | No Phase Four retention/deletion consumer. | Stage 5 owns retention policy and historical presentation. |
 
-`read_ahead` was checked alongside these and **is** consumed, in
-`resource_plan.go` and `sqlite_transfer_pipeline.go`.
-
-These are **missing consumers, not design errors.** Each field's resume-hash
-classification is already correct for its intended behavior — structural for
-`large_table_threshold`, safe-runtime for `checkpoint_frequency` — which means
-the surrounding design anticipated the implementation that never landed. Treat
-this block as unfinished wiring rather than as configuration to delete
-reflexively.
-
-**Decided 2026-08-01: implement real consumers for all five.** Not reject, not
-remove. Each row needs a working consumer plus a test that the setting actually
-takes effect — not merely that it parses. Two carry-overs from the analysis
-above still apply: `history_retention_days` is assigned to Stage 5 by the stage
-boundary below, so raise that conflict before building it; and
-`large_table_threshold` must not be stripped from the resume projection, since
-its membership there is deliberate.
+Key evidence: `TestStage4CheckpointFrequencyProvenanceAndBound`,
+`TestStage4UpsertMergeAdmissionIntersectsNativeAndResourceCaps`,
+`TestStage4LargeTableThresholdUsesRetainedSQLiteSizeAndBindsResumeTopology`,
+`TestStage4DeferredRuntimeTuningPersistsFencedSQLiteHistoryBeforePrepare`, and
+`TestAppendAttemptTerminalAuditWritesRedactedRuntimeTuningBeforeOutcome`.
 
 ### G. The live gate
 
-Every live row above reflects a tree from before the last hardening. The full
-TLS matrix must be rerun, and the application's aggregate publication path needs
-its first live coverage. **RUN on 2026-07-31.** The 2026-08-06 date was a Codex approval-service quota
-and never applied here; all five TLS containers were already healthy. See the
-live-matrix section of `docs/STAGE4_HANDOFF.md` for working DSNs and results:
-every PostgreSQL Stage 4 route passes, and the six remaining failures were each
-verified pre-existing at the pre-session commit.
+Every live row above remains subject to the armed exit gate after the local
+follow-up. The full TLS matrix, application's aggregate publication path, race
+matrix, and route-specific crash/resume proofs must be rerun with
+`DMTX_STAGE4_LIVE_REQUIRED=1`; this workspace does not claim that live gate is
+closed.
 
 Stage 4 cannot be declared complete while any of A through G, including F2, is
 open. Local
@@ -928,47 +839,23 @@ the deterministic tuning contract.
 
 ## Highest-risk gaps
 
-Reordered 2026-07-31. The two original top risks are closed.
-
-1. **Every implemented route is one certified cell, not a family.** Delete
-   reconciliation is PostgreSQL-to-PostgreSQL upsert only; strict consistency is
-   PostgreSQL only; the composed incremental route has one live proof. The
-   acceptance sections ask for six-engine matrices. This is now the single
-   largest distance between "implemented" and "complete", and it is easy to
-   mistake a green suite for coverage.
-2. **Six live failures, all pre-existing.** The matrix ran on 2026-07-31 and
-   every PostgreSQL Stage 4 route passed. What did not: three
-   `*ToSQLiteCommonFixtureLive` fixtures blocked by one qualified-foreign-key
-   rejection, and three `TestStage4*StableRunnerLiveTLS` routes (MySQL, MariaDB,
-   SQL Server) timing out under a one-connection budget. Each was confirmed
-   failing at `ccc985b` too, so none is a regression. The three timeouts are the
-   sharper risk: they are Stage 4 routes on three engines.
-3. **Validation logic is implemented but proven on one engine.** Section 12's
-   contracts are covered by roughly 50 non-live fixtures; what is missing is the
-   per-engine live matrix. The risk is inverted from what it looks like: the
-   algorithms are done, so the remaining failure mode is an engine-specific
-   driver or type behavior that only live proof surfaces.
-4. **Schema-contract modes are implemented but proven on one engine.** All five
-   modes and their projection, pruning, and decision-fact contracts are covered
-   non-live; only the per-engine live matrix is open. Same inverted risk shape
-   as validation.
-5. **Strict consistency for MySQL, MariaDB, SQL Server, and SQLite is
-   unimplemented.** Snapshot ownership, crash cleanup, and SQL Server snapshot
-   reuse remain the highest-risk cells.
-6. **Dry-run does not meet its target-aware contract.** It still avoids the
-   target, state, lease, and audit, and reports only source row counts.
-7. **The application's aggregate publication path has no live coverage.** The
-   composed run completion is proven at the migrate layer, but the `app` branch
-   that calls it is reachable only through a PostgreSQL route.
-8. **Five operator-facing settings are inert.** See the inert-configuration
-   audit below. They parse, validate, and in some cases alter the resume
-   compatibility hash, but no transfer, state, or lifecycle path reads them. An
-   operator tuning them gets silence, not an error. Their hash classifications
-   are already correct for the intended behavior, so this is unfinished wiring
-   rather than a design flaw — the fix is to implement or reject, not to strip
-   them out of the resume projection.
-8. **Closed:** network resume now exists
-   (`TestStage4PostgresTLSToSQLiteNetworkCrashResumeLive`,
-   `TestStage4AdapterNetworkResumeReplansChangedRangeCount`, and the
-   `TestStage4AdapterNetworkResume*` family), and the backend-conformant Stage 4
-   state model landed (`TestStage4BackendConformance`).
+1. **The armed live exit gate is not yet a completion result.** Run the
+   composed route, race, and process-kill/resume matrices with
+   `DMTX_STAGE4_LIVE_REQUIRED=1`; an unarmed skip is not evidence.
+2. **Target protocol capability discovery remains uneven.** Every admitted
+   relational/SQLite writer, catalog executor, deep probe, and strict route
+   still needs its real type/collation/object/protocol matrix, including
+   concurrency and commit-ack ambiguity.
+3. **Delete remains intentionally non-cross-engine.** Only the documented
+   same-engine cells and SQLite incremental-delete are admitted. Do not infer a
+   cross-engine delete contract from ordinary cross-engine upsert.
+4. **Deferred strict cells must stay refused.** MySQL/MariaDB and SQLite
+   migration scope, ClickHouse strict, unsupported target capability cells, and
+   any missing native writer/validator have no safe fallback.
+5. **Process-boundary truthfulness remains the sharpest operational risk.**
+   The remaining matrix must prove target rows, state, leases, fences, strict
+   snapshots, cleanup receipts, and final outcome across real interruption—not
+   just a clean return from a unit fixture.
+6. **`history_retention_days` is a Stage 5 boundary.** Phase Four records
+   bounded runtime history and audit facts but does not claim retention-policy
+   behavior or historical presentation.

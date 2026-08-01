@@ -35,6 +35,21 @@ func verifySQLServer2022Source(
 	return validateSQLServer2022SourceCatalog(catalog)
 }
 
+// VerifySQLServer2022MigrationSnapshotSource validates the exact read-only
+// database-snapshot catalog shape used by SQL Server migration strict
+// consistency. It is intentionally separate from ordinary source admission:
+// a snapshot must be read-only and must identify its source database.
+func VerifySQLServer2022MigrationSnapshotSource(
+	ctx context.Context,
+	queryer SQLServerCatalogQueryer,
+) error {
+	catalog, err := readSQLServer2022SourceCatalog(ctx, queryer)
+	if err != nil {
+		return err
+	}
+	return validateSQLServer2022MigrationSnapshotCatalog(catalog)
+}
+
 // VerifySQLServer2022Target pins native target behavior to the same SQL Server
 // 2022 database flags admitted for source discovery: compatibility level 160,
 // online/writable ordinary database state, and the explicitly inspected
@@ -45,6 +60,17 @@ func VerifySQLServer2022Target(
 	database *sql.DB,
 ) error {
 	return verifySQLServer2022Target(ctx, database)
+}
+
+// VerifySQLServer2022TargetWithQueryer applies the same target admission to
+// a pinned connection or transaction. Target-side mutation protocols use it
+// immediately before DDL/DML so pool-level verification cannot authenticate a
+// different physical session.
+func VerifySQLServer2022TargetWithQueryer(
+	ctx context.Context,
+	queryer SQLServerCatalogQueryer,
+) error {
+	return verifySQLServer2022Target(ctx, queryer)
 }
 
 func verifySQLServer2022Target(
@@ -146,6 +172,19 @@ func readSQLServer2022SourceCatalog(
 func validateSQLServer2022SourceCatalog(
 	value sqlServer2022SourceCatalog,
 ) error {
+	return validateSQLServer2022Catalog(value, false)
+}
+
+func validateSQLServer2022MigrationSnapshotCatalog(
+	value sqlServer2022SourceCatalog,
+) error {
+	return validateSQLServer2022Catalog(value, true)
+}
+
+func validateSQLServer2022Catalog(
+	value sqlServer2022SourceCatalog,
+	migrationSnapshot bool,
+) error {
 	if value.productMajorVersion != sqlServer2022MajorVersion ||
 		!strings.HasPrefix(
 			value.productVersion,
@@ -191,11 +230,11 @@ func validateSQLServer2022SourceCatalog(
 	if value.state != "ONLINE" ||
 		value.userAccess != "MULTI_USER" ||
 		value.containment != "NONE" ||
-		value.readOnly ||
 		value.autoClose ||
 		value.autoShrink ||
 		value.standby ||
-		value.sourceDatabaseID.Valid {
+		migrationSnapshot && (!value.readOnly || !value.sourceDatabaseID.Valid || value.sourceDatabaseID.Int64 <= 0) ||
+		!migrationSnapshot && (value.readOnly || value.sourceDatabaseID.Valid) {
 		return sqlServerSourcePolicy(
 			"database catalog shape",
 			value.databaseName,

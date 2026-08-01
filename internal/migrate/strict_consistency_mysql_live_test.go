@@ -7,13 +7,18 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5"
 
+	"github.com/johndauphine/dmtx/internal/config"
+	"github.com/johndauphine/dmtx/internal/engine"
+	"github.com/johndauphine/dmtx/internal/schema"
 	"github.com/johndauphine/dmtx/internal/state"
 )
 
@@ -24,6 +29,149 @@ type mysqlStrictLiveFixture struct {
 	tlsName   string
 	engine    StrictConsistencyEngine
 	sslServer string
+	collation string
+}
+
+// mysqlStrictPostgresLiveTarget is a test-only forwarding target that keeps
+// this strict-composition sentinel out of independently tested target-schema
+// evolution. It retains the real PostgreSQL planner, writer, counts, replay
+// isolation, and network upsert path against the real database.
+type mysqlStrictPostgresLiveTarget struct{ target *postgresTargetAdapter }
+
+func (target *mysqlStrictPostgresLiveTarget) Engine() string { return target.target.Engine() }
+func (target *mysqlStrictPostgresLiveTarget) PlanTables(source string, tables []schema.Table, mode string) ([]schema.Table, error) {
+	return target.target.PlanTables(source, tables, mode)
+}
+func (target *mysqlStrictPostgresLiveTarget) PreflightTables(ctx context.Context, tables []schema.Table, mode string) error {
+	return target.target.PreflightTables(ctx, tables, mode)
+}
+func (target *mysqlStrictPostgresLiveTarget) PrepareTables(ctx context.Context, tables []schema.Table, mode string) error {
+	return target.target.PrepareTables(ctx, tables, mode)
+}
+func (target *mysqlStrictPostgresLiveTarget) WriteBatch(ctx context.Context, table schema.Table, columns []string, mode string, rows [][]any) (WriteReceipt, error) {
+	return target.target.WriteBatch(ctx, table, columns, mode, rows)
+}
+func (target *mysqlStrictPostgresLiveTarget) CountRows(ctx context.Context, table schema.Table) (int, error) {
+	return target.target.CountRows(ctx, table)
+}
+func (target *mysqlStrictPostgresLiveTarget) FinalizeTables(ctx context.Context, tables []schema.Table, mode string) error {
+	return target.target.FinalizeTables(ctx, tables, mode)
+}
+func (target *mysqlStrictPostgresLiveTarget) Close() error                         { return target.target.Close() }
+func (target *mysqlStrictPostgresLiveTarget) stage4NetworkIdempotentUpsertTarget() {}
+func (target *mysqlStrictPostgresLiveTarget) WriteStage4NetworkBatch(ctx context.Context, table schema.Table, columns []string, rows [][]any) (WriteReceipt, error) {
+	return target.target.WriteStage4NetworkBatch(ctx, table, columns, rows)
+}
+func (target *mysqlStrictPostgresLiveTarget) PreflightStage4NetworkReplayIsolation(ctx context.Context, tables []schema.Table) error {
+	return target.target.PreflightStage4NetworkReplayIsolation(ctx, tables)
+}
+
+// TestStage4MySQLFamilyStrictComposedPostgresLiveTLS proves the aggregate
+// runner, rather than just the primitive: a source commit made after durable
+// strict evidence is intentionally absent from the target and validation uses
+// the retained MySQL/MariaDB transaction view.
+func TestStage4MySQLFamilyStrictComposedPostgresLiveTLS(t *testing.T) {
+	for _, fixture := range []mysqlStrictLiveFixture{
+		{name: "MySQL", dsnEnv: "DMTX_TEST_MYSQL_DSN", caEnv: "DMTX_TEST_MYSQL_CA", tlsName: "dmtx_test", engine: StrictConsistencyMySQL, sslServer: "localhost", collation: "utf8mb4_0900_bin"},
+		{name: "MariaDB", dsnEnv: "DMTX_TEST_MARIADB_DSN", caEnv: "DMTX_TEST_MARIADB_CA", tlsName: "dmtx_mariadb_test", engine: StrictConsistencyMariaDB, sslServer: "localhost", collation: "utf8mb4_nopad_bin"},
+	} {
+		fixture := fixture
+		t.Run(fixture.name, func(t *testing.T) { testStage4MySQLFamilyStrictComposedPostgresLiveTLS(t, fixture) })
+	}
+}
+
+func testStage4MySQLFamilyStrictComposedPostgresLiveTLS(t *testing.T, fixture mysqlStrictLiveFixture) {
+	t.Helper()
+	if os.Getenv("DMTX_TEST_POSTGRES_DSN") == "" {
+		t.Skip("set DMTX_TEST_POSTGRES_DSN and MySQL-family TLS variables to run this composed strict sentinel")
+	}
+	sourceDB, sourceNamespace, table := openMySQLStrictLiveSource(t, fixture)
+	pgDSN := os.Getenv("DMTX_TEST_POSTGRES_DSN")
+	pgConfig, err := pgx.ParseConfig(pgDSN)
+	if err != nil {
+		t.Fatalf("parse PostgreSQL DSN: %v", err)
+	}
+	if !postgresRouteLiveRequiresTLS(pgConfig) {
+		t.Fatal("DMTX_TEST_POSTGRES_DSN must use verified TLS")
+	}
+	targetCAFile := stage4PostgresDeleteLiveCAFile(t, pgConfig.ConnString())
+	targetDB, err := sql.Open("pgx", pgDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = targetDB.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := targetDB.PingContext(ctx); err != nil {
+		t.Fatalf("ping PostgreSQL target: %v", err)
+	}
+	targetNamespace := "dmtx_mysql_strict_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	if _, err := targetDB.ExecContext(ctx, "CREATE SCHEMA "+postgresIdentifier(targetNamespace)); err != nil {
+		t.Fatalf("create target schema: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanup, done := context.WithTimeout(context.Background(), 20*time.Second)
+		defer done()
+		if _, err := targetDB.ExecContext(cleanup, "DROP SCHEMA IF EXISTS "+postgresIdentifier(targetNamespace)+" CASCADE"); err != nil {
+			t.Errorf("drop target schema: %v", err)
+		}
+	})
+	if _, err := targetDB.ExecContext(ctx, "CREATE TABLE "+postgresQualified(targetNamespace, table)+" (id bigint PRIMARY KEY, payload character varying(40) NOT NULL)"); err != nil {
+		t.Fatalf("create strict target table: %v", err)
+	}
+	flavor := engine.MySQLServerFlavorOracle80
+	if fixture.engine == StrictConsistencyMariaDB {
+		flavor = engine.MySQLServerFlavorMariaDB1011
+	}
+	source := &relationalSourceAdapter{spec: relationalSourceSpec{engine: "mysql", displayName: fixture.name, listTables: engine.ListMySQLTables, inspectTable: engine.InspectMySQLTable, readQuery: mySQLReadQuery, qualifiedTable: mySQLQualified, wrapRows: wrapMySQLSourceRows, preflightRows: preflightMySQLSourceRows}, database: sourceDB, namespace: sourceNamespace, mySQLFlavor: flavor}
+	target := &mysqlStrictPostgresLiveTarget{target: &postgresTargetAdapter{database: targetDB, batchWriter: newPostgresNativeWriter(targetDB), namespace: targetNamespace}}
+	raw := state.YAMLStore{Path: filepath.Join(t.TempDir(), "state.yaml")}
+	runID := "mysql-family-strict-" + strings.ToLower(fixture.name) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	if err := raw.InitializeRun(state.Run{
+		ID: runID, Source: "source", Target: "target", SourceEngine: "mysql",
+		SourceIdentity: "mysql:strict-live", TargetIdentity: "postgres:strict-live",
+		Outcome: state.Running, Resumable: true, Reason: "running", StartedAt: time.Now().Add(-time.Minute),
+	}, "configuration-"+runID); err != nil {
+		t.Fatalf("initialize MySQL-family strict live run: %v", err)
+	}
+	quoted := "`" + sourceNamespace + "`.`" + table + "`"
+	backend := &stage4PostgresStrictMutationBackend{Stage4StateBackend: raw, mutate: func() error {
+		_, err := sourceDB.ExecContext(ctx, "INSERT INTO "+quoted+" (id,payload) VALUES (99,'after-view')")
+		return err
+	}}
+	events := make([]string, 0)
+	observer := stage4AdapterObserver{recordingTableObserver: recordingTableObserver{events: &events}, run: stage4LifecycleRunContext(t, backend, runID, false)}
+	cfg := stage4AdapterTestConfig(t, "source-password", "target-password")
+	sourceType := "mysql"
+	if fixture.engine == StrictConsistencyMariaDB {
+		sourceType = "mariadb"
+	}
+	cfg.Source = config.Endpoint{Type: sourceType, Host: "localhost", Port: 3306, Database: sourceNamespace, User: "dmtx", Schema: sourceNamespace, SSLMode: "verify-full", TLSCAFile: os.Getenv(fixture.caEnv)}
+	cfg.Target = config.Endpoint{Type: "postgres", Host: pgConfig.Host, Port: int(pgConfig.Port), Database: pgConfig.Database, User: pgConfig.User, Password: pgConfig.Password, Schema: targetNamespace, SSLMode: "verify-full", TLSCAFile: targetCAFile}
+	cfg.Migration.TargetMode = "upsert"
+	cfg.Migration.IncludeTables = []string{table}
+	cfg.Migration.Partitions = 2
+	cfg.Migration.ReaderParallelism = 2
+	cfg.Migration.StrictConsistency = true
+	cfg.Migration.StrictConsistencyScope = config.StrictConsistencyTable
+	cfg.Migration.Validation.Mode = config.ValidationCountOnly
+	if cfg.Source.SSLMode != "verify-full" || cfg.Source.TLSCAFile == "" || cfg.Target.SSLMode != "verify-full" || cfg.Target.TLSCAFile != targetCAFile || cfg.Target.Password != pgConfig.Password {
+		t.Fatal("composed endpoint lost verified-TLS authority")
+	}
+	result, err := migrateWithStage4Adapters(ctx, cfg, observer, source, target, "upsert", observer.run)
+	if err != nil {
+		t.Fatalf("run %s composed strict route: %v", fixture.name, err)
+	}
+	if result.Rows != 3 || !result.Validated {
+		t.Fatalf("strict result = %#v", result)
+	}
+	var targetCount int
+	if err := targetDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+postgresQualified(targetNamespace, table)).Scan(&targetCount); err != nil {
+		t.Fatal(err)
+	}
+	if targetCount != 3 {
+		t.Fatalf("target count = %d, want retained strict count 3", targetCount)
+	}
 }
 
 func openMySQLStrictLiveSource(
@@ -68,9 +216,9 @@ func openMySQLStrictLiveSource(
 	if _, err := database.ExecContext(ctx, fmt.Sprintf(
 		`CREATE TABLE %s (
 			id BIGINT NOT NULL PRIMARY KEY,
-			payload VARCHAR(40) NOT NULL
-		) ENGINE=InnoDB`,
-		quoted,
+			payload VARCHAR(40) CHARACTER SET utf8mb4 COLLATE %s NOT NULL
+		) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=%s`,
+		quoted, fixture.collation, fixture.collation,
 	)); err != nil {
 		t.Fatalf("create %s strict fixture: %v", fixture.name, err)
 	}
@@ -246,21 +394,23 @@ func testMySQLFamilyStrictRejectsNonInnoDBLive(
 
 func TestMySQLStrictTableSnapshotLive(t *testing.T) {
 	testMySQLFamilyStrictTableSnapshotLive(t, mysqlStrictLiveFixture{
-		name:    "MySQL",
-		dsnEnv:  "DMTX_TEST_MYSQL_DSN",
-		caEnv:   "DMTX_TEST_MYSQL_CA",
-		tlsName: "dmtx_test",
-		engine:  StrictConsistencyMySQL,
+		name:      "MySQL",
+		dsnEnv:    "DMTX_TEST_MYSQL_DSN",
+		caEnv:     "DMTX_TEST_MYSQL_CA",
+		tlsName:   "dmtx_test",
+		engine:    StrictConsistencyMySQL,
+		collation: "utf8mb4_0900_bin",
 	})
 }
 
 func TestMySQLStrictRejectsEngineOrLockPrivilegeLive(t *testing.T) {
 	testMySQLFamilyStrictRejectsNonInnoDBLive(t, mysqlStrictLiveFixture{
-		name:    "MySQL",
-		dsnEnv:  "DMTX_TEST_MYSQL_DSN",
-		caEnv:   "DMTX_TEST_MYSQL_CA",
-		tlsName: "dmtx_test",
-		engine:  StrictConsistencyMySQL,
+		name:      "MySQL",
+		dsnEnv:    "DMTX_TEST_MYSQL_DSN",
+		caEnv:     "DMTX_TEST_MYSQL_CA",
+		tlsName:   "dmtx_test",
+		engine:    StrictConsistencyMySQL,
+		collation: "utf8mb4_0900_bin",
 	})
 }
 
@@ -272,6 +422,7 @@ func TestMariaDBStrictTableSnapshotLive(t *testing.T) {
 		tlsName:   "dmtx_mariadb_test",
 		engine:    StrictConsistencyMariaDB,
 		sslServer: "localhost",
+		collation: "utf8mb4_nopad_bin",
 	})
 }
 

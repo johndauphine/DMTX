@@ -11,13 +11,14 @@ import (
 )
 
 const (
-	sqliteStage4SchemaVersion = 1
+	sqliteStage4SchemaVersion = 2
 
 	stage4SchemaRecord          = "schema_snapshot"
 	stage4IncrementalRecord     = "incremental_attempt"
 	stage4DeleteRecord          = "delete_reconciliation"
 	stage4StrictRecord          = "strict_snapshot"
 	stage4StrictMigrationRecord = "strict_migration_snapshot"
+	stage4StrictCleanupRecord   = "strict_migration_cleanup_intent"
 	stage4SingletonRecordID     = "table"
 	stage4MigrationTaskKey      = "migration"
 )
@@ -63,6 +64,19 @@ func ensureSQLiteStage4Schema(database *sql.DB) error {
 		}
 	case err != nil:
 		return fmt.Errorf("read Stage 4 state schema: %w", err)
+	case version == 1:
+		// Version 2 reserves the generic record namespace for immutable
+		// delete-journal readiness receipts. The table already has the required
+		// key and payload shape, so the durable migration is the explicit
+		// version transition rather than a physical DDL change.
+		if _, err := transaction.Exec(
+			`UPDATE state_schema_versions
+			 SET version = ?
+			 WHERE component = 'stage4_state' AND version = 1`,
+			sqliteStage4SchemaVersion,
+		); err != nil {
+			return fmt.Errorf("migrate Stage 4 state schema to version %d: %w", sqliteStage4SchemaVersion, err)
+		}
 	case version != sqliteStage4SchemaVersion:
 		return fmt.Errorf("unsupported Stage 4 state schema version %d", version)
 	}
@@ -1398,6 +1412,123 @@ func (store SQLiteStore) LoadLatestStrictMigrationSnapshot(
 		return StrictMigrationSnapshot{}, false, fmt.Errorf("commit latest strict migration snapshot read: %w", err)
 	}
 	return latest, found, nil
+}
+
+func (store SQLiteStore) SaveStrictMigrationCleanupIntent(
+	intent StrictMigrationCleanupIntent,
+) error {
+	intent, err := normalizeStrictMigrationCleanupIntent(intent)
+	if err != nil {
+		return err
+	}
+	database, err := store.openStage4()
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	transaction, err := database.Begin()
+	if err != nil {
+		return fmt.Errorf("begin strict migration cleanup intent: %w", err)
+	}
+	defer transaction.Rollback()
+	run, err := requireSQLiteRun(transaction, intent.RunID)
+	if err != nil {
+		return err
+	}
+	if err := requireStrictRunSourceEngine(run, intent.SourceEngine); err != nil {
+		return err
+	}
+	payload, found, err := loadSQLiteStage4Record(
+		transaction,
+		stage4StrictMigrationRecord,
+		intent.RunID,
+		stage4MigrationTaskKey,
+		intent.EpochID,
+	)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("%w: strict migration snapshot cleanup owner %q", ErrUnknownWork, intent.EpochID)
+	}
+	var owner StrictMigrationSnapshot
+	if err := json.Unmarshal([]byte(payload), &owner); err != nil {
+		return fmt.Errorf("decode strict migration snapshot cleanup owner: %w", err)
+	}
+	if owner.RunID != intent.RunID || owner.SourceEngine != intent.SourceEngine ||
+		owner.SnapshotReference != intent.SnapshotReference ||
+		owner.ProcessEpoch != intent.ProcessEpoch ||
+		!owner.CapturedAt.Equal(intent.CapturedAt) {
+		return fmt.Errorf("%w: strict migration cleanup intent differs from durable owner", ErrImmutableEvidence)
+	}
+	encoded, err := json.Marshal(intent)
+	if err != nil {
+		return fmt.Errorf("encode strict migration cleanup intent: %w", err)
+	}
+	created, existingPayload, err := insertSQLiteStage4Record(
+		transaction,
+		stage4StrictCleanupRecord,
+		intent.RunID,
+		stage4MigrationTaskKey,
+		intent.EpochID,
+		string(encoded),
+	)
+	if err != nil {
+		return err
+	}
+	if !created {
+		var existing StrictMigrationCleanupIntent
+		if err := json.Unmarshal([]byte(existingPayload), &existing); err != nil {
+			return fmt.Errorf("decode strict migration cleanup intent: %w", err)
+		}
+		if !reflect.DeepEqual(existing, intent) {
+			return fmt.Errorf("%w: strict migration cleanup intent", ErrImmutableEvidence)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit strict migration cleanup intent: %w", err)
+	}
+	return nil
+}
+
+func (store SQLiteStore) LoadStrictMigrationCleanupIntent(
+	runID string,
+	epochID string,
+) (StrictMigrationCleanupIntent, bool, error) {
+	database, err := store.openStage4()
+	if err != nil {
+		return StrictMigrationCleanupIntent{}, false, err
+	}
+	defer database.Close()
+	transaction, err := database.Begin()
+	if err != nil {
+		return StrictMigrationCleanupIntent{}, false, fmt.Errorf("begin strict migration cleanup intent read: %w", err)
+	}
+	defer transaction.Rollback()
+	if _, err := requireSQLiteRun(transaction, runID); err != nil {
+		return StrictMigrationCleanupIntent{}, false, err
+	}
+	payload, found, err := loadSQLiteStage4Record(
+		transaction,
+		stage4StrictCleanupRecord,
+		runID,
+		stage4MigrationTaskKey,
+		epochID,
+	)
+	if err != nil || !found {
+		return StrictMigrationCleanupIntent{}, found, err
+	}
+	var intent StrictMigrationCleanupIntent
+	if err := json.Unmarshal([]byte(payload), &intent); err != nil {
+		return StrictMigrationCleanupIntent{}, false, fmt.Errorf("decode strict migration cleanup intent: %w", err)
+	}
+	if _, err := normalizeStrictMigrationCleanupIntent(intent); err != nil {
+		return StrictMigrationCleanupIntent{}, false, fmt.Errorf("normalize strict migration cleanup intent: %w", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		return StrictMigrationCleanupIntent{}, false, fmt.Errorf("commit strict migration cleanup intent read: %w", err)
+	}
+	return intent, true, nil
 }
 
 func (store SQLiteStore) SaveStrictSnapshotEvidence(evidence StrictSnapshotEvidence) error {

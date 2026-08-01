@@ -178,8 +178,12 @@ func TestStage4AdapterNetworkFreshCheckpointsEveryTableBeforeAnyWrite(
 		runID,
 		time.Now().Add(-time.Minute),
 	)
+	ordinaryAfterCalls := 0
+	publishedAfterCalls := 0
 	observer := stage4AdapterObserver{
 		recordingTableObserver: recordingTableObserver{events: &events},
+		afterTableCalls:        &ordinaryAfterCalls,
+		afterPublicationCalls:  &publishedAfterCalls,
 		run: stage4LifecycleRunContext(
 			t,
 			backend,
@@ -208,6 +212,13 @@ func TestStage4AdapterNetworkFreshCheckpointsEveryTableBeforeAnyWrite(
 	if result != (Result{Tables: 2, Rows: 4, Validated: true}) {
 		t.Fatalf("result = %#v", result)
 	}
+	if ordinaryAfterCalls != 0 || publishedAfterCalls != 2 {
+		t.Fatalf(
+			"ordinary after calls=%d published after calls=%d",
+			ordinaryAfterCalls,
+			publishedAfterCalls,
+		)
+	}
 	seenRanges := make(map[uint64]int, len(readRanges))
 	for _, rangeIndex := range readRanges {
 		seenRanges[rangeIndex]++
@@ -235,18 +246,12 @@ func TestStage4AdapterNetworkFreshCheckpointsEveryTableBeforeAnyWrite(
 		t.Fatalf("global table-set admission followed mutation: %v", events)
 	}
 	// A composed route publishes each table's terminal evidence through one
-	// aggregate completion, so the execution segment closes on the table's own
-	// stable close rather than on a separate ordinary AfterTable checkpoint.
+	// aggregate completion. It then emits the publication callback (recorded as
+	// "after" by this observer) after both validation counts, without invoking
+	// the state-mutating ordinary AfterTable hook a second time.
 	previousClose := beforeTables
 	for _, name := range []string{"items", "widgets"} {
 		before := stage4AdapterEventIndex(events, "before:"+name)
-		if stage4AdapterEventIndex(events, "after:"+name) >= 0 {
-			t.Fatalf(
-				"composed table %s published a separate ordinary checkpoint: %v",
-				name,
-				events,
-			)
-		}
 		closeIndex := -1
 		for index := before + 1; index < len(events); index++ {
 			if events[index] == "source_stable_close:"+name {
@@ -267,8 +272,10 @@ func TestStage4AdapterNetworkFreshCheckpointsEveryTableBeforeAnyWrite(
 		finalize := stage4AdapterEventIndex(segment, "target_finalize")
 		sourceCount := stage4AdapterEventIndex(segment, "source_count")
 		targetCount := stage4AdapterEventIndex(segment, "target_count")
+		published := stage4AdapterEventIndex(segment, "after:"+name)
 		if prepare < 0 || write <= prepare || finalize <= write ||
-			sourceCount <= finalize || targetCount <= finalize {
+			sourceCount <= finalize || targetCount <= finalize ||
+			published <= sourceCount || published <= targetCount {
 			t.Fatalf(
 				"table %s lifecycle order is incomplete: %v",
 				name,

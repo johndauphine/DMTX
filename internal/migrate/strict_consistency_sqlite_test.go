@@ -3,10 +3,12 @@ package migrate
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/johndauphine/dmtx/internal/state"
 )
@@ -329,5 +331,115 @@ func TestSQLiteStrictCloseIsIdempotentAndFinal(t *testing.T) {
 		func(context.Context, *sql.Tx) error { return nil },
 	); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("reader after close = %v", err)
+	}
+}
+
+// TestSQLiteStrictCloseWaitsForActiveReader pins the teardown contract that
+// matters to the composed adapter: Close closes admission immediately, but it
+// must never roll back the transaction while a live reader callback is using
+// it. The first bounded Close times out while the callback is deliberately
+// blocked; the source remains locked until the reader returns, and then a
+// later Close observes the completed, released session.
+func TestSQLiteStrictCloseWaitsForActiveReader(t *testing.T) {
+	source, path := newSQLiteStrictSource(t, 1)
+	opener, err := NewSQLiteStrictConsistencyOpener(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := opener.OpenStrictConsistency(
+		context.Background(),
+		sqliteStrictRequest("items"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := opened.(*SQLiteStrictConsistencySession)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	readerDone := make(chan error, 1)
+	go func() {
+		readerDone <- session.RunReader(
+			context.Background(),
+			func(_ context.Context, transaction *sql.Tx) error {
+				var count int
+				if err := transaction.QueryRow("SELECT COUNT(*) FROM items").Scan(&count); err != nil {
+					return err
+				}
+				if count != 1 {
+					return errors.New("reader saw an unexpected row count")
+				}
+				close(entered)
+				<-release
+				// A second query after Close has begun proves rollback did not
+				// race the active callback.
+				return transaction.QueryRow("SELECT COUNT(*) FROM items").Scan(&count)
+			},
+		)
+	}()
+	<-entered
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	err = session.Close(closeCtx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close while reader is blocked = %v, want deadline exceeded", err)
+	}
+	if err := session.RunReader(context.Background(), func(context.Context, *sql.Tx) error { return nil }); err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("late reader after close admission = %v", err)
+	}
+
+	writer, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.Exec(`INSERT INTO items (id, payload) VALUES (2, 'blocked')`); err == nil {
+		t.Fatal("source write committed while strict reader was still active")
+	}
+
+	close(release)
+	if err := <-readerDone; err != nil {
+		t.Fatalf("reader after delayed close = %v", err)
+	}
+	if err := session.Close(context.Background()); err != nil {
+		t.Fatalf("close after reader return = %v", err)
+	}
+	if _, err := writer.Exec(`INSERT INTO items (id, payload) VALUES (2, 'after-close')`); err != nil {
+		t.Fatalf("source write after strict cleanup = %v", err)
+	}
+}
+
+func TestSQLiteStrictCancelledReaderNeverBorrowsView(t *testing.T) {
+	source, _ := newSQLiteStrictSource(t, 1)
+	opener, err := NewSQLiteStrictConsistencyOpener(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := opener.OpenStrictConsistency(context.Background(), sqliteStrictRequest("items"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := opened.(*SQLiteStrictConsistencySession)
+	defer func() {
+		if closeErr := session.Close(context.Background()); closeErr != nil {
+			t.Error(closeErr)
+		}
+	}()
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	if err := session.RunReader(cancelled, func(context.Context, *sql.Tx) error {
+		called = true
+		return nil
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled reader = %v, want context canceled", err)
+	}
+	if called {
+		t.Fatal("cancelled reader callback ran")
+	}
+	if err := session.RunReader(context.Background(), func(context.Context, *sql.Tx) error { return nil }); err != nil {
+		t.Fatalf("reader after cancelled admission = %v", err)
 	}
 }
