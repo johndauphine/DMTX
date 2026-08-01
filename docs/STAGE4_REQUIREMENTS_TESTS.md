@@ -469,7 +469,7 @@ it cannot implement safely until separately admitted.
 | Writer failure releases readers/memory/connections with no leaks. | **Covered base:** SQLite/resource tests. Missing `TestStage4NetworkWriterFailureReleasesAllResourcesLive`. |
 | PostgreSQL/SQL Server rollback; committed-prefix writer resumes after prefix. | **Partial:** writer unit tests and generic prefix tracker. Missing three fault-injected live fixtures from Section 8.4. |
 | MySQL row loss/conversion warning fails. | **Covered base/live:** Stage 3 MySQL/MariaDB bulk sentinels; retain in Stage 4 gate. |
-| Write-before-checkpoint replay neither duplicates nor overwrites. | **Live-proven for the SQLite and PostgreSQL targets**, verified 2026-07-31. `TestStage4PostgresTLSToSQLiteNetworkCrashResumeLive` injects a durable-acknowledgement failure mid-transfer, resumes, and compares the whole ordered row set with `reflect.DeepEqual` — which proves no duplicate rows *and* no overwritten values, not merely a matching count. It now runs on both state backends. `TestStage4PostgresTLSToSQLiteNetworkInteriorInsertReplayLive` covers the interior-insert case, and `TestStage4PostgresDeleteCompositionCrashResumeLiveTLS` covers a PostgreSQL target. **Genuinely remaining:** MySQL, MariaDB, and SQL Server targets. |
+| Write-before-checkpoint replay neither duplicates nor overwrites. | **Live-proven for the SQLite and PostgreSQL targets**, verified 2026-07-31. `TestStage4PostgresTLSToSQLiteNetworkCrashResumeLive` injects a durable-acknowledgement failure mid-transfer, resumes, and compares the whole ordered row set with `reflect.DeepEqual` — which proves no duplicate rows *and* no overwritten values, not merely a matching count. It now runs on both state backends. `TestStage4PostgresTLSToSQLiteNetworkInteriorInsertReplayLive` covers the interior-insert case, and `TestStage4PostgresDeleteCompositionCrashResumeLiveTLS` covers a PostgreSQL target. **Nothing remains.** An earlier draft of this row called MySQL, MariaDB, and SQL Server targets a gap; that was wrong. Only `postgresTargetAdapter` and `sqliteTargetAdapter` implement `stage4NetworkIdempotentUpsertTarget`, the route-owned marker asserting the target's upsert path is safe to replay after a durable issued-page record. Every other target is refused as policy — "Stage 4 target engine %q has no certified idempotent network upsert path". Those engines are not untested members of the contract; they are deliberately outside it, so the certified target set is PostgreSQL and SQLite and both are live-proven. |
 | Concurrent wide tables remain within budget. | **SQLite only.** Missing `TestStage4NetworkWideTableJobsShareMemoryBudgetLive`. |
 
 ## Acceptance 21.6 — State, lease, and resume
@@ -641,11 +641,16 @@ Every certified-cell implementation needs its family. Missing, by name:
   row count, which is what "through the resumable range protocol" requires. A
   route that transferred correctly but left durable evidence unfinished would
   formerly have passed.
-- `TestStage4CertifiedRelationalUpsertReplayMatrixLive` — narrower than it
-  looks. SQLite and PostgreSQL targets are already live-proven (see Acceptance
-  21.5); what is missing is the MySQL-family and SQL Server targets. The
-  existing crash-resume fixture is the template: inject a durable-acknowledgement
-  failure, resume, and compare the entire ordered row set rather than a count.
+- ~~`TestStage4CertifiedRelationalUpsertReplayMatrixLive`~~ — **satisfied,
+  verified 2026-07-31.** The certified target set for Stage 4 network replay is
+  exactly PostgreSQL and SQLite, because only those two implement
+  `stage4NetworkIdempotentUpsertTarget`; every other target is refused as
+  policy. Both are live-proven by
+  `TestStage4PostgresTLSToSQLiteNetworkCrashResumeLive` (on both state
+  backends), `TestStage4PostgresTLSToSQLiteNetworkInteriorInsertReplayLive`, and
+  `TestStage4PostgresDeleteCompositionCrashResumeLiveTLS`. There is no MySQL,
+  MariaDB, or SQL Server cell to write — a matrix over them would be asserting a
+  contract those engines are explicitly outside of.
 
 ### B. Validation (Section 12) — logic done, live matrix open
 
