@@ -96,21 +96,47 @@ not a property of this repository or environment. All five TLS containers were
 already running and healthy, and the matrix was executed directly. Do not
 re-propagate the "blocked until 2026-08-06" claim; it is wrong.
 
-Working DSNs (local test containers, throwaway credentials):
+Working environment (local test containers, throwaway credentials). Two target
+databases must exist first — the fixtures need a target distinct from the
+source:
+
+```sh
+docker exec dmtx-mysql80-tls mysql -uroot -pdmtx_root_test_only \
+  -e "CREATE DATABASE IF NOT EXISTS dmtx_target; GRANT ALL ON dmtx_target.* TO 'dmtx'@'%'; FLUSH PRIVILEGES;"
+docker exec dmtx-mariadb1011-tls mariadb -uroot -pdmtx_root_test_only \
+  -e "CREATE DATABASE IF NOT EXISTS dmtx_target; GRANT ALL ON dmtx_target.* TO 'dmtx'@'%'; FLUSH PRIVILEGES;"
+docker exec dmtx-mssql2022-tls /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa \
+  -P 'TestPass2024' -C -Q "IF DB_ID('dmtx_target') IS NULL CREATE DATABASE dmtx_target;"
+```
 
 ```sh
 export DMTX_TEST_POSTGRES_DSN="postgres://dmtx:dmtx_test_only@127.0.0.1:55432/dmtx_test?sslmode=verify-full&sslrootcert=/private/tmp/dmtx-postgres16-tls.zlfSES/server.crt"
 export DMTX_TEST_MYSQL_CA=/private/tmp/dmtx-mysql80-tls/certs/ca.pem
 export DMTX_TEST_MARIADB_CA=/private/tmp/dmtx-mysql80-tls/certs/ca.pem
 export DMTX_TEST_MSSQL_CA=/private/tmp/dmtx-mssql2022-tls/certs/ca.pem
-export DMTX_TEST_MYSQL_DSN="dmtx:dmtx_test_only@tcp(127.0.0.1:53306)/dmtx?tls=dmtx_test"
-export DMTX_TEST_MARIADB_DSN="dmtx:dmtx_test_only@tcp(127.0.0.1:54306)/dmtx_source?tls=dmtx_mariadb_test"
+export DMTX_TEST_MYSQL_DSN="dmtx:dmtx_test_only@tcp(127.0.0.1:53306)/dmtx?tls=dmtx_test&parseTime=true"
+export DMTX_TEST_MYSQL_TARGET_DSN="dmtx:dmtx_test_only@tcp(127.0.0.1:53306)/dmtx_target?tls=dmtx_test&parseTime=true"
+export DMTX_TEST_MYSQL_ADMIN_DSN="root:dmtx_root_test_only@tcp(127.0.0.1:53306)/dmtx_target?tls=dmtx_test&parseTime=true"
+export DMTX_TEST_MARIADB_DSN="dmtx:dmtx_test_only@tcp(127.0.0.1:54306)/dmtx_source?tls=dmtx_mariadb_test&parseTime=true"
+export DMTX_TEST_MARIADB_TARGET_DSN="dmtx:dmtx_test_only@tcp(127.0.0.1:54306)/dmtx_target?tls=dmtx_mariadb_test&parseTime=true"
 export DMTX_TEST_MSSQL_DSN="sqlserver://sa:TestPass2024@127.0.0.1:51433?database=master&encrypt=true&tlsmin=1.2&guid+conversion=true&certificate=/private/tmp/dmtx-mssql2022-tls/certs/ca.pem"
+export DMTX_TEST_MSSQL_TARGET_DSN="sqlserver://sa:TestPass2024@127.0.0.1:51433?database=dmtx_target&encrypt=true&tlsmin=1.2&guid+conversion=true&certificate=/private/tmp/dmtx-mssql2022-tls/certs/ca.pem"
 ```
 
-The TLS config names are fixed by the fixtures: `dmtx_test` for MySQL,
-`dmtx_mariadb_test` for MariaDB. SQL Server additionally requires
-`guid conversion=true` and `tlsmin=1.2`.
+Non-obvious requirements the fixtures enforce, each of which cost a debugging
+cycle to discover:
+
+- TLS config names are fixed: `dmtx_test` for MySQL, `dmtx_mariadb_test` for
+  MariaDB.
+- SQL Server additionally requires `guid conversion=true` and `tlsmin=1.2`.
+- MySQL and MariaDB DSNs need `parseTime=true`, or bulk-writer round-trips fail
+  scanning DATETIME into `time.Time`.
+- `DMTX_TEST_MYSQL_ADMIN_DSN` (root) is needed for the binary-log-safe trigger
+  sentinel. Note it **fails rather than skips** when the target DSN is set but
+  the admin DSN is not — deliberate fail-loud behaviour on partial provisioning.
+
+**Provision all of it.** With only the source DSNs set, 38 live tests skip
+silently. With the full set above, 9 skip and everything else runs.
 
 ### Result: the whole matrix is green
 
