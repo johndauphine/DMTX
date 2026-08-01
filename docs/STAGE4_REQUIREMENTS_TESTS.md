@@ -730,13 +730,22 @@ Every certified-cell implementation needs its family. Missing, by name:
   MariaDB, or SQL Server cell to write — a matrix over them would be asserting a
   contract those engines are explicitly outside of.
 
-### B. Validation (Section 12) — logic done, live matrix open
+### B. Validation (Section 12) — CLOSED
 
-Not a slice. The mode, timeout, policy, NULL-parity, sampling, and canonical
-value contracts are all implemented and covered non-live. What remains is
-`TestSQLServerValidationModesLive`, `TestMySQLValidationModesLive`,
-`TestMariaDBValidationModesLive`, `TestStage4ValidationRouteMatrixLive`, and
-`TestValidationTimeoutFallbackEngineMatrixLive` — all gated on block G.
+The mode, timeout, policy, NULL-parity, sampling, and canonical value contracts
+are implemented and covered by roughly 50 non-live fixtures. The live half is
+now complete for everything reachable:
+
+- Deep validation is certified for PostgreSQL sources only, proven live by
+  `TestStage4AdapterPostgresStableDeepValidationComposedRouteLiveTLS`. Verified
+  2026-07-31 that other engines are refused before mutation, so the proposed
+  per-engine deep-mode fixtures have no reachable cells.
+- `count_only` runs live on every certified engine through the stable-runner
+  sentinels.
+- **Validation failure detection** is proven live by
+  `TestStage4ValidationDetectsTargetMismatchLive`, which was the real gap: every
+  other live fixture asserted `Validated: true`, so nothing showed validation
+  could fail against a real database at all.
 
 ### C. Strict consistency — COMPLETE
 
@@ -773,13 +782,21 @@ route selects it, and `ValidateMigration` still rejects SQLite strict. Admitting
 the route is the next step and needs the certified-pair policy updated
 deliberately, not as a side effect.
 
-### D. Schema-contract modes — logic done, live matrix open
+### D. Schema-contract modes — CLOSED
 
-Corrected 2026-07-31. Every mode is implemented and covered non-live by 25
-fixtures in `schema_contract_test.go`; the earlier claim that `freeze`,
-`report`, `discard_value` pruning, the entity-default matrix, and the
-unsafe-evolution matrix had no fixtures was wrong. What remains is
-`TestStage4SchemaContractTargetMatrixLive` — gated on block G.
+Every mode is implemented and covered non-live by 25 fixtures in
+`schema_contract_test.go`. Live enforcement is now proven too:
+`TestStage4SchemaContractFreezeStopsLiveDrift` and
+`TestStage4SchemaContractModesLive` distinguish four modes against identical
+real drift on a PostgreSQL target, and `TestStage4SchemaContractSQLiteTargetLive`
+covers the SQLite target. The target matrix is bounded — only PostgreSQL and
+SQLite targets reach the Stage 4 composed path under upsert — and both cells are
+covered.
+
+Two live-only findings are recorded in Section 7.4: `report` mode leaves the run
+failing at the write layer with a low-level column error rather than a
+contract-level message, and `evolve` is unavailable on a SQLite target because
+there is no target-catalog evolution executor (refused as policy, fails closed).
 
 ### E. Dry-run (Section 7.2) — started 2026-07-31
 
