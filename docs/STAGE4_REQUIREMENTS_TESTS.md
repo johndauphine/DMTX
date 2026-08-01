@@ -155,8 +155,19 @@ for PostgreSQL, SQL Server, Oracle MySQL, MariaDB, SQLite, and ClickHouse
 rebuild. One composed route exists today:
 `TestStage4AdapterPostgresSchemaEvolutionComposedRouteLiveTLS`.
 
-**Notes from an attempt on 2026-07-31** (the fixture was not landed; these are
-the obstacles that will meet the next attempt):
+**First live contract enforcement landed 2026-07-31.**
+`TestStage4SchemaContractFreezeStopsLiveDrift` establishes a real baseline
+snapshot on a PostgreSQL source, adds a column to the live source, and requires
+the next run under `freeze` to refuse before any target write. It asserts the
+*reason*, and the live error names the contract, the mode, the exact drifted
+column, and the timing: "schema contract drift_blocked: freeze column_added for
+...network_items.note: freeze mode rejects drift before transfer". That is the
+first proof that a contract mode enforces against a real database rather than
+only in projection.
+
+The remaining matrix work is the other modes and the other targets. The four
+obstacles below cost several drafts to find and are what the setup pattern in
+that fixture solves — read them before extending it:
 
 - Do not use a SQLite target to prove a contract mode. Source drift is refused
   by SQLite's own retained-shape preflight *before* the contract is consulted,
@@ -165,12 +176,13 @@ the obstacles that will meet the next attempt):
 - Source and target must be different databases. The same endpoint is refused
   outright, and separate schemas within one database still resolve to a single
   endpoint.
-- The hard part is the cross-run lifecycle: establishing a successful baseline
-  snapshot and then running a second, drifted run against it requires the prior
-  snapshot and the target authority to line up. A second run with a fresh run ID
-  against the same state backend fails in target-schema-evolution projection
-  ("full target authority does not contain the exact source-backed prior
-  table"). Understand that keying before writing the fixture.
+- **The baseline run must be published as successful.** The contract compares
+  against the latest *successful* snapshot, and `Execute` does not append the
+  success record — that is the application layer's job. A baseline left Running
+  is not an authority, and the second run then fails in target-schema-evolution
+  projection with "full target authority does not contain the exact
+  source-backed prior table". Use `completeStage4IncrementalTestRun`. This was
+  the single blocking obstacle.
 - Whatever the fixture asserts, assert the *reason*. A contract test that
   accepts any error is worthless — that is how the SQLite-target version above
   looked like it worked.
