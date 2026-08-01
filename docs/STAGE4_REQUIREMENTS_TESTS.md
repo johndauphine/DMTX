@@ -415,7 +415,13 @@ non-live deep semantics in `TestSQLiteDatabaseValidationProbeDeepSemantics` and
 - `TestSQLServerValidationModesLive`
 - `TestMySQLValidationModesLive`
 - `TestMariaDBValidationModesLive`
-- `TestStage4ValidationRouteMatrixLive`
+- `TestStage4ValidationRouteMatrixLive` — the per-engine happy path. Note that
+  live **failure** detection is now proven by
+  `TestStage4ValidationDetectsTargetMismatchLive`, which was the sharper gap:
+  every other live fixture asserted `Validated: true`, so nothing demonstrated
+  that validation could fail against a real database at all. It deletes a target
+  row behind the tool's back and requires the reason to name the row-count
+  disagreement, not merely that something failed.
 - `TestValidationTimeoutFallbackEngineMatrixLive`
 
 ClickHouse keeps rebuild equality validation and must explicitly reject modes
@@ -590,7 +596,13 @@ Every certified-cell implementation needs its family. Missing, by name:
   with `TestStage4CertifiedRelationalDeleteRejectsUncertifiedModes` pinning the
   upsert-only and no-strict-epoch edges
 - `TestStage4SchemaContractTargetMatrixLive`
-- `TestStage4ValidationRouteMatrixLive`
+- `TestStage4ValidationRouteMatrixLive` — the per-engine happy path. Note that
+  live **failure** detection is now proven by
+  `TestStage4ValidationDetectsTargetMismatchLive`, which was the sharper gap:
+  every other live fixture asserted `Validated: true`, so nothing demonstrated
+  that validation could fail against a real database at all. It deletes a target
+  row behind the tool's back and requires the reason to name the row-count
+  disagreement, not merely that something failed.
 - `TestStage4CertifiedRelationalCrashResumeMatrixLive` (both state backends)
 - ~~`TestStage4CertifiedRelationalTransferLifecycleLive`~~ — **satisfied
   2026-07-31** by the per-engine stable-runner sentinels rather than a new
