@@ -181,8 +181,17 @@ func TestSQLServerTargetRejectsUnsafeEmptyIdentityPrimerLive(
 			},
 		},
 		{
-			name:   "foreign key",
-			needle: "foreign key",
+			name: "foreign key",
+			// The refusal arrives one layer earlier than this case's name
+			// implies. The shape below is a single self-referencing table, and
+			// relational table ordering rejects that as a dependency cycle
+			// before any empty-identity primer analysis runs — see
+			// orderAdapterSourceTablesForMode, which refuses a lone in-scope
+			// self-reference outright. Asserting the loose phrase "foreign key"
+			// hid that: the real message hyphenates it, so the case failed
+			// against correct behaviour. Assert the reason that actually
+			// applies rather than the one the name suggests.
+			needle: "foreign-key dependency cycle",
 			shape: func(
 				_ *testing.T,
 				tableName string,
