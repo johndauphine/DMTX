@@ -155,6 +155,26 @@ for PostgreSQL, SQL Server, Oracle MySQL, MariaDB, SQLite, and ClickHouse
 rebuild. One composed route exists today:
 `TestStage4AdapterPostgresSchemaEvolutionComposedRouteLiveTLS`.
 
+**Notes from an attempt on 2026-07-31** (the fixture was not landed; these are
+the obstacles that will meet the next attempt):
+
+- Do not use a SQLite target to prove a contract mode. Source drift is refused
+  by SQLite's own retained-shape preflight *before* the contract is consulted,
+  so the run fails for an unrelated reason and a naive test passes without
+  exercising the contract at all. Use a target that can accept the drift.
+- Source and target must be different databases. The same endpoint is refused
+  outright, and separate schemas within one database still resolve to a single
+  endpoint.
+- The hard part is the cross-run lifecycle: establishing a successful baseline
+  snapshot and then running a second, drifted run against it requires the prior
+  snapshot and the target authority to line up. A second run with a fresh run ID
+  against the same state backend fails in target-schema-evolution projection
+  ("full target authority does not contain the exact source-backed prior
+  table"). Understand that keying before writing the fixture.
+- Whatever the fixture asserts, assert the *reason*. A contract test that
+  accepts any error is worthless — that is how the SQLite-target version above
+  looked like it worked.
+
 ## Section 8 — Transfer semantics and safety
 
 ### 8.1 Table eligibility and ordering
