@@ -56,7 +56,7 @@ sections to match whatever he decides on the re-ask.
 ## Current repository state
 
 - Branch: `codex/stage-4-production-semantics`
-- HEAD: `20bcbb1 stage4: project intra-schema foreign keys into SQLite`
+- HEAD: `635be27 stage4: instruct the next agent to re-ask the decisions` (65 commits on this branch)
 - Main was not changed; nothing was pushed or merged.
 - The worktree is **fully clean**. `docs/STAGE4_REQUIREMENTS_TESTS.md` is now
   tracked and committed.
