@@ -165,9 +165,29 @@ column, and the timing: "schema contract drift_blocked: freeze column_added for
 first proof that a contract mode enforces against a real database rather than
 only in projection.
 
-The remaining matrix work is the other modes and the other targets. The four
-obstacles below cost several drafts to find and are what the setup pattern in
-that fixture solves — read them before extending it:
+`TestStage4SchemaContractModesLive` extends that to a mode matrix against the
+same real drift, so a mode that silently behaved like another fails rather than
+blends in: **evolve** adds the column to the target, **report** and
+**discard_value** leave the target shape untouched, **freeze** aborts before any
+write.
+
+Two things the live matrix surfaced that projection tests did not:
+
+- `tables: discard_value` is rejected by configuration policy, so a contract
+  applying `discard_value` to every entity is refused outright. The mode belongs
+  on the column entities only. This is documented behaviour, but it is easy to
+  write a fixture that trips it and misread the refusal as a defect.
+- **`report` mode leaves the run failing at the write layer.** It deliberately
+  does not act on drift, so an added source column has nowhere to go and the
+  transfer stops with `permanent transfer error: requested column note is not
+  present in schema`. The contract guarantee holds — the target schema is not
+  mutated — but the operator sees a low-level column error rather than a
+  contract-level message about unhandled drift. Worth improving; it is a
+  reporting wart, not a correctness bug.
+
+The remaining matrix work is the other targets. The four obstacles below cost
+several drafts to find and are what the setup pattern in those fixtures solves —
+read them before extending it:
 
 - Do not use a SQLite target to prove a contract mode. Source drift is refused
   by SQLite's own retained-shape preflight *before* the contract is consulted,

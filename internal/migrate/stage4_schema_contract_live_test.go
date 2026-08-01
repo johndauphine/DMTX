@@ -36,6 +36,30 @@ import (
 //     the latest *successful* snapshot, so a baseline left Running leaves the
 //     second run without the prior authority it needs.
 func TestStage4SchemaContractFreezeStopsLiveDrift(t *testing.T) {
+	runStage4SchemaContractLiveMode(t, config.SchemaContractFreeze, nil)
+}
+
+// TestStage4SchemaContractModesLive extends the freeze proof across the modes
+// whose live behaviour differs. Each mode is given the identical real drift and
+// judged on what it must do with it, so a mode that silently behaved like
+// another would fail rather than blend in.
+func TestStage4SchemaContractModesLive(t *testing.T) {
+	for name, mode := range map[string]config.SchemaContractMode{
+		"report":  config.SchemaContractReport,
+		"evolve":  config.SchemaContractEvolve,
+		"discard": config.SchemaContractDiscardValue,
+	} {
+		t.Run(name, func(t *testing.T) {
+			runStage4SchemaContractLiveMode(t, mode, nil)
+		})
+	}
+}
+
+func runStage4SchemaContractLiveMode(
+	t *testing.T,
+	mode config.SchemaContractMode,
+	_ any,
+) {
 	dsn := os.Getenv("DMTX_TEST_POSTGRES_DSN")
 	if dsn == "" {
 		t.Skip(
@@ -193,12 +217,53 @@ func TestStage4SchemaContractFreezeStopsLiveDrift(t *testing.T) {
 	}
 
 	frozen := newConfig()
-	frozen.Migration.SchemaContract = &config.SchemaContract{
-		Tables:   config.SchemaContractFreeze,
-		Columns:  config.SchemaContractFreeze,
-		DataType: config.SchemaContractFreeze,
+	// `tables: discard_value` is rejected by configuration policy, so the table
+	// entity keeps evolve while the column entities carry the mode under test.
+	tableMode := mode
+	if mode == config.SchemaContractDiscardValue {
+		tableMode = config.SchemaContractEvolve
 	}
-	frozenEvents, frozenErr := runOnce(t, "stage4-freeze-drift", frozen)
+	frozen.Migration.SchemaContract = &config.SchemaContract{
+		Tables:   tableMode,
+		Columns:  mode,
+		DataType: mode,
+	}
+	frozenEvents, frozenErr := runOnce(t, "stage4-contract-drift", frozen)
+
+	if mode != config.SchemaContractFreeze {
+		// report deliberately does not act on drift, so the added source column
+		// has nowhere to go and the write fails. That is a real operator-facing
+		// wart worth naming: the run stops with a low-level "requested column
+		// note is not present in schema" rather than a contract-level message.
+		// The contract guarantee under test is narrower — report must not
+		// mutate the target schema — and that is what is asserted below.
+		if mode != config.SchemaContractReport && frozenErr != nil {
+			t.Fatalf("%s refused drift it must handle: %v", mode, frozenErr)
+		}
+		var targetHasNote int
+		if err := targetSetup.QueryRowContext(
+			ctx,
+			`SELECT COUNT(*) FROM information_schema.columns
+			  WHERE table_schema = 'public' AND table_name = $1
+			    AND column_name = 'note'`,
+			tableName,
+		).Scan(&targetHasNote); err != nil {
+			t.Fatalf("inspect %s target column: %v", mode, err)
+		}
+		switch mode {
+		case config.SchemaContractEvolve:
+			if targetHasNote != 1 {
+				t.Fatalf("evolve did not add the drifted column to the target")
+			}
+		default:
+			// report and discard_value must leave the target shape alone.
+			if targetHasNote != 0 {
+				t.Fatalf("%s mutated the target schema", mode)
+			}
+		}
+		return
+	}
+
 	if frozenErr == nil {
 		t.Fatal("freeze accepted a drifted live source")
 	}
