@@ -818,7 +818,11 @@ Tuning disclosure with provenance and delete-policy disclosure have landed, and
 the zero-mutation guarantee is now asserted rather than assumed. Remaining:
 
 - target preflight (dry-run currently never opens the target)
-- schema drift reporting
+- schema drift reporting — **also blocked on decision 1**, which was not
+  obvious. Verified 2026-07-31 by reading `dry_run.go`: all four planners open a
+  source and never a target, so drift reporting cannot be built without first
+  settling how dry-run may open a target. It reads like independent work in this
+  list; it is not.
 - ~~pagination selection disclosure~~ — **closed 2026-07-31** for SQLite sources;
   other engines omit the field rather than guess
 - ~~estimate provenance labelling~~ — **closed 2026-07-31**; `rows_provenance` is

@@ -187,7 +187,9 @@ those areas should be built until they are answered.
    treated? For a `drop_recreate` migration into a fresh SQLite file, absence is
    the normal case, not an error. See the hazard note in the requirements map:
    `db.Ping()` creates a SQLite file, so a naive preflight would violate
-   dry-run's zero-mutation guarantee.
+   dry-run's zero-mutation guarantee. **This decision also gates schema drift
+   reporting**, the other open item in block E: drift needs the target catalog,
+   and dry-run opens no target today. Answering this unblocks both.
 2. **May dry-run open state read-only?** Delete due-ness needs the durable
    last-success time. Today `Plan.Deletes.DueStateKnown` is permanently false
    and the reporting half of the requirement cannot close either way until this
