@@ -200,6 +200,42 @@ those areas should be built until they are answered.
    requirements map; note the warning there against "fixing" them by stripping
    them from the resume projection.
 
+## Correction: strict route admission is not a gate flip
+
+Recorded 2026-08-01, after John chose "admit all four". My recommendation
+understated the cost and should not be acted on as described.
+
+What is actually true:
+
+- The four openers (`SQLiteStrictConsistencyOpener`,
+  `MySQLStrictConsistencyOpener`, `SQLServerStrictConsistencyOpener`, and the
+  MariaDB path through the MySQL opener) are implemented and their **opener
+  contract** is live-proven: open a stable view, hold it, refuse invalid scopes.
+- **Nothing consumes them.** Verified by locating every non-test reference:
+  each constructor is referenced only by its own definition and its tests. They
+  are inert in exactly the sense block F2 uses for the five settings.
+- Admission is gated in **three** places, not one: `migration_validation.go`
+  (route resolution), `requireStage4PostgresStrictRoute` (adapter admission),
+  and `sqlite_transfer_pipeline.go` (SQLite refuses strict as policy).
+- The composed strict route is PostgreSQL-typed throughout — roughly 1,400 lines
+  asserting `*PostgresStrictConsistencySession`, `*postgresTargetAdapter`, and
+  `*relationalSourceAdapter`, plus postgres-specific epoch binding, network
+  planning, retained row bounds, catalog equality, and completion evidence. The
+  stable-network-view layer takes a `*PostgresStrictConsistencySession` directly.
+
+So opening the gate would admit configurations the composed route cannot serve.
+Delivering strict consistency on those engines means building a Stage 4 composed
+route per engine — network planning, durable ranges, epoch binding, resume, and
+validation evidence — which is comparable in size to what Stage 4 already did
+for PostgreSQL, not a flag change. For SQLite it is larger still, because SQLite
+is not a certified Stage 4 **source** at all, so strict would ride on top of a
+route that does not exist yet.
+
+This needs a fresh decision. The honest options are to scope it as its own
+stage, to pick one engine (MySQL and MariaDB share an opener and are the
+cheapest pair), or to leave the openers unreachable and say so in the docs
+rather than carrying them as if they shipped.
+
 ## Verification already obtained
 
 Rerun immediately before committing `1afd447`, all green:
