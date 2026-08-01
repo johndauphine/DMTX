@@ -178,27 +178,97 @@ Fixed in the projection rather than the renderer: the renderer cannot know the
 mapping. This also restored the destructive-acknowledgement gate, which the
 schema error had been masking.
 
-## Decisions waiting on John
+## Decisions John made (2026-08-01) — implement these
 
-Three items are blocked on a product decision, not on effort. Nothing further in
-those areas should be built until they are answered.
+All four were answered. They were previously blocking; they are not any more.
+Recorded here because they existed only in a chat session that has ended.
 
-1. **Target preflight in dry-run.** How should a not-yet-existing target be
-   treated? For a `drop_recreate` migration into a fresh SQLite file, absence is
-   the normal case, not an error. See the hazard note in the requirements map:
-   `db.Ping()` creates a SQLite file, so a naive preflight would violate
-   dry-run's zero-mutation guarantee. **This decision also gates schema drift
-   reporting**, the other open item in block E: drift needs the target catalog,
-   and dry-run opens no target today. Answering this unblocks both.
-2. **May dry-run open state read-only?** Delete due-ness needs the durable
-   last-success time. Today `Plan.Deletes.DueStateKnown` is permanently false
-   and the reporting half of the requirement cannot close either way until this
-   is settled.
-3. **The five inert settings** (`checkpoint_frequency`, `upsert_merge_size`,
-   `large_table_threshold`, `runtime_tuning_interval`, `history_retention_days`).
-   Implement, reject at parse, or remove — per row. See block F2 in the
-   requirements map; note the warning there against "fixing" them by stripping
-   them from the resume projection.
+### 1. Target preflight: **require the target to exist**
+
+A dry run must fail when the target is absent, rather than treating absence as
+the normal first-run case.
+
+- **John was told the tradeoff and chose this anyway**: it makes dry-run fail
+  for a `drop_recreate` migration into a fresh SQLite file, which is the normal
+  first run. Make the error say plainly that the target must be created first,
+  so it reads as a deliberate refusal and not a bug.
+- **Hazard — do not skip this.** The SQLite existence check must use `os.Stat`,
+  never `db.Ping()`. Verified by probe: `sql.Open` is lazy and creates nothing,
+  but `Ping` **creates the database file**. Using Ping would both violate
+  dry-run's zero-mutation guarantee and make the check vacuous, since it would
+  always report the target as existing.
+- **Known breakage to fix in the same change**:
+  `TestStage4DryRunDisclosesTuningAndDeletePolicy` in
+  `internal/migrate/dry_run_disclosure_test.go` builds a target path it never
+  creates, so it will start failing. Create the target file in the test, and
+  keep its zero-mutation assertion by expecting source + target in the
+  directory rather than source alone. Do not weaken that assertion — it is the
+  regression guard for the Ping hazard above.
+
+### 2. Dry-run **may** open the durable state store read-only
+
+Read-only only; a dry run still writes nothing. This unblocks real delete
+due/candidate reporting: `PlannedDelete.DueStateKnown` can become true, and
+`TestDeleteReconcileDryRunReportsDueCandidates` (block F) can close. Update the
+doc comment on `PlannedDelete` in `dry_run.go`, which currently states as a
+contract that dry-run never opens state.
+
+### 3. Implement real consumers for all five inert settings
+
+`checkpoint_frequency`, `upsert_merge_size`, `large_table_threshold`,
+`runtime_tuning_interval`, `history_retention_days` — wire each to actual
+behavior rather than rejecting or removing.
+
+- `history_retention_days` is assigned to **Stage 5** by the stage-boundary
+  section of the requirements map. Raise that conflict before implementing it;
+  the other four are unambiguous.
+- **Do not** remove `large_table_threshold` from the resume-compatibility
+  projection. Its membership there is deliberate and asserted by
+  `TestResumeCompatibilityHashSeparatesSafeRuntimeAndStructuralChanges`. The
+  gap is the missing consumer, not the hash.
+- Each one needs a test that the setting actually takes effect, not merely that
+  it parses.
+
+### 4. Admit all four strict openers — **revisit before starting**
+
+John chose "admit all four" based on a recommendation that understated the cost
+by a large margin. See the correction section immediately below. The decision
+should be re-taken with accurate numbers; do not begin this as if it were a
+gate change.
+
+## Where the last session stopped
+
+Tree clean at `dcf1192`, 60 commits on `codex/stage-4-production-semantics`,
+offline suite green, full live TLS matrix green under normal and `-race`.
+
+Work had just started on decision 1 and **no code was written** — nothing is
+half-finished. The design that had been worked out, to save re-deriving it:
+
+- New file `internal/migrate/dry_run_target.go`. Add `Target *PlannedTarget` to
+  `Plan` and attach it in `DryRun` (`dry_run.go:137`), which is the one place
+  every engine path passes through — the same reason tuning and delete
+  disclosure are attached there rather than in each planner.
+- `PlannedTarget{Exists bool, DriftKnown bool, Drift []PlannedDrift}` and
+  `PlannedDrift{Table, Kind, Column, SourceType, TargetType}` with kinds
+  `missing_table`, `missing_column`, `extra_column`, `type_mismatch`.
+- Existence: SQLite by `os.Stat`; server engines by `engine.Open*` plus a ping,
+  where connecting to a named database that does not exist fails and *is* the
+  existence check.
+- **Drift scope, recommended**: table-presence drift is engine-neutral and can
+  be computed whenever the target catalog is readable. Column *type* drift is
+  only meaningful when source and target engines match — comparing PostgreSQL
+  `text` against SQLite `TEXT` is not a real comparison. Where drift cannot be
+  computed honestly, set `DriftKnown: false` and omit the detail rather than
+  guess. This follows the precedent already set for pagination disclosure in
+  the same file.
+- Catalog helpers that already exist: `userTables` (`sqlite.go:171`) and
+  `inspectSQLiteSchema` (`sqlite_schema.go:20`) for SQLite on either side;
+  `engine.InspectPostgresTable`, `engine.InspectMySQLTable`,
+  `engine.InspectSQLServerTable`, and `engine.ListSQLServerTables` for the
+  server engines.
+
+Block status: **A, B, C, D, G closed.** E, F, F2 open but no longer
+decision-blocked — all three now have answers to build against.
 
 ## Correction: strict route admission is not a gate flip
 
