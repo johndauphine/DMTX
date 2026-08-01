@@ -817,20 +817,19 @@ than shipping.
 Tuning disclosure with provenance and delete-policy disclosure have landed, and
 the zero-mutation guarantee is now asserted rather than assumed. Remaining:
 
-- target preflight (dry-run currently never opens the target)
-- schema drift reporting — **also blocked on decision 1**, which was not
-  obvious. Verified 2026-07-31 by reading `dry_run.go`: all four planners open a
-  source and never a target, so drift reporting cannot be built without first
-  settling how dry-run may open a target. It reads like independent work in this
-  list; it is not.
+- target preflight — **decided 2026-08-01: require the target to exist.** See
+  the handoff for the Ping hazard and the test this will break.
+- schema drift reporting — unblocked 2026-08-01 by the preflight decision.
+  Verified 2026-07-31 by reading `dry_run.go`: all four planners open a source
+  and never a target, so this could not be built until target opening was
+  settled. It reads like independent work in this list; it was not.
 - ~~pagination selection disclosure~~ — **closed 2026-07-31** for SQLite sources;
   other engines omit the field rather than guess
 - ~~estimate provenance labelling~~ — **closed 2026-07-31**; `rows_provenance` is
   always `exact`, and no duration estimate is emitted for want of evidence
-- delete due/candidate state — **blocked on a decision**: due-ness needs the
-  durable last-success time, and dry-run's contract is that it opens no state.
-  Either admit a read-only state open for dry-run, or accept that due-ness is
-  unavailable and keep `due_state_known: false` permanently.
+- delete due/candidate state — **decided 2026-08-01: a read-only state open is
+  allowed.** Dry-run may read state, never write it. Implement real due/candidate
+  reporting and let `due_state_known` become true.
 
 ### F. Small named gaps
 
@@ -846,10 +845,9 @@ the zero-mutation guarantee is now asserted rather than assumed. Remaining:
   hoped-for one, and also assert the table lifecycle was never entered.
 - ~~`TestTargetLeaseTwoProcessRace`, `TestDifferentCanonicalTargetsRunConcurrently`~~ — **closed 2026-07-31**
 - ~~`TestStage4EveryRequiredWriteFailureReturnsStateExitSix`~~ — **closed 2026-07-31**
-- periodic-checkpoint supersession pair (Section 11.3) — **blocked on a product
-  decision, not effort**: `checkpoint_frequency` is an inert setting today, so
-  there is nothing to supersede. Resolve whether it drives a real periodic save
-  or is removed as superseded by per-range acknowledgement
+- periodic-checkpoint supersession pair (Section 11.3) — **decided 2026-08-01:
+  implement a real periodic save.** `checkpoint_frequency` gets a real consumer,
+  so there will be something to supersede and this pair becomes buildable.
 - ~~engine retry classifiers (Section 8.6)~~ — **already covered**; verified 2026-07-31, all six engines in `TestClassifyEngineRetryMatrix`
 - ~~`TestStage4LiveMatrixEnvironmentRequired`~~ — **closed 2026-07-31**; arm with
   `DMTX_STAGE4_LIVE_REQUIRED=1`, and it fails naming every absent endpoint
@@ -878,10 +876,13 @@ the surrounding design anticipated the implementation that never landed. Treat
 this block as unfinished wiring rather than as configuration to delete
 reflexively.
 
-No fixture closes this block. The required work is a decision per row —
-implement, reject at parse, or remove — followed by a test that the setting
-either takes effect or is refused. Accepting a value that does nothing is the
-behavior to eliminate.
+**Decided 2026-08-01: implement real consumers for all five.** Not reject, not
+remove. Each row needs a working consumer plus a test that the setting actually
+takes effect — not merely that it parses. Two carry-overs from the analysis
+above still apply: `history_retention_days` is assigned to Stage 5 by the stage
+boundary below, so raise that conflict before building it; and
+`large_table_threshold` must not be stripped from the resume projection, since
+its membership there is deliberate.
 
 ### G. The live gate
 
