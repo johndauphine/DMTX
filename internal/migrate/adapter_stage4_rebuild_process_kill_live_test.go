@@ -625,9 +625,17 @@ migration:
 	return cfg, nil
 }
 
+// stage4RebuildProcessKillNames builds the ephemeral fixture table names for
+// one process-kill cell. Every name is forced under a dmtx_ prefix because
+// SQLite reserves the sqlite_ prefix for internal objects and refuses to create
+// a table that uses it. The SQLite selector's engine prefix is literally
+// "sqlite", so without this the SQLite cells cannot seed at all. Applying the
+// prefix here rather than at the one call site keeps a future engine selector
+// from reintroducing the same collision.
 func stage4RebuildProcessKillNames(prefix string) (string, string) {
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
-	return prefix + "_parents_" + suffix, prefix + "_children_" + suffix
+	return "dmtx_" + prefix + "_parents_" + suffix,
+		"dmtx_" + prefix + "_children_" + suffix
 }
 
 func stage4RebuildProcessKillSQLiteSource(
@@ -838,8 +846,8 @@ func stage4RebuildProcessKillSQLiteFixture(
 	parent, child := stage4RebuildProcessKillNames("sqlite")
 	cleanupSQLServerNativeTables(t, sourceDatabase, child, parent)
 	for _, statement := range []string{
-		"CREATE TABLE " + sqlServerQualified(source.Schema, parent) + " ([id] BIGINT NOT NULL, [payload] VARCHAR(64) NOT NULL, CONSTRAINT " + sqlServerIdentifier(parent+"_pk") + " PRIMARY KEY ([id]))",
-		"CREATE TABLE " + sqlServerQualified(source.Schema, child) + " ([id] BIGINT NOT NULL, [parent_id] BIGINT NOT NULL, [payload] VARCHAR(64) NOT NULL, CONSTRAINT " + sqlServerIdentifier(child+"_pk") + " PRIMARY KEY ([id]), CONSTRAINT " + sqlServerIdentifier(child+"_parent_fk") + " FOREIGN KEY ([parent_id]) REFERENCES " + sqlServerQualified(source.Schema, parent) + " ([id]))",
+		"CREATE TABLE " + sqlServerQualified(source.Schema, parent) + " ([id] BIGINT NOT NULL, [payload] VARCHAR(64) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL, CONSTRAINT " + sqlServerIdentifier(parent+"_pk") + " PRIMARY KEY ([id]))",
+		"CREATE TABLE " + sqlServerQualified(source.Schema, child) + " ([id] BIGINT NOT NULL, [parent_id] BIGINT NOT NULL, [payload] VARCHAR(64) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL, CONSTRAINT " + sqlServerIdentifier(child+"_pk") + " PRIMARY KEY ([id]), CONSTRAINT " + sqlServerIdentifier(child+"_parent_fk") + " FOREIGN KEY ([parent_id]) REFERENCES " + sqlServerQualified(source.Schema, parent) + " ([id]))",
 		"INSERT INTO " + sqlServerQualified(source.Schema, parent) + " ([id], [payload]) VALUES (1, 'parent-one'), (2, 'parent-two')",
 		"INSERT INTO " + sqlServerQualified(source.Schema, child) + " ([id], [parent_id], [payload]) VALUES (10, 1, 'child-one'), (20, 2, 'child-two')",
 	} {
