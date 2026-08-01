@@ -1,8 +1,57 @@
 # DMTX Stage 4 handoff
 
-Updated 2026-07-31. This is a continuation note for the next AI working in
+Updated 2026-08-01. This is a continuation note for the next AI working in
 the local repository. Preserve the existing worktree; do not reset, clean, or
 checkout another branch.
+
+## FIRST ACTION: re-ask John the four decisions
+
+John answered these on 2026-08-01, but asked that they be **put to him again
+with recommendations** before any of them is implemented. Do that first. One of
+the four recommendations he answered against was wrong, and he knows it, which
+is why he wants the set re-run.
+
+Ask all four together, with the honest cost of each. Accurate recommendations
+below — these supersede the ones he was originally given.
+
+**1. Dry-run target preflight: how should a not-yet-existing target be treated?**
+His answer was *require the target to exist*. **Recommend reconsidering.**
+Requiring existence makes dry-run fail for `drop_recreate` into a fresh SQLite
+file, which is the normal first run — an operator's very first dry run would
+fail. The alternative, *absent is valid, probed without connecting*, reports
+absence as a fact instead of an error and costs no more to build. If he holds
+his original answer, implement it as chosen and make the error text say the
+target must be created first. Either way the `os.Stat`-not-`Ping` hazard below
+applies.
+
+**2. May dry-run open the durable state store read-only?**
+His answer was *yes*. **Recommend keeping it.** Low cost, and delete due-ness is
+the main thing an operator wants from the delete section of the report. Read
+only; a dry run still writes nothing.
+
+**3. What should happen to the five inert settings?**
+His answer was *implement real consumers for all five*. **Recommend splitting
+the row for `history_retention_days`**, which the stage-boundary section assigns
+to Stage 5 — implementing it here contradicts a boundary he already set. The
+other four are unambiguous Stage 4 work. Also worth flagging when asking: this
+is the largest of the four decisions by effort, five separate consumers each
+needing real behavior plus a test that it takes effect.
+
+**4. Should the four strict-consistency openers be admitted to the Stage 4 route?**
+His answer was *admit all four*, given on a recommendation that called it
+"turning working, tested code into a shipping feature." **That was wrong and
+must be corrected when re-asking.** It is not a gate change. The openers are
+live-proven at the *opener* contract only, nothing consumes them, admission is
+gated in three separate places, and the composed strict route is PostgreSQL-typed
+across roughly 1,400 lines. Full detail in the correction section below.
+**Recommend** either scoping this as its own stage, or doing MySQL and MariaDB
+only — they share an opener and are the cheapest pair — or explicitly
+documenting the openers as unreachable rather than carrying them as shipped.
+SQLite is the most expensive of the four by a wide margin, because it is not a
+certified Stage 4 *source* at all.
+
+Everything recorded further down assumes his original answers. Update those
+sections to match whatever he decides on the re-ask.
 
 ## Current repository state
 
