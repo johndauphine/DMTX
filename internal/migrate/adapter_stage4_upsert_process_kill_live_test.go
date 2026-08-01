@@ -66,7 +66,8 @@ func (backend *stage4UpsertProcessKillBlockingBackend) AcknowledgeRange(
 	if err := file.Close(); err != nil {
 		return state.RangeState{}, err
 	}
-	select {}
+	stage4ParkUntilKilled()
+	return state.RangeState{}, nil
 }
 
 // stage4UpsertProcessKillSQLiteObserver is the SQLite equivalent of the
@@ -125,7 +126,22 @@ func (observer *stage4UpsertProcessKillSQLiteObserver) parkAfterPageWrite() erro
 	if err := file.Close(); err != nil {
 		return err
 	}
-	select {}
+	stage4ParkUntilKilled()
+	return nil
+}
+
+// stage4ParkUntilKilled blocks until the parent ends this process.
+//
+// It deliberately sleeps rather than using select{}. A bare select{} lets the Go
+// runtime declare "all goroutines are asleep - deadlock!" and abort the child
+// once the route's own goroutines have finished, which kills the child before
+// the parent chooses to — turning an external-kill proof into a self-terminating
+// one, intermittently. A sleeping goroutine is not counted as deadlocked, so the
+// child stays alive until it is actually signalled.
+func stage4ParkUntilKilled() {
+	for {
+		time.Sleep(time.Minute)
+	}
 }
 
 type stage4UpsertProcessKillFixture struct {
