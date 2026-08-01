@@ -150,9 +150,13 @@ item is the per-engine live matrix.
 | Every decision has entity, mode, kind, object, previous/current evidence, action, and reason in stable order. | **Covered:** `TestSchemaContractDecisionFactsAreCompleteStableAndInputImmutable`, `TestStage4SchemaDecisionsPublishBeforeTargetPlanning`, `TestStage4SchemaDecisionSinkFailureStopsBeforePlanningAndMutation`, `TestStage4SchemaDriftRequiresDecisionSinkBeforeTargetPlanning`. Secret safety: `TestSchemaContractErrorDoesNotExposeEvidenceValues`. | None. |
 | Reject simultaneous `schema_contract` and deprecated `schema_evolution`; preserve compatible old form when supported. | **Covered:** the "conflicting schema names" case in `TestParseRejectsInvalidProductionSemantics`, `TestParseCanonicalizesDeprecatedProductionSettings`, `TestSchemaEvolutionRenamePreservesHashWireShape`. | None. |
 
-Required live proof is `TestStage4SchemaContractTargetMatrixLive`, with subtests
-for PostgreSQL, SQL Server, Oracle MySQL, MariaDB, SQLite, and ClickHouse
-rebuild. One composed route exists today:
+Required live proof was specified as `TestStage4SchemaContractTargetMatrixLive`
+with subtests for six engines. That specification predates the Stage 4
+certification boundary: only PostgreSQL and SQLite targets can reach the
+composed path under upsert, and both are now covered by
+`TestStage4SchemaContractFreezeStopsLiveDrift`,
+`TestStage4SchemaContractModesLive`, and
+`TestStage4SchemaContractSQLiteTargetLive`. One composed route exists today:
 `TestStage4AdapterPostgresSchemaEvolutionComposedRouteLiveTLS`.
 
 **First live contract enforcement landed 2026-07-31.**
@@ -193,8 +197,18 @@ before any target write. So the SQLite target supports refusal modes but cannot
 apply an evolution, which is a capability boundary rather than a defect, and it
 fails closed.
 
-The remaining matrix work is the MySQL-family and SQL Server targets. The
-obstacles below cost
+**The target matrix is bounded, and both cells are now covered.** For `upsert`
+mode `migrateWithStage4Adapters` always routes through
+`admitStage4AdapterNetworkTransfer`, which refuses any target lacking
+`stage4NetworkIdempotentUpsertTarget` — implemented only by
+`postgresTargetAdapter` and `sqliteTargetAdapter`. So a MySQL-family or SQL
+Server target cannot reach the Stage 4 composed path at all under upsert, and a
+contract matrix over them would be unreachable rather than merely unwritten.
+This is the same certification boundary that bounds the upsert-replay matrix;
+see Acceptance 21.5. If those engines are later admitted to the Stage 4 network
+route, the contract matrix should grow with them.
+
+The obstacles below cost
 several drafts to find and are what the setup pattern in those fixtures solves —
 read them before extending it:
 
