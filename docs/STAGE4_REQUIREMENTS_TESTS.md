@@ -493,7 +493,17 @@ non-live deep semantics in `TestSQLiteDatabaseValidationProbeDeepSemantics` and
 - `TestSQLServerValidationModesLive`
 - `TestMySQLValidationModesLive`
 - `TestMariaDBValidationModesLive`
-- `TestStage4ValidationRouteMatrixLive` — the per-engine happy path. Note that
+- `TestStage4ValidationRouteMatrixLive` — **bounded, and the bound is narrower
+  than the name implies.** Verified live 2026-07-31: deep validation is
+  certified for PostgreSQL sources only. `adapter_validation_database.go` gates
+  it on `adapter.spec.engine != adapterValidationPostgres` and a MySQL source
+  running `null_parity` or `sample` is refused before mutation with
+  "database-backed deep validation for source engine \"mysql\" is not
+  certified". So the reachable deep-validation cell is PostgreSQL, already
+  proven by `TestStage4AdapterPostgresStableDeepValidationComposedRouteLiveTLS`;
+  every other engine runs `count_only`, which the per-engine stable-runner
+  sentinels already exercise live. A matrix of deep modes across engines would
+  be asserting a contract those engines are outside of. Note that
   live **failure** detection is now proven by
   `TestStage4ValidationDetectsTargetMismatchLive`, which was the sharper gap:
   every other live fixture asserted `Validated: true`, so nothing demonstrated
@@ -674,7 +684,17 @@ Every certified-cell implementation needs its family. Missing, by name:
   with `TestStage4CertifiedRelationalDeleteRejectsUncertifiedModes` pinning the
   upsert-only and no-strict-epoch edges
 - `TestStage4SchemaContractTargetMatrixLive`
-- `TestStage4ValidationRouteMatrixLive` — the per-engine happy path. Note that
+- `TestStage4ValidationRouteMatrixLive` — **bounded, and the bound is narrower
+  than the name implies.** Verified live 2026-07-31: deep validation is
+  certified for PostgreSQL sources only. `adapter_validation_database.go` gates
+  it on `adapter.spec.engine != adapterValidationPostgres` and a MySQL source
+  running `null_parity` or `sample` is refused before mutation with
+  "database-backed deep validation for source engine \"mysql\" is not
+  certified". So the reachable deep-validation cell is PostgreSQL, already
+  proven by `TestStage4AdapterPostgresStableDeepValidationComposedRouteLiveTLS`;
+  every other engine runs `count_only`, which the per-engine stable-runner
+  sentinels already exercise live. A matrix of deep modes across engines would
+  be asserting a contract those engines are outside of. Note that
   live **failure** detection is now proven by
   `TestStage4ValidationDetectsTargetMismatchLive`, which was the sharper gap:
   every other live fixture asserted `Validated: true`, so nothing demonstrated
