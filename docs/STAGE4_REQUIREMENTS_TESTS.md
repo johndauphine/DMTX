@@ -185,14 +185,26 @@ Two things the live matrix surfaced that projection tests did not:
   contract-level message about unhandled drift. Worth improving; it is a
   reporting wart, not a correctness bug.
 
-The remaining matrix work is the other targets. The four obstacles below cost
+`TestStage4SchemaContractSQLiteTargetLive` covers the SQLite target and found a
+genuine engine difference: **`evolve` is not available there**. The run is
+refused as policy — "Stage 4 upsert schema action add_column for table
+network_items requires a composed target-catalog evolution executor seam" —
+before any target write. So the SQLite target supports refusal modes but cannot
+apply an evolution, which is a capability boundary rather than a defect, and it
+fails closed.
+
+The remaining matrix work is the MySQL-family and SQL Server targets. The
+obstacles below cost
 several drafts to find and are what the setup pattern in those fixtures solves —
 read them before extending it:
 
-- Do not use a SQLite target to prove a contract mode. Source drift is refused
-  by SQLite's own retained-shape preflight *before* the contract is consulted,
-  so the run fails for an unrelated reason and a naive test passes without
-  exercising the contract at all. Use a target that can accept the drift.
+- ~~Do not use a SQLite target to prove a contract mode.~~ **This was a
+  misdiagnosis, corrected 2026-07-31.** The retained-shape preflight only fired
+  because the draft had no *successful* baseline; with a correct baseline the
+  contract decides first, and `TestStage4SchemaContractSQLiteTargetLive` proves
+  `freeze` refuses on a SQLite target with the same contract-level message as on
+  PostgreSQL. The real SQLite-target limitation is different and narrower: see
+  the evolution-seam note below.
 - Source and target must be different databases. The same endpoint is refused
   outright, and separate schemas within one database still resolve to a single
   endpoint.

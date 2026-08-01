@@ -39,6 +39,22 @@ func TestStage4SchemaContractFreezeStopsLiveDrift(t *testing.T) {
 	runStage4SchemaContractLiveMode(t, config.SchemaContractFreeze, nil)
 }
 
+// TestStage4SchemaContractSQLiteTargetLive records how the same contract modes
+// behave when the target is SQLite rather than PostgreSQL. The engines differ
+// materially and the difference is worth pinning: SQLite validates the retained
+// table shape in its own preflight, which can refuse drift before the contract
+// is consulted at all.
+func TestStage4SchemaContractSQLiteTargetLive(t *testing.T) {
+	for name, mode := range map[string]config.SchemaContractMode{
+		"freeze": config.SchemaContractFreeze,
+		"evolve": config.SchemaContractEvolve,
+	} {
+		t.Run(name, func(t *testing.T) {
+			runStage4SchemaContractSQLiteTargetMode(t, mode)
+		})
+	}
+}
+
 // TestStage4SchemaContractModesLive extends the freeze proof across the modes
 // whose live behaviour differs. Each mode is given the identical real drift and
 // judged on what it must do with it, so a mode that silently behaved like
@@ -284,4 +300,118 @@ func runStage4SchemaContractLiveMode(
 		}
 	}
 	t.Logf("freeze refused live drift: %v", frozenErr)
+}
+
+func runStage4SchemaContractSQLiteTargetMode(
+	t *testing.T,
+	mode config.SchemaContractMode,
+) {
+	dsn := os.Getenv("DMTX_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("set DMTX_TEST_POSTGRES_DSN to run the SQLite-target contract sentinel")
+	}
+	parsed, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse DMTX_TEST_POSTGRES_DSN: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	setup, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open contract source: %v", err)
+	}
+	t.Cleanup(func() { _ = setup.Close() })
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	namespace := "dmtx_s4_sqlt_" + suffix
+	tableName := "network_items"
+	if _, err := setup.ExecContext(
+		ctx, "CREATE SCHEMA "+postgresIdentifier(namespace),
+	); err != nil {
+		t.Fatalf("create contract schema: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(), 20*time.Second)
+		defer cleanupCancel()
+		if _, err := setup.ExecContext(
+			cleanupCtx,
+			"DROP SCHEMA IF EXISTS "+postgresIdentifier(namespace)+" CASCADE",
+		); err != nil {
+			t.Errorf("drop contract schema: %v", err)
+		}
+	})
+	qualified := postgresQualified(namespace, tableName)
+	for _, statement := range []string{
+		`CREATE TABLE ` + qualified + ` (
+			id BIGINT NOT NULL,
+			payload BIGINT NOT NULL,
+			PRIMARY KEY (id)
+		)`,
+		`INSERT INTO ` + qualified + ` (id, payload) VALUES (1, 11), (2, 22)`,
+	} {
+		if _, err := setup.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("seed contract fixture: %v", err)
+		}
+	}
+
+	targetPath := filepath.Join(t.TempDir(), "target.db")
+	createStage4NetworkSQLiteTarget(t, ctx, targetPath, tableName)
+	backend := state.SQLiteStore{Path: filepath.Join(t.TempDir(), "state.db")}
+	runOnce := func(runID string, cfg config.Config) ([]string, error) {
+		initializeStage4LifecycleRun(
+			t, backend, runID, time.Now().Add(-time.Minute))
+		events := make([]string, 0)
+		_, err := PostgresToSQLiteWithObserver(ctx, cfg, stage4AdapterObserver{
+			recordingTableObserver: recordingTableObserver{events: &events},
+			run: Stage4RunContext{
+				RunID:          runID,
+				Backend:        backend,
+				SpoolDirectory: stage4LifecyclePrivateSpool(t, runID),
+			},
+		})
+		return events, err
+	}
+
+	baselineRun := "stage4-sqlt-baseline"
+	if _, err := runOnce(
+		baselineRun,
+		stage4NetworkLifecycleLiveConfig(
+			t, parsed, namespace, targetPath, tableName),
+	); err != nil {
+		t.Fatalf("establish SQLite-target baseline: %v", err)
+	}
+	completeStage4IncrementalTestRun(t, backend, baselineRun)
+
+	if _, err := setup.ExecContext(
+		ctx, "ALTER TABLE "+qualified+" ADD COLUMN note TEXT",
+	); err != nil {
+		t.Fatalf("drift contract source: %v", err)
+	}
+
+	drifted := stage4NetworkLifecycleLiveConfig(
+		t, parsed, namespace, targetPath, tableName)
+	drifted.Migration.SchemaContract = &config.SchemaContract{
+		Tables:   mode,
+		Columns:  mode,
+		DataType: mode,
+	}
+	events, driftErr := runOnce("stage4-sqlt-drift", drifted)
+
+	// Whatever layer decides, the invariant that matters is that an unhandled
+	// or refused drift never writes to the target.
+	if driftErr != nil {
+		for _, event := range events {
+			if strings.HasPrefix(event, "target_write") {
+				t.Fatalf(
+					"%s wrote to the SQLite target before failing: %v",
+					mode,
+					events,
+				)
+			}
+		}
+		t.Logf("SQLite target refused %s drift: %v", mode, driftErr)
+		return
+	}
+	t.Logf("SQLite target accepted %s drift", mode)
 }
