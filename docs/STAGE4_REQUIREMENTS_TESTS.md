@@ -469,7 +469,7 @@ it cannot implement safely until separately admitted.
 | Writer failure releases readers/memory/connections with no leaks. | **Covered base:** SQLite/resource tests. Missing `TestStage4NetworkWriterFailureReleasesAllResourcesLive`. |
 | PostgreSQL/SQL Server rollback; committed-prefix writer resumes after prefix. | **Partial:** writer unit tests and generic prefix tracker. Missing three fault-injected live fixtures from Section 8.4. |
 | MySQL row loss/conversion warning fails. | **Covered base/live:** Stage 3 MySQL/MariaDB bulk sentinels; retain in Stage 4 gate. |
-| Write-before-checkpoint replay neither duplicates nor overwrites. | **SQLite only.** Missing per-target insert-only replay live fixtures. |
+| Write-before-checkpoint replay neither duplicates nor overwrites. | **Live-proven for the SQLite and PostgreSQL targets**, verified 2026-07-31. `TestStage4PostgresTLSToSQLiteNetworkCrashResumeLive` injects a durable-acknowledgement failure mid-transfer, resumes, and compares the whole ordered row set with `reflect.DeepEqual` — which proves no duplicate rows *and* no overwritten values, not merely a matching count. It now runs on both state backends. `TestStage4PostgresTLSToSQLiteNetworkInteriorInsertReplayLive` covers the interior-insert case, and `TestStage4PostgresDeleteCompositionCrashResumeLiveTLS` covers a PostgreSQL target. **Genuinely remaining:** MySQL, MariaDB, and SQL Server targets. |
 | Concurrent wide tables remain within budget. | **SQLite only.** Missing `TestStage4NetworkWideTableJobsShareMemoryBudgetLive`. |
 
 ## Acceptance 21.6 — State, lease, and resume
@@ -641,7 +641,11 @@ Every certified-cell implementation needs its family. Missing, by name:
   row count, which is what "through the resumable range protocol" requires. A
   route that transferred correctly but left durable evidence unfinished would
   formerly have passed.
-- `TestStage4CertifiedRelationalUpsertReplayMatrixLive`
+- `TestStage4CertifiedRelationalUpsertReplayMatrixLive` — narrower than it
+  looks. SQLite and PostgreSQL targets are already live-proven (see Acceptance
+  21.5); what is missing is the MySQL-family and SQL Server targets. The
+  existing crash-resume fixture is the template: inject a durable-acknowledgement
+  failure, resume, and compare the entire ordered row set rather than a count.
 
 ### B. Validation (Section 12) — logic done, live matrix open
 
