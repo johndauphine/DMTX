@@ -16,7 +16,13 @@ requirements map remains [STAGE4_REQUIREMENTS_TESTS.md](STAGE4_REQUIREMENTS_TEST
 - Avoid review loops. Act only on findings that change correctness, safety, or
   conformance; otherwise record the result and continue.
 
-## Status: the paused work is complete and the armed gate is green
+## Status: Stage 4 is complete
+
+Updated 2026-08-01. All blocks A through G, including F2, are closed against
+named tests, and the armed gate passes on the current tree. The section below
+records how each paused item was resolved.
+
+## The paused work is complete and the armed gate is green
 
 Updated 2026-08-01 by Claude, resuming from the Codex pause. All four paused
 matrices now have real focused evidence, and the full armed gate passes.
@@ -105,19 +111,31 @@ side because the product behaviour was correct and deliberate in each case:
 In every case the fix was to the test. Changing the guard or the ordering rule
 to make them pass would have removed a real protection.
 
-## Remaining scope
+## Remaining scope: none for Stage 4
 
-Nothing from the paused list. Two items are explicitly **not** closed and were
-never in it:
+Both items previously listed here are resolved:
 
-- **Network-backed incremental hard-kill cells.** Item 3 of the original
-  verified-evidence list already noted this: the incremental route matrix does
-  not give each network-backed cell its own external hard-kill route. Do not
-  claim that broader matrix complete until it is added and run.
-- **Strict-opener route admission.** SQLite, MySQL, MariaDB, and SQL Server
-  strict consistency remain implemented behind a PostgreSQL-only gate. This is
-  a per-engine composed-route build, not a flag change; the correction section
-  in the previous handoff has the detail.
+- **Network-backed incremental hard-kill cells** — closed by
+  `TestStage4IncrementalNetworkProcessKillResumeLive`: PostgreSQL, MySQL, and
+  SQL Server sources on both durable state backends, each child killed by its
+  parent after a network range acknowledgement is durable, then resumed. A row
+  inserted after the fence and before the resume must not enter the window,
+  which is what proves the resumed run honours the durable fence rather than
+  recomputing one.
+- **Strict-opener route admission** — already delivered in the checkpoint. The
+  earlier correction section described the pre-checkpoint state; MySQL, MariaDB,
+  SQL Server, and SQLite strict paths are composed and are proven by the 14-cell
+  `TestStage4StrictProcessKillResumeMatrixLive` plus live concurrent-writer
+  isolation. Treat that correction as historical.
+
+`docs/STAGE4_REQUIREMENTS_TESTS.md` now marks A through G, including F2, closed,
+each against named tests.
+
+Two boundaries remain deliberate rather than open, and both are enforced by
+pre-mutation refusals with their own tests, so neither can widen by accident:
+cross-engine delete reconciliation stays refused, and `history_retention_days`
+has no Phase Four consumer because the stage boundary assigns retention to
+Stage 5.
 
 ## Local armed live gate
 

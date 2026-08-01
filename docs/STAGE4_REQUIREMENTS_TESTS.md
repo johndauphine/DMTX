@@ -185,7 +185,7 @@ live/process-kill composed matrix**.
 | Resume may suppress backup acknowledgement only with durable proof of the same unchanged run and owned target contents. | **Partial:** `TestStage4AdapterRebuildRejectsChangedRecoveryIdentityBeforeMutation`, `TestStage4AdapterRebuildRejectsIncompleteCheckpointPrefixWithWriteAuthority`, and the rerun/replay/publication recovery fixtures prove the runner classifier. | The application/preflight gate still needs `TestRebuildResumeSuppressesAcknowledgementOnlyWithOwnedRunEvidence` and `TestRebuildResumeRechecksAcknowledgementAfterConfigOrTargetChange` against real targets. |
 | Upsert requires target capability, complete source/target PKs, and existing tables unless contract evolution creates new ones. | **Covered; the "contract-authorized creation is absent" note is obsolete.** `TestPrepareStage4SchemaGateFirstUpsertEvolveAuthorizesExactCreates` proves an evolve contract authorizes exactly the intended creates, and `TestPrepareStage4SchemaGateFirstBaselineDoesNotImplicitlyAuthorizeCreates` proves a baseline does not, with `TestStage4TargetSchemaEvolutionProjectionAcceptsExplicitFirstRunCreates` on the projection side. Retained: `TestCapabilityValidationPrecedesAdapterConstruction`, `TestAdapterRunnerRejectsMissingPrimaryKeyBeforeTargetMutation`. | Live matrix. |
 | Upsert inserts new rows, updates changed non-key values, retains target-only rows, and preserves existing sequence/index/FK/check objects. | **Covered base:** `TestUpsertUpdatesSourceColumnsWithoutReplacingTargetRow`, `TestAdapterRunnerUpsertAllowsTargetOnlyRows`, and Stage 3 retained-object/native upsert tests. | S4.2/S4.5: `TestStage4UpsertRetainedObjectsSurviveCrashResumeLive`; delete reconciliation is the only allowed target-only removal. |
-| Upsert is idempotent under retry and complete-window replay. | **Covered at runner/native-writer level for admitted relational/SQLite targets:** `TestStage4AdapterRebuildReplaysIssuedRangeWithoutRedrop`, `TestPostgresStage4NetworkRebuildWriterSeparatesFreshAndReplay`, `TestSQLServerNativeWriterStage4RebuildSeparatesFreshAndReplay`, and the SQLite/MySQL writer suites separate fresh writes from issued replay. | The real composed process-kill/replay matrix remains open. |
+| Upsert is idempotent under retry and complete-window replay. | **Covered at runner/native-writer level for admitted relational/SQLite targets:** `TestStage4AdapterRebuildReplaysIssuedRangeWithoutRedrop`, `TestPostgresStage4NetworkRebuildWriterSeparatesFreshAndReplay`, `TestSQLServerNativeWriterStage4RebuildSeparatesFreshAndReplay`, and the SQLite/MySQL writer suites separate fresh writes from issued replay. | **Closed 2026-08-01**: the composed process-kill/replay matrix is `TestStage4UpsertProcessKillReplayLive`, 10 cells across the admitted upsert target families and both state backends. |
 
 ### 7.4 Schema drift and contract
 
@@ -347,7 +347,7 @@ read them before extending it:
 **Current status.** Date-based incremental upsert is admitted through the
 relational/SQLite capability matrix, with full mode still refused. The exact
 attempt key scope—not a later live whole-source query—governs final deep
-validation and resume. The armed cross-route/live matrix remains open.
+validation and resume. **Closed 2026-08-01** by `TestStage4IncrementalCertifiedRouteMatrixLiveTLS` and `TestStage4IncrementalNetworkProcessKillResumeLive`.
 
 ### 9.1 Date-based incremental upsert
 
@@ -604,7 +604,7 @@ must remain pre-mutation refusals.
 **Current status.** The contract/evolution and validation primitives are
 covered non-live, with representative PostgreSQL, MySQL, SQL Server, SQLite,
 and cross-driver TLS fixtures. See Sections 7.4 and 12 for capability limits;
-the armed all-pairs/type/object live matrix remains open.
+**closed 2026-08-01** by `TestStage4ValidationRouteMatrixLive` and `TestStage4SchemaContractTargetMatrixLive`.
 
 - Schema add/drop/evolution/freeze/report/discard behavior: **covered** by the
   25 fixtures in `schema_contract_test.go`.
@@ -680,7 +680,22 @@ paths. In particular, absent SQLite dry-run targets now fail structured
 preflight without artifacts, and the listed transfer settings are no longer
 inert.
 
-### A. Route matrices — the largest block
+### A. Route matrices — CLOSED 2026-08-01
+
+**Status.** Every named matrix below is now satisfied, several by tests that
+already existed under different names — the recurring hazard in this document.
+The mapping is: the incremental matrix is
+`TestStage4IncrementalCertifiedRouteMatrixLiveTLS` (canonical 4x4) plus
+`TestStage4IncrementalMariaDBFamilyAliasLiveTLS`; the delete matrix is
+`TestStage4CertifiedRelationalDeleteRouteMatrixLive` for admission and
+`TestStage4SameEngineDeleteProcessKillReplayLive` for the armed process-kill
+half; validation is `TestStage4ValidationRouteMatrixLive`; schema contract is
+`TestStage4SchemaContractTargetMatrixLive`. The per-route crash/resume matrix is
+covered by four armed kill matrices — rebuild, delete, upsert, and strict — each
+across both durable state backends, plus
+`TestStage4IncrementalNetworkProcessKillResumeLive` and
+`TestStage4IncrementalSQLiteProcessCrashResume` for incremental. The prose below
+records the assessment that led here and is kept for provenance.
 
 Every certified-cell implementation needs its family. Missing, by name:
 
@@ -726,7 +741,15 @@ Every certified-cell implementation needs its family. Missing, by name:
   SQLite targets, but each composed target needs the armed interruption/replay
   proof before its capability is treated as an exit-gate result.
 
-### B. Deep validation (Section 12) — IMPLEMENTED; MATRIX OPEN
+### B. Deep validation (Section 12) — CLOSED 2026-08-01
+
+**Status.** `TestStage4ValidationRouteMatrixLive` is the armed all-pairs
+matrix across PostgreSQL, SQL Server, MySQL, and SQLite, with typed integer
+keys, NULL text, binary bytes, and timestamps so canonical row representation is
+exercised rather than only SQL-shape helpers. Collation and timeout are covered
+by `TestStage4ValidationRouteMatrixRefusesUnprovenCrossEngineTextKeyBeforeMutation`
+and `TestStage4ValidationRouteMatrixTimeoutPolicyLiveTLS`, and the MariaDB
+flavor by `TestStage4ValidationMariaDBFlavorLive`. `full` remains refused.
 
 The relational/SQLite database probe and incremental evidence path implement
 count, NULL parity, and deterministic samples with typed canonical values and
@@ -735,7 +758,17 @@ armed all-pairs/type/collation/timeout and process-kill matrix, not an
 engine-family production refusal. See the representative real-driver probes in
 Section 12.
 
-### C. Strict consistency — IMPLEMENTED; MATRIX OPEN
+### C. Strict consistency — CLOSED 2026-08-01
+
+**Status.** Process-kill is `TestStage4StrictProcessKillResumeMatrixLive`, 14
+cells: PostgreSQL table/migration, SQL Server table/migration, MySQL table,
+MariaDB table, and SQLite table, each against YAML and SQLite state.
+Concurrent-writer isolation is proven live by mutation backends that write to
+the source during the epoch in `adapter_stage4_postgres_strict_live_test.go`,
+`strict_consistency_postgres_live_test.go`, and
+`strict_consistency_mysql_live_test.go`, with `TestSQLServerStrictTableLockLive`
+and `TestSQLServerMigrationSnapshotLiveTLS` for SQL Server. Unsupported scopes
+and ClickHouse remain pre-mutation refusals.
 
 Section 10's PostgreSQL and SQL Server table/migration paths plus MySQL/MariaDB
 and SQLite table paths are composed to admitted relational/SQLite targets.
@@ -743,7 +776,16 @@ Unsupported migration scopes, ClickHouse, and absent writer/validator cells
 remain pre-mutation refusals. The open work is armed concurrent-writer,
 process-kill, recovery, and target-matrix proof—not composition admission.
 
-### D. Schema-contract modes and evolution — IMPLEMENTED; MATRIX OPEN
+### D. Schema-contract modes and evolution — CLOSED 2026-08-01
+
+**Status.** `TestStage4SchemaContractTargetMatrixLive` covers all five target
+families with both a native exact-catalog and a composed-upsert half, proving
+create/add/relax/widen and target-only retention. Collision and foreign-key
+fail-closed behaviour is covered by
+`TestSQLiteTargetEvolutionCopySwapRejectsIncomingForeignKeysBeforeMutation`,
+`TestSQLiteTargetEvolutionCopySwapRejectsConcurrentTemporaryNameCollision`,
+`TestMySQLTargetEvolutionCreatePlannerRejectsAuthorityCollisions`, and
+`TestSQLServerSQLitePreflightRejectsObjectCollisionWithoutMutation`.
 
 PostgreSQL, MySQL/MariaDB, SQL Server, and SQLite target executors are
 capability-gated. SQLite now has the intentionally narrow safe copy/swap path,
@@ -751,7 +793,16 @@ including WAL/recovery authority; it is no longer a blanket `evolve` refusal.
 The remaining matrix is type/object/collision/FK/protocol behavior and real
 process-kill composition, not the absence of a SQLite executor.
 
-### E. Dry-run (Section 7.2) — IMPLEMENTED; ROUTE PROOF OPEN
+### E. Dry-run (Section 7.2) — CLOSED 2026-08-01
+
+**Status.** The armed live route proof is
+`TestStage4DryRunRouteMatrixLive` across PostgreSQL, MySQL, MariaDB, and SQL
+Server, asserting exact counts, live target preflight, and zero mutation read
+from the target's own contents rather than from the absence of an error.
+`TestStage4DryRunRefusesUncertifiedRouteBeforeReachingEndpointsLive` pins the
+configuration-only refusal, which arrives as a structured non-proceed with a nil
+error — a test asserting only on the error would pass against a dry run that
+admitted the route.
 
 Configuration rejection occurs before endpoint construction. Existing endpoints
 and state are inspected read-only; absent SQLite targets fail structured target
@@ -760,7 +811,7 @@ policy/action facts, and delete candidates are exact only when a read-only key
 scan proves them. The remaining work is protocol-capability and armed live
 route coverage; unprovable candidate impact stays explicitly unavailable.
 
-### F. Small named gaps
+### F. Small named gaps — CLOSED 2026-08-01
 
 - ~~`TestDeterministicTuningPreservesPinnedIntent`~~ — **closed 2026-07-31**
 - Dry-run candidate impact is implemented only with fully read-only key
@@ -797,17 +848,36 @@ Key evidence: `TestStage4CheckpointFrequencyProvenanceAndBound`,
 `TestStage4DeferredRuntimeTuningPersistsFencedSQLiteHistoryBeforePrepare`, and
 `TestAppendAttemptTerminalAuditWritesRedactedRuntimeTuningBeforeOutcome`.
 
-### G. The live gate
+### G. The live gate — CLOSED 2026-08-01
 
-Every live row above remains subject to the armed exit gate after the local
-follow-up. The full TLS matrix, application's aggregate publication path, race
-matrix, and route-specific crash/resume proofs must be rerun with
-`DMTX_STAGE4_LIVE_REQUIRED=1`; this workspace does not claim that live gate is
-closed.
+The armed exit gate was run on the current tree with all five TLS engines, both
+target databases, and the admin DSNs provisioned:
 
-Stage 4 cannot be declared complete while any of A through G, including F2, is
-open. Local
-`go test ./...` passing is necessary and nowhere near sufficient.
+```text
+DMTX_STAGE4_LIVE_REQUIRED=1 go test ./... -count=1          all packages ok
+DMTX_STAGE4_LIVE_REQUIRED=1 go test -race ./... -count=1    all packages ok
+go vet ./...                                                clean
+git diff --check                                            clean
+```
+
+`DMTX_STAGE4_LIVE_REQUIRED=1` is the part that matters. Without it a missing
+endpoint makes a live test skip and the suite still prints ok, which is how
+dozens of gaps stayed hidden earlier in this work.
+
+## Stage 4 status: complete
+
+All of A through G, including F2, are closed, each against named tests and the
+armed commands above. Local `go test ./...` passing remains necessary and
+nowhere near sufficient; the armed gate is the claim.
+
+One boundary is deliberate rather than closed: `history_retention_days` has no
+Phase Four consumer because the stage boundary assigns retention to Stage 5. It
+is recorded in F2 as a boundary, not as missing work.
+
+Two known non-goals are also recorded rather than hidden. Cross-engine delete
+reconciliation stays refused, and strict consistency remains admitted only to
+the engines listed in C. Both are enforced by pre-mutation refusals with their
+own tests, so neither can be widened by accident.
 
 ## Stage 5 and Stage 6 boundary
 
