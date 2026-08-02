@@ -407,8 +407,16 @@ func TestSQLServerToPostgresDatabaseValidationProbeLiveTLS(t *testing.T) {
 
 func TestSQLiteToMySQLDatabaseValidationProbeLiveTLS(t *testing.T) {
 	dsn, ca := os.Getenv("DMTX_TEST_MYSQL_TARGET_DSN"), os.Getenv("DMTX_TEST_MYSQL_CA")
-	if dsn == "" || ca == "" || os.Getenv("MYSQL_REQUIRED") == "" {
-		t.Skip("set MYSQL_REQUIRED, DMTX_TEST_MYSQL_TARGET_DSN, and DMTX_TEST_MYSQL_CA")
+	// Gate on the fixture variables only. Requiring an extra MYSQL_REQUIRED
+	// sentinel made this skip even in a fully provisioned armed run, because
+	// nothing in the documented environment sets it — so this probe had never
+	// executed. DMTX_STAGE4_LIVE_REQUIRED turns an absent fixture into a
+	// failure; a second opt-in defeats that.
+	if dsn == "" || ca == "" {
+		stage4RequireLiveFixture(
+			t,
+			"DMTX_TEST_MYSQL_TARGET_DSN and DMTX_TEST_MYSQL_CA",
+		)
 	}
 	registerMySQLCommonFixtureTLSNamed(t, ca, "dmtx_test")
 	parsed := parseMySQLNativeTargetDSNForTLS(t, "validation target", dsn, "dmtx_test")
@@ -459,9 +467,14 @@ func TestSQLiteToMySQLDatabaseValidationProbeLiveTLS(t *testing.T) {
 func TestMySQLToSQLServerDatabaseValidationProbeLiveTLS(t *testing.T) {
 	sourceDSN, sourceCA := os.Getenv("DMTX_TEST_MYSQL_DSN"), os.Getenv("DMTX_TEST_MYSQL_CA")
 	targetDSN, targetCA := os.Getenv("DMTX_TEST_MSSQL_TARGET_DSN"), os.Getenv("DMTX_TEST_MSSQL_CA")
-	if os.Getenv("MYSQL_REQUIRED") == "" || os.Getenv("MSSQL_REQUIRED") == "" ||
-		sourceDSN == "" || sourceCA == "" || targetDSN == "" || targetCA == "" {
-		t.Skip("set MYSQL_REQUIRED, MSSQL_REQUIRED, DMTX_TEST_MYSQL_DSN, DMTX_TEST_MYSQL_CA, DMTX_TEST_MSSQL_TARGET_DSN, and DMTX_TEST_MSSQL_CA")
+	// See the note on the SQLite-to-MySQL probe above: the extra per-engine
+	// sentinels are deliberately not consulted, because they made this probe
+	// skip in every armed run.
+	if sourceDSN == "" || sourceCA == "" || targetDSN == "" || targetCA == "" {
+		stage4RequireLiveFixture(
+			t,
+			"DMTX_TEST_MYSQL_DSN, DMTX_TEST_MYSQL_CA, DMTX_TEST_MSSQL_TARGET_DSN, and DMTX_TEST_MSSQL_CA",
+		)
 	}
 	registerMySQLCommonFixtureTLSNamed(t, sourceCA, "dmtx_test")
 	sourceConfig := parseMySQLNativeTargetDSNForTLS(t, "validation source", sourceDSN, "dmtx_test")
@@ -578,4 +591,16 @@ func TestMySQLToSQLServerDatabaseValidationProbeLiveTLS(t *testing.T) {
 	if err != nil || !report.Passed {
 		t.Fatalf("MySQL-to-SQL Server validation report=%#v err=%v", report, err)
 	}
+}
+
+// stage4RequireLiveFixture skips a live test when its fixture variables are
+// absent, but fails when the run is armed. An armed gate that still skips is
+// the failure this whole environment exists to prevent: the suite prints ok
+// while the cell never ran.
+func stage4RequireLiveFixture(t *testing.T, names string) {
+	t.Helper()
+	if os.Getenv("DMTX_STAGE4_LIVE_REQUIRED") == "1" {
+		t.Fatalf("armed live gate is missing fixture variables: %s", names)
+	}
+	t.Skip("set " + names + " to run this live validation probe")
 }

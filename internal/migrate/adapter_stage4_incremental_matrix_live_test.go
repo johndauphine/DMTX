@@ -998,6 +998,11 @@ func (fixture *stage4IncrementalLiveRouteFixture) runPostFenceWindow(
 	if mutationBackend.mutationErr != nil {
 		t.Fatalf("insert post-fence source row: %v", mutationBackend.mutationErr)
 	}
+	if !mutationBackend.mutated {
+		t.Fatal(
+			"post-fence source row was never written, so the exclusion assertions below prove nothing",
+		)
+	}
 	task := state.TaskKey{
 		Type:   stage4AdapterNetworkTaskType,
 		Schema: fixture.sourceTable.Schema,
@@ -1072,6 +1077,14 @@ type stage4IncrementalLivePostFenceMutationBackend struct {
 	once        sync.Once
 	mutate      func() error
 	mutationErr error
+	// mutated records that the post-fence write actually happened. Without it
+	// the matrix cannot distinguish "the post-fence row was correctly excluded"
+	// from "the post-fence row was never written", because both leave the
+	// target without row 3 and mutationErr nil. The mutation only runs when
+	// BeginIncrementalAttempt reports a newly created attempt, so a route change
+	// that stopped creating one would have turned every cell green while proving
+	// nothing.
+	mutated bool
 }
 
 func (backend *stage4IncrementalLivePostFenceMutationBackend) BeginIncrementalAttempt(
@@ -1083,6 +1096,7 @@ func (backend *stage4IncrementalLivePostFenceMutationBackend) BeginIncrementalAt
 	}
 	backend.once.Do(func() {
 		backend.mutationErr = backend.mutate()
+		backend.mutated = backend.mutationErr == nil
 	})
 	if backend.mutationErr != nil {
 		return state.IncrementalAttempt{}, false, backend.mutationErr
