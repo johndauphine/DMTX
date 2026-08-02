@@ -80,6 +80,7 @@ type EffectiveInt struct {
 // parsed migration intent and one memory snapshot.
 type EffectiveTransferPlan struct {
 	TargetMode          string
+	ConnectionLimit     EffectiveInt
 	DetectedMemoryLimit EffectiveBytes
 	MemoryBudget        EffectiveBytes
 	Workers             EffectiveInt
@@ -128,6 +129,10 @@ func ResolveEffectiveTransferPlan(ctx context.Context, migration Migration, opti
 	if targetMode != "drop_recreate" && targetMode != "upsert" {
 		return EffectiveTransferPlan{}, fmt.Errorf("resolve transfer resources: invalid target mode %q", targetMode)
 	}
+	connectionLimit, err := effectiveConnectionLimit(migration)
+	if err != nil {
+		return EffectiveTransferPlan{}, err
+	}
 
 	snapshot, err := probe.ProbeMemory(ctx)
 	if err != nil {
@@ -161,15 +166,43 @@ func ResolveEffectiveTransferPlan(ctx context.Context, migration Migration, opti
 	}
 	memorySlots := boundedMemorySlots(budget.Value)
 
-	workerCap := minInt(MaxTransferWorkers, memorySlots)
+	workerCap := minInt(
+		minInt(MaxTransferWorkers, memorySlots),
+		connectionLimit.Value,
+	)
 	workers := effectiveCount(options.RequestedWorkers, minInt(logicalCPUs, workerCap), workerCap)
 
-	readerCap := minInt(MaxTransferReaders, workers.Value)
-	readers := effectiveCount(options.RequestedReaders, minInt(logicalCPUs, readerCap), readerCap)
+	readerCap := minInt(
+		minInt(MaxTransferReaders, workers.Value),
+		connectionLimit.Value-1,
+	)
 
-	writerCap := minInt(MaxTransferWriters, workers.Value)
-	defaultWriters := maxInt(1, minInt((logicalCPUs+1)/2, writerCap))
+	writerCap := minInt(
+		minInt(MaxTransferWriters, workers.Value),
+		connectionLimit.Value-1,
+	)
+	defaultWriters := maxInt(
+		1,
+		minInt(
+			minInt((logicalCPUs+1)/2, writerCap),
+			connectionLimit.Value/2,
+		),
+	)
+	defaultReaders := minInt(
+		minInt(logicalCPUs, readerCap),
+		connectionLimit.Value-defaultWriters,
+	)
+	readers := effectiveCount(
+		options.RequestedReaders,
+		defaultReaders,
+		readerCap,
+	)
 	writers := effectiveCount(options.RequestedWriters, defaultWriters, writerCap)
+	readers, writers = clampCombinedConcurrency(
+		readers,
+		writers,
+		connectionLimit.Value,
+	)
 
 	queueCap := minInt(MaxTransferQueueDepth, memorySlots)
 	defaultQueue := minInt(queueCap, maxInt(1, readers.Value+writers.Value))
@@ -184,9 +217,17 @@ func ResolveEffectiveTransferPlan(ctx context.Context, migration Migration, opti
 		chunkCap = int(maxRowsByMemory)
 	}
 	chunkRows := effectiveCount(options.RequestedChunkRows, minInt(DefaultTransferChunkRows, chunkCap), chunkCap)
+	if workers.Value > connectionLimit.Value ||
+		readers.Value+writers.Value > connectionLimit.Value {
+		return EffectiveTransferPlan{}, fmt.Errorf(
+			"resolve transfer resources: effective concurrency exceeds connection limit %d",
+			connectionLimit.Value,
+		)
+	}
 
 	return EffectiveTransferPlan{
 		TargetMode:          targetMode,
+		ConnectionLimit:     connectionLimit,
 		DetectedMemoryLimit: detected,
 		MemoryBudget:        budget,
 		Workers:             workers,
@@ -197,23 +238,73 @@ func ResolveEffectiveTransferPlan(ctx context.Context, migration Migration, opti
 	}, nil
 }
 
+func effectiveConnectionLimit(migration Migration) (EffectiveInt, error) {
+	value := migration.ConnectionLimit
+	provenance := ProvenanceDerived
+	if migration.fieldWasSet("connection_limit") {
+		provenance = ProvenanceRequested
+	}
+	if value == 0 {
+		value = DefaultConnectionLimit
+	}
+	if value < 2 {
+		return EffectiveInt{}, fmt.Errorf(
+			"resolve transfer resources: connection limit must permit at least one reader and one writer",
+		)
+	}
+	return EffectiveInt{Value: value, Provenance: provenance}, nil
+}
+
+func clampCombinedConcurrency(
+	readers EffectiveInt,
+	writers EffectiveInt,
+	limit int,
+) (EffectiveInt, EffectiveInt) {
+	for readers.Value+writers.Value > limit {
+		readerPinned := readers.Provenance != ProvenanceDerived
+		writerPinned := writers.Provenance != ProvenanceDerived
+		switch {
+		case readerPinned && !writerPinned && writers.Value > 1:
+			writers.Value--
+			writers.Provenance = ProvenanceSafetyClamped
+		case writerPinned && !readerPinned && readers.Value > 1:
+			readers.Value--
+			readers.Provenance = ProvenanceSafetyClamped
+		case readers.Value >= writers.Value && readers.Value > 1:
+			readers.Value--
+			readers.Provenance = ProvenanceSafetyClamped
+		case writers.Value > 1:
+			writers.Value--
+			writers.Provenance = ProvenanceSafetyClamped
+		default:
+			return readers, writers
+		}
+	}
+	return readers, writers
+}
+
 func inheritMigrationTransferOptions(migration Migration, options TransferPlanOptions) TransferPlanOptions {
-	if options.UserMemoryCeilingBytes == 0 {
+	if options.UserMemoryCeilingBytes == 0 &&
+		migration.fieldWasSet("memory_ceiling_bytes") {
 		options.UserMemoryCeilingBytes = migration.MemoryCeilingBytes
 	}
-	if options.RequestedWorkers == 0 {
+	if options.RequestedWorkers == 0 && migration.fieldWasSet("workers") {
 		options.RequestedWorkers = migration.Workers
 	}
-	if options.RequestedReaders == 0 {
+	if options.RequestedReaders == 0 &&
+		migration.fieldWasSet("reader_parallelism") {
 		options.RequestedReaders = migration.ReaderParallelism
 	}
-	if options.RequestedWriters == 0 {
+	if options.RequestedWriters == 0 &&
+		migration.fieldWasSet("writer_parallelism") {
 		options.RequestedWriters = migration.WriterParallelism
 	}
-	if options.RequestedQueueDepth == 0 {
+	if options.RequestedQueueDepth == 0 &&
+		migration.fieldWasSet("read_ahead") {
 		options.RequestedQueueDepth = migration.ReadAhead
 	}
-	if options.RequestedChunkRows == 0 {
+	if options.RequestedChunkRows == 0 &&
+		migration.fieldWasSet("chunk_size") {
 		options.RequestedChunkRows = migration.ChunkSize
 	}
 	return options

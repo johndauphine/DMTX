@@ -8,7 +8,21 @@ import (
 )
 
 func (store SQLiteStore) UpdateRecoverableOutcome(runID string, outcome Outcome, reason string, endedAt time.Time) error {
-	if err := validateRecoverableOutcome(runID, outcome, reason, endedAt); err != nil {
+	return store.updateTerminalAttemptOutcome(runID, outcome, true, reason, endedAt)
+}
+
+func (store SQLiteStore) UpdateNonResumableOutcome(runID string, outcome Outcome, reason string, endedAt time.Time) error {
+	return store.updateTerminalAttemptOutcome(runID, outcome, false, reason, endedAt)
+}
+
+func (store SQLiteStore) updateTerminalAttemptOutcome(
+	runID string,
+	outcome Outcome,
+	shouldResume bool,
+	reason string,
+	endedAt time.Time,
+) error {
+	if err := validateTerminalAttemptOutcome(runID, outcome, reason, endedAt); err != nil {
 		return err
 	}
 	database, err := store.Open()
@@ -22,18 +36,36 @@ func (store SQLiteStore) UpdateRecoverableOutcome(runID string, outcome Outcome,
 	}
 	defer transaction.Rollback()
 
-	var source, target string
+	var run Run
 	var startedAt time.Time
 	var latest Outcome
 	var resumable bool
 	err = transaction.QueryRow(`
-		SELECT source, target, started_at, outcome, resumable
+		SELECT source, target, source_engine, source_identity, target_identity,
+		       lease_target, lease_owner_token, lease_generation,
+		       started_at, outcome, resumable
 		FROM runs WHERE id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1
-	`, runID).Scan(&source, &target, &startedAt, &latest, &resumable)
+	`, runID).Scan(
+		&run.Source,
+		&run.Target,
+		&run.SourceEngine,
+		&run.SourceIdentity,
+		&run.TargetIdentity,
+		&run.LeaseTarget,
+		&run.LeaseOwnerToken,
+		&run.LeaseGeneration,
+		&startedAt,
+		&latest,
+		&resumable,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("update recoverable run state: unknown run %q", runID)
 	}
 	if err != nil {
+		return fmt.Errorf("read run for recoverable state: %w", err)
+	}
+	run.ID = runID
+	if err := validateRunRecord(run); err != nil {
 		return fmt.Errorf("read run for recoverable state: %w", err)
 	}
 	if err := ensureResumableTransition(Run{
@@ -49,9 +81,15 @@ func (store SQLiteStore) UpdateRecoverableOutcome(runID string, outcome Outcome,
 		return fmt.Errorf("replace recoverable run state: %w", err)
 	}
 	if _, err := transaction.Exec(`
-		INSERT INTO runs (id, source, target, outcome, resumable, reason, started_at, ended_at)
-		VALUES (?, ?, ?, ?, 1, ?, ?, ?)
-	`, runID, source, target, outcome, reason, startedAt.UTC(), endedAt.UTC()); err != nil {
+		INSERT INTO runs (
+			id, source, target, source_engine, source_identity, target_identity,
+			lease_target, lease_owner_token, lease_generation,
+			outcome, resumable, reason, started_at, ended_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, runID, run.Source, run.Target, run.SourceEngine, run.SourceIdentity, run.TargetIdentity,
+		run.LeaseTarget, run.LeaseOwnerToken, run.LeaseGeneration,
+		outcome, shouldResume, reason, startedAt.UTC(), endedAt.UTC()); err != nil {
 		return fmt.Errorf("record recoverable run state: %w", err)
 	}
 	if err := transaction.Commit(); err != nil {

@@ -49,6 +49,11 @@ func projectMySQLTableForPostgres(
 	}
 
 	projected := sourceTable
+	// MySQL collation is source-only admission evidence. PostgreSQL has no
+	// catalog representation for it, so it must not become part of the
+	// projected target authority after the certified binary-collation check
+	// above succeeds.
+	projected.MySQLCollation = ""
 	projected.Columns = append([]schema.Column(nil), sourceTable.Columns...)
 	projected.Indexes = clonePostgresProjectionIndexes(sourceTable.Indexes)
 	projected.ForeignKeys = clonePostgresProjectionForeignKeys(
@@ -217,7 +222,7 @@ func projectMySQLColumnForPostgres(
 			arguments[0] > 255 {
 			return modifierError()
 		}
-		return "text", &schema.DeclaredType{
+		return "varchar", &schema.DeclaredType{
 			Base:      "varchar",
 			Arguments: append([]int(nil), arguments...),
 		}, "", nil
@@ -234,7 +239,7 @@ func projectMySQLColumnForPostgres(
 			arguments[0] > 65_535 {
 			return modifierError()
 		}
-		return "text", &schema.DeclaredType{
+		return "varchar", &schema.DeclaredType{
 			Base:      "varchar",
 			Arguments: append([]int(nil), arguments...),
 		}, "", nil

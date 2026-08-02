@@ -17,6 +17,15 @@ import (
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
+// MySQLCatalogQueryer is the read-only catalog surface used by version-pinned
+// MySQL-family discovery. Both *sql.DB and *sql.Tx implement it, which lets a
+// target replay fence re-run the exact source-discovery contract while its
+// metadata lock is held.
+type MySQLCatalogQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 // MySQLDSN builds a TLS-required MySQL connection string without logging or
 // resolving password templates.
 func MySQLDSN(endpoint config.Endpoint) (string, error) {
@@ -288,11 +297,40 @@ func InspectMySQLTable(ctx context.Context, database *sql.DB, namespace, name st
 	if err != nil {
 		return schema.Table{}, err
 	}
+	return InspectMySQLTableForFlavor(
+		ctx,
+		database,
+		flavor,
+		namespace,
+		name,
+	)
+}
+
+// InspectMySQLTableForFlavor runs the complete version-pinned discovery
+// contract through a caller-supplied catalog queryer. The explicit flavor is
+// required so callers cannot accidentally dispatch from a configuration
+// alias; each flavor implementation still revalidates its server/session
+// contract before inspecting table, column, index, CHECK, and foreign-key
+// metadata.
+func InspectMySQLTableForFlavor(
+	ctx context.Context,
+	queryer MySQLCatalogQueryer,
+	flavor MySQLServerFlavor,
+	namespace string,
+	name string,
+) (schema.Table, error) {
+	if queryer == nil {
+		return schema.Table{}, fmt.Errorf(
+			"inspect MySQL table %s.%s: catalog queryer is required",
+			namespace,
+			name,
+		)
+	}
 	switch flavor {
 	case mysqlServerFlavorOracle80:
-		return inspectMySQL80Table(ctx, database, namespace, name)
+		return inspectMySQL80Table(ctx, queryer, namespace, name)
 	case mysqlServerFlavorMariaDB1011:
-		return inspectMariaDB1011Table(ctx, database, namespace, name)
+		return inspectMariaDB1011Table(ctx, queryer, namespace, name)
 	default:
 		return schema.Table{}, fmt.Errorf(
 			"inspect MySQL table %s.%s: unsupported server flavor",

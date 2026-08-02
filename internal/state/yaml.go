@@ -12,7 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const yamlStateVersion = 2
+const yamlStateVersion = 5
 
 var (
 	yamlStateBeforeReplace = func(string, string) error { return nil }
@@ -29,18 +29,42 @@ type YAMLStore struct {
 }
 
 type yamlStateDocument struct {
-	Version                   int               `yaml:"version"`
-	Runs                      []Run             `yaml:"runs,omitempty"`
-	Tasks                     []Task            `yaml:"tasks,omitempty"`
-	ConfigHashes              map[string]string `yaml:"config_hashes,omitempty"`
-	ResumeCompatibilityHashes map[string]string `yaml:"resume_compatibility_hashes,omitempty"`
-	WorkTasks                 []WorkTask        `yaml:"work_tasks,omitempty"`
-	WorkRanges                []RangeState      `yaml:"work_ranges,omitempty"`
+	Version                       int                                   `yaml:"version"`
+	Runs                          []Run                                 `yaml:"runs,omitempty"`
+	Tasks                         []Task                                `yaml:"tasks,omitempty"`
+	ConfigHashes                  map[string]string                     `yaml:"config_hashes,omitempty"`
+	ResumeCompatibilityHashes     map[string]string                     `yaml:"resume_compatibility_hashes,omitempty"`
+	WorkTasks                     []WorkTask                            `yaml:"work_tasks,omitempty"`
+	WorkRanges                    []RangeState                          `yaml:"work_ranges,omitempty"`
+	SchemaSnapshots               []SchemaSnapshot                      `yaml:"schema_snapshots,omitempty"`
+	Stage4TableInventories        []Stage4TableInventoryReceipt         `yaml:"stage4_table_inventories,omitempty"`
+	Stage4TableCompletions        []Stage4TableCompletionReceipt        `yaml:"stage4_table_completions,omitempty"`
+	Stage4RebuildFinalizations    []Stage4RebuildFinalizationReceipt    `yaml:"stage4_rebuild_finalizations,omitempty"`
+	Stage4RebuildReadiness        []Stage4RebuildReadyReceipt           `yaml:"stage4_rebuild_readiness,omitempty"`
+	Stage4DeleteJournalReadiness  []Stage4DeleteJournalReadinessReceipt `yaml:"stage4_delete_journal_readiness,omitempty"`
+	IncrementalAttempts           []IncrementalAttempt                  `yaml:"incremental_attempts,omitempty"`
+	DeleteReconciliations         []DeleteReconciliation                `yaml:"delete_reconciliations,omitempty"`
+	StrictMigrationSnapshots      []StrictMigrationSnapshot             `yaml:"strict_migration_snapshots,omitempty"`
+	StrictMigrationCleanupIntents []StrictMigrationCleanupIntent        `yaml:"strict_migration_cleanup_intents,omitempty"`
+	StrictSnapshotEvidence        []StrictSnapshotEvidence              `yaml:"strict_snapshot_evidence,omitempty"`
 }
 
 // Append records a state transition for a migration run.
 func (store YAMLStore) Append(run Run) error {
+	if err := validateRunRecord(run); err != nil {
+		return err
+	}
 	return store.update(func(document *yamlStateDocument) error {
+		for _, existing := range document.Runs {
+			if existing.ID != run.ID {
+				continue
+			}
+			var err error
+			run, err = inheritRunWorkloadIdentity(existing, run)
+			if err != nil {
+				return err
+			}
+		}
 		for _, existing := range document.Runs {
 			if existing.ID == run.ID && existing.Outcome == run.Outcome {
 				return fmt.Errorf("record run state: duplicate run outcome %q/%q", run.ID, run.Outcome)
@@ -274,8 +298,13 @@ func (store YAMLStore) loadUnlocked() (yamlStateDocument, error) {
 	if document.Version < 0 || document.Version > yamlStateVersion {
 		return yamlStateDocument{}, fmt.Errorf("decode YAML state: unsupported version %d", document.Version)
 	}
-	// Versions zero and one are the completed Stage 1 layout. Its fields are
-	// retained verbatim; Stage 2 work topology is added on the next mutation.
+	for _, run := range document.Runs {
+		if err := validateRunRecord(run); err != nil {
+			return yamlStateDocument{}, fmt.Errorf("decode YAML state: %w", err)
+		}
+	}
+	// Older layouts are retained verbatim. Stage 2 work topology and Stage 4
+	// restartability evidence are added on the next mutation.
 	document.Version = yamlStateVersion
 	return document, nil
 }

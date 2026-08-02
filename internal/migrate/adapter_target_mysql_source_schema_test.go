@@ -140,6 +140,27 @@ func TestProjectPostgresTableForMySQLPreservesCommonShape(t *testing.T) {
 		!strings.Contains(got.Checks[1].Expression.CanonicalSQL(), "IN") {
 		t.Fatalf("projected checks = %#v", got.Checks)
 	}
+	renderedCheck, err := schema.RenderPortableCheckForMySQL(
+		check,
+		got.Columns,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedCheck, err := schema.ParseMySQLCatalogCheck(
+		renderedCheck,
+		got.Columns,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Checks[0].Expression, expectedCheck) {
+		t.Fatalf(
+			"projected MySQL check = %q, want catalog canonical %q",
+			got.Checks[0].Expression.CanonicalSQL(),
+			expectedCheck.CanonicalSQL(),
+		)
+	}
 }
 
 func TestProjectPostgresTableForMySQLNormalizesForeignKeyMatch(t *testing.T) {
@@ -169,6 +190,86 @@ func TestProjectPostgresTableForMySQLNormalizesForeignKeyMatch(t *testing.T) {
 	}
 	if got.ForeignKeys[0].Match != "NONE" {
 		t.Fatalf("foreign-key match = %q", got.ForeignKeys[0].Match)
+	}
+}
+
+func TestProjectMySQLTargetTableCanonicalizesPortableChecksForCatalogRecovery(
+	t *testing.T,
+) {
+	portable, err := schema.ParseSQLiteCheckExpression(`code <> ''`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := schema.Table{
+		Schema:         "app",
+		Name:           "items",
+		MySQLCollation: "utf8mb4_0900_bin",
+		Columns: []schema.Column{
+			{
+				Name:               "id",
+				Type:               "bigint",
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 1,
+				DeclaredType:       &schema.DeclaredType{Base: "bigint"},
+			},
+			{
+				Name:         "code",
+				Type:         "varchar",
+				Nullable:     true,
+				DeclaredType: &schema.DeclaredType{Base: "varchar", Arguments: []int{16}},
+			},
+		},
+		Checks: []schema.CheckConstraint{{
+			Name: "items_code_check", Expression: portable,
+		}},
+	}
+	projected, err := projectMySQLTargetTable(
+		"mysql",
+		source,
+		engine.MySQLServerFlavorOracle80,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := schema.RenderPortableCheckForMySQL(
+		portable,
+		projected.Columns,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := schema.ParseMySQLCatalogCheck(rendered, projected.Columns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projected.Checks) != 1 ||
+		!reflect.DeepEqual(projected.Checks[0].Expression, want) {
+		t.Fatalf(
+			"projected check = %#v, want exact MySQL catalog AST %#v",
+			projected.Checks,
+			want,
+		)
+	}
+	first := projected.Checks[0].Expression
+	if err := canonicalizeMySQLTargetChecks(&projected); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(projected.Checks[0].Expression, first) {
+		t.Fatalf(
+			"first repeated MySQL check canonicalization changed the AST: before=%#v after=%#v",
+			first,
+			projected.Checks[0].Expression,
+		)
+	}
+	if err := canonicalizeMySQLTargetChecks(&projected); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(projected.Checks[0].Expression, first) {
+		t.Fatalf(
+			"second repeated MySQL check canonicalization changed the AST: before=%#v after=%#v",
+			first,
+			projected.Checks[0].Expression,
+		)
 	}
 }
 
@@ -818,6 +919,78 @@ func TestProjectMySQLTargetTableClonesSourceMetadata(t *testing.T) {
 		source.Indexes[0].Columns[0].Name != "id" ||
 		*source.Identity.Frontier != 9 {
 		t.Fatalf("projection mutated source metadata: %#v", source)
+	}
+}
+
+func TestProjectMySQLTargetTablePreservesOracleSpatialMetadata(
+	t *testing.T,
+) {
+	srid := uint32(4326)
+	source := schema.Table{
+		Schema:         "source",
+		Name:           "places",
+		MySQLCollation: "utf8mb4_0900_bin",
+		Columns: []schema.Column{
+			{
+				Name:               "id",
+				Type:               "bigint",
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 1,
+				DeclaredType:       &schema.DeclaredType{Base: "bigint"},
+			},
+			{
+				Name: "position",
+				Type: "point",
+				DeclaredType: &schema.DeclaredType{
+					Base: "point",
+					Spatial: &schema.SpatialTypeMetadata{
+						Subtype: schema.SpatialSubtypePoint,
+						SRID:    &srid,
+					},
+				},
+			},
+		},
+	}
+	projected, err := projectMySQLTargetTable(
+		"mysql",
+		source,
+		engine.MySQLServerFlavorOracle80,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spatial := projected.Columns[1].DeclaredType.Spatial
+	if spatial == nil ||
+		spatial.Subtype != schema.SpatialSubtypePoint ||
+		spatial.SRID == nil ||
+		*spatial.SRID != 4326 {
+		t.Fatalf("projected spatial metadata = %#v", spatial)
+	}
+	*spatial.SRID = 0
+	if source.Columns[1].DeclaredType.Spatial.SRID == nil ||
+		*source.Columns[1].DeclaredType.Spatial.SRID != 4326 {
+		t.Fatal("MySQL spatial projection aliases source SRID metadata")
+	}
+
+	if _, err := projectMySQLTargetTable(
+		"mysql",
+		source,
+		engine.MySQLServerFlavorMariaDB1011,
+	); err == nil {
+		t.Fatal("MariaDB target accepted Oracle MySQL spatial metadata")
+	}
+
+	indexed := source
+	indexed.Indexes = []schema.Index{{
+		Name:    "places_position_idx",
+		Columns: []schema.IndexColumn{{Name: "position"}},
+	}}
+	if _, err := projectMySQLTargetTable(
+		"mysql",
+		indexed,
+		engine.MySQLServerFlavorOracle80,
+	); err == nil {
+		t.Fatal("unmodeled MySQL spatial index was accepted")
 	}
 }
 

@@ -30,6 +30,17 @@ func TestParseAcceptsExplicitZeroRetriesAndCheckpointFrequency(t *testing.T) {
 	if got.Migration.MaxRetries != 0 || got.Migration.CheckpointFrequency != 0 {
 		t.Fatalf("explicit zero settings were defaulted: %#v", got.Migration)
 	}
+	for _, field := range []string{"max_retries", "checkpoint_frequency"} {
+		provenance, found := got.Migration.SettingProvenance(field)
+		if !found || provenance != ProvenanceRequested {
+			t.Fatalf(
+				"%s provenance = %q, found=%t; want requested",
+				field,
+				provenance,
+				found,
+			)
+		}
+	}
 }
 
 func TestParseRejectsUnsafeTransferSettings(t *testing.T) {

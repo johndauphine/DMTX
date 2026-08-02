@@ -39,6 +39,13 @@ func projectMySQLTargetTable(
 	if err != nil {
 		return schema.Table{}, err
 	}
+	if err := validateMySQLSpatialTargetProjection(
+		sourceEngine,
+		target,
+		targetFlavor,
+	); err != nil {
+		return schema.Table{}, err
+	}
 	if err := normalizeMySQLTargetCollation(
 		sourceEngine,
 		&target,
@@ -46,7 +53,142 @@ func projectMySQLTargetTable(
 	); err != nil {
 		return schema.Table{}, err
 	}
+	normalizeMySQLTargetDeclaredTypeArguments(&target)
+	if err := canonicalizeMySQLTargetChecks(&target); err != nil {
+		return schema.Table{}, err
+	}
 	return target, nil
+}
+
+// normalizeMySQLTargetDeclaredTypeArguments removes a serialization-only
+// distinction from a target-ready projection. Schema snapshots deliberately
+// canonicalize an absent argument list as an empty JSON array, while native
+// MySQL discovery returns nil for a declaration with no type modifiers. Both
+// mean the same catalog declaration (for example BIGINT), so retaining the
+// slice representation would make a schema evolution DDL it just applied fail
+// the retained-table recheck.
+func normalizeMySQLTargetDeclaredTypeArguments(table *schema.Table) {
+	if table == nil {
+		return
+	}
+	for index := range table.Columns {
+		declared := table.Columns[index].DeclaredType
+		if declared != nil && len(declared.Arguments) == 0 {
+			declared.Arguments = nil
+		}
+	}
+}
+
+// canonicalizeMySQLTargetChecks freezes a CHECK in the same portable AST form
+// returned by the exact MySQL/MariaDB catalog reader after DMTX renders and
+// installs it. Without this conversion, a syntactically equivalent source
+// expression such as `code <> ”` can differ from the catalog's quoted
+// identifier form and make a post-DDL recovery prefix appear mixed.
+func canonicalizeMySQLTargetChecks(table *schema.Table) error {
+	if table == nil {
+		return fmt.Errorf("MySQL target CHECK canonicalization table is nil")
+	}
+	for index := range table.Checks {
+		rendered, err := schema.RenderPortableCheckForMySQL(
+			table.Checks[index].Expression,
+			table.Columns,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"canonicalize MySQL target CHECK %s.%s: %w",
+				table.Name,
+				table.Checks[index].Name,
+				err,
+			)
+		}
+		expression, err := schema.ParseMySQLCatalogCheck(rendered, table.Columns)
+		if err != nil {
+			return fmt.Errorf(
+				"parse planned MySQL target CHECK %s.%s: %w",
+				table.Name,
+				table.Checks[index].Name,
+				err,
+			)
+		}
+		table.Checks[index].Expression = expression
+	}
+	return nil
+}
+
+func validateMySQLSpatialTargetProjection(
+	sourceEngine string,
+	table schema.Table,
+	targetFlavor engine.MySQLServerFlavor,
+) error {
+	spatialColumns := make(map[string]struct{})
+	for _, column := range table.Columns {
+		if column.DeclaredType == nil ||
+			column.DeclaredType.Spatial == nil {
+			continue
+		}
+		if sourceEngine != "mysql" ||
+			targetFlavor != engine.MySQLServerFlavorOracle80 {
+			return mysqlProjectionPolicy(
+				"map spatial metadata to MySQL-family target",
+				table.Name+"."+column.Name,
+			)
+		}
+		if err := schema.ValidateDeclaredType(
+			*column.DeclaredType,
+		); err != nil {
+			return mysqlProjectionPolicy(
+				"map MySQL spatial metadata",
+				table.Name+"."+column.Name,
+			)
+		}
+		subtype := string(column.DeclaredType.Spatial.Subtype)
+		if column.Type != subtype ||
+			column.DeclaredType.Base != mySQLSpatialCatalogBase(
+				column.DeclaredType.Spatial.Subtype,
+			) ||
+			column.Default != nil ||
+			column.PrimaryKey ||
+			column.PrimaryKeyPosition != 0 {
+			return mysqlProjectionPolicy(
+				"map MySQL spatial column",
+				table.Name+"."+column.Name,
+			)
+		}
+		spatialColumns[column.Name] = struct{}{}
+	}
+	if len(spatialColumns) == 0 {
+		return nil
+	}
+	for _, index := range table.Indexes {
+		for _, column := range index.Columns {
+			if _, spatial := spatialColumns[column.Name]; spatial {
+				return mysqlProjectionPolicy(
+					"map MySQL spatial index",
+					table.Name+"."+index.Name+"."+column.Name,
+				)
+			}
+		}
+	}
+	for _, foreignKey := range table.ForeignKeys {
+		for _, column := range foreignKey.Columns {
+			if _, spatial := spatialColumns[column]; spatial {
+				return mysqlProjectionPolicy(
+					"map MySQL spatial foreign key",
+					table.Name+"."+foreignKey.Name+"."+column,
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func mySQLSpatialCatalogBase(
+	subtype schema.SpatialSubtype,
+) string {
+	if subtype == schema.SpatialSubtypeGeometryCollection {
+		return "geomcollection"
+	}
+	return string(subtype)
 }
 
 func normalizeMySQLTargetCollation(
@@ -99,6 +241,30 @@ func cloneMySQLTargetTable(source schema.Table) schema.Table {
 				[]int(nil),
 				source.Columns[index].DeclaredType.Arguments...,
 			)
+			if source.Columns[index].DeclaredType.Spatial != nil {
+				spatial := *source.Columns[index].DeclaredType.Spatial
+				if spatial.SRID != nil {
+					srid := *spatial.SRID
+					spatial.SRID = &srid
+				}
+				declaration.Spatial = &spatial
+			}
+			if source.Columns[index].DeclaredType.MySQL != nil {
+				mysql := *source.Columns[index].DeclaredType.MySQL
+				mysql.EnumMembers = append(
+					[]string(nil),
+					mysql.EnumMembers...,
+				)
+				mysql.SetMembers = append(
+					[]string(nil),
+					mysql.SetMembers...,
+				)
+				if mysql.BitWidth != nil {
+					width := *mysql.BitWidth
+					mysql.BitWidth = &width
+				}
+				declaration.MySQL = &mysql
+			}
 			cloned.Columns[index].DeclaredType = &declaration
 		}
 		cloned.Columns[index].Default = cloneSchemaExpression(

@@ -17,6 +17,32 @@ type SQLiteStore struct {
 	Path string
 }
 
+type sqliteRowsResult interface {
+	Err() error
+	Close() error
+}
+
+func finishSQLiteRows(
+	rows sqliteRowsResult,
+	iterationAction string,
+	closeAction string,
+) error {
+	if err := rows.Err(); err != nil {
+		iterationErr := fmt.Errorf("%s: %w", iterationAction, err)
+		if closeErr := rows.Close(); closeErr != nil {
+			return errors.Join(
+				iterationErr,
+				fmt.Errorf("%s: %w", closeAction, closeErr),
+			)
+		}
+		return iterationErr
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("%s: %w", closeAction, err)
+	}
+	return nil
+}
+
 // Task is a durable table-level migration checkpoint.
 type Task struct {
 	RunID              string    `json:"run_id"`
@@ -73,16 +99,56 @@ func (store SQLiteStore) AdvanceRowNumberTask(runID, table string, rowsDone int,
 
 // Append records a state transition for a migration run.
 func (store SQLiteStore) Append(run Run) error {
+	if err := validateRunRecord(run); err != nil {
+		return err
+	}
 	database, err := store.Open()
 	if err != nil {
 		return err
 	}
 	defer database.Close()
+	existingRows, err := database.Query(`
+		SELECT id, source, target, source_engine, source_identity, target_identity,
+		       lease_target, lease_owner_token, lease_generation,
+		       outcome, resumable, reason, started_at, ended_at
+		FROM runs WHERE id = ? ORDER BY started_at, rowid
+	`, run.ID)
+	if err != nil {
+		return fmt.Errorf("read run workload identity: %w", err)
+	}
+	for existingRows.Next() {
+		existing, err := scanRun(existingRows)
+		if err != nil {
+			existingRows.Close()
+			return fmt.Errorf("decode run workload identity: %w", err)
+		}
+		run, err = inheritRunWorkloadIdentity(existing, run)
+		if err != nil {
+			existingRows.Close()
+			return err
+		}
+	}
+	if err := finishSQLiteRows(
+		existingRows,
+		"iterate run workload identity",
+		"close run workload identity query",
+	); err != nil {
+		return err
+	}
+	if err := validateRunRecord(run); err != nil {
+		return err
+	}
 
 	_, err = database.Exec(`
-		INSERT INTO runs (id, source, target, outcome, resumable, reason, started_at, ended_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, run.ID, run.Source, run.Target, run.Outcome, run.Resumable, run.Reason, run.StartedAt.UTC(), nullableTime(run.EndedAt))
+		INSERT INTO runs (
+			id, source, target, source_engine, source_identity, target_identity,
+			lease_target, lease_owner_token, lease_generation,
+			outcome, resumable, reason, started_at, ended_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, run.ID, run.Source, run.Target, run.SourceEngine, run.SourceIdentity, run.TargetIdentity,
+		run.LeaseTarget, run.LeaseOwnerToken, run.LeaseGeneration,
+		run.Outcome, run.Resumable, run.Reason, run.StartedAt.UTC(), nullableTime(run.EndedAt))
 	if err != nil {
 		return fmt.Errorf("record run state: %w", err)
 	}
@@ -185,7 +251,12 @@ func (store SQLiteStore) Latest() (Run, bool, error) {
 		return Run{}, false, err
 	}
 	defer database.Close()
-	row := database.QueryRow(`SELECT id, source, target, outcome, resumable, reason, started_at, ended_at FROM runs ORDER BY started_at DESC, rowid DESC LIMIT 1`)
+	row := database.QueryRow(`
+		SELECT id, source, target, source_engine, source_identity, target_identity,
+		       lease_target, lease_owner_token, lease_generation,
+		       outcome, resumable, reason, started_at, ended_at
+		FROM runs ORDER BY started_at DESC, rowid DESC LIMIT 1
+	`)
 	run, err := scanRun(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Run{}, false, nil
@@ -203,7 +274,12 @@ func (store SQLiteStore) List() ([]Run, error) {
 		return nil, err
 	}
 	defer database.Close()
-	rows, err := database.Query(`SELECT id, source, target, outcome, resumable, reason, started_at, ended_at FROM runs ORDER BY started_at, rowid`)
+	rows, err := database.Query(`
+		SELECT id, source, target, source_engine, source_identity, target_identity,
+		       lease_target, lease_owner_token, lease_generation,
+		       outcome, resumable, reason, started_at, ended_at
+		FROM runs ORDER BY started_at, rowid
+	`)
 	if err != nil {
 		return nil, fmt.Errorf("list run state: %w", err)
 	}
@@ -247,6 +323,10 @@ func (store SQLiteStore) Open() (*sql.DB, error) {
 	if _, err := database.Exec(`
 		CREATE TABLE IF NOT EXISTS runs (
 			id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, outcome TEXT NOT NULL,
+			source_engine TEXT NOT NULL DEFAULT '',
+			source_identity TEXT NOT NULL DEFAULT '', target_identity TEXT NOT NULL DEFAULT '',
+			lease_target TEXT NOT NULL DEFAULT '', lease_owner_token TEXT NOT NULL DEFAULT '',
+			lease_generation INTEGER NOT NULL DEFAULT 0,
 			resumable INTEGER NOT NULL, reason TEXT NOT NULL, started_at DATETIME NOT NULL,
 			ended_at DATETIME, PRIMARY KEY (id, outcome)
 		);
@@ -267,6 +347,30 @@ func (store SQLiteStore) Open() (*sql.DB, error) {
 		database.Close()
 		return nil, fmt.Errorf("upgrade row-number checkpoints: %w", err)
 	}
+	if _, err := database.Exec(`ALTER TABLE runs ADD COLUMN source_identity TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		database.Close()
+		return nil, fmt.Errorf("upgrade source endpoint identity: %w", err)
+	}
+	if _, err := database.Exec(`ALTER TABLE runs ADD COLUMN target_identity TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		database.Close()
+		return nil, fmt.Errorf("upgrade target endpoint identity: %w", err)
+	}
+	if _, err := database.Exec(`ALTER TABLE runs ADD COLUMN source_engine TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		database.Close()
+		return nil, fmt.Errorf("upgrade source engine identity: %w", err)
+	}
+	if _, err := database.Exec(`ALTER TABLE runs ADD COLUMN lease_target TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		database.Close()
+		return nil, fmt.Errorf("upgrade target lease identity: %w", err)
+	}
+	if _, err := database.Exec(`ALTER TABLE runs ADD COLUMN lease_owner_token TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		database.Close()
+		return nil, fmt.Errorf("upgrade target lease owner token: %w", err)
+	}
+	if _, err := database.Exec(`ALTER TABLE runs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		database.Close()
+		return nil, fmt.Errorf("upgrade target lease generation: %w", err)
+	}
 	return database, nil
 }
 
@@ -275,11 +379,29 @@ type rowScanner interface{ Scan(dest ...any) error }
 func scanRun(scanner rowScanner) (Run, error) {
 	var run Run
 	var endedAt sql.NullTime
-	if err := scanner.Scan(&run.ID, &run.Source, &run.Target, &run.Outcome, &run.Resumable, &run.Reason, &run.StartedAt, &endedAt); err != nil {
+	if err := scanner.Scan(
+		&run.ID,
+		&run.Source,
+		&run.Target,
+		&run.SourceEngine,
+		&run.SourceIdentity,
+		&run.TargetIdentity,
+		&run.LeaseTarget,
+		&run.LeaseOwnerToken,
+		&run.LeaseGeneration,
+		&run.Outcome,
+		&run.Resumable,
+		&run.Reason,
+		&run.StartedAt,
+		&endedAt,
+	); err != nil {
 		return Run{}, err
 	}
 	if endedAt.Valid {
 		run.EndedAt = endedAt.Time
+	}
+	if err := validateRunRecord(run); err != nil {
+		return Run{}, err
 	}
 	return run, nil
 }

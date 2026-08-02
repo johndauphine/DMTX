@@ -59,6 +59,48 @@ func TestOrderAdapterSourceTablesForUpsertIsDeterministic(
 	}
 }
 
+func TestOrderAdapterSourceTablesUsesQualifiedForeignKeyIdentity(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	identityParent := adapterDependencyTable("accounts")
+	identityParent.Schema = "identity"
+	child := adapterDependencyTable(
+		"events",
+		schema.ForeignKey{
+			ReferencedSchema: "identity",
+			ReferencedTable:  "accounts",
+		},
+	)
+	child.Schema = "sales"
+	ownerSameName := adapterDependencyTable(
+		"accounts",
+		schema.ForeignKey{ReferencedTable: "events"},
+	)
+	ownerSameName.Schema = "sales"
+
+	ordered, err := orderAdapterSourceTablesForMode(
+		[]schema.Table{ownerSameName, child, identityParent},
+		"upsert",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, len(ordered))
+	for index, table := range ordered {
+		got[index] = table.Schema + "." + table.Name
+	}
+	want := []string{
+		"identity.accounts",
+		"sales.events",
+		"sales.accounts",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("qualified dependency order = %v, want %v", got, want)
+	}
+}
+
 func TestOrderAdapterSourceTablesKeepsDropRecreateOrder(t *testing.T) {
 	tables := []schema.Table{
 		adapterDependencyTable(
@@ -79,6 +121,46 @@ func TestOrderAdapterSourceTablesKeepsDropRecreateOrder(t *testing.T) {
 		[]string{"children", "parents"},
 	) {
 		t.Fatalf("drop/recreate order = %v", got)
+	}
+}
+
+func TestRelationalStage4TargetsOrderRebuildParentsBeforeChildren(
+	t *testing.T,
+) {
+	tables := []schema.Table{
+		adapterDependencyTable(
+			"children",
+			schema.ForeignKey{ReferencedTable: "parents"},
+		),
+		adapterDependencyTable("parents"),
+	}
+	for name, target := range map[string]adapterTargetSourceTableOrderer{
+		"postgres": &postgresTargetAdapter{},
+		"mysql":    &mysqlTargetAdapter{},
+		"mssql":    &sqlServerTargetAdapter{},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ordered, err := target.OrderSourceTables(
+				"sqlite",
+				tables,
+				"drop_recreate",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := adapterDependencyNames(ordered); !reflect.DeepEqual(
+				got,
+				[]string{"parents", "children"},
+			) {
+				t.Fatalf("rebuild order = %v", got)
+			}
+			if got := adapterDependencyNames(tables); !reflect.DeepEqual(
+				got,
+				[]string{"children", "parents"},
+			) {
+				t.Fatalf("source table slice was mutated: %v", got)
+			}
+		})
 	}
 }
 

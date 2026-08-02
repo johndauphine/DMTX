@@ -27,16 +27,22 @@ func (store SQLiteStore) AbandonRun(runID, reason string, endedAt time.Time) err
 	var run Run
 	var existingEnded sql.NullTime
 	err = transaction.QueryRow(`
-		SELECT rowid, id, source, target, outcome, resumable, reason, started_at, ended_at
+		SELECT rowid, id, source, target, source_engine, source_identity, target_identity,
+		       lease_target, lease_owner_token, lease_generation,
+		       outcome, resumable, reason, started_at, ended_at
 		FROM runs WHERE id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1
 	`, runID).Scan(
-		&rowID, &run.ID, &run.Source, &run.Target, &run.Outcome,
+		&rowID, &run.ID, &run.Source, &run.Target, &run.SourceEngine, &run.SourceIdentity, &run.TargetIdentity,
+		&run.LeaseTarget, &run.LeaseOwnerToken, &run.LeaseGeneration, &run.Outcome,
 		&run.Resumable, &run.Reason, &run.StartedAt, &existingEnded,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("abandon run: unknown run %q", runID)
 	}
 	if err != nil {
+		return fmt.Errorf("read run for abandonment: %w", err)
+	}
+	if err := validateRunRecord(run); err != nil {
 		return fmt.Errorf("read run for abandonment: %w", err)
 	}
 	if run.Outcome == Success {
@@ -58,16 +64,28 @@ func (store SQLiteStore) AbandonRun(runID, reason string, endedAt time.Time) err
 		}
 	} else {
 		if _, err := transaction.Exec(`
-			INSERT INTO runs (id, source, target, outcome, resumable, reason, started_at, ended_at)
-			VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+			INSERT INTO runs (
+				id, source, target, source_engine, source_identity, target_identity,
+				lease_target, lease_owner_token, lease_generation,
+				outcome, resumable, reason, started_at, ended_at
+			)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
 			ON CONFLICT(id, outcome) DO UPDATE SET
 				source = excluded.source,
 				target = excluded.target,
+				source_engine = excluded.source_engine,
+				source_identity = excluded.source_identity,
+				target_identity = excluded.target_identity,
+				lease_target = excluded.lease_target,
+				lease_owner_token = excluded.lease_owner_token,
+				lease_generation = excluded.lease_generation,
 				resumable = 0,
 				reason = excluded.reason,
 				started_at = excluded.started_at,
 				ended_at = excluded.ended_at
-		`, run.ID, run.Source, run.Target, Failed, reason, run.StartedAt.UTC(), endedAt.UTC()); err != nil {
+		`, run.ID, run.Source, run.Target, run.SourceEngine, run.SourceIdentity, run.TargetIdentity,
+			run.LeaseTarget, run.LeaseOwnerToken, run.LeaseGeneration,
+			Failed, reason, run.StartedAt.UTC(), endedAt.UTC()); err != nil {
 			return fmt.Errorf("record abandoned run: %w", err)
 		}
 		if run.Outcome != Failed {

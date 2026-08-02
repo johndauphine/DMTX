@@ -109,6 +109,7 @@ func TestSQLServerSourcePrimaryKeyFromCatalogPreservesOrder(t *testing.T) {
 	positions, err := sqlServerSourcePrimaryKeyFromCatalog(
 		table,
 		validSQLServerSourcePrimaryKeyCatalog(),
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -203,11 +204,36 @@ func TestSQLServerSourcePrimaryKeyFailsClosed(t *testing.T) {
 					_, err := sqlServerSourcePrimaryKeyFromCatalog(
 						table,
 						value,
+						false,
 					)
 					return err
 				}(),
 			)
 		})
+	}
+}
+
+func TestSQLServerTargetPrimaryKeyAcceptsPhysicalDirectionAndClustering(
+	t *testing.T,
+) {
+	table := sqlServerSourceConstraintTestTable()
+	catalog := validSQLServerSourcePrimaryKeyCatalog()
+	catalog.indexType = 2
+	catalog.indexTypeDescription = "NONCLUSTERED"
+	catalog.columns[0].descending = true
+	positions, err := sqlServerSourcePrimaryKeyFromCatalog(
+		table,
+		catalog,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("target physical primary key: %v", err)
+	}
+	if !reflect.DeepEqual(
+		positions,
+		map[string]int{"tenant_id": 1, "order_id": 2},
+	) {
+		t.Fatalf("target primary-key positions = %#v", positions)
 	}
 }
 
@@ -245,6 +271,7 @@ func TestSQLServerSourceIndexFromCatalogPreservesPortableShape(
 	index, err := sqlServerSourceIndexFromCatalog(
 		sqlServerSourceConstraintTestTable(),
 		validSQLServerSourceIndexCatalog(),
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -275,6 +302,7 @@ func TestSQLServerSourceIndexAllowsNullableNonuniqueKey(t *testing.T) {
 	index, err := sqlServerSourceIndexFromCatalog(
 		sqlServerSourceConstraintTestTable(),
 		catalog,
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -283,6 +311,38 @@ func TestSQLServerSourceIndexAllowsNullableNonuniqueKey(t *testing.T) {
 		index.Columns[0].Name != "parent_id" ||
 		!index.Columns[0].Descending {
 		t.Fatalf("index = %#v", index)
+	}
+}
+
+func TestSQLServerTargetIndexAcceptsPhysicalTextComparison(t *testing.T) {
+	catalog := validSQLServerSourceIndexCatalog()
+	catalog.columns = []sqlServerSourceIndexColumnCatalog{{
+		indexColumnID: 1,
+		keyOrdinal:    1,
+		columnID:      4,
+		name:          "status",
+		collation: sql.NullString{
+			String: "Latin1_General_100_BIN2_UTF8",
+			Valid:  true,
+		},
+	}}
+	index, err := sqlServerSourceIndexFromCatalog(
+		sqlServerSourceConstraintTestTable(),
+		catalog,
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := schema.Index{
+		Name:   "UX_orders_amount_tenant",
+		Unique: true,
+		Columns: []schema.IndexColumn{{
+			Name: "status",
+		}},
+	}
+	if !reflect.DeepEqual(index, expected) {
+		t.Fatalf("index = %#v, want %#v", index, expected)
 	}
 }
 
@@ -388,6 +448,7 @@ func TestSQLServerSourceIndexFailsClosedOnNonportableShape(t *testing.T) {
 					_, err := sqlServerSourceIndexFromCatalog(
 						table,
 						value,
+						false,
 					)
 					return err
 				}(),
@@ -530,6 +591,7 @@ func TestSQLServerSourceForeignKeyFromCatalogPreservesOrderAndActions(
 	}
 	expected := schema.ForeignKey{
 		Name:              "FK_orders_parent",
+		ReferencedSchema:  "dbo",
 		ReferencedTable:   "parents",
 		Columns:           []string{"tenant_id", "parent_id"},
 		ReferencedColumns: []string{"tenant_id", "parent_id"},

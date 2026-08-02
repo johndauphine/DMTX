@@ -221,6 +221,30 @@ func cloneMySQLMaterializedTables(source []Table) []Table {
 					[]int(nil),
 					column.DeclaredType.Arguments...,
 				)
+				if column.DeclaredType.Spatial != nil {
+					spatial := *column.DeclaredType.Spatial
+					if spatial.SRID != nil {
+						srid := *spatial.SRID
+						spatial.SRID = &srid
+					}
+					declaration.Spatial = &spatial
+				}
+				if column.DeclaredType.MySQL != nil {
+					mysql := *column.DeclaredType.MySQL
+					mysql.EnumMembers = append(
+						[]string(nil),
+						mysql.EnumMembers...,
+					)
+					mysql.SetMembers = append(
+						[]string(nil),
+						mysql.SetMembers...,
+					)
+					if mysql.BitWidth != nil {
+						width := *mysql.BitWidth
+						mysql.BitWidth = &width
+					}
+					declaration.MySQL = &mysql
+				}
 				cloned[tableIndex].Columns[columnIndex].
 					DeclaredType = &declaration
 			}

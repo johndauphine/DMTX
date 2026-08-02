@@ -268,6 +268,118 @@ func TestValidateMySQLRetainedTableShapeReportsFirstMismatch(t *testing.T) {
 	}
 }
 
+func TestValidateMySQLRetainedTableShapeNormalizesSerializedModifierFreeArguments(
+	t *testing.T,
+) {
+	// Schema snapshots deliberately canonicalize an omitted declaration's
+	// arguments as an empty array. Native MySQL discovery represents that same
+	// modifier-free declaration with nil. Exercise the durable
+	// serialization/materialization path before retained-table preflight so a
+	// future comparison change cannot reintroduce the composed evolution
+	// mismatch between those equivalent representations.
+	planned := schema.Table{
+		Schema: "target_db",
+		Name:   "events",
+		Columns: []schema.Column{
+			{
+				Name:               "id",
+				Type:               "bigint",
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 1,
+				DeclaredType:       &schema.DeclaredType{Base: "bigint"},
+			},
+			{
+				Name:         "payload",
+				Type:         "varchar",
+				DeclaredType: &schema.DeclaredType{Base: "varchar", Arguments: []int{16}},
+			},
+		},
+	}
+	snapshot, err := schema.NewSchemaSnapshot([]schema.Table{planned})
+	if err != nil {
+		t.Fatalf("snapshot planned table: %v", err)
+	}
+	encoded, err := snapshot.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("encode planned snapshot: %v", err)
+	}
+	durable, err := schema.ParseSchemaSnapshot(encoded)
+	if err != nil {
+		t.Fatalf("parse planned snapshot: %v", err)
+	}
+	rehydrated, err := schema.MaterializeSchemaSnapshot(durable)
+	if err != nil {
+		t.Fatalf("materialize planned snapshot: %v", err)
+	}
+	if len(rehydrated) != 1 || rehydrated[0].Columns[0].DeclaredType == nil {
+		t.Fatalf("rehydrated table = %#v, want one declared id column", rehydrated)
+	}
+	if rehydrated[0].Columns[0].DeclaredType.Arguments == nil {
+		t.Fatal("durable modifier-free declaration did not rehydrate as empty arguments")
+	}
+
+	// planned keeps the native-catalog representation (nil arguments), while
+	// rehydrated carries the durable representation (empty arguments).
+	if err := validateMySQLRetainedTableShape(rehydrated[0], planned); err != nil {
+		t.Fatalf("equivalent modifier-free arguments were rejected: %v", err)
+	}
+
+	actual := planned
+	actual.Columns = append([]schema.Column(nil), planned.Columns...)
+	changed := *actual.Columns[1].DeclaredType
+	changed.Arguments = []int{17}
+	actual.Columns[1].DeclaredType = &changed
+	if err := validateMySQLRetainedTableShape(rehydrated[0], actual); err == nil ||
+		!strings.Contains(err.Error(), "column 2 (payload)") {
+		t.Fatalf("real modifier change error = %v", err)
+	}
+}
+
+func TestValidateMySQLRetainedTableShapeAcceptsRebasedOwnerRelativeForeignKey(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	planned := mysqlNativeTestTable()
+	planned.Schema = "target"
+	planned.ForeignKeys = []schema.ForeignKey{{
+		Name:              "items_parent_fk",
+		Columns:           []string{"id"},
+		ReferencedTable:   "parents",
+		ReferencedColumns: []string{"id"},
+		OnUpdate:          "NO ACTION",
+		OnDelete:          "CASCADE",
+		Match:             "NONE",
+	}}
+	actual := planned
+	actual.ForeignKeys = append(
+		[]schema.ForeignKey(nil),
+		planned.ForeignKeys...,
+	)
+	actual.ForeignKeys[0].ReferencedSchema = "target"
+
+	if err := validateMySQLRetainedTableShape(
+		planned,
+		actual,
+	); err == nil {
+		t.Fatal("unqualified planned reference matched qualified catalog shape")
+	}
+	if err := rebaseProjectedForeignKeySchemas(
+		"",
+		"target",
+		"MySQL",
+		&planned,
+	); err != nil {
+		t.Fatalf("rebase owner-relative foreign key: %v", err)
+	}
+	if err := validateMySQLRetainedTableShape(
+		planned,
+		actual,
+	); err != nil {
+		t.Fatalf("rebased retained shape was rejected: %v", err)
+	}
+}
+
 func TestValidateMySQLRetainedColumnTreatsUUIDAsPhysicalVarchar36(
 	t *testing.T,
 ) {
@@ -289,6 +401,42 @@ func TestValidateMySQLRetainedColumnTreatsUUIDAsPhysicalVarchar36(
 	actual.DeclaredType.Arguments = []int{35}
 	if err := validateMySQLRetainedColumn(planned, actual); err == nil {
 		t.Fatal("non-VARCHAR(36) retained UUID shape was accepted")
+	}
+}
+
+func TestValidateMySQLRetainedColumnComparesExactSpatialMetadata(
+	t *testing.T,
+) {
+	srid := uint32(4326)
+	planned := schema.Column{
+		Name: "position",
+		Type: "point",
+		DeclaredType: &schema.DeclaredType{
+			Base: "point",
+			Spatial: &schema.SpatialTypeMetadata{
+				Subtype: schema.SpatialSubtypePoint,
+				SRID:    &srid,
+			},
+		},
+	}
+	actual := planned
+	actualDeclaration := *planned.DeclaredType
+	actualSpatial := *planned.DeclaredType.Spatial
+	actualSRID := *planned.DeclaredType.Spatial.SRID
+	actualSpatial.SRID = &actualSRID
+	actualDeclaration.Spatial = &actualSpatial
+	actual.DeclaredType = &actualDeclaration
+	if err := validateMySQLRetainedColumn(planned, actual); err != nil {
+		t.Fatalf("exact retained spatial column was rejected: %v", err)
+	}
+
+	*actual.DeclaredType.Spatial.SRID = 0
+	if err := validateMySQLRetainedColumn(planned, actual); err == nil {
+		t.Fatal("retained spatial SRID drift was accepted")
+	}
+	actual.DeclaredType.Spatial.SRID = nil
+	if err := validateMySQLRetainedColumn(planned, actual); err == nil {
+		t.Fatal("unspecified retained spatial SRID replaced explicit SRID")
 	}
 }
 

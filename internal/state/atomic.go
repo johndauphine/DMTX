@@ -5,6 +5,9 @@ import "fmt"
 // InitializeRun atomically records a run's initial state and compatibility
 // hash so a hard stop cannot expose one without the other.
 func (store SQLiteStore) InitializeRun(run Run, configHash string) error {
+	if err := validateRunRecord(run); err != nil {
+		return err
+	}
 	database, err := store.Open()
 	if err != nil {
 		return err
@@ -18,9 +21,15 @@ func (store SQLiteStore) InitializeRun(run Run, configHash string) error {
 	defer transaction.Rollback()
 
 	if _, err := transaction.Exec(`
-		INSERT INTO runs (id, source, target, outcome, resumable, reason, started_at, ended_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, run.ID, run.Source, run.Target, run.Outcome, run.Resumable, run.Reason, run.StartedAt.UTC(), nullableTime(run.EndedAt)); err != nil {
+		INSERT INTO runs (
+			id, source, target, source_engine, source_identity, target_identity,
+			lease_target, lease_owner_token, lease_generation,
+			outcome, resumable, reason, started_at, ended_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, run.ID, run.Source, run.Target, run.SourceEngine, run.SourceIdentity, run.TargetIdentity,
+		run.LeaseTarget, run.LeaseOwnerToken, run.LeaseGeneration,
+		run.Outcome, run.Resumable, run.Reason, run.StartedAt.UTC(), nullableTime(run.EndedAt)); err != nil {
 		return fmt.Errorf("record initial run state: %w", err)
 	}
 	if _, err := transaction.Exec(`CREATE TABLE IF NOT EXISTS run_config_hashes (run_id TEXT PRIMARY KEY, config_hash TEXT NOT NULL)`); err != nil {

@@ -57,7 +57,7 @@ const mysql80SourcePrimaryKeyQuery = `
 
 func discoverMySQL80SourcePrimaryKey(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table *schema.Table,
 ) error {
 	rows, err := database.QueryContext(
@@ -204,7 +204,7 @@ const mysql80SourceIndexesQuery = `
 
 func discoverMySQL80SourceIndexes(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table schema.Table,
 ) ([]schema.Index, error) {
 	rows, err := database.QueryContext(
@@ -408,7 +408,7 @@ const mysql80SourceChecksQuery = `
 
 func discoverMySQL80SourceChecks(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table schema.Table,
 ) ([]schema.CheckConstraint, error) {
 	rows, err := database.QueryContext(
@@ -525,7 +525,7 @@ const mysql80SourceForeignKeysQuery = `
 
 func discoverMySQL80SourceForeignKeys(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table schema.Table,
 ) ([]schema.ForeignKey, error) {
 	rows, err := database.QueryContext(
@@ -586,11 +586,12 @@ func discoverMySQL80SourceForeignKeys(
 				)
 			}
 			foreignKeys = append(foreignKeys, schema.ForeignKey{
-				Name:            catalog.name,
-				ReferencedTable: catalog.referencedTable.String,
-				OnUpdate:        catalog.onUpdate,
-				OnDelete:        catalog.onDelete,
-				Match:           catalog.match,
+				Name:             catalog.name,
+				ReferencedSchema: catalog.referencedSchema.String,
+				ReferencedTable:  catalog.referencedTable.String,
+				OnUpdate:         catalog.onUpdate,
+				OnDelete:         catalog.onDelete,
+				Match:            catalog.match,
 			})
 			current = &foreignKeys[len(foreignKeys)-1]
 			uniqueName = catalog.uniqueConstraintName.String

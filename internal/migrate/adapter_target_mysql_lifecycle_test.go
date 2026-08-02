@@ -403,6 +403,28 @@ func (connection *mysqlTargetLifecycleTestConnection) QueryContext(
 	arguments []sqldriver.NamedValue,
 ) (sqldriver.Rows, error) {
 	switch {
+	case strings.Contains(query, "VERSION()") &&
+		strings.Contains(query, "@@version_comment"):
+		return newMySQLTargetLifecycleRows(
+			[]string{"version", "version_comment"},
+			[]any{
+				"8.0.46",
+				"MySQL Community Server - GPL",
+			},
+		), nil
+	case strings.Contains(
+		query,
+		"information_schema.SCHEMA_PRIVILEGES",
+	) && strings.Contains(query, "PRIVILEGE_TYPE = 'TRIGGER'"):
+		return newMySQLTargetLifecycleRows(
+			[]string{
+				"global_visibility",
+				"schema_visibility",
+				"table_visibility",
+				"partial_revokes",
+			},
+			[]any{false, true, false, 0},
+		), nil
 	case strings.Contains(query, "@@SESSION.FOREIGN_KEY_CHECKS"):
 		value := connection.foreignKeyChecks
 		if value == 0 && !containsMySQLLifecycleStatement(

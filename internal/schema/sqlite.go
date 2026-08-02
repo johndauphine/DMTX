@@ -312,6 +312,13 @@ func renderSQLiteForeignKey(foreignKey ForeignKey) (string, error) {
 	if len(foreignKey.Columns) == 0 || foreignKey.ReferencedTable == "" {
 		return "", &PolicyError{Operation: "create SQLite foreign key", Type: "incomplete foreign key", Target: string(SQLite)}
 	}
+	if foreignKey.ReferencedSchema != "" {
+		return "", &PolicyError{
+			Operation: "create SQLite foreign key",
+			Type:      "qualified referenced table",
+			Target:    string(SQLite),
+		}
+	}
 	statement := "FOREIGN KEY (" + quotedIdentifiers(foreignKey.Columns) + ") REFERENCES " + quote(SQLite, foreignKey.ReferencedTable)
 	if len(foreignKey.ReferencedColumns) > 0 {
 		if len(foreignKey.ReferencedColumns) != len(foreignKey.Columns) {

@@ -108,12 +108,12 @@ func finalizePostgresTargets(
 	for _, statement := range objectPlan {
 		if _, err := transaction.ExecContext(
 			ctx,
-			statement.SQL,
+			statement.SQL(),
 		); err != nil {
 			return fmt.Errorf(
 				"create PostgreSQL post-load object %s on table %s: %w",
-				statement.Name,
-				statement.Table,
+				statement.Name(),
+				statement.Table(),
 				err,
 			)
 		}

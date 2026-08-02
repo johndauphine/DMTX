@@ -12,9 +12,19 @@ import (
 
 type sqliteTargetAdapter struct {
 	database                *sql.DB
+	stage4BatchWriter       sqliteStage4NetworkBatchWriter
 	sourceEngine            string
 	sqlServerRoute          bool
 	destructiveAcknowledged bool
+	// evolutionCommit is nil in production. Keeping the COMMIT acknowledgement
+	// seam per adapter lets the evolution package exercise the real
+	// commit-then-error recovery path without a process-global test hook.
+	evolutionCommit func(context.Context, *sql.Conn) (sql.Result, error)
+	// deleteCommit and deleteAfterReservation are nil in production. They keep
+	// the Stage 4 delete receipt path's commit-acknowledgement and writer-fence
+	// recovery testable without a package-global hook.
+	deleteCommit           func(context.Context, *sql.Conn) (sql.Result, error)
+	deleteAfterReservation func(context.Context, *sql.Conn) error
 }
 
 func validateSQLiteTargetEndpoint(endpoint config.Endpoint) error {
@@ -35,7 +45,10 @@ func openSQLiteTargetAdapter(
 	if err != nil {
 		return nil, err
 	}
-	return &sqliteTargetAdapter{database: database}, nil
+	return &sqliteTargetAdapter{
+		database:          database,
+		stage4BatchWriter: newSQLiteStage4NetworkWriter(database),
+	}, nil
 }
 
 func (adapter *sqliteTargetAdapter) Engine() string {
@@ -55,12 +68,6 @@ func (adapter *sqliteTargetAdapter) PlanTables(
 	switch sourceEngine {
 	case "postgres", "mysql", "sqlite":
 	case "mssql":
-		if mode != "drop_recreate" {
-			return nil, sqliteSQLServerProjectionPolicy(
-				"map SQL Server target mode",
-				mode,
-			)
-		}
 		adapter.sqlServerRoute = true
 	default:
 		return nil, fmt.Errorf(
@@ -94,6 +101,14 @@ func (adapter *sqliteTargetAdapter) PlanTables(
 		default:
 			targetTable.Schema = ""
 			targetTable.Identity = cloneSchemaIdentity(sourceTable.Identity)
+		}
+		if err := rebaseProjectedForeignKeySchemas(
+			sourceTable.Schema,
+			"",
+			"SQLite",
+			&targetTable,
+		); err != nil {
+			return nil, err
 		}
 		if _, err := schema.DropTable(schema.SQLite, targetTable); err != nil {
 			return nil, fmt.Errorf(
@@ -261,6 +276,141 @@ func (adapter *sqliteTargetAdapter) WriteBatch(
 	mode string,
 	rows [][]any,
 ) (WriteReceipt, error) {
+	normalized, err := adapter.normalizeWriteBatch(
+		table,
+		columns,
+		rows,
+	)
+	if err != nil {
+		return WriteReceipt{
+			Certainty:     CommitNotCommitted,
+			AttemptedRows: int64(len(rows)),
+		}, err
+	}
+	return writeSQLiteBatchReceipt(
+		ctx,
+		adapter.database,
+		table,
+		columns,
+		mode,
+		normalized,
+		nil,
+		nil,
+	)
+}
+
+func (adapter *sqliteTargetAdapter) WriteStage4NetworkBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	if adapter == nil {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"SQLite Stage 4 network target adapter is not configured",
+				),
+			)
+	}
+	normalized, err := adapter.normalizeWriteBatch(
+		table,
+		columns,
+		rows,
+	)
+	if err != nil {
+		return WriteReceipt{
+			Certainty:     CommitNotCommitted,
+			AttemptedRows: attempted,
+		}, err
+	}
+	writer := adapter.stage4BatchWriter
+	if writer == nil && adapter.database != nil {
+		writer = newSQLiteStage4NetworkWriter(adapter.database)
+	}
+	if writer == nil {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"SQLite Stage 4 network batch writer is not configured",
+				),
+			)
+	}
+	return writer.WriteStage4NetworkBatch(
+		ctx,
+		table,
+		columns,
+		normalized,
+	)
+}
+
+// WriteStage4NetworkRebuildBatch delegates only to a writer that explicitly
+// proves duplicate-safe insert-only replay. This is deliberately not routed
+// through WriteBatch(drop_recreate), whose ordinary insert contract is not
+// safe after an issued page may already have committed.
+func (adapter *sqliteTargetAdapter) WriteStage4NetworkRebuildBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	mode NetworkWriteMode,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	if adapter == nil {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"SQLite Stage 4 rebuild target adapter is not configured",
+				),
+			)
+	}
+	normalized, err := adapter.normalizeWriteBatch(table, columns, rows)
+	if err != nil {
+		return WriteReceipt{
+			Certainty:     CommitNotCommitted,
+			AttemptedRows: attempted,
+		}, err
+	}
+	writer := adapter.stage4BatchWriter
+	if writer == nil && adapter.database != nil {
+		writer = newSQLiteStage4NetworkWriter(adapter.database)
+	}
+	rebuildWriter, ok := writer.(sqliteStage4NetworkRebuildBatchWriter)
+	if !ok || rebuildWriter == nil {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"SQLite Stage 4 rebuild batch writer is not configured",
+				),
+			)
+	}
+	return rebuildWriter.WriteStage4NetworkRebuildBatch(
+		ctx,
+		table,
+		columns,
+		mode,
+		normalized,
+	)
+}
+
+func (adapter *sqliteTargetAdapter) normalizeWriteBatch(
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) ([][]any, error) {
 	if adapter.sourceEngine == "postgres" {
 		normalized, err := normalizePostgresSQLiteBatch(
 			table,
@@ -268,10 +418,7 @@ func (adapter *sqliteTargetAdapter) WriteBatch(
 			rows,
 		)
 		if err != nil {
-			return WriteReceipt{
-				Certainty:     CommitNotCommitted,
-				AttemptedRows: int64(len(rows)),
-			}, err
+			return nil, err
 		}
 		rows = normalized
 	}
@@ -282,10 +429,7 @@ func (adapter *sqliteTargetAdapter) WriteBatch(
 			rows,
 		)
 		if err != nil {
-			return WriteReceipt{
-				Certainty:     CommitNotCommitted,
-				AttemptedRows: int64(len(rows)),
-			}, err
+			return nil, err
 		}
 		rows = normalized
 	}
@@ -296,23 +440,11 @@ func (adapter *sqliteTargetAdapter) WriteBatch(
 			rows,
 		)
 		if err != nil {
-			return WriteReceipt{
-				Certainty:     CommitNotCommitted,
-				AttemptedRows: int64(len(rows)),
-			}, err
+			return nil, err
 		}
 		rows = normalized
 	}
-	return writeSQLiteBatchReceipt(
-		ctx,
-		adapter.database,
-		table,
-		columns,
-		mode,
-		rows,
-		nil,
-		nil,
-	)
+	return rows, nil
 }
 
 func (adapter *sqliteTargetAdapter) CountRows(

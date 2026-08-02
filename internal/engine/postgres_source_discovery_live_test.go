@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -28,9 +29,19 @@ func TestInspectPostgres16SourceSchemaLive(t *testing.T) {
 	if parsed.TLSConfig == nil {
 		t.Fatal("DMTX_TEST_POSTGRES_DSN must require TLS")
 	}
+	if !postgresTLSConfigVerifiesServer(parsed.TLSConfig) {
+		t.Fatal(
+			"DMTX_TEST_POSTGRES_DSN must verify the PostgreSQL server certificate",
+		)
+	}
 	for _, fallback := range parsed.Fallbacks {
 		if fallback.TLSConfig == nil {
 			t.Fatal("DMTX_TEST_POSTGRES_DSN fallback must require TLS")
+		}
+		if !postgresTLSConfigVerifiesServer(fallback.TLSConfig) {
+			t.Fatal(
+				"DMTX_TEST_POSTGRES_DSN fallback must verify the PostgreSQL server certificate",
+			)
 		}
 	}
 
@@ -99,11 +110,11 @@ func TestInspectPostgres16SourceSchemaLive(t *testing.T) {
 		t.Fatalf("plan source objects: %v", err)
 	}
 	for _, object := range objects {
-		if _, err := database.ExecContext(ctx, object.SQL); err != nil {
+		if _, err := database.ExecContext(ctx, object.SQL()); err != nil {
 			t.Fatalf(
 				"create source object %s on %s: %v",
-				object.Name,
-				object.Table,
+				object.Name(),
+				object.Table(),
 				err,
 			)
 		}
@@ -216,6 +227,12 @@ func TestInspectPostgres16SourceSchemaLive(t *testing.T) {
 		)
 		assertPostgresSourcePolicyError(t, err, "identity generation")
 	})
+}
+
+func postgresTLSConfigVerifiesServer(config *tls.Config) bool {
+	return config != nil &&
+		config.RootCAs != nil &&
+		(!config.InsecureSkipVerify || config.VerifyPeerCertificate != nil)
 }
 
 func postgresSourceDiscoveryFixture(
@@ -334,6 +351,22 @@ func postgresSourceDiscoveryFixture(
 					Type:     "jsonb",
 					Nullable: true,
 				},
+				{
+					Name: "rounded_bucket",
+					Type: "numeric",
+					DeclaredType: &schema.DeclaredType{
+						Base:      "numeric",
+						Arguments: []int{2, -3},
+					},
+				},
+				{
+					Name: "fractional_ratio",
+					Type: "numeric",
+					DeclaredType: &schema.DeclaredType{
+						Base:      "numeric",
+						Arguments: []int{3, 5},
+					},
+				},
 			},
 			Indexes: []schema.Index{{
 				Name:   "accounts_code_uq",
@@ -404,6 +437,16 @@ func assertPostgresSourceDiscoveryFixture(
 		!reflect.DeepEqual(
 			accounts.Columns[5].DeclaredType.Arguments,
 			[]int{3},
+		) ||
+		accounts.Columns[7].DeclaredType == nil ||
+		!reflect.DeepEqual(
+			accounts.Columns[7].DeclaredType.Arguments,
+			[]int{2, -3},
+		) ||
+		accounts.Columns[8].DeclaredType == nil ||
+		!reflect.DeepEqual(
+			accounts.Columns[8].DeclaredType.Arguments,
+			[]int{3, 5},
 		) {
 		t.Fatalf("account modifiers = %#v", accounts.Columns)
 	}

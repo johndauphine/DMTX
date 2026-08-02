@@ -22,8 +22,8 @@ func TestSQLServerTargetEndpointValidationDoesNotResolveSecrets(t *testing.T) {
 		t.Fatalf("validate SQL Server target endpoint: %v", err)
 	}
 	endpoint.Schema = "other"
-	if err := validateSQLServerTargetEndpoint(endpoint); err == nil {
-		t.Fatal("non-dbo SQL Server target schema was accepted")
+	if err := validateSQLServerTargetEndpoint(endpoint); err != nil {
+		t.Fatalf("validate configured SQL Server target schema: %v", err)
 	}
 }
 

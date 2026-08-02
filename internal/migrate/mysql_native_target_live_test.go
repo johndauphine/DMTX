@@ -1593,19 +1593,6 @@ func assertMySQLNativePreflightDidNotMutate(
 	}
 }
 
-func parseMySQLNativeTargetDSN(
-	t *testing.T,
-	role string,
-	dsn string,
-) *mysqlDriver.Config {
-	return parseMySQLNativeTargetDSNForTLS(
-		t,
-		role,
-		dsn,
-		"dmtx_test",
-	)
-}
-
 func parseMySQLNativeTargetDSNForTLS(
 	t *testing.T,
 	role string,
@@ -1730,7 +1717,24 @@ func mysqlNativeMetadataWithoutNamespace(
 ) map[string]schema.Table {
 	result := make(map[string]schema.Table, len(tables))
 	for name, table := range tables {
+		namespace := table.Schema
 		table.Schema = ""
+		// Foreign keys carry the same qualifier, and a source and target
+		// legitimately live in differently named databases, so comparing it
+		// literally would fail a correct migration. The qualifier is cleared
+		// only when it matches the owning table's own schema: a reference that
+		// escaped to another database keeps it and therefore still fails the
+		// comparison. That makes this stricter than dropping it outright — a
+		// target foreign key still pointing at the source database is caught.
+		if len(table.ForeignKeys) != 0 {
+			keys := append([]schema.ForeignKey(nil), table.ForeignKeys...)
+			for index := range keys {
+				if keys[index].ReferencedSchema == namespace {
+					keys[index].ReferencedSchema = ""
+				}
+			}
+			table.ForeignKeys = keys
+		}
 		result[name] = table
 	}
 	return result

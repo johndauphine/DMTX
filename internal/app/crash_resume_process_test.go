@@ -230,8 +230,7 @@ func (observer stage1BlockingCheckpointObserver) AfterSQLiteRangeChunk(
 	if err := os.WriteFile(observer.commitPath, []byte(fmt.Sprintf("%d", chunk.ChunkRows)), 0o600); err != nil {
 		return err
 	}
-	<-ctx.Done()
-	return ctx.Err()
+	return waitForParentHardKill(ctx)
 }
 
 func stage1HelperCommand(mode, configPath, runID, readyPath, proceedPath, commitPath string) *exec.Cmd {

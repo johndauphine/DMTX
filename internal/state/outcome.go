@@ -28,6 +28,16 @@ func latestResumableRun(runs []Run, target string) (Run, bool) {
 			selected, found = Run{}, false
 			continue
 		}
+		if !run.Resumable {
+			// A terminal revision supersedes only an older revision of the
+			// same run. Independent failed attempts on this target retain the
+			// established selection behavior unless a later success supersedes
+			// the target as a whole.
+			if found && selected.ID == run.ID {
+				selected, found = Run{}, false
+			}
+			continue
+		}
 		if run.Resumable && resumableOutcome(run.Outcome) {
 			selected, found = run, true
 		}

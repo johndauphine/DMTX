@@ -38,7 +38,27 @@ func mysqlTableCollation(table Table) (string, error) {
 // represented structurally (for example unsigned and zerofill) never enter
 // this renderer.
 func renderMySQLDeclaredType(value DeclaredType) (string, error) {
+	if err := ValidateCatalogType(value); err != nil {
+		return "", mysqlDeclaredTypePolicy(value)
+	}
 	base := strings.ToLower(strings.Join(strings.Fields(value.Base), " "))
+	if value.Spatial != nil {
+		expectedBase := string(value.Spatial.Subtype)
+		if value.Spatial.Subtype == SpatialSubtypeGeometryCollection {
+			expectedBase = "geomcollection"
+		}
+		if base != expectedBase {
+			return "", mysqlDeclaredTypePolicy(value)
+		}
+		rendered := strings.ToUpper(string(value.Spatial.Subtype))
+		if value.Spatial.SRID != nil {
+			rendered += " SRID " + strconv.FormatUint(
+				uint64(*value.Spatial.SRID),
+				10,
+			)
+		}
+		return rendered, nil
+	}
 	noArguments := func() bool { return len(value.Arguments) == 0 }
 	oneArgument := func(minimum, maximum int) (int, bool) {
 		if len(value.Arguments) != 1 ||
@@ -278,7 +298,10 @@ func mysqlColumnMaximumInnoDBLocalBytes(
 	base := mysqlColumnBase(column)
 	switch base {
 	case "tinytext", "text", "mediumtext", "longtext",
-		"tinyblob", "blob", "mediumblob", "longblob", "json":
+		"tinyblob", "blob", "mediumblob", "longblob", "json",
+		"geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		"geomcollection":
 		// Account for the external pointer, variable-field directory, and
 		// conservative record bookkeeping even though the server-level
 		// declared-row calculation uses a smaller LOB reference. MySQL 8.0
@@ -381,6 +404,14 @@ func mysqlColumnMaximumRowBytes(column Column) (uint64, error) {
 		// JSON uses binary large-object storage. Keep a wider conservative
 		// inline allowance than ordinary BLOB/TEXT references.
 		return 20, nil
+	case "geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		"geomcollection":
+		// MySQL stores spatial payloads in its binary large-object format.
+		// The exact payload is bounded separately from live OCTET_LENGTH
+		// evidence; the server-level declared-row calculation uses only the
+		// off-page reference.
+		return 12, nil
 	default:
 		return 0, mysqlDeclaredTypePolicy(value)
 	}

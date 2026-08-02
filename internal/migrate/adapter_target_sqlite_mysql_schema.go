@@ -203,6 +203,19 @@ func projectMySQLTableForSQLite(
 				source.Name+"."+sourceForeignKey.Name,
 			)
 		}
+		// SQLite has a single namespace: a reference inside the migrated schema
+		// is expressible only unqualified, and one that escapes it names a
+		// relation this migration does not carry. See the PostgreSQL projection
+		// for the same rule.
+		switch sourceForeignKey.ReferencedSchema {
+		case "", source.Schema:
+			foreignKey.ReferencedSchema = ""
+		default:
+			return schema.Table{}, sqliteMySQLProjectionPolicy(
+				"map MySQL cross-schema foreign key",
+				source.Name+"."+sourceForeignKey.Name,
+			)
+		}
 		if strings.ToUpper(strings.TrimSpace(
 			sourceForeignKey.Match,
 		)) != "NONE" {

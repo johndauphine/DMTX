@@ -23,14 +23,82 @@ const (
 )
 
 // PostgresObjectStatement is one deterministic, fully rendered post-load DDL
-// statement. Schema, Table, and Name are retained separately so an executor can
-// report an object without parsing SQL.
+// statement. Its fields are intentionally private so only this planner can
+// construct or alter executable PostgreSQL object SQL. Read-only accessors let
+// adapters report and execute an authentic planner result without parsing it.
 type PostgresObjectStatement struct {
-	Kind   PostgresObjectKind
-	Schema string
-	Table  string
-	Name   string
-	SQL    string
+	kind        PostgresObjectKind
+	schema      string
+	table       string
+	name        string
+	sql         string
+	plannerSeal [sha256.Size]byte
+}
+
+// Kind returns the dependency class of the planned object.
+func (statement PostgresObjectStatement) Kind() PostgresObjectKind {
+	return statement.kind
+}
+
+// Schema returns the exact target PostgreSQL namespace.
+func (statement PostgresObjectStatement) Schema() string {
+	return statement.schema
+}
+
+// Table returns the exact target table name.
+func (statement PostgresObjectStatement) Table() string {
+	return statement.table
+}
+
+// Name returns the exact target object name.
+func (statement PostgresObjectStatement) Name() string {
+	return statement.name
+}
+
+// SQL returns the exact additive DDL rendered by the PostgreSQL object planner.
+func (statement PostgresObjectStatement) SQL() string {
+	return statement.sql
+}
+
+func newPostgresObjectStatement(
+	kind PostgresObjectKind,
+	namespace string,
+	table string,
+	name string,
+	sql string,
+) PostgresObjectStatement {
+	statement := PostgresObjectStatement{
+		kind:   kind,
+		schema: namespace,
+		table:  table,
+		name:   name,
+		sql:    sql,
+	}
+	statement.plannerSeal = postgresObjectStatementSeal(statement)
+	return statement
+}
+
+func (statement PostgresObjectStatement) plannerAuthentic() bool {
+	return statement.plannerSeal != [sha256.Size]byte{} &&
+		statement.plannerSeal == postgresObjectStatementSeal(statement)
+}
+
+func postgresObjectStatementSeal(
+	statement PostgresObjectStatement,
+) [sha256.Size]byte {
+	var payload strings.Builder
+	for _, field := range []string{
+		strconv.Itoa(int(statement.kind)),
+		statement.schema,
+		statement.table,
+		statement.name,
+		statement.sql,
+	} {
+		payload.WriteString(strconv.Itoa(len(field)))
+		payload.WriteByte(':')
+		payload.WriteString(field)
+	}
+	return sha256.Sum256([]byte(payload.String()))
 }
 
 // PostgresNamespaceMapper maps a source namespace to its target PostgreSQL
@@ -444,6 +512,16 @@ func validatePostgresForeignKey(
 	); err != nil {
 		return nil, err
 	}
+	referencedSchema := foreignKey.ReferencedSchema
+	if referencedSchema == "" {
+		referencedSchema = table.source.Schema
+	} else if err := validateSourceObjectIdentifier(
+		"referenced namespace",
+		referencedSchema,
+		false,
+	); err != nil {
+		return nil, err
+	}
 	if err := validatePostgresForeignKeyColumns(
 		table,
 		foreignKey.Columns,
@@ -452,13 +530,14 @@ func validatePostgresForeignKey(
 		return nil, err
 	}
 	referenced := tables[postgresSourceTableKey(
-		table.source.Schema,
+		referencedSchema,
 		foreignKey.ReferencedTable,
 	)]
 	if referenced == nil {
 		return nil, postgresObjectPolicy(
 			"create PostgreSQL foreign key",
-			"unknown referenced table "+foreignKey.ReferencedTable,
+			"unknown referenced table "+
+				referencedSchema+"."+foreignKey.ReferencedTable,
 		)
 	}
 
@@ -695,13 +774,13 @@ func planPostgresIndex(
 		spec.table.targetSchema,
 		spec.table.source.Name,
 	) + " (" + strings.Join(columns, ", ") + ");"
-	return PostgresObjectStatement{
-		Kind:   PostgresIndexObject,
-		Schema: spec.table.targetSchema,
-		Table:  spec.table.source.Name,
-		Name:   name,
-		SQL:    sql,
-	}, nil
+	return newPostgresObjectStatement(
+		PostgresIndexObject,
+		spec.table.targetSchema,
+		spec.table.source.Name,
+		name,
+		sql,
+	), nil
 }
 
 func renderPostgresObjectIndexColumn(
@@ -776,13 +855,13 @@ func planPostgresCheck(
 		spec.table.source.Name,
 	) + " ADD CONSTRAINT " + quote(Postgres, name) +
 		" CHECK (" + expression + ");"
-	return PostgresObjectStatement{
-		Kind:   PostgresCheckObject,
-		Schema: spec.table.targetSchema,
-		Table:  spec.table.source.Name,
-		Name:   name,
-		SQL:    sql,
-	}, nil
+	return newPostgresObjectStatement(
+		PostgresCheckObject,
+		spec.table.targetSchema,
+		spec.table.source.Name,
+		name,
+		sql,
+	), nil
 }
 
 func validateRenderedPostgresCheck(expression string) error {
@@ -883,13 +962,13 @@ func planPostgresForeignKey(
 		" MATCH " + match +
 		" ON UPDATE " + onUpdate +
 		" ON DELETE " + onDelete + ";"
-	return PostgresObjectStatement{
-		Kind:   PostgresForeignKeyObject,
-		Schema: spec.table.targetSchema,
-		Table:  spec.table.source.Name,
-		Name:   name,
-		SQL:    sql,
-	}, nil
+	return newPostgresObjectStatement(
+		PostgresForeignKeyObject,
+		spec.table.targetSchema,
+		spec.table.source.Name,
+		name,
+		sql,
+	), nil
 }
 
 func normalizePostgresForeignKeyAction(value string) (string, error) {
@@ -969,21 +1048,77 @@ func postgresCheckSortKey(check CheckConstraint) string {
 }
 
 func postgresForeignKeySortKey(foreignKey ForeignKey) string {
-	parts := []string{foreignKey.Name}
-	parts = append(parts, foreignKey.Columns...)
-	parts = append(parts, foreignKey.ReferencedTable)
-	parts = append(parts, foreignKey.ReferencedColumns...)
-	parts = append(
-		parts,
+	var key strings.Builder
+	appendPostgresForeignKeySortField(&key, "name", foreignKey.Name)
+	appendPostgresForeignKeySortFields(
+		&key,
+		"columns",
+		foreignKey.Columns,
+	)
+	appendPostgresForeignKeySortField(
+		&key,
+		"referenced_schema",
+		foreignKey.ReferencedSchema,
+	)
+	appendPostgresForeignKeySortField(
+		&key,
+		"referenced_table",
+		foreignKey.ReferencedTable,
+	)
+	appendPostgresForeignKeySortFields(
+		&key,
+		"referenced_columns",
+		foreignKey.ReferencedColumns,
+	)
+	appendPostgresForeignKeySortField(
+		&key,
+		"on_update",
 		strings.ToUpper(strings.Join(strings.Fields(
 			foreignKey.OnUpdate,
 		), " ")),
+	)
+	appendPostgresForeignKeySortField(
+		&key,
+		"on_delete",
 		strings.ToUpper(strings.Join(strings.Fields(
 			foreignKey.OnDelete,
 		), " ")),
+	)
+	appendPostgresForeignKeySortField(
+		&key,
+		"match",
 		strings.ToUpper(strings.TrimSpace(foreignKey.Match)),
 	)
-	return strings.Join(parts, "\x00")
+	return key.String()
+}
+
+func appendPostgresForeignKeySortFields(
+	key *strings.Builder,
+	name string,
+	values []string,
+) {
+	appendPostgresForeignKeySortField(
+		key,
+		name+"_count",
+		strconv.Itoa(len(values)),
+	)
+	for _, value := range values {
+		appendPostgresForeignKeySortField(key, name+"_item", value)
+	}
+}
+
+func appendPostgresForeignKeySortField(
+	key *strings.Builder,
+	name string,
+	value string,
+) {
+	key.WriteString(strconv.Itoa(len(name)))
+	key.WriteByte(':')
+	key.WriteString(name)
+	key.WriteByte('=')
+	key.WriteString(strconv.Itoa(len(value)))
+	key.WriteByte(':')
+	key.WriteString(value)
 }
 
 func indexDisplayName(table Table, index Index) string {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 
 	"github.com/johndauphine/dmtx/internal/schema"
 )
@@ -22,12 +21,12 @@ func preflightSQLServerSQLiteObjectNames(
 	plannedTables := make(map[string]string, len(tables))
 	plannedIndexes := make(map[string]string)
 	for _, table := range tables {
-		key := strings.ToLower(table.Name)
+		key := stage4SQLiteIdentifier(table.Name)
 		selected[key] = true
 		plannedTables[key] = table.Name
 		for _, index := range table.Indexes {
 			if !index.Inline {
-				plannedIndexes[strings.ToLower(index.Name)] = index.Name
+				plannedIndexes[stage4SQLiteIdentifier(index.Name)] = index.Name
 			}
 		}
 	}
@@ -55,10 +54,10 @@ func preflightSQLServerSQLiteObjectNames(
 				err,
 			)
 		}
-		key := strings.ToLower(name)
+		key := stage4SQLiteIdentifier(name)
 		if planned, exists := plannedTables[key]; exists {
 			if objectType == "table" &&
-				strings.EqualFold(owner, planned) {
+				stage4SQLiteIdentifier(owner) == stage4SQLiteIdentifier(planned) {
 				continue
 			}
 			return sqliteSQLServerProjectionPolicy(
@@ -68,7 +67,7 @@ func preflightSQLServerSQLiteObjectNames(
 		}
 		if planned, exists := plannedIndexes[key]; exists {
 			if objectType == "index" &&
-				selected[strings.ToLower(owner)] {
+				selected[stage4SQLiteIdentifier(owner)] {
 				continue
 			}
 			return sqliteSQLServerProjectionPolicy(

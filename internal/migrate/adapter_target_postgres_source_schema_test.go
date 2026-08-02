@@ -281,6 +281,7 @@ func TestPostgresTargetPlansMySQLTypesObjectsAndIdentityWithoutMutation(
 		)
 	}
 	if planned.Schema != "archive" ||
+		planned.MySQLCollation != "" ||
 		planned.Identity == nil ||
 		planned.Identity == source.Identity ||
 		planned.Identity.Frontier == source.Identity.Frontier ||
@@ -304,8 +305,8 @@ func TestPostgresTargetPlansMySQLTypesObjectsAndIdentityWithoutMutation(
 		"integer",
 		"double precision",
 		"numeric",
-		"text",
-		"text",
+		"varchar",
+		"varchar",
 		"text",
 		"text",
 		"text",

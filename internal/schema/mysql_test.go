@@ -116,6 +116,124 @@ func TestCreateMySQLTableRendersExactTypesDefaultsAndIdentity(t *testing.T) {
 	}
 }
 
+func TestCreateMySQLTableRendersExactSpatialMetadata(t *testing.T) {
+	zero := uint32(0)
+	earth := uint32(4326)
+	table := Table{
+		Schema: "target",
+		Name:   "spatial_samples",
+		Columns: []Column{
+			{
+				Name:               "id",
+				Type:               "bigint",
+				PrimaryKey:         true,
+				PrimaryKeyPosition: 1,
+				DeclaredType:       &DeclaredType{Base: "bigint"},
+			},
+			mysqlSpatialTestColumn(
+				"any_shape",
+				SpatialSubtypeGeometry,
+				nil,
+			),
+			mysqlSpatialTestColumn(
+				"position",
+				SpatialSubtypePoint,
+				&earth,
+			),
+			mysqlSpatialTestColumn(
+				"path",
+				SpatialSubtypeLineString,
+				&zero,
+			),
+			mysqlSpatialTestColumn(
+				"area",
+				SpatialSubtypePolygon,
+				nil,
+			),
+			mysqlSpatialTestColumn(
+				"points",
+				SpatialSubtypeMultiPoint,
+				nil,
+			),
+			mysqlSpatialTestColumn(
+				"paths",
+				SpatialSubtypeMultiLineString,
+				nil,
+			),
+			mysqlSpatialTestColumn(
+				"areas",
+				SpatialSubtypeMultiPolygon,
+				nil,
+			),
+			mysqlSpatialTestColumn(
+				"collection",
+				SpatialSubtypeGeometryCollection,
+				nil,
+			),
+		},
+	}
+	got, err := CreateTable(MySQL, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "CREATE TABLE `target`.`spatial_samples` (" +
+		"`id` BIGINT NOT NULL, " +
+		"`any_shape` GEOMETRY NOT NULL, " +
+		"`position` POINT SRID 4326 NOT NULL, " +
+		"`path` LINESTRING SRID 0 NOT NULL, " +
+		"`area` POLYGON NOT NULL, " +
+		"`points` MULTIPOINT NOT NULL, " +
+		"`paths` MULTILINESTRING NOT NULL, " +
+		"`areas` MULTIPOLYGON NOT NULL, " +
+		"`collection` GEOMETRYCOLLECTION NOT NULL, " +
+		"PRIMARY KEY (`id`)) ENGINE=InnoDB " +
+		"DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_bin " +
+		"ROW_FORMAT=DYNAMIC;"
+	if got != want {
+		t.Fatalf("MySQL spatial DDL:\n got: %s\nwant: %s", got, want)
+	}
+	materialized, err := MaterializeMySQLObjectNames([]Table{table})
+	if err != nil {
+		t.Fatal(err)
+	}
+	*materialized[0].Columns[2].DeclaredType.Spatial.SRID = 0
+	if table.Columns[2].DeclaredType.Spatial.SRID == nil ||
+		*table.Columns[2].DeclaredType.Spatial.SRID != 4326 {
+		t.Fatal("MySQL object materialization aliases spatial SRID metadata")
+	}
+
+	invalid := table
+	invalid.Columns = append([]Column(nil), table.Columns...)
+	declaration := *invalid.Columns[2].DeclaredType
+	declaration.Base = "geometry"
+	invalid.Columns[2].DeclaredType = &declaration
+	if _, err := CreateTable(MySQL, invalid); err == nil {
+		t.Fatal("MySQL renderer accepted a spatial base/subtype mismatch")
+	}
+}
+
+func mysqlSpatialTestColumn(
+	name string,
+	subtype SpatialSubtype,
+	srid *uint32,
+) Column {
+	base := string(subtype)
+	if subtype == SpatialSubtypeGeometryCollection {
+		base = "geomcollection"
+	}
+	return Column{
+		Name: name,
+		Type: string(subtype),
+		DeclaredType: &DeclaredType{
+			Base: base,
+			Spatial: &SpatialTypeMetadata{
+				Subtype: subtype,
+				SRID:    srid,
+			},
+		},
+	}
+}
+
 func TestCreateMySQLTableEscapesStringDefaults(t *testing.T) {
 	table := Table{
 		Name: "notes",

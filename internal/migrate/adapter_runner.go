@@ -15,7 +15,10 @@ func (route resolvedAdapterRoute) execute(
 	cfg config.Config,
 	observer TableObserver,
 ) (Result, error) {
-	if route.override != nil {
+	if route.override != nil && !stage4SQLiteCompatibilityRouteRequiresComposition(
+		cfg,
+		route,
+	) {
 		return route.override(ctx, cfg, observer)
 	}
 	if route.source.open == nil || route.target.open == nil {
@@ -24,6 +27,18 @@ func (route resolvedAdapterRoute) execute(
 			route.source.engine,
 			route.target.engine,
 		)
+	}
+	mode, err := normalizeAdapterTargetMode(cfg.Migration.TargetMode)
+	if err != nil {
+		return Result{}, err
+	}
+	stage4, err := resolveStage4AdapterAdmission(
+		cfg,
+		observer,
+		false,
+	)
+	if err != nil {
+		return Result{}, err
 	}
 	source, err := route.source.open(ctx, cfg.Source)
 	if err != nil {
@@ -87,7 +102,32 @@ func (route resolvedAdapterRoute) execute(
 			return Result{}, err
 		}
 	}
-	return migrateWithAdapters(ctx, cfg, observer, source, target)
+	return migrateWithAdaptersAdmission(
+		ctx,
+		cfg,
+		observer,
+		source,
+		target,
+		mode,
+		stage4,
+	)
+}
+
+// SQLite-to-SQLite normally retains the compatibility override. Strict
+// consistency, date-based incremental transfer, delete reconciliation, and an
+// explicit upsert-merge cap all require the durable Stage 4 lifecycle: the
+// legacy path cannot supply the corresponding stable-view, attempt, receipt,
+// or target-writer proof. Route only those explicit contracts through
+// composed adapters.
+func stage4SQLiteCompatibilityRouteRequiresComposition(
+	cfg config.Config,
+	route resolvedAdapterRoute,
+) bool {
+	return (cfg.Migration.StrictConsistency ||
+		len(cfg.Migration.DateUpdatedColumns) != 0 ||
+		cfg.Migration.Deletes.Mode == config.DeleteModeReconcile ||
+		stage4AdapterUpsertMergeExplicitlyRequested(cfg.Migration)) &&
+		route.source.engine == "sqlite" && route.target.engine == "sqlite"
 }
 
 func executeBuiltInComposedRoute(
@@ -113,7 +153,10 @@ func executeBuiltInComposedRoute(
 			pair.target,
 		)
 	}
-	if route.override != nil {
+	if route.override != nil && !stage4SQLiteCompatibilityRouteRequiresComposition(
+		cfg,
+		route,
+	) {
 		return Result{}, fmt.Errorf(
 			"migration pair %s-to-%s is not a composed adapter route",
 			pair.source,
@@ -245,6 +288,48 @@ func migrateWithAdapters(
 	mode, err := normalizeAdapterTargetMode(cfg.Migration.TargetMode)
 	if err != nil {
 		return Result{}, err
+	}
+	stage4, err := resolveStage4AdapterAdmission(
+		cfg,
+		observer,
+		false,
+	)
+	if err != nil {
+		return Result{}, err
+	}
+	return migrateWithAdaptersAdmission(
+		ctx,
+		cfg,
+		observer,
+		source,
+		target,
+		mode,
+		stage4,
+	)
+}
+
+func migrateWithAdaptersAdmission(
+	ctx context.Context,
+	cfg config.Config,
+	observer TableObserver,
+	source sourceAdapter,
+	target targetAdapter,
+	mode string,
+	stage4 stage4AdapterAdmission,
+) (Result, error) {
+	if err := requireStage4UpsertMergeComposition(cfg, stage4.enabled); err != nil {
+		return Result{}, err
+	}
+	if stage4.enabled {
+		return migrateWithStage4Adapters(
+			ctx,
+			cfg,
+			observer,
+			source,
+			target,
+			mode,
+			stage4.run,
+		)
 	}
 	names, err := source.ListTables(ctx)
 	if err != nil {

@@ -26,6 +26,10 @@ func validate(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}
+	if err := config.ValidateBoundedStage4Settings(cfg.Migration); err != nil {
+		fmt.Fprintf(stderr, "configuration: %v\n", err)
+		return ConfigurationError
+	}
 	result, err := migrate.ValidateSQLite(context.Background(), cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "validation: %v\n", err)

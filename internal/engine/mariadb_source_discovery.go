@@ -43,7 +43,14 @@ func VerifyMariaDB1011Source(
 	ctx context.Context,
 	database *sql.DB,
 ) error {
-	catalog, err := readMariaDB1011SourceServerCatalog(ctx, database)
+	return verifyMariaDB1011Source(ctx, database)
+}
+
+func verifyMariaDB1011Source(
+	ctx context.Context,
+	queryer MySQLCatalogQueryer,
+) error {
+	catalog, err := readMariaDB1011SourceServerCatalog(ctx, queryer)
 	if err != nil {
 		return err
 	}
@@ -52,7 +59,7 @@ func VerifyMariaDB1011Source(
 
 func readMariaDB1011SourceServerCatalog(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 ) (mariaDB1011SourceServerCatalog, error) {
 	var catalog mariaDB1011SourceServerCatalog
 	if err := database.QueryRowContext(
@@ -171,7 +178,7 @@ func validateMariaDB1011SourceServerCatalog(
 
 func readMariaDB1011SourceTableCatalog(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	namespace string,
 	name string,
 ) (mysql80SourceTableCatalog, error) {
@@ -313,7 +320,7 @@ const mariaDB1011SourceColumnsQuery = `
 
 func readMariaDB1011SourceColumns(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table mysql80SourceTableCatalog,
 	namespace string,
 	name string,
@@ -569,11 +576,11 @@ func mariaDB1011SharedColumnType(
 
 func inspectMariaDB1011Table(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	namespace string,
 	name string,
 ) (schema.Table, error) {
-	if err := VerifyMariaDB1011Source(ctx, database); err != nil {
+	if err := verifyMariaDB1011Source(ctx, database); err != nil {
 		return schema.Table{}, err
 	}
 	tableCatalog, err := readMariaDB1011SourceTableCatalog(

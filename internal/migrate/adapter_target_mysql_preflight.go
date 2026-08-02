@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 
@@ -50,6 +51,54 @@ func preflightMySQLRetainedTables(
 	database *sql.DB,
 	targetTables []schema.Table,
 ) error {
+	if len(targetTables) != 0 {
+		flavor, err := engine.DetectMySQLServerFlavor(
+			ctx,
+			database,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"preflight MySQL upsert trigger visibility: %w",
+				err,
+			)
+		}
+		selected := make(
+			map[string]struct{},
+			len(targetTables),
+		)
+		namespace := targetTables[0].Schema
+		for _, table := range targetTables {
+			if table.Schema != namespace {
+				return fmt.Errorf(
+					"preflight MySQL upsert: all tables must use one target database",
+				)
+			}
+			selected[adapterSourceTableKey(
+				table.Schema,
+				table.Name,
+			)] = struct{}{}
+			if err := preflightStage4MySQLTriggerMetadataVisibility(
+				ctx,
+				database,
+				flavor,
+				table,
+			); err != nil {
+				return fmt.Errorf(
+					"preflight MySQL table %s trigger visibility: %w",
+					table.Name,
+					err,
+				)
+			}
+		}
+		if err := preflightMySQLSelectedTargetTriggers(
+			ctx,
+			database,
+			namespace,
+			selected,
+		); err != nil {
+			return err
+		}
+	}
 	for _, planned := range targetTables {
 		exists, err := mysqlTargetTableExists(
 			ctx,
@@ -123,6 +172,13 @@ func validateMySQLRetainedTableShape(
 ) error {
 	planned = mysqlTableShapeWithoutFrontier(planned)
 	actual = mysqlTableShapeWithoutFrontier(actual)
+	// Schema evolution rehydrates durable source/target evidence, whose
+	// canonical JSON represents a modifier-free declaration as an empty
+	// argument array. Native MySQL discovery represents the same declaration
+	// with nil. Normalize only that representation detail before the exact
+	// target-shape comparison; every real modifier remains significant.
+	normalizeMySQLTargetDeclaredTypeArguments(&planned)
+	normalizeMySQLTargetDeclaredTypeArguments(&actual)
 	if planned.Schema != actual.Schema ||
 		planned.Name != actual.Name ||
 		planned.MySQLCollation != actual.MySQLCollation ||
@@ -249,6 +305,7 @@ func validateMySQLRetainedTableShape(
 			)
 		}
 		if expected.Name != found.Name ||
+			expected.ReferencedSchema != found.ReferencedSchema ||
 			expected.ReferencedTable != found.ReferencedTable ||
 			expected.OnUpdate != found.OnUpdate ||
 			expected.OnDelete != found.OnDelete ||
@@ -374,11 +431,10 @@ func validateMySQLRetainedColumn(
 		if planned.DeclaredType != nil || actual.DeclaredType != nil {
 			return fmt.Errorf("declared type presence differs")
 		}
-	} else if planned.DeclaredType.Base != actual.DeclaredType.Base ||
-		!slices.Equal(
-			planned.DeclaredType.Arguments,
-			actual.DeclaredType.Arguments,
-		) {
+	} else if !reflect.DeepEqual(
+		*planned.DeclaredType,
+		*actual.DeclaredType,
+	) {
 		return fmt.Errorf("declared type differs")
 	}
 	plannedSQL, plannedErr := renderMySQLRetainedColumn(planned)
@@ -677,7 +733,7 @@ func preflightMySQLSelectedTargetTriggers(
 			tableName,
 		)]; planned {
 			return fmt.Errorf(
-				"preflight MySQL table %s: target trigger %s prevents safe replacement",
+				"preflight MySQL table %s: target trigger %s prevents safe target writes",
 				tableName,
 				triggerName,
 			)

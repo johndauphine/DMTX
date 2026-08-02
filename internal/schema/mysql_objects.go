@@ -601,14 +601,25 @@ func validateMySQLForeignKey(
 			"incomplete foreign key for table "+table.source.Name,
 		)
 	}
+	referencedSchema := foreignKey.ReferencedSchema
+	if referencedSchema == "" {
+		referencedSchema = table.source.Schema
+	} else if err := validateMySQLIdentifier(
+		"referenced schema",
+		referencedSchema,
+		false,
+	); err != nil {
+		return nil, err
+	}
 	referenced := tables[mysqlObjectTableKey(
-		table.source.Schema,
+		referencedSchema,
 		foreignKey.ReferencedTable,
 	)]
 	if referenced == nil {
 		return nil, mysqlObjectPolicy(
 			"create MySQL foreign key",
-			"unknown referenced table "+foreignKey.ReferencedTable,
+			"unknown referenced table "+
+				referencedSchema+"."+foreignKey.ReferencedTable,
 		)
 	}
 	referencedColumns := append(

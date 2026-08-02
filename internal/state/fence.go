@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -65,12 +66,16 @@ func (guard *LeaseGuard) Protect(ctx context.Context, operation func() error) (e
 	}()
 
 	var ownerToken string
+	var runID string
 	var generation int64
 	queryErr := connection.QueryRowContext(ctx,
-		`SELECT owner_token, generation FROM leases WHERE target = ?`,
+		`SELECT run_id, owner_token, generation FROM leases WHERE target = ?`,
 		guard.lease.Target,
-	).Scan(&ownerToken, &generation)
-	if errors.Is(queryErr, sql.ErrNoRows) || ownerToken != guard.lease.OwnerToken || generation != guard.lease.Generation {
+	).Scan(&runID, &ownerToken, &generation)
+	if errors.Is(queryErr, sql.ErrNoRows) ||
+		runID != guard.lease.RunID ||
+		ownerToken != guard.lease.OwnerToken ||
+		generation != guard.lease.Generation {
 		return fmt.Errorf("%w: target=%q generation=%d", ErrLeaseLost, guard.lease.Target, guard.lease.Generation)
 	}
 	if queryErr != nil {
@@ -113,24 +118,354 @@ func (guard *LeaseGuard) Release() error {
 // FenceBackend returns a backend whose every mutation is protected by the
 // supplied lease generation. Reads remain available for diagnosis after loss.
 func FenceBackend(backend Backend, guard *LeaseGuard) Backend {
-	return &fencedBackend{backend: backend, ranges: backend.(RangeBackend), guard: guard}
+	stage4, _ := backend.(Stage4Backend)
+	fenced := &fencedBackend{
+		backend: backend,
+		ranges:  backend.(RangeBackend),
+		stage4:  stage4,
+		guard:   guard,
+	}
+	aggregate, aggregateOK := backend.(Stage4AggregateBackend)
+	readiness, readinessOK := backend.(Stage4DeleteJournalReadinessBackend)
+	if readinessOK && stage4DeleteJournalReadinessBackendIsNil(readiness) {
+		readinessOK = false
+	}
+	if !aggregateOK {
+		if readinessOK {
+			return &fencedDeleteJournalReadinessBackend{
+				fencedBackend: fenced,
+				readiness:     readiness,
+			}
+		}
+		return fenced
+	}
+	fencedAggregate := &fencedAggregateBackend{
+		fencedBackend: fenced,
+		aggregate:     aggregate,
+	}
+	recovery, ok := backend.(Stage4RebuildRecoveryBackend)
+	if !ok {
+		if readinessOK {
+			return &fencedAggregateDeleteJournalReadinessBackend{
+				fencedAggregateBackend: fencedAggregate,
+				readiness:              readiness,
+			}
+		}
+		return fencedAggregate
+	}
+	fencedRebuild := &fencedRebuildAggregateBackend{
+		fencedAggregateBackend: fencedAggregate,
+		recovery:               recovery,
+	}
+	if readinessOK {
+		return &fencedRebuildAggregateDeleteJournalReadinessBackend{
+			fencedRebuildAggregateBackend: fencedRebuild,
+			readiness:                     readiness,
+		}
+	}
+	return fencedRebuild
+}
+
+func stage4DeleteJournalReadinessBackendIsNil(
+	backend Stage4DeleteJournalReadinessBackend,
+) bool {
+	if backend == nil {
+		return true
+	}
+	value := reflect.ValueOf(backend)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 type fencedBackend struct {
 	backend Backend
 	ranges  RangeBackend
+	stage4  Stage4Backend
 	guard   *LeaseGuard
+}
+
+// fencedAggregateBackend is a conditional capability wrapper. Backends that
+// do not implement aggregate Stage 4 completion must not appear to implement
+// it merely because they were passed through FenceBackend.
+type fencedAggregateBackend struct {
+	*fencedBackend
+	aggregate Stage4AggregateBackend
+}
+
+// fencedRebuildAggregateBackend is returned only when the wrapped backend
+// really implements terminal rebuild recovery. Keeping the methods off the
+// ordinary aggregate wrapper prevents a capability type assertion from
+// succeeding merely because fencing was applied.
+type fencedRebuildAggregateBackend struct {
+	*fencedAggregateBackend
+	recovery Stage4RebuildRecoveryBackend
+}
+
+// fencedDeleteJournalReadinessBackend is returned only when the wrapped
+// backend actually advertises durable delete-journal readiness. The optional
+// capability remains absent from ordinary fenced backends.
+type fencedDeleteJournalReadinessBackend struct {
+	*fencedBackend
+	readiness Stage4DeleteJournalReadinessBackend
+}
+
+type fencedAggregateDeleteJournalReadinessBackend struct {
+	*fencedAggregateBackend
+	readiness Stage4DeleteJournalReadinessBackend
+}
+
+type fencedRebuildAggregateDeleteJournalReadinessBackend struct {
+	*fencedRebuildAggregateBackend
+	readiness Stage4DeleteJournalReadinessBackend
+}
+
+func (backend *fencedAggregateBackend) EnsureStage4TableInventory(
+	inventory Stage4TableInventory,
+) error {
+	return backend.protectRun(inventory.RunID, func() error {
+		return backend.aggregate.EnsureStage4TableInventory(inventory)
+	})
+}
+
+func (backend *fencedAggregateBackend) CompleteStage4Table(
+	completion Stage4TableCompletion,
+) error {
+	return backend.protectRun(completion.RunID, func() error {
+		return backend.aggregate.CompleteStage4Table(completion)
+	})
+}
+
+func (backend *fencedAggregateBackend) CompleteStage4Run(
+	completion Stage4RunCompletion,
+) error {
+	return backend.protectRun(completion.RunID, func() error {
+		return backend.aggregate.CompleteStage4Run(completion)
+	})
+}
+
+func (backend *fencedAggregateBackend) LoadStage4TableInventory(
+	runID string,
+) (Stage4TableInventoryReceipt, bool, error) {
+	return backend.aggregate.LoadStage4TableInventory(runID)
+}
+
+func (backend *fencedAggregateBackend) LoadStage4TableCompletions(
+	runID string,
+) ([]Stage4TableCompletionReceipt, error) {
+	return backend.aggregate.LoadStage4TableCompletions(runID)
+}
+
+func (backend *fencedRebuildAggregateBackend) SaveStage4RebuildReady(
+	ready Stage4RebuildReady,
+) error {
+	return backend.protectRun(ready.RunID, func() error {
+		return backend.recovery.SaveStage4RebuildReady(ready)
+	})
+}
+
+func (backend *fencedRebuildAggregateBackend) EnsureStage4RebuildFinalization(
+	finalization Stage4RebuildFinalization,
+) (Stage4RebuildFinalizationReceipt, bool, error) {
+	var receipt Stage4RebuildFinalizationReceipt
+	var created bool
+	err := backend.protectRun(finalization.RunID, func() error {
+		var err error
+		receipt, created, err = backend.recovery.EnsureStage4RebuildFinalization(
+			finalization,
+		)
+		return err
+	})
+	return receipt, created, err
+}
+
+func (backend *fencedRebuildAggregateBackend) LoadStage4RebuildFinalization(
+	runID string,
+	phase Stage4RebuildFinalizationPhase,
+) (Stage4RebuildFinalizationReceipt, bool, error) {
+	return backend.recovery.LoadStage4RebuildFinalization(runID, phase)
+}
+
+func (backend *fencedRebuildAggregateBackend) LoadStage4RebuildReady(
+	runID string,
+) (Stage4RebuildReadyReceipt, bool, error) {
+	return backend.recovery.LoadStage4RebuildReady(runID)
+}
+
+func (backend *fencedDeleteJournalReadinessBackend) SaveStage4DeleteJournalReadiness(
+	ready Stage4DeleteJournalReadiness,
+) error {
+	return backend.protectRun(ready.RunID, func() error {
+		return backend.readiness.SaveStage4DeleteJournalReadiness(ready)
+	})
+}
+
+func (backend *fencedDeleteJournalReadinessBackend) EnsureStage4DeleteJournalReadiness(
+	ready Stage4DeleteJournalReadiness,
+) (Stage4DeleteJournalReadinessReceipt, bool, error) {
+	var receipt Stage4DeleteJournalReadinessReceipt
+	var created bool
+	err := backend.protectRun(ready.RunID, func() error {
+		var err error
+		receipt, created, err = backend.readiness.EnsureStage4DeleteJournalReadiness(ready)
+		return err
+	})
+	return receipt, created, err
+}
+
+func (backend *fencedDeleteJournalReadinessBackend) LoadStage4DeleteJournalReadiness(
+	runID string,
+) (Stage4DeleteJournalReadinessReceipt, bool, error) {
+	return backend.readiness.LoadStage4DeleteJournalReadiness(runID)
+}
+
+func (backend *fencedDeleteJournalReadinessBackend) ValidateStage4DeleteJournalReadinessBoundary(
+	boundary Stage4DeleteJournalReadinessBoundary,
+) error {
+	return backend.readiness.ValidateStage4DeleteJournalReadinessBoundary(boundary)
+}
+
+func (backend *fencedAggregateDeleteJournalReadinessBackend) SaveStage4DeleteJournalReadiness(
+	ready Stage4DeleteJournalReadiness,
+) error {
+	return backend.protectRun(ready.RunID, func() error {
+		return backend.readiness.SaveStage4DeleteJournalReadiness(ready)
+	})
+}
+
+func (backend *fencedAggregateDeleteJournalReadinessBackend) EnsureStage4DeleteJournalReadiness(
+	ready Stage4DeleteJournalReadiness,
+) (Stage4DeleteJournalReadinessReceipt, bool, error) {
+	var receipt Stage4DeleteJournalReadinessReceipt
+	var created bool
+	err := backend.protectRun(ready.RunID, func() error {
+		var err error
+		receipt, created, err = backend.readiness.EnsureStage4DeleteJournalReadiness(ready)
+		return err
+	})
+	return receipt, created, err
+}
+
+func (backend *fencedAggregateDeleteJournalReadinessBackend) LoadStage4DeleteJournalReadiness(
+	runID string,
+) (Stage4DeleteJournalReadinessReceipt, bool, error) {
+	return backend.readiness.LoadStage4DeleteJournalReadiness(runID)
+}
+
+func (backend *fencedAggregateDeleteJournalReadinessBackend) ValidateStage4DeleteJournalReadinessBoundary(
+	boundary Stage4DeleteJournalReadinessBoundary,
+) error {
+	return backend.readiness.ValidateStage4DeleteJournalReadinessBoundary(boundary)
+}
+
+func (backend *fencedRebuildAggregateDeleteJournalReadinessBackend) SaveStage4DeleteJournalReadiness(
+	ready Stage4DeleteJournalReadiness,
+) error {
+	return backend.protectRun(ready.RunID, func() error {
+		return backend.readiness.SaveStage4DeleteJournalReadiness(ready)
+	})
+}
+
+func (backend *fencedRebuildAggregateDeleteJournalReadinessBackend) EnsureStage4DeleteJournalReadiness(
+	ready Stage4DeleteJournalReadiness,
+) (Stage4DeleteJournalReadinessReceipt, bool, error) {
+	var receipt Stage4DeleteJournalReadinessReceipt
+	var created bool
+	err := backend.protectRun(ready.RunID, func() error {
+		var err error
+		receipt, created, err = backend.readiness.EnsureStage4DeleteJournalReadiness(ready)
+		return err
+	})
+	return receipt, created, err
+}
+
+func (backend *fencedRebuildAggregateDeleteJournalReadinessBackend) LoadStage4DeleteJournalReadiness(
+	runID string,
+) (Stage4DeleteJournalReadinessReceipt, bool, error) {
+	return backend.readiness.LoadStage4DeleteJournalReadiness(runID)
+}
+
+func (backend *fencedRebuildAggregateDeleteJournalReadinessBackend) ValidateStage4DeleteJournalReadinessBoundary(
+	boundary Stage4DeleteJournalReadinessBoundary,
+) error {
+	return backend.readiness.ValidateStage4DeleteJournalReadinessBoundary(boundary)
 }
 
 func (backend *fencedBackend) protect(operation func() error) error {
 	return backend.guard.Protect(context.Background(), operation)
 }
 
+func sameLease(left, right Lease) bool {
+	return left.Target == right.Target &&
+		left.RunID == right.RunID &&
+		left.OwnerToken == right.OwnerToken &&
+		left.Generation == right.Generation
+}
+
+func (backend *fencedBackend) requireBoundRunLease(runID string) error {
+	runs, err := backend.backend.List()
+	if err != nil {
+		return fmt.Errorf("verify bound target lease: %w", err)
+	}
+	expected := backend.guard.Lease()
+	found := false
+	for _, run := range runs {
+		if run.ID != runID {
+			continue
+		}
+		bound, err := run.BoundLease()
+		if err != nil || !sameLease(bound, expected) {
+			return fmt.Errorf(
+				"%w: run %q is not bound to target=%q generation=%d",
+				ErrLeaseLost,
+				runID,
+				expected.Target,
+				expected.Generation,
+			)
+		}
+		found = true
+	}
+	if !found {
+		return fmt.Errorf("%w: unknown mutation run %q", ErrLeaseLost, runID)
+	}
+	return nil
+}
+
+func (backend *fencedBackend) protectOwnedRun(
+	runID string,
+	operation func() error,
+) error {
+	if backend.guard == nil || runID == "" || backend.guard.Lease().RunID != runID {
+		return fmt.Errorf("%w: mutation run %q is not owned by the lease", ErrLeaseLost, runID)
+	}
+	return backend.protect(operation)
+}
+
+func (backend *fencedBackend) protectRun(runID string, operation func() error) error {
+	return backend.protectOwnedRun(runID, func() error {
+		if err := backend.requireBoundRunLease(runID); err != nil {
+			return err
+		}
+		return operation()
+	})
+}
+
 func (backend *fencedBackend) InitializeRun(run Run, hash string) error {
-	return backend.protect(func() error { return backend.backend.InitializeRun(run, hash) })
+	lease := backend.guard.Lease()
+	bound, err := runWithBoundLease(run, lease)
+	if err != nil {
+		return fmt.Errorf("%w: initialize run lease binding: %v", ErrLeaseLost, err)
+	}
+	return backend.protectOwnedRun(run.ID, func() error {
+		return backend.backend.InitializeRun(bound, hash)
+	})
 }
 func (backend *fencedBackend) Append(run Run) error {
-	return backend.protect(func() error { return backend.backend.Append(run) })
+	return backend.protectRun(run.ID, func() error { return backend.backend.Append(run) })
 }
 func (backend *fencedBackend) List() ([]Run, error) { return backend.backend.List() }
 func (backend *fencedBackend) Latest() (Run, bool, error) {
@@ -139,38 +474,64 @@ func (backend *fencedBackend) Latest() (Run, bool, error) {
 func (backend *fencedBackend) LatestResumableForTarget(target string) (Run, bool, error) {
 	return backend.backend.LatestResumableForTarget(target)
 }
+func (backend *fencedBackend) BindRunLease(runID string, lease Lease) error {
+	if backend.guard == nil || !sameLease(backend.guard.Lease(), lease) {
+		return fmt.Errorf("%w: target lease rebind does not match current owner", ErrLeaseLost)
+	}
+	return backend.protectOwnedRun(runID, func() error {
+		return backend.backend.BindRunLease(runID, lease)
+	})
+}
 func (backend *fencedBackend) ReactivateRun(runID, reason string) error {
-	return backend.protect(func() error { return backend.backend.ReactivateRun(runID, reason) })
+	return backend.protectRun(runID, func() error { return backend.backend.ReactivateRun(runID, reason) })
 }
 func (backend *fencedBackend) UpdateFailure(runID, reason string, endedAt time.Time) error {
-	return backend.protect(func() error { return backend.backend.UpdateFailure(runID, reason, endedAt) })
+	return backend.protectRun(runID, func() error { return backend.backend.UpdateFailure(runID, reason, endedAt) })
 }
 func (backend *fencedBackend) UpdateRecoverableOutcome(runID string, outcome Outcome, reason string, endedAt time.Time) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.backend.UpdateRecoverableOutcome(runID, outcome, reason, endedAt)
 	})
 }
+func (backend *fencedBackend) UpdateNonResumableOutcome(runID string, outcome Outcome, reason string, endedAt time.Time) error {
+	terminal, ok := backend.backend.(TerminalOutcomeBackend)
+	if !ok {
+		return fmt.Errorf("non-resumable terminal outcome backend is unavailable")
+	}
+	return backend.protectRun(runID, func() error {
+		return terminal.UpdateNonResumableOutcome(runID, outcome, reason, endedAt)
+	})
+}
 func (backend *fencedBackend) AbandonRun(runID, reason string, endedAt time.Time) error {
-	return backend.protect(func() error { return backend.backend.AbandonRun(runID, reason, endedAt) })
+	return backend.protectRun(runID, func() error { return backend.backend.AbandonRun(runID, reason, endedAt) })
 }
 func (backend *fencedBackend) CreateTask(task Task) error {
-	return backend.protect(func() error { return backend.backend.CreateTask(task) })
+	return backend.protectRun(task.RunID, func() error { return backend.backend.CreateTask(task) })
 }
 func (backend *fencedBackend) CreateTasks(tasks []Task) error {
-	return backend.protect(func() error { return backend.backend.CreateTasks(tasks) })
+	if len(tasks) == 0 {
+		return nil
+	}
+	runID := tasks[0].RunID
+	for _, task := range tasks[1:] {
+		if task.RunID != runID {
+			return fmt.Errorf("%w: batch contains multiple run IDs", ErrLeaseLost)
+		}
+	}
+	return backend.protectRun(runID, func() error { return backend.backend.CreateTasks(tasks) })
 }
 func (backend *fencedBackend) AdvanceIntegerKeysetTask(runID, table string, rows int, watermark int64) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.backend.AdvanceIntegerKeysetTask(runID, table, rows, watermark)
 	})
 }
 func (backend *fencedBackend) AdvanceRowNumberTask(runID, table string, rows int, watermark int64) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.backend.AdvanceRowNumberTask(runID, table, rows, watermark)
 	})
 }
 func (backend *fencedBackend) CompleteTask(runID, table string, rows int, completedAt time.Time) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.backend.CompleteTask(runID, table, rows, completedAt)
 	})
 }
@@ -178,13 +539,13 @@ func (backend *fencedBackend) ListTasks(runID string) ([]Task, error) {
 	return backend.backend.ListTasks(runID)
 }
 func (backend *fencedBackend) SaveConfigHash(runID, hash string) error {
-	return backend.protect(func() error { return backend.backend.SaveConfigHash(runID, hash) })
+	return backend.protectRun(runID, func() error { return backend.backend.SaveConfigHash(runID, hash) })
 }
 func (backend *fencedBackend) ConfigHash(runID string) (string, bool, error) {
 	return backend.backend.ConfigHash(runID)
 }
 func (backend *fencedBackend) SaveResumeCompatibilityHash(runID, hash string) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.backend.SaveResumeCompatibilityHash(runID, hash)
 	})
 }
@@ -192,13 +553,13 @@ func (backend *fencedBackend) ResumeCompatibilityHash(runID string) (string, boo
 	return backend.backend.ResumeCompatibilityHash(runID)
 }
 func (backend *fencedBackend) AcknowledgeConfigOverride(runID, hash, compatibility string) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.backend.AcknowledgeConfigOverride(runID, hash, compatibility)
 	})
 }
 func (backend *fencedBackend) EnsureWorkPlan(task WorkTask, ranges []RangeState) (bool, error) {
 	var created bool
-	err := backend.protect(func() error {
+	err := backend.protectRun(task.RunID, func() error {
 		var err error
 		created, err = backend.ranges.EnsureWorkPlan(task, ranges)
 		return err
@@ -206,20 +567,20 @@ func (backend *fencedBackend) EnsureWorkPlan(task WorkTask, ranges []RangeState)
 	return created, err
 }
 func (backend *fencedBackend) ResetWorkPlan(task WorkTask, ranges []RangeState) error {
-	return backend.protect(func() error { return backend.ranges.ResetWorkPlan(task, ranges) })
+	return backend.protectRun(task.RunID, func() error { return backend.ranges.ResetWorkPlan(task, ranges) })
 }
 func (backend *fencedBackend) ListWork(runID string) ([]WorkTask, []RangeState, error) {
 	return backend.ranges.ListWork(runID)
 }
 func (backend *fencedBackend) BeginRangeChunk(intent RangeChunkIntent) error {
-	return backend.protect(func() error { return backend.ranges.BeginRangeChunk(intent) })
+	return backend.protectRun(intent.RunID, func() error { return backend.ranges.BeginRangeChunk(intent) })
 }
 func (backend *fencedBackend) RecordRangeAttempt(attempt RangeAttempt) error {
-	return backend.protect(func() error { return backend.ranges.RecordRangeAttempt(attempt) })
+	return backend.protectRun(attempt.RunID, func() error { return backend.ranges.RecordRangeAttempt(attempt) })
 }
 func (backend *fencedBackend) AcknowledgeRange(ack RangeAcknowledgement) (RangeState, error) {
 	var updated RangeState
-	err := backend.protect(func() error {
+	err := backend.protectRun(ack.RunID, func() error {
 		var err error
 		updated, err = backend.ranges.AcknowledgeRange(ack)
 		return err
@@ -227,17 +588,290 @@ func (backend *fencedBackend) AcknowledgeRange(ack RangeAcknowledgement) (RangeS
 	return updated, err
 }
 func (backend *fencedBackend) CompleteRange(runID string, task TaskKey, rangeID, topology string, expected uint64, completedAt time.Time) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.ranges.CompleteRange(runID, task, rangeID, topology, expected, completedAt)
 	})
 }
 func (backend *fencedBackend) CompleteWorkTask(runID string, task TaskKey, topology string, completedAt time.Time) error {
-	return backend.protect(func() error {
+	return backend.protectRun(runID, func() error {
 		return backend.ranges.CompleteWorkTask(runID, task, topology, completedAt)
 	})
 }
+func (backend *fencedBackend) stage4Backend() (Stage4Backend, error) {
+	if backend.stage4 == nil {
+		return nil, fmt.Errorf("Stage 4 state is unsupported by this backend")
+	}
+	return backend.stage4, nil
+}
+func (backend *fencedBackend) SaveSchemaSnapshot(snapshot SchemaSnapshot) error {
+	return backend.protectRun(snapshot.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.SaveSchemaSnapshot(snapshot)
+	})
+}
+func (backend *fencedBackend) LoadSchemaSnapshot(runID string, task TaskKey) (SchemaSnapshot, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return SchemaSnapshot{}, false, err
+	}
+	return stage4.LoadSchemaSnapshot(runID, task)
+}
+func (backend *fencedBackend) LoadLatestApplicableSchemaSnapshot(
+	runID string,
+	task TaskKey,
+) (SchemaSnapshot, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return SchemaSnapshot{}, false, err
+	}
+	return stage4.LoadLatestApplicableSchemaSnapshot(runID, task)
+}
+func (backend *fencedBackend) BeginIncrementalAttempt(attempt IncrementalAttempt) (IncrementalAttempt, bool, error) {
+	var stored IncrementalAttempt
+	var created bool
+	err := backend.protectRun(attempt.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		stored, created, err = stage4.BeginIncrementalAttempt(attempt)
+		return err
+	})
+	return stored, created, err
+}
+func (backend *fencedBackend) LoadIncrementalAttempt(
+	runID string,
+	task TaskKey,
+	attemptID string,
+) (IncrementalAttempt, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return IncrementalAttempt{}, false, err
+	}
+	return stage4.LoadIncrementalAttempt(runID, task, attemptID)
+}
+func (backend *fencedBackend) LoadActiveIncrementalAttempt(
+	runID string,
+	task TaskKey,
+) (IncrementalAttempt, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return IncrementalAttempt{}, false, err
+	}
+	return stage4.LoadActiveIncrementalAttempt(runID, task)
+}
+func (backend *fencedBackend) LoadLatestCommittedIncrementalAttempt(
+	runID string,
+	task TaskKey,
+) (IncrementalAttempt, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return IncrementalAttempt{}, false, err
+	}
+	return stage4.LoadLatestCommittedIncrementalAttempt(runID, task)
+}
+func (backend *fencedBackend) CommitIncrementalAttempt(commit IncrementalCommit) error {
+	return backend.protectRun(commit.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.CommitIncrementalAttempt(commit)
+	})
+}
+func (backend *fencedBackend) BeginDeleteReconciliation(
+	record DeleteReconciliation,
+) (DeleteReconciliation, bool, error) {
+	var stored DeleteReconciliation
+	var created bool
+	err := backend.protectRun(record.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		stored, created, err = stage4.BeginDeleteReconciliation(record)
+		return err
+	})
+	return stored, created, err
+}
+func (backend *fencedBackend) LoadDeleteReconciliation(
+	runID string,
+	task TaskKey,
+	attemptID string,
+) (DeleteReconciliation, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return DeleteReconciliation{}, false, err
+	}
+	return stage4.LoadDeleteReconciliation(runID, task, attemptID)
+}
+func (backend *fencedBackend) LoadLatestSuccessfulDeleteReconciliation(
+	runID string,
+	task TaskKey,
+) (DeleteReconciliation, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return DeleteReconciliation{}, false, err
+	}
+	return stage4.LoadLatestSuccessfulDeleteReconciliation(runID, task)
+}
+func (backend *fencedBackend) SaveDeleteReconciliationPlan(
+	plan DeleteReconciliationPlan,
+) error {
+	return backend.protectRun(plan.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.SaveDeleteReconciliationPlan(plan)
+	})
+}
+func (backend *fencedBackend) BeginDeleteReconciliationBatch(
+	batch DeleteReconciliationBatch,
+) (DeleteReconciliationBatch, bool, error) {
+	var stored DeleteReconciliationBatch
+	var created bool
+	err := backend.protectRun(batch.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		stored, created, err =
+			stage4.BeginDeleteReconciliationBatch(batch)
+		return err
+	})
+	return stored, created, err
+}
+func (backend *fencedBackend) CommitDeleteReconciliationBatch(
+	commit DeleteReconciliationBatchCommit,
+) error {
+	return backend.protectRun(commit.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.CommitDeleteReconciliationBatch(commit)
+	})
+}
+func (backend *fencedBackend) FinishDeleteReconciliation(result DeleteReconciliationResult) error {
+	return backend.protectRun(result.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.FinishDeleteReconciliation(result)
+	})
+}
+func (backend *fencedBackend) SaveStrictMigrationSnapshot(snapshot StrictMigrationSnapshot) error {
+	return backend.protectRun(snapshot.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.SaveStrictMigrationSnapshot(snapshot)
+	})
+}
+func (backend *fencedBackend) LoadStrictMigrationSnapshot(
+	runID string,
+	epochID string,
+) (StrictMigrationSnapshot, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return StrictMigrationSnapshot{}, false, err
+	}
+	return stage4.LoadStrictMigrationSnapshot(runID, epochID)
+}
+func (backend *fencedBackend) LoadLatestStrictMigrationSnapshot(
+	runID string,
+) (StrictMigrationSnapshot, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return StrictMigrationSnapshot{}, false, err
+	}
+	return stage4.LoadLatestStrictMigrationSnapshot(runID)
+}
+func (backend *fencedBackend) SaveStrictMigrationCleanupIntent(
+	intent StrictMigrationCleanupIntent,
+) error {
+	return backend.protectRun(intent.RunID, func() error {
+		cleanup, ok := backend.backend.(StrictMigrationCleanupBackend)
+		if !ok || cleanup == nil {
+			return fmt.Errorf("strict migration cleanup receipt backend is unavailable")
+		}
+		return cleanup.SaveStrictMigrationCleanupIntent(intent)
+	})
+}
+func (backend *fencedBackend) LoadStrictMigrationCleanupIntent(
+	runID string,
+	epochID string,
+) (StrictMigrationCleanupIntent, bool, error) {
+	cleanup, ok := backend.backend.(StrictMigrationCleanupBackend)
+	if !ok || cleanup == nil {
+		return StrictMigrationCleanupIntent{}, false, fmt.Errorf("strict migration cleanup receipt backend is unavailable")
+	}
+	return cleanup.LoadStrictMigrationCleanupIntent(runID, epochID)
+}
+func (backend *fencedBackend) SaveStrictSnapshotEvidence(evidence StrictSnapshotEvidence) error {
+	return backend.protectRun(evidence.RunID, func() error {
+		stage4, err := backend.stage4Backend()
+		if err != nil {
+			return err
+		}
+		return stage4.SaveStrictSnapshotEvidence(evidence)
+	})
+}
+func (backend *fencedBackend) LoadStrictSnapshotEvidence(
+	runID string,
+	task TaskKey,
+	attemptID string,
+) (StrictSnapshotEvidence, bool, error) {
+	stage4, err := backend.stage4Backend()
+	if err != nil {
+		return StrictSnapshotEvidence{}, false, err
+	}
+	return stage4.LoadStrictSnapshotEvidence(runID, task, attemptID)
+}
 
 var (
-	_ Backend      = (*fencedBackend)(nil)
-	_ RangeBackend = (*fencedBackend)(nil)
+	_ Backend                       = (*fencedBackend)(nil)
+	_ RangeBackend                  = (*fencedBackend)(nil)
+	_ Stage4Backend                 = (*fencedBackend)(nil)
+	_ StrictMigrationCleanupBackend = (*fencedBackend)(nil)
+
+	_ Backend                       = (*fencedAggregateBackend)(nil)
+	_ RangeBackend                  = (*fencedAggregateBackend)(nil)
+	_ Stage4Backend                 = (*fencedAggregateBackend)(nil)
+	_ Stage4AggregateBackend        = (*fencedAggregateBackend)(nil)
+	_ StrictMigrationCleanupBackend = (*fencedAggregateBackend)(nil)
+
+	_ Backend                       = (*fencedRebuildAggregateBackend)(nil)
+	_ RangeBackend                  = (*fencedRebuildAggregateBackend)(nil)
+	_ Stage4Backend                 = (*fencedRebuildAggregateBackend)(nil)
+	_ Stage4AggregateBackend        = (*fencedRebuildAggregateBackend)(nil)
+	_ Stage4RebuildRecoveryBackend  = (*fencedRebuildAggregateBackend)(nil)
+	_ StrictMigrationCleanupBackend = (*fencedRebuildAggregateBackend)(nil)
+
+	_ Backend                             = (*fencedDeleteJournalReadinessBackend)(nil)
+	_ RangeBackend                        = (*fencedDeleteJournalReadinessBackend)(nil)
+	_ Stage4Backend                       = (*fencedDeleteJournalReadinessBackend)(nil)
+	_ Stage4DeleteJournalReadinessBackend = (*fencedDeleteJournalReadinessBackend)(nil)
+	_ StrictMigrationCleanupBackend       = (*fencedDeleteJournalReadinessBackend)(nil)
+
+	_ Backend                             = (*fencedAggregateDeleteJournalReadinessBackend)(nil)
+	_ RangeBackend                        = (*fencedAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4Backend                       = (*fencedAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4AggregateBackend              = (*fencedAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4DeleteJournalReadinessBackend = (*fencedAggregateDeleteJournalReadinessBackend)(nil)
+	_ StrictMigrationCleanupBackend       = (*fencedAggregateDeleteJournalReadinessBackend)(nil)
+
+	_ Backend                             = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
+	_ RangeBackend                        = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4Backend                       = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4AggregateBackend              = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4RebuildRecoveryBackend        = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
+	_ Stage4DeleteJournalReadinessBackend = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
+	_ StrictMigrationCleanupBackend       = (*fencedRebuildAggregateDeleteJournalReadinessBackend)(nil)
 )

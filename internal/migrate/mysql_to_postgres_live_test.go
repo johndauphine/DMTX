@@ -279,10 +279,6 @@ func testMySQLFamilyToPostgresCommonFixtureLive(
 	)
 }
 
-func registerMySQLCommonFixtureTLS(t *testing.T, caPath string) {
-	registerMySQLCommonFixtureTLSNamed(t, caPath, "dmtx_test")
-}
-
 func registerMySQLCommonFixtureTLSNamed(
 	t *testing.T,
 	caPath string,
@@ -306,26 +302,6 @@ func registerMySQLCommonFixtureTLSNamed(
 	); err != nil {
 		t.Fatalf("register MySQL common-fixture TLS: %v", err)
 	}
-}
-
-func createMySQLCommonFixture(
-	t *testing.T,
-	ctx context.Context,
-	database *sql.DB,
-	prefix string,
-	accountsName string,
-	eventsName string,
-) {
-	t.Helper()
-	createMySQLCommonFixtureWithCollation(
-		t,
-		ctx,
-		database,
-		prefix,
-		accountsName,
-		eventsName,
-		"utf8mb4_bin",
-	)
 }
 
 func createMySQLCommonFixtureWithCollation(

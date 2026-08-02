@@ -17,9 +17,10 @@ import (
 )
 
 type Result struct {
-	Tables    int  `json:"tables"`
-	Rows      int  `json:"rows"`
-	Validated bool `json:"validated"`
+	Tables        int                  `json:"tables"`
+	Rows          int                  `json:"rows"`
+	Validated     bool                 `json:"validated"`
+	RuntimeTuning *RuntimeTuningReport `json:"runtime_tuning,omitempty"`
 }
 
 const sqliteWriteBatchSize = 500
@@ -36,6 +37,16 @@ type TableObserver interface {
 // source compatible.
 type TableSetObserver interface {
 	BeforeTables(context.Context, []string) error
+}
+
+// Stage4TablePublicationObserver observes a table only after the composed
+// Stage 4 aggregate transaction has durably published its ordinary checkpoint,
+// structured work, and range evidence. It is deliberately separate from
+// TableObserver.AfterTable: the latter owns the ordinary checkpoint on legacy
+// routes, while calling it again after aggregate completion would attempt a
+// second, non-idempotent state mutation.
+type Stage4TablePublicationObserver interface {
+	AfterStage4TablePublication(context.Context, string, int) error
 }
 
 // PageObserver records target-acknowledged page frontiers. It is optional so
@@ -89,74 +100,6 @@ func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer
 	return runSQLiteToSQLite(ctx, cfg, nil, nil, observer, false)
 }
 
-func sqliteToSQLiteLegacyWithObserver(ctx context.Context, cfg config.Config, observer TableObserver) (Result, error) {
-	if cfg.Source.Type != "sqlite" || cfg.Target.Type != "sqlite" {
-		return Result{}, fmt.Errorf("SQLite first pass requires source.type and target.type to be sqlite")
-	}
-	if cfg.Source.Database == "" || cfg.Target.Database == "" {
-		return Result{}, fmt.Errorf("SQLite source and target database paths are required")
-	}
-	if config.SameEndpoint(cfg.Source, cfg.Target) {
-		return Result{}, fmt.Errorf("source and target SQLite databases must differ")
-	}
-	source, err := sql.Open("sqlite", cfg.Source.Database)
-	if err != nil {
-		return Result{}, fmt.Errorf("open source: %w", err)
-	}
-	defer source.Close()
-	target, err := sql.Open("sqlite", cfg.Target.Database)
-	if err != nil {
-		return Result{}, fmt.Errorf("open target: %w", err)
-	}
-	defer target.Close()
-	names, err := userTables(ctx, source)
-	if err != nil {
-		return Result{}, err
-	}
-	names, err = selectedTables(names, cfg)
-	if err != nil {
-		return Result{}, err
-	}
-	if err := requireSQLiteDestructiveAcknowledgement(ctx, target, names, cfg.Migration); err != nil {
-		return Result{}, err
-	}
-	if err := validateSQLiteSchemaBeforeMutation(ctx, source, target, names, cfg.Migration.TargetMode); err != nil {
-		return Result{}, err
-	}
-	if setObserver, ok := observer.(TableSetObserver); ok {
-		tables := append([]string(nil), names...)
-		if err := setObserver.BeforeTables(ctx, tables); err != nil {
-			return Result{}, fmt.Errorf("checkpoint table set: %w", err)
-		}
-		if err := notifySQLiteWriteBoundary(ctx, observer, SQLiteBoundaryTableSetCheckpoint, ""); err != nil {
-			return Result{}, err
-		}
-	}
-	result := Result{Validated: true}
-	for _, name := range names {
-		if observer != nil {
-			if err := observer.BeforeTable(ctx, name); err != nil {
-				return Result{}, fmt.Errorf("checkpoint before %s: %w", name, err)
-			}
-		}
-		copied, err := copyTable(ctx, source, target, name, cfg.Migration.TargetMode, observer, TableProgress{}, false)
-		if err != nil {
-			return Result{}, err
-		}
-		if err := validateCount(ctx, source, target, name, cfg.Migration.TargetMode); err != nil {
-			return Result{}, err
-		}
-		if observer != nil {
-			if err := observer.AfterTable(ctx, name, copied); err != nil {
-				return Result{}, fmt.Errorf("checkpoint after %s: %w", name, err)
-			}
-		}
-		result.Tables++
-		result.Rows += copied
-	}
-	return result, nil
-}
-
 func selectedTables(names []string, cfg config.Config) ([]string, error) {
 	selected, err := config.SelectTables(names, cfg.Migration.IncludeTables, cfg.Migration.ExcludeTables)
 	if err != nil {
@@ -169,7 +112,7 @@ func selectedTables(names []string, cfg config.Config) ([]string, error) {
 }
 
 func userTables(ctx context.Context, database *sql.DB) ([]string, error) {
-	rows, err := database.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+	rows, err := database.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND lower(name) <> 'dmtx_internal_delete_batch_receipts' ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("list source tables: %w", err)
 	}
@@ -502,10 +445,6 @@ func retrySQLiteWriteAttempts(
 	return receipt, err
 }
 
-func writeBatch(ctx context.Context, target *sql.DB, table schema.Table, columns []string, mode string, rows [][]any) error {
-	return writeBatchWithObserver(ctx, target, table, columns, mode, rows, nil)
-}
-
 func writeBatchWithObserver(ctx context.Context, target *sql.DB, table schema.Table, columns []string, mode string, rows [][]any, observer TableObserver) error {
 	_, err := writeSQLiteBatchReceipt(ctx, target, table, columns, mode, rows, observer, nil)
 	return err
@@ -728,11 +667,6 @@ func contains(values []string, value string) bool {
 	}
 	return false
 }
-func prepareTarget(ctx context.Context, target *sql.DB, table schema.Table, mode string) error {
-	_, err := prepareTargetWithStatus(ctx, target, table, mode, nil)
-	return err
-}
-
 func prepareTargetWithStatus(ctx context.Context, target *sql.DB, table schema.Table, mode string, observer TableObserver) (bool, error) {
 	if mode == "drop_recreate" {
 		drop, err := schema.DropTable(schema.SQLite, table)
@@ -885,6 +819,12 @@ func countRows(ctx context.Context, database *sql.DB, name string) (int, error) 
 	return count, err
 }
 func inspectTable(ctx context.Context, database *sql.DB, name string) (schema.Table, []string, error) {
+	if strings.EqualFold(name, sqliteDeleteJournalTable) {
+		return schema.Table{}, nil, fmt.Errorf(
+			"SQLite table %s is private DMTX delete receipt state and is not a migratable source table",
+			sqliteDeleteJournalTable,
+		)
+	}
 	return inspectSQLiteSchema(ctx, database, name)
 }
 func quote(name string) string { return `"` + strings.ReplaceAll(name, `"`, `""`) + `"` }

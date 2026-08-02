@@ -217,10 +217,6 @@ func TestResumeFindsRunThroughSQLiteHardlinkAlias(t *testing.T) {
 	if err := target.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Link(targetPath, targetAlias); err != nil {
-		t.Skipf("hardlinks unavailable: %v", err)
-	}
-
 	originalConfiguration := "source:\n  type: sqlite\n  database: " + sourcePath +
 		"\ntarget:\n  type: sqlite\n  database: " + targetPath +
 		"\nmigration:\n  target_mode: upsert\n"
@@ -244,6 +240,9 @@ func TestResumeFindsRunThroughSQLiteHardlinkAlias(t *testing.T) {
 		StartedAt: started,
 	}, hash); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.Link(targetPath, targetAlias); err != nil {
+		t.Skipf("hardlinks unavailable: %v", err)
 	}
 	aliasConfiguration := "source:\n  type: sqlite\n  database: " + sourcePath +
 		"\ntarget:\n  type: sqlite\n  database: " + targetAlias +

@@ -24,7 +24,14 @@ func VerifyMySQL80Source(
 	ctx context.Context,
 	database *sql.DB,
 ) error {
-	catalog, err := readMySQL80ServerCatalog(ctx, database)
+	return verifyMySQL80Source(ctx, database)
+}
+
+func verifyMySQL80Source(
+	ctx context.Context,
+	queryer MySQLCatalogQueryer,
+) error {
+	catalog, err := readMySQL80ServerCatalog(ctx, queryer)
 	if err != nil {
 		return err
 	}
@@ -37,7 +44,14 @@ func VerifyMySQL80Target(
 	ctx context.Context,
 	database *sql.DB,
 ) error {
-	catalog, err := readMySQL80ServerCatalog(ctx, database)
+	return verifyMySQL80Target(ctx, database)
+}
+
+func verifyMySQL80Target(
+	ctx context.Context,
+	queryer MySQLCatalogQueryer,
+) error {
+	catalog, err := readMySQL80ServerCatalog(ctx, queryer)
 	if err != nil {
 		return err
 	}
@@ -48,7 +62,7 @@ func VerifyMySQL80Target(
 		return err
 	}
 	var generateInvisiblePrimaryKey, requirePrimaryKey int
-	if err := database.QueryRowContext(
+	if err := queryer.QueryRowContext(
 		ctx,
 		`SELECT
 			@@session.sql_generate_invisible_primary_key,
@@ -129,7 +143,7 @@ func validateMySQL80TargetVersion(
 
 func readMySQL80ServerCatalog(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 ) (mysql80SourceServerCatalog, error) {
 	var catalog mysql80SourceServerCatalog
 	err := database.QueryRowContext(ctx, mysql80SourceServerCatalogQuery).Scan(
@@ -358,7 +372,7 @@ const mysql80SourceTableCatalogQuery = `
 
 func readMySQL80SourceTableCatalog(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	namespace string,
 	name string,
 ) (mysql80SourceTableCatalog, error) {
@@ -529,7 +543,7 @@ const mysql80SourceColumnsQuery = `
 
 func readMySQL80SourceColumns(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	table mysql80SourceTableCatalog,
 	namespace string,
 	name string,
@@ -684,10 +698,16 @@ func mySQL80SourceColumnFromCatalog(
 	if !validMySQLSourceIdentifier(catalog.name) ||
 		(catalog.nullable != "YES" && catalog.nullable != "NO") ||
 		catalog.generation != "" ||
-		catalog.comment != "" ||
-		catalog.srid.Valid {
+		catalog.comment != "" {
 		return schema.Column{}, metadata, mysqlSourcePolicy(
 			"column catalog shape",
+			catalog.name+" "+catalog.columnType,
+		)
+	}
+	spatialSubtype, spatial := mySQL80SpatialSubtype(catalog.dataType)
+	if catalog.srid.Valid && !spatial {
+		return schema.Column{}, metadata, mysqlSourcePolicy(
+			"column spatial catalog shape",
 			catalog.name+" "+catalog.columnType,
 		)
 	}
@@ -966,6 +986,36 @@ func mySQL80SourceColumnFromCatalog(
 			Base:      catalog.dataType,
 			Arguments: []int{int(catalog.datetimePrecision.Int64)},
 		}
+	case "geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		"geomcollection":
+		if !spatial ||
+			catalog.columnType != catalog.dataType ||
+			!mySQLNonCharacterColumn(catalog) ||
+			catalog.numericPrecision.Valid ||
+			catalog.numericScale.Valid ||
+			catalog.datetimePrecision.Valid ||
+			catalog.defaultValue.Valid ||
+			metadata.autoIncrement ||
+			metadata.defaultGenerated ||
+			catalog.srid.Valid &&
+				(catalog.srid.Int64 < 0 ||
+					catalog.srid.Int64 > int64(^uint32(0))) {
+			return schema.Column{}, metadata, unsupportedMySQLSourceType(catalog)
+		}
+		var srid *uint32
+		if catalog.srid.Valid {
+			value := uint32(catalog.srid.Int64)
+			srid = &value
+		}
+		column.Type = string(spatialSubtype)
+		column.DeclaredType = &schema.DeclaredType{
+			Base: catalog.dataType,
+			Spatial: &schema.SpatialTypeMetadata{
+				Subtype: spatialSubtype,
+				SRID:    srid,
+			},
+		}
 	case "json":
 		if catalog.columnType != "json" ||
 			catalog.characterLength.Valid ||
@@ -1023,6 +1073,31 @@ func mySQLNonCharacterColumn(
 		!catalog.collation.Valid
 }
 
+func mySQL80SpatialSubtype(
+	value string,
+) (schema.SpatialSubtype, bool) {
+	switch value {
+	case "geometry":
+		return schema.SpatialSubtypeGeometry, true
+	case "point":
+		return schema.SpatialSubtypePoint, true
+	case "linestring":
+		return schema.SpatialSubtypeLineString, true
+	case "polygon":
+		return schema.SpatialSubtypePolygon, true
+	case "multipoint":
+		return schema.SpatialSubtypeMultiPoint, true
+	case "multilinestring":
+		return schema.SpatialSubtypeMultiLineString, true
+	case "multipolygon":
+		return schema.SpatialSubtypeMultiPolygon, true
+	case "geomcollection":
+		return schema.SpatialSubtypeGeometryCollection, true
+	default:
+		return "", false
+	}
+}
+
 func unsupportedMySQLSourceType(
 	catalog mysql80SourceColumnCatalog,
 ) error {
@@ -1034,11 +1109,11 @@ func unsupportedMySQLSourceType(
 
 func inspectMySQL80Table(
 	ctx context.Context,
-	database *sql.DB,
+	database MySQLCatalogQueryer,
 	namespace string,
 	name string,
 ) (schema.Table, error) {
-	if err := VerifyMySQL80Source(ctx, database); err != nil {
+	if err := verifyMySQL80Source(ctx, database); err != nil {
 		return schema.Table{}, err
 	}
 	tableCatalog, err := readMySQL80SourceTableCatalog(

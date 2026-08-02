@@ -15,7 +15,10 @@ func TestExecuteBuiltInComposedRouteRejectsResolvedPairMismatch(
 		context.Background(),
 		config.Config{
 			Source: config.Endpoint{
-				Type: "postgres",
+				Type:     "postgres",
+				Host:     "source.example.test",
+				Database: "source",
+				User:     "reader",
 			},
 			Target: config.Endpoint{
 				Type:     "sqlite",

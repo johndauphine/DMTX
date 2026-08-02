@@ -28,6 +28,14 @@ type relationalSourceAdapter struct {
 	spec      relationalSourceSpec
 	database  *sql.DB
 	namespace string
+	// endpoint is the resolved source endpoint retained only for internal
+	// engine-owned connections such as a SQL Server database snapshot. It is
+	// never emitted in state, diagnostics, or topology identities.
+	endpoint config.Endpoint
+	// mySQLFlavor is live server evidence recorded before a table-stable
+	// session pins the source's only connection. It is revalidated by the
+	// flavor-specific inspector inside that pinned transaction.
+	mySQLFlavor engine.MySQLServerFlavor
 }
 
 func (adapter *relationalSourceAdapter) postgresDatabaseHandle() *sql.DB {
@@ -74,7 +82,7 @@ func openMySQLSourceAdapter(
 	ctx context.Context,
 	endpoint config.Endpoint,
 ) (sourceAdapter, error) {
-	return openRelationalSourceAdapter(ctx, endpoint, relationalSourceSpec{
+	source, err := openRelationalSourceAdapter(ctx, endpoint, relationalSourceSpec{
 		engine:      "mysql",
 		displayName: "MySQL/MariaDB",
 		defaultNamespace: func(endpoint config.Endpoint) string {
@@ -89,6 +97,32 @@ func openMySQLSourceAdapter(
 		wrapRows:       wrapMySQLSourceRows,
 		preflightRows:  preflightMySQLSourceRows,
 	})
+	if err != nil {
+		return nil, err
+	}
+	adapter, ok := source.(*relationalSourceAdapter)
+	if !ok || adapter == nil {
+		_ = source.Close()
+		return nil, fmt.Errorf(
+			"MySQL-family source opened with an invalid adapter",
+		)
+	}
+	flavor, err := engine.DetectMySQLServerFlavor(ctx, adapter.database)
+	if err != nil {
+		if closeErr := adapter.Close(); closeErr != nil {
+			return nil, fmt.Errorf(
+				"record MySQL-family source flavor: %w (close: %v)",
+				err,
+				closeErr,
+			)
+		}
+		return nil, fmt.Errorf(
+			"record MySQL-family source flavor: %w",
+			err,
+		)
+	}
+	adapter.mySQLFlavor = flavor
+	return adapter, nil
 }
 
 func openSQLServerSourceAdapter(
@@ -145,10 +179,17 @@ func openRelationalSourceAdapter(
 	if namespace == "" {
 		namespace = spec.defaultNamespace(resolved)
 	}
+	if spec.engine == "mssql" && isSQLServerDeleteJournalNamespace(namespace) {
+		if closeErr := database.Close(); closeErr != nil {
+			return nil, fmt.Errorf("SQL Server source schema %q is reserved for DMTX delete receipt evidence (close: %v)", namespace, closeErr)
+		}
+		return nil, fmt.Errorf("SQL Server source schema %q is reserved for DMTX delete receipt evidence", namespace)
+	}
 	return &relationalSourceAdapter{
 		spec:      spec,
 		database:  database,
 		namespace: namespace,
+		endpoint:  resolved,
 	}, nil
 }
 
@@ -172,13 +213,60 @@ func (adapter *relationalSourceAdapter) DisplayName() string {
 func (adapter *relationalSourceAdapter) ListTables(
 	ctx context.Context,
 ) ([]string, error) {
-	return adapter.spec.listTables(ctx, adapter.database, adapter.namespace)
+	tables, err := adapter.spec.listTables(ctx, adapter.database, adapter.namespace)
+	if err != nil || adapter == nil || adapter.spec.engine != "mysql" {
+		return tables, err
+	}
+	// The admitted MySQL/MariaDB source contracts require
+	// lower_case_table_names=0, so the private lower-case relation is hidden
+	// only by its exact case-sensitive catalog name. A distinct user relation
+	// with different case remains visible on a server where those names are
+	// distinct.
+	filtered := tables[:0]
+	for _, name := range tables {
+		if name == mysqlDeleteJournalTable {
+			// Do not silently hide an ordinary user relation that happens to
+			// collide with the private name. A live source adapter authenticates
+			// the exact private authority read-only before omitting it. The
+			// non-live fallback exists only for narrow in-package adapter fakes;
+			// production MySQL source adapters always have both fields set.
+			if adapter.database != nil && supportedMySQLDeleteFlavor(adapter.mySQLFlavor) {
+				journal, journalErr := inspectMySQLDeleteReceiptJournal(
+					ctx,
+					adapter.database,
+					adapter.mySQLFlavor,
+					adapter.namespace,
+				)
+				if journalErr != nil {
+					return nil, fmt.Errorf(
+						"authenticate private MySQL delete receipt journal while listing source tables: %w",
+						journalErr,
+					)
+				}
+				if !journal.Exists || journal.EmptyPrefix {
+					return nil, fmt.Errorf(
+						"private MySQL delete receipt journal is not a complete authenticated authority",
+					)
+				}
+			}
+			continue
+		}
+		filtered = append(filtered, name)
+	}
+	return filtered, nil
 }
 
 func (adapter *relationalSourceAdapter) InspectTable(
 	ctx context.Context,
 	name string,
 ) (schema.Table, error) {
+	if adapter != nil && adapter.spec.engine == "mysql" &&
+		name == mysqlDeleteJournalTable {
+		return schema.Table{}, fmt.Errorf(
+			"MySQL table %s is private DMTX delete receipt state and is not a migratable source table",
+			mysqlDeleteJournalTable,
+		)
+	}
 	return adapter.spec.inspectTable(
 		ctx,
 		adapter.database,

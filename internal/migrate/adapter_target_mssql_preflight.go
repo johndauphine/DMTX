@@ -113,7 +113,7 @@ func (adapter *sqlServerTargetAdapter) PreflightTables(
 				planned.Name,
 			)
 		}
-		actual, err := engine.InspectSQLServerTable(
+		actual, err := engine.InspectSQLServerTargetTableWithQueryer(
 			ctx,
 			adapter.database,
 			planned.Schema,
@@ -145,11 +145,21 @@ func preflightSQLServerUpsertForeignKeyKeys(
 ) error {
 	byName := make(map[string]schema.Table, len(tables))
 	for _, table := range tables {
-		byName[table.Name] = table
+		byName[sqlServerPreflightTableKey(
+			table.Schema,
+			table.Name,
+		)] = table
 	}
 	for _, table := range tables {
 		for _, foreignKey := range table.ForeignKeys {
-			referenced, exists := byName[foreignKey.ReferencedTable]
+			referencedSchema := foreignKey.ReferencedSchema
+			if referencedSchema == "" {
+				referencedSchema = table.Schema
+			}
+			referenced, exists := byName[sqlServerPreflightTableKey(
+				referencedSchema,
+				foreignKey.ReferencedTable,
+			)]
 			if !exists {
 				return fmt.Errorf(
 					"preflight SQL Server table %s: foreign key %s references an unselected table",
@@ -170,6 +180,10 @@ func preflightSQLServerUpsertForeignKeyKeys(
 		}
 	}
 	return nil
+}
+
+func sqlServerPreflightTableKey(namespace, table string) string {
+	return strings.ToLower(namespace) + "\x00" + strings.ToLower(table)
 }
 
 func preflightSQLServerTargetPermissions(

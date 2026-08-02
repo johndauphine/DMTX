@@ -6,7 +6,21 @@ import (
 )
 
 func (store YAMLStore) UpdateRecoverableOutcome(runID string, outcome Outcome, reason string, endedAt time.Time) error {
-	if err := validateRecoverableOutcome(runID, outcome, reason, endedAt); err != nil {
+	return store.updateTerminalAttemptOutcome(runID, outcome, true, reason, endedAt)
+}
+
+func (store YAMLStore) UpdateNonResumableOutcome(runID string, outcome Outcome, reason string, endedAt time.Time) error {
+	return store.updateTerminalAttemptOutcome(runID, outcome, false, reason, endedAt)
+}
+
+func (store YAMLStore) updateTerminalAttemptOutcome(
+	runID string,
+	outcome Outcome,
+	resumable bool,
+	reason string,
+	endedAt time.Time,
+) error {
+	if err := validateTerminalAttemptOutcome(runID, outcome, reason, endedAt); err != nil {
 		return err
 	}
 	return store.update(func(document *yamlStateDocument) error {
@@ -22,7 +36,7 @@ func (store YAMLStore) UpdateRecoverableOutcome(runID string, outcome Outcome, r
 		}
 		run := document.Runs[latest]
 		run.Outcome = outcome
-		run.Resumable = true
+		run.Resumable = resumable
 		run.Reason = reason
 		run.EndedAt = endedAt.UTC()
 		document.Runs = appendAuthoritativeRun(document.Runs, run)

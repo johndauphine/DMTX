@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -486,7 +487,7 @@ func TestStage1FullRunCrashHelperProcess(t *testing.T) {
 		if err := os.WriteFile(eventPath, []byte(reached), 0o600); err != nil {
 			return err
 		}
-		select {}
+		return waitForParentHardKill(context.Background())
 	}
 	command := os.Getenv(fullRunCrashCommandEnv)
 	if command == "" {

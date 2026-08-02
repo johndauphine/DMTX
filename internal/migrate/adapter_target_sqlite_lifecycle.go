@@ -470,15 +470,15 @@ type sqliteTargetPreparation struct {
 func planSQLiteTargetPreparation(
 	targetTables []schema.Table,
 ) ([]sqliteTargetPreparation, error) {
-	ordered := append([]schema.Table(nil), targetTables...)
-	sort.Slice(ordered, func(left, right int) bool {
-		leftName := strings.ToLower(ordered[left].Name)
-		rightName := strings.ToLower(ordered[right].Name)
-		if leftName == rightName {
-			return ordered[left].Name < ordered[right].Name
-		}
-		return leftName < rightName
-	})
+	// Creation must be parent-before-child while foreign-key enforcement is
+	// active.  prepareDropRecreate executes the resulting plan in reverse for
+	// drops, then forward for creates, so a populated child never blocks its
+	// parent's drop and no selected table is recreated before the complete old
+	// set has been removed.
+	ordered, err := orderAdapterSourceTablesForMode(targetTables, "upsert")
+	if err != nil {
+		return nil, fmt.Errorf("order SQLite target preparation: %w", err)
+	}
 	preparation := make(
 		[]sqliteTargetPreparation,
 		len(ordered),
@@ -593,7 +593,11 @@ func (adapter *sqliteTargetAdapter) prepareDropRecreate(
 			return rollback(err)
 		}
 	}
-	for _, item := range preparation {
+	// Drop in reverse dependency order, then recreate in forward dependency
+	// order below.  Both loops remain set-wide, preserving the Stage 4 rebuild
+	// lifecycle: no CREATE is issued until every selected table was dropped.
+	for index := len(preparation) - 1; index >= 0; index-- {
+		item := preparation[index]
 		if _, err := connection.ExecContext(
 			ctx,
 			item.drop,

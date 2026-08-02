@@ -108,7 +108,10 @@ func projectSQLServerColumnForPostgres(
 			arguments[0] > 8_000 {
 			break
 		}
-		return "text", copyDeclaration("varchar"), nil
+		// A PostgreSQL catalog round trip represents VARCHAR as varchar (not
+		// source-neutral text). Keep the projection canonical so retained
+		// target authority can be authenticated on later incremental runs.
+		return "varchar", copyDeclaration("varchar"), nil
 	case "text":
 		if !noArguments() || source.Type != "text" {
 			break
@@ -150,12 +153,16 @@ func projectSQLServerColumnForPostgres(
 			arguments[0] > 6 {
 			break
 		}
-		return "datetime", copyDeclaration("timestamp"), nil
+		// PostgreSQL catalog discovery represents TIMESTAMP as timestamp, not
+		// the source-neutral datetime alias.  Keep the projected generic type
+		// canonical so a later prior-authority proof can authenticate the exact
+		// table that this projection created.
+		return "timestamp", copyDeclaration("timestamp"), nil
 	case "smalldatetime":
 		if !noArguments() || source.Type != "datetime" {
 			break
 		}
-		return "datetime", &schema.DeclaredType{
+		return "timestamp", &schema.DeclaredType{
 			Base:      "timestamp",
 			Arguments: []int{0},
 		}, nil

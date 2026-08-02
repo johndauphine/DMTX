@@ -21,11 +21,33 @@ func VerifySQLServer2022Source(
 	ctx context.Context,
 	database *sql.DB,
 ) error {
-	catalog, err := readSQLServer2022SourceCatalog(ctx, database)
+	return verifySQLServer2022Source(ctx, database)
+}
+
+func verifySQLServer2022Source(
+	ctx context.Context,
+	queryer SQLServerCatalogQueryer,
+) error {
+	catalog, err := readSQLServer2022SourceCatalog(ctx, queryer)
 	if err != nil {
 		return err
 	}
 	return validateSQLServer2022SourceCatalog(catalog)
+}
+
+// VerifySQLServer2022MigrationSnapshotSource validates the exact read-only
+// database-snapshot catalog shape used by SQL Server migration strict
+// consistency. It is intentionally separate from ordinary source admission:
+// a snapshot must be read-only and must identify its source database.
+func VerifySQLServer2022MigrationSnapshotSource(
+	ctx context.Context,
+	queryer SQLServerCatalogQueryer,
+) error {
+	catalog, err := readSQLServer2022SourceCatalog(ctx, queryer)
+	if err != nil {
+		return err
+	}
+	return validateSQLServer2022MigrationSnapshotCatalog(catalog)
 }
 
 // VerifySQLServer2022Target pins native target behavior to the same SQL Server
@@ -37,7 +59,25 @@ func VerifySQLServer2022Target(
 	ctx context.Context,
 	database *sql.DB,
 ) error {
-	catalog, err := readSQLServer2022SourceCatalog(ctx, database)
+	return verifySQLServer2022Target(ctx, database)
+}
+
+// VerifySQLServer2022TargetWithQueryer applies the same target admission to
+// a pinned connection or transaction. Target-side mutation protocols use it
+// immediately before DDL/DML so pool-level verification cannot authenticate a
+// different physical session.
+func VerifySQLServer2022TargetWithQueryer(
+	ctx context.Context,
+	queryer SQLServerCatalogQueryer,
+) error {
+	return verifySQLServer2022Target(ctx, queryer)
+}
+
+func verifySQLServer2022Target(
+	ctx context.Context,
+	queryer SQLServerCatalogQueryer,
+) error {
+	catalog, err := readSQLServer2022SourceCatalog(ctx, queryer)
 	if err != nil {
 		return err
 	}
@@ -93,7 +133,7 @@ const sqlServer2022SourceCatalogQuery = `
 
 func readSQLServer2022SourceCatalog(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 ) (sqlServer2022SourceCatalog, error) {
 	var result sqlServer2022SourceCatalog
 	err := database.QueryRowContext(
@@ -131,6 +171,19 @@ func readSQLServer2022SourceCatalog(
 
 func validateSQLServer2022SourceCatalog(
 	value sqlServer2022SourceCatalog,
+) error {
+	return validateSQLServer2022Catalog(value, false)
+}
+
+func validateSQLServer2022MigrationSnapshotCatalog(
+	value sqlServer2022SourceCatalog,
+) error {
+	return validateSQLServer2022Catalog(value, true)
+}
+
+func validateSQLServer2022Catalog(
+	value sqlServer2022SourceCatalog,
+	migrationSnapshot bool,
 ) error {
 	if value.productMajorVersion != sqlServer2022MajorVersion ||
 		!strings.HasPrefix(
@@ -177,11 +230,11 @@ func validateSQLServer2022SourceCatalog(
 	if value.state != "ONLINE" ||
 		value.userAccess != "MULTI_USER" ||
 		value.containment != "NONE" ||
-		value.readOnly ||
 		value.autoClose ||
 		value.autoShrink ||
 		value.standby ||
-		value.sourceDatabaseID.Valid {
+		migrationSnapshot && (!value.readOnly || !value.sourceDatabaseID.Valid || value.sourceDatabaseID.Int64 <= 0) ||
+		!migrationSnapshot && (value.readOnly || value.sourceDatabaseID.Valid) {
 		return sqlServerSourcePolicy(
 			"database catalog shape",
 			value.databaseName,
@@ -301,7 +354,7 @@ const sqlServerSourceTableCatalogQuery = `
 
 func readSQLServerSourceTableCatalog(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 	namespace string,
 	name string,
 ) (sqlServerSourceTableCatalog, error) {
@@ -519,7 +572,7 @@ const sqlServerSourceColumnsQuery = `
 
 func readSQLServerSourceColumns(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 	table sqlServerSourceTableCatalog,
 	namespace string,
 	name string,
@@ -1040,15 +1093,17 @@ func sqlServerTemporalPrecision(base string, scale int) int {
 
 func inspectSQLServer2022Table(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 	namespace string,
 	name string,
+	targetPhysicalPrimaryKey bool,
 ) (schema.Table, error) {
 	first, firstObjectID, err := inspectSQLServer2022TableOnce(
 		ctx,
 		database,
 		namespace,
 		name,
+		targetPhysicalPrimaryKey,
 	)
 	if err != nil {
 		return schema.Table{}, err
@@ -1058,6 +1113,7 @@ func inspectSQLServer2022Table(
 		database,
 		namespace,
 		name,
+		targetPhysicalPrimaryKey,
 	)
 	if err != nil {
 		return schema.Table{}, err
@@ -1074,9 +1130,10 @@ func inspectSQLServer2022Table(
 
 func inspectSQLServer2022TableOnce(
 	ctx context.Context,
-	database *sql.DB,
+	database SQLServerCatalogQueryer,
 	namespace string,
 	name string,
+	targetPhysicalPrimaryKey bool,
 ) (schema.Table, int64, error) {
 	catalog, err := readSQLServerSourceTableCatalog(
 		ctx,
@@ -1107,6 +1164,7 @@ func inspectSQLServer2022TableOnce(
 		database,
 		&table,
 		catalog.objectID,
+		targetPhysicalPrimaryKey,
 	); err != nil {
 		return schema.Table{}, 0, err
 	}
@@ -1123,6 +1181,7 @@ func inspectSQLServer2022TableOnce(
 		database,
 		table,
 		catalog.objectID,
+		targetPhysicalPrimaryKey,
 	)
 	if err != nil {
 		return schema.Table{}, 0, err

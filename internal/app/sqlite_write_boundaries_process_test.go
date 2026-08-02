@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/migrate"
@@ -174,8 +175,22 @@ func (observer *stage1WriteBoundaryObserver) AfterSQLiteWriteBoundary(
 	if err := os.WriteFile(observer.eventPath, []byte(boundary), 0o600); err != nil {
 		return err
 	}
-	<-ctx.Done()
-	return ctx.Err()
+	return waitForParentHardKill(ctx)
+}
+
+// waitForParentHardKill keeps crash-fixture helper processes alive after
+// publishing their durable sentinel. A bare receive from Background().Done()
+// leaves a helper with no timers or runnable goroutines, so newer Go runtimes
+// terminate it as a deadlock before the parent can send SIGKILL.
+func waitForParentHardKill(ctx context.Context) error {
+	timer := time.NewTimer(24 * time.Hour)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("hard-kill test parent did not terminate helper")
+	}
 }
 
 func stage1WriteBoundaryHelperCommand(

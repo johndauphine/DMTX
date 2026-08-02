@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -49,8 +50,8 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}
-	if cfg.Source.Type != "sqlite" || cfg.Target.Type != "sqlite" {
-		fmt.Fprintln(stderr, "resume is currently supported only for SQLite-to-SQLite migrations")
+	if err := config.ValidateBoundedStage4Settings(cfg.Migration); err != nil {
+		fmt.Fprintf(stderr, "configuration: %v\n", err)
 		return ConfigurationError
 	}
 	if err := migrate.ValidateMigration(cfg); err != nil {
@@ -63,7 +64,7 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		return StateError
 	}
 
-	run, found, err := latestRunForSQLiteTarget(store, cfg.Target.Database)
+	run, found, err := latestRunForTarget(store, cfg.Target)
 	if err != nil {
 		fmt.Fprintf(stderr, "read migration run: %v\n", err)
 		return StateError
@@ -72,10 +73,12 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "no resumable run exists for this target")
 		return StateError
 	}
-	if !config.SameEndpoint(
-		config.Endpoint{Type: "sqlite", Database: run.Source},
-		cfg.Source,
-	) {
+	sourceMatches, err := runSourceMatchesEndpoint(run, cfg.Source)
+	if err != nil {
+		fmt.Fprintf(stderr, "compare resumable run source identity: %v\n", err)
+		return StateError
+	}
+	if !sourceMatches {
 		fmt.Fprintln(stderr, "resumable run source does not match the supplied configuration")
 		return ConfigurationError
 	}
@@ -94,14 +97,36 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "configuration hash: %v\n", err)
 		return StateError
 	}
+	configHashCandidates, err :=
+		config.SQLiteIdentityHashCandidates(hashConfig)
+	if err != nil {
+		fmt.Fprintf(stderr, "SQLite identity configuration hashes: %v\n", err)
+		return StateError
+	}
 	resumeCompatibilityHash, err := config.ResumeCompatibilityHash(hashConfig)
 	if err != nil {
 		fmt.Fprintf(stderr, "resume compatibility hash: %v\n", err)
 		return StateError
 	}
+	resumeCompatibilityHashCandidates, err :=
+		config.SQLiteIdentityResumeCompatibilityHashCandidates(hashConfig)
+	if err != nil {
+		fmt.Fprintf(
+			stderr,
+			"SQLite identity resume compatibility hashes: %v\n",
+			err,
+		)
+		return StateError
+	}
 	if run.Outcome == state.Success {
 		return finalizePersistedSuccess(
-			configPath, cfg, configHash, run, store, stdout, stderr,
+			configPath,
+			cfg,
+			configHashCandidates,
+			run,
+			store,
+			stdout,
+			stderr,
 		)
 	}
 	if !run.Resumable || run.Outcome != state.Running && run.Outcome != state.Failed &&
@@ -121,14 +146,18 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		return StateError
 	}
 	guard := state.NewLeaseGuard(leaseStore, lease)
-	store = state.FenceBackend(store, guard)
 	leaseReleased := false
 	defer func() {
 		if !leaseReleased {
 			_ = guard.Release()
 		}
 	}()
-	authoritative, found, err := latestRunForSQLiteTarget(store, cfg.Target.Database)
+	store, err = newStage4FencedStateBackend(store, guard)
+	if err != nil {
+		fmt.Fprintf(stderr, "fence Stage 4 state backend: %v\n", err)
+		return StateError
+	}
+	authoritative, found, err := latestRunForTarget(store, cfg.Target)
 	if err != nil {
 		fmt.Fprintf(stderr, "reselect migration run: %v\n", err)
 		return StateError
@@ -155,7 +184,10 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "resumable run is missing its data-plane configuration hash")
 		return ConfigurationError
 	}
-	configOverride := storedHash != configHash
+	configOverride := !matchesHashCandidate(
+		storedHash,
+		configHashCandidates,
+	)
 	if configOverride {
 		if !options.forceResume {
 			fmt.Fprintln(stderr, "resumable run configuration does not match the supplied data-plane settings")
@@ -167,13 +199,34 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "read resume compatibility hash: %v\n", compatibilityErr)
 			return StateError
 		}
-		if !compatibilityFound || storedCompatibility != resumeCompatibilityHash {
+		if !compatibilityFound ||
+			!matchesHashCandidate(
+				storedCompatibility,
+				resumeCompatibilityHashCandidates,
+			) {
 			fmt.Fprintln(stderr, "force-resume cannot override a structurally incompatible data-plane change")
 			return ConfigurationError
 		}
 	}
+	if err := store.BindRunLease(run.ID, lease); err != nil {
+		fmt.Fprintf(stderr, "bind resumed run to target lease: %v\n", err)
+		return StateError
+	}
 	if err := store.ReactivateRun(run.ID, "migration resume in progress"); err != nil {
 		fmt.Fprintf(stderr, "reactivate migration run: %v\n", err)
+		return StateError
+	}
+	spoolDirectory, err := stage4SpoolDirectory(statePath, run.ID)
+	if err != nil {
+		if stateErr := persistStage4SpoolPreparationFailure(
+			store,
+			run.ID,
+			err,
+		); stateErr != nil {
+			fmt.Fprintf(stderr, "record Stage 4 spool preparation failure: %v\n", stateErr)
+			return StateError
+		}
+		fmt.Fprintf(stderr, "Stage 4 spool directory: %v\n", err)
 		return StateError
 	}
 	if err := appLifecycleBoundary("resume_reactivated"); err != nil {
@@ -188,8 +241,13 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "record resume outcome: %v\n", stateErr)
 			return StateError
 		}
-		if auditErr := appendAudit(
-			configPath, run.ID, "resume_"+disposition.auditSuffix,
+		if auditErr := appendAttemptTerminalAudit(
+			configPath,
+			run.ID,
+			"resume",
+			migrate.Result{},
+			disposition,
+			err,
 		); auditErr != nil {
 			fmt.Fprintf(stderr, "%v\n", auditErr)
 			return StateError
@@ -238,9 +296,36 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 	}
-	observer := resumeCheckpointObserver{tableCheckpointObserver: tableCheckpointObserver{store: store, runID: run.ID, guard: guard, resetTopology: true}, existing: existing}
+	observer := resumeCheckpointObserver{
+		tableCheckpointObserver: tableCheckpointObserver{
+			store:          store,
+			runID:          run.ID,
+			guard:          guard,
+			resetTopology:  true,
+			resume:         true,
+			spoolDirectory: spoolDirectory,
+			configPath:     configPath,
+		},
+		existing: existing,
+	}
 	migrationContext, heartbeat := startLeaseHeartbeat(migrationContext, guard, 30*time.Second)
-	result, err := migrate.SQLiteToSQLiteResumeWithProgress(migrationContext, cfg, completed, progress, observer)
+	var result migrate.Result
+	if cfg.Source.Type == "sqlite" && cfg.Target.Type == "sqlite" {
+		result, err = migrate.SQLiteToSQLiteResumeWithProgress(
+			migrationContext,
+			cfg,
+			completed,
+			progress,
+			observer,
+		)
+	} else {
+		result, err = migrate.ExecuteResume(
+			migrationContext,
+			cfg,
+			completed,
+			observer,
+		)
+	}
 	if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
 		err = fmt.Errorf("%w: renew target lease: %v", state.ErrState, heartbeatErr)
 	}
@@ -258,7 +343,14 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "record resume outcome: %v\n", stateErr)
 			return StateError
 		}
-		if auditErr := appendAudit(configPath, run.ID, "resume_"+disposition.auditSuffix); auditErr != nil {
+		if auditErr := appendAttemptTerminalAudit(
+			configPath,
+			run.ID,
+			"resume",
+			result,
+			disposition,
+			err,
+		); auditErr != nil {
 			fmt.Fprintf(stderr, "%v\n", auditErr)
 			return StateError
 		}
@@ -284,9 +376,19 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return StateError
 	}
-	if err := store.Append(state.Run{ID: run.ID, Source: run.Source, Target: run.Target, Outcome: state.Success, Resumable: false, Reason: resumeSuccessReason, StartedAt: run.StartedAt, EndedAt: time.Now().UTC()}); err != nil {
-		fmt.Fprintf(stderr, "record resumed migration state: %v\n", err)
+	published, err := publishStage4RunSuccess(
+		observer.tableCheckpointObserver,
+		resumeSuccessReason,
+	)
+	if err != nil {
+		fmt.Fprintf(stderr, "publish resumed migration state: %v\n", err)
 		return StateError
+	}
+	if !published {
+		if err := store.Append(state.Run{ID: run.ID, Source: run.Source, Target: run.Target, Outcome: state.Success, Resumable: false, Reason: resumeSuccessReason, StartedAt: run.StartedAt, EndedAt: time.Now().UTC()}); err != nil {
+			fmt.Fprintf(stderr, "record resumed migration state: %v\n", err)
+			return StateError
+		}
 	}
 	if err := appLifecycleBoundary("resume_success_persisted"); err != nil {
 		fmt.Fprintf(stderr, "resume lifecycle: %v\n", err)
@@ -359,36 +461,137 @@ func resumeArguments(args []string) (resumeOptions, bool) {
 	return options, true
 }
 
-func latestRunForSQLiteTarget(store state.Backend, target string) (state.Run, bool, error) {
+func latestRunForTarget(
+	store state.Backend,
+	target config.Endpoint,
+) (state.Run, bool, error) {
+	targetIdentity, err := endpointWorkloadIdentity(target)
+	if err != nil {
+		return state.Run{}, false, err
+	}
 	runs, err := store.List()
 	if err != nil {
 		return state.Run{}, false, err
 	}
-	targetEndpoint := config.Endpoint{Type: "sqlite", Database: target}
 	var selected state.Run
 	var found bool
 	for _, run := range runs {
-		if !config.SameEndpoint(
-			config.Endpoint{Type: "sqlite", Database: run.Target},
-			targetEndpoint,
-		) {
+		matches, err := runEndpointIdentityMatches(
+			run.TargetIdentity,
+			config.Endpoint{
+				Type:     target.Type,
+				Database: run.Target,
+			},
+			target,
+			targetIdentity,
+		)
+		if err != nil {
+			return state.Run{}, false, err
+		}
+		if !matches {
 			continue
 		}
-		selected, found = run, true
+		if run.Outcome == state.Success {
+			// A later success supersedes every older resumable attempt. Keep
+			// it selectable so resume can finish any missing terminal audit
+			// or release bookkeeping without touching the data plane.
+			selected, found = run, true
+			continue
+		}
+		// A terminal non-resumable result supersedes only an older revision
+		// of the same run. In particular, a SQL Server migration-snapshot
+		// run that closed gracefully has released its physical snapshot and
+		// must not fall back to that run's earlier running row.
+		if !run.Resumable {
+			if found && selected.ID == run.ID {
+				selected, found = state.Run{}, false
+			}
+			continue
+		}
+		if run.Resumable && resumeEligibleOutcome(run.Outcome) {
+			selected, found = run, true
+		}
 	}
 	return selected, found, nil
 }
 
+func resumeEligibleOutcome(outcome state.Outcome) bool {
+	switch outcome {
+	case state.Running, state.Failed, state.Cancelled, state.Partial:
+		return true
+	default:
+		return false
+	}
+}
+
+func runSourceMatchesEndpoint(
+	run state.Run,
+	source config.Endpoint,
+) (bool, error) {
+	engine, err := config.CanonicalEngine(source.Type)
+	if err != nil {
+		return false, err
+	}
+	if run.SourceEngine != "" && run.SourceEngine != engine {
+		return false, nil
+	}
+	identity, err := endpointWorkloadIdentity(source)
+	if err != nil {
+		return false, err
+	}
+	return runEndpointIdentityMatches(
+		run.SourceIdentity,
+		config.Endpoint{Type: engine, Database: run.Source},
+		source,
+		identity,
+	)
+}
+
+func runEndpointIdentityMatches(
+	storedIdentity string,
+	legacy config.Endpoint,
+	current config.Endpoint,
+	currentIdentity string,
+) (bool, error) {
+	if storedIdentity != "" {
+		if storedIdentity == currentIdentity {
+			return true, nil
+		}
+		engine, err := config.CanonicalEngine(current.Type)
+		if err != nil {
+			return false, err
+		}
+		if engine != "sqlite" {
+			return false, nil
+		}
+		return equivalentSQLiteLeaseIdentity(
+			storedIdentity,
+			currentIdentity,
+		)
+	}
+	engine, err := config.CanonicalEngine(current.Type)
+	if err != nil {
+		return false, err
+	}
+	if engine != "sqlite" {
+		// A legacy network run has no canonical host/port/schema evidence and
+		// cannot safely be attached to the supplied endpoint.
+		return false, nil
+	}
+	legacy.Type = engine
+	return config.SameEndpoint(legacy, current), nil
+}
+
 func sameResumeCandidate(left, right state.Run) bool {
 	return left.ID == right.ID &&
-		config.SameEndpoint(
-			config.Endpoint{Type: "sqlite", Database: left.Source},
-			config.Endpoint{Type: "sqlite", Database: right.Source},
-		) &&
-		config.SameEndpoint(
-			config.Endpoint{Type: "sqlite", Database: left.Target},
-			config.Endpoint{Type: "sqlite", Database: right.Target},
-		) &&
+		left.Source == right.Source &&
+		left.Target == right.Target &&
+		left.SourceEngine == right.SourceEngine &&
+		left.SourceIdentity == right.SourceIdentity &&
+		left.TargetIdentity == right.TargetIdentity &&
+		left.LeaseTarget == right.LeaseTarget &&
+		left.LeaseOwnerToken == right.LeaseOwnerToken &&
+		left.LeaseGeneration == right.LeaseGeneration &&
 		left.Outcome == right.Outcome &&
 		left.Resumable == right.Resumable &&
 		left.Reason == right.Reason &&
@@ -410,7 +613,7 @@ func abandonResumeRun(configPath string, cfg config.Config, run state.Run, store
 			_ = guard.Release()
 		}
 	}()
-	authoritative, found, err := latestRunForSQLiteTarget(store, cfg.Target.Database)
+	authoritative, found, err := latestRunForTarget(store, cfg.Target)
 	if err != nil {
 		fmt.Fprintf(stderr, "reselect migration run for abandonment: %v\n", err)
 		return StateError
@@ -428,6 +631,10 @@ func abandonResumeRun(configPath string, cfg config.Config, run state.Run, store
 		return StateError
 	}
 	run = authoritative
+	if err := store.BindRunLease(run.ID, lease); err != nil {
+		fmt.Fprintf(stderr, "bind abandoned run to target lease: %v\n", err)
+		return StateError
+	}
 	if err := store.AbandonRun(run.ID, reason, time.Now().UTC()); err != nil {
 		fmt.Fprintf(stderr, "abandon run: %v\n", err)
 		return StateError
@@ -460,7 +667,7 @@ func abandonResumeRun(configPath string, cfg config.Config, run state.Run, store
 func finalizePersistedSuccess(
 	configPath string,
 	cfg config.Config,
-	configHash string,
+	configHashCandidates []string,
 	run state.Run,
 	store state.Backend,
 	stdout, stderr io.Writer,
@@ -487,9 +694,7 @@ func finalizePersistedSuccess(
 			_ = guard.Release()
 		}
 	}()
-	authoritative, found, err := latestRunForSQLiteTarget(
-		store, cfg.Target.Database,
-	)
+	authoritative, found, err := latestRunForTarget(store, cfg.Target)
 	if err != nil {
 		fmt.Fprintf(stderr, "reselect successful migration run: %v\n", err)
 		return StateError
@@ -512,7 +717,7 @@ func finalizePersistedSuccess(
 		fmt.Fprintln(stderr, "successful run is missing its data-plane configuration hash")
 		return ConfigurationError
 	}
-	if storedHash != configHash {
+	if !matchesHashCandidate(storedHash, configHashCandidates) {
 		fmt.Fprintln(
 			stderr,
 			"force-resume cannot rewrite configuration evidence for terminal-state repair",
@@ -570,6 +775,10 @@ func finalizePersistedSuccess(
 		result.Rows += task.RowsDone
 	}
 
+	if err := store.BindRunLease(run.ID, lease); err != nil {
+		fmt.Fprintf(stderr, "bind terminal repair to target lease: %v\n", err)
+		return StateError
+	}
 	if err := appendAudit(configPath, run.ID, "resume_finalization_started"); err != nil {
 		_ = heartbeat.Stop()
 		heartbeatStopped = true
@@ -602,12 +811,43 @@ func finalizePersistedSuccess(
 	return Success
 }
 
+func matchesHashCandidate(stored string, candidates []string) bool {
+	for _, candidate := range candidates {
+		if stored == candidate {
+			return true
+		}
+	}
+	return false
+}
+
 type resumeCheckpointObserver struct {
 	tableCheckpointObserver
 	existing map[string]bool
 }
 
 func (observer resumeCheckpointObserver) BeforeTables(ctx context.Context, tables []string) error {
+	discovered := make(map[string]struct{}, len(tables))
+	for _, table := range tables {
+		discovered[table] = struct{}{}
+	}
+	unexpected := make([]string, 0)
+	for table := range observer.existing {
+		if _, ok := discovered[table]; !ok {
+			unexpected = append(unexpected, table)
+		}
+	}
+	if len(unexpected) > 0 {
+		sort.Strings(unexpected)
+		return stateCheckpointError(
+			"validate resumed table set",
+			fmt.Errorf(
+				"%w: persisted checkpoints were not rediscovered for %q",
+				state.ErrTopologyChanged,
+				unexpected,
+			),
+		)
+	}
+
 	missing := make([]string, 0, len(tables))
 	for _, table := range tables {
 		if !observer.existing[table] {

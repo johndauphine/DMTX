@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/engine"
@@ -24,10 +25,8 @@ func (adapter *postgresTargetAdapter) postgresDatabaseHandle() *sql.DB {
 }
 
 func validatePostgresTargetEndpoint(endpoint config.Endpoint) error {
-	if endpoint.Host == "" || endpoint.Database == "" || endpoint.User == "" {
-		return fmt.Errorf("PostgreSQL host, database, and user are required")
-	}
-	return nil
+	_, err := engine.PostgresDSN(endpoint)
+	return err
 }
 
 func openPostgresTargetAdapter(
@@ -77,6 +76,106 @@ func (adapter *postgresTargetAdapter) PlanTables(
 	sourceTables []schema.Table,
 	mode string,
 ) ([]schema.Table, error) {
+	targetTables, err := adapter.planTablesBeforeObjectNameMaterialization(
+		sourceEngine,
+		sourceTables,
+		mode,
+	)
+	if err != nil {
+		return nil, err
+	}
+	targetTables, err = schema.MaterializePostgresObjectNames(
+		targetTables,
+		schema.PostgresObjectPlanOptions{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"materialize PostgreSQL target object names: %w",
+			err,
+		)
+	}
+	return targetTables, nil
+}
+
+func (adapter *postgresTargetAdapter) PlanTablesAfterPrior(
+	sourceEngine string,
+	priorSourceTables []schema.Table,
+	priorTargetTables []schema.Table,
+	priorTargetReservations []TargetSchemaEvolutionNameReservation,
+	currentSourceTables []schema.Table,
+	mode string,
+) ([]schema.Table, error) {
+	priorTables, err := adapter.planTablesBeforeObjectNameMaterialization(
+		sourceEngine,
+		priorSourceTables,
+		mode,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"plan PostgreSQL prior target tables: %w",
+			err,
+		)
+	}
+	reservations := make(
+		[]schema.PostgresObjectNameReservation,
+		len(priorTargetReservations),
+	)
+	for index, reservation := range priorTargetReservations {
+		if reservation.Scope != "relation" {
+			return nil, fmt.Errorf(
+				"PostgreSQL target authority contains unsupported name reservation scope %q",
+				reservation.Scope,
+			)
+		}
+		if reservation.Namespace != adapter.namespace {
+			return nil, fmt.Errorf(
+				"PostgreSQL target relation reservation namespace %q differs from configured target namespace %q",
+				reservation.Namespace,
+				adapter.namespace,
+			)
+		}
+		if strings.TrimSpace(reservation.Name) == "" ||
+			reservation.Name != strings.TrimSpace(reservation.Name) {
+			return nil, fmt.Errorf(
+				"PostgreSQL target relation reservation %d has a non-canonical name",
+				index,
+			)
+		}
+		reservations[index] = schema.PostgresObjectNameReservation{
+			Namespace: reservation.Namespace,
+			Name:      reservation.Name,
+		}
+	}
+	currentTables, err := adapter.planTablesBeforeObjectNameMaterialization(
+		sourceEngine,
+		currentSourceTables,
+		mode,
+	)
+	if err != nil {
+		return nil, err
+	}
+	currentTables, err =
+		schema.MaterializePostgresObjectNamesAfterPriorAuthority(
+			currentTables,
+			priorTables,
+			priorTargetTables,
+			reservations,
+			schema.PostgresObjectPlanOptions{},
+		)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"materialize PostgreSQL target object names after prior projection: %w",
+			err,
+		)
+	}
+	return currentTables, nil
+}
+
+func (adapter *postgresTargetAdapter) planTablesBeforeObjectNameMaterialization(
+	sourceEngine string,
+	sourceTables []schema.Table,
+	mode string,
+) ([]schema.Table, error) {
 	mode, err := normalizeAdapterTargetMode(mode)
 	if err != nil {
 		return nil, err
@@ -91,6 +190,14 @@ func (adapter *postgresTargetAdapter) PlanTables(
 			return nil, err
 		}
 		targetTable := postgresTargetTable(projected, adapter.namespace)
+		if err := rebaseProjectedForeignKeySchemas(
+			sourceTable.Schema,
+			adapter.namespace,
+			"PostgreSQL",
+			&targetTable,
+		); err != nil {
+			return nil, err
+		}
 		if _, err := schema.DropTable(schema.Postgres, targetTable); err != nil {
 			return nil, fmt.Errorf(
 				"plan PostgreSQL table %s: %w",
@@ -170,6 +277,80 @@ func (adapter *postgresTargetAdapter) WriteBatch(
 		}, fmt.Errorf("PostgreSQL native batch writer is not configured")
 	}
 	return adapter.batchWriter.WriteBatch(
+		ctx,
+		table,
+		columns,
+		mode,
+		rows,
+	)
+}
+
+func (adapter *postgresTargetAdapter) WriteStage4NetworkBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	if adapter == nil {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"PostgreSQL Stage 4 network target adapter is not configured",
+				),
+			)
+	}
+	writer, ok := adapter.batchWriter.(postgresStage4NetworkBatchWriter)
+	if !ok {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"PostgreSQL Stage 4 network batch writer is not configured",
+				),
+			)
+	}
+	return writer.WriteStage4NetworkBatch(
+		ctx,
+		table,
+		columns,
+		rows,
+	)
+}
+
+func (adapter *postgresTargetAdapter) WriteStage4NetworkRebuildBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	mode NetworkWriteMode,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	if adapter == nil {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf("PostgreSQL Stage 4 rebuild target adapter is not configured"),
+			)
+	}
+	writer, ok := adapter.batchWriter.(postgresStage4NetworkRebuildBatchWriter)
+	if !ok || isNilInterface(writer) {
+		return WriteReceipt{
+				Certainty:     CommitNotCommitted,
+				AttemptedRows: attempted,
+			}, NewTransferError(
+				ErrorClassState,
+				fmt.Errorf("PostgreSQL Stage 4 rebuild batch writer is not configured"),
+			)
+	}
+	return writer.WriteStage4NetworkRebuildBatch(
 		ctx,
 		table,
 		columns,

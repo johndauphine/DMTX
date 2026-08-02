@@ -195,9 +195,9 @@ func TestSQLiteTargetPreparationDropsAllTablesBeforeAnyCreate(
 		t.Fatalf("DDL statements = %#v", ddl)
 	}
 	if !strings.HasPrefix(ddl[0], "DROP TABLE") ||
-		!strings.Contains(ddl[0], `"first"`) ||
+		!strings.Contains(ddl[0], `"later"`) ||
 		!strings.HasPrefix(ddl[1], "DROP TABLE") ||
-		!strings.Contains(ddl[1], `"later"`) ||
+		!strings.Contains(ddl[1], `"first"`) ||
 		!strings.HasPrefix(ddl[2], "CREATE TABLE") ||
 		!strings.Contains(ddl[2], `"first"`) ||
 		!strings.HasPrefix(ddl[3], "CREATE TABLE") ||
@@ -206,6 +206,96 @@ func TestSQLiteTargetPreparationDropsAllTablesBeforeAnyCreate(
 			"preparation did not run deterministic two-phase DDL: %#v",
 			ddl,
 		)
+	}
+}
+
+func TestSQLiteTargetRebuildsPopulatedForeignKeySetInLifecycleOrder(
+	t *testing.T,
+) {
+	adapter := openSQLiteLifecycleTestAdapter(t)
+	execSQLiteLifecycleTest(
+		t,
+		adapter.database,
+		`CREATE TABLE "accounts" (
+			"id" INTEGER NOT NULL,
+			PRIMARY KEY ("id")
+		);
+		CREATE TABLE "transactions" (
+			"id" INTEGER NOT NULL,
+			"account_id" INTEGER NOT NULL,
+			PRIMARY KEY ("id"),
+			FOREIGN KEY ("account_id") REFERENCES "accounts" ("id")
+		);
+		INSERT INTO "accounts" VALUES (91);
+		INSERT INTO "transactions" VALUES (92, 91);`,
+	)
+	accounts := sqliteLifecycleTable("accounts")
+	transactions := sqliteLifecycleTable("transactions")
+	transactions.Columns = append(transactions.Columns, schema.Column{
+		Name:     "account_id",
+		Type:     "integer",
+		Nullable: false,
+		DeclaredType: &schema.DeclaredType{
+			Base: "integer",
+		},
+	})
+	transactions.ForeignKeys = []schema.ForeignKey{{
+		Columns:           []string{"account_id"},
+		ReferencedTable:   "accounts",
+		ReferencedColumns: []string{"id"},
+	}}
+	tables := []schema.Table{accounts, transactions}
+	if err := adapter.PreflightTables(
+		context.Background(), tables, "drop_recreate",
+	); err != nil {
+		t.Fatalf("PreflightTables: %v", err)
+	}
+	if err := adapter.PreflightDestructive(
+		context.Background(), tables, config.Migration{
+			TargetMode:              "drop_recreate",
+			DestructiveAcknowledged: true,
+		},
+	); err != nil {
+		t.Fatalf("PreflightDestructive: %v", err)
+	}
+	if err := adapter.PrepareTables(
+		context.Background(), tables, "drop_recreate",
+	); err != nil {
+		t.Fatalf("PrepareTables populated FK set: %v", err)
+	}
+	if _, err := adapter.WriteStage4NetworkRebuildBatch(
+		context.Background(),
+		accounts,
+		[]string{"id"},
+		NetworkWriteFreshInsert,
+		[][]any{{1}, {2}},
+	); err != nil {
+		t.Fatalf("write rebuilt accounts: %v", err)
+	}
+	if _, err := adapter.WriteStage4NetworkRebuildBatch(
+		context.Background(),
+		transactions,
+		[]string{"id", "account_id"},
+		NetworkWriteFreshInsert,
+		[][]any{{10, 1}, {20, 2}},
+	); err != nil {
+		t.Fatalf("write rebuilt transactions: %v", err)
+	}
+	if err := adapter.FinalizeTables(
+		context.Background(), tables, "drop_recreate",
+	); err != nil {
+		t.Fatalf("FinalizeTables: %v", err)
+	}
+	if err := preflightSQLiteForeignKeyIntegrity(
+		context.Background(), adapter.database, "",
+	); err != nil {
+		t.Fatalf("foreign_key_check after rebuild: %v", err)
+	}
+	for _, table := range tables {
+		rows, err := adapter.CountRows(context.Background(), table)
+		if err != nil || rows != 2 {
+			t.Fatalf("rebuilt %s rows=%d err=%v, want 2", table.Name, rows, err)
+		}
 	}
 }
 

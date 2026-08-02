@@ -16,15 +16,48 @@ import (
 
 // Event is one durable operator-visible migration fact.
 type Event struct {
-	At       time.Time `json:"at"`
-	RunID    string    `json:"run_id"`
-	Type     string    `json:"type"`
-	Previous string    `json:"previous_hash,omitempty"`
-	Hash     string    `json:"hash"`
+	At       time.Time       `json:"at"`
+	RunID    string          `json:"run_id"`
+	Type     string          `json:"type"`
+	Previous string          `json:"previous_hash,omitempty"`
+	Payload  json.RawMessage `json:"payload,omitempty"`
+	Hash     string          `json:"hash"`
 }
 
 // Append records an event after linking it to the stream's previous event.
 func Append(path, runID, eventType string, at time.Time) error {
+	return appendEvent(path, runID, eventType, nil, at)
+}
+
+// AppendPayload records a typed JSON payload as part of the hash-linked event.
+// Payload-free Append events retain the original wire format and hash formula.
+func AppendPayload(
+	path string,
+	runID string,
+	eventType string,
+	payload any,
+	at time.Time,
+) error {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode audit event payload: %w", err)
+	}
+	return appendEvent(
+		path,
+		runID,
+		eventType,
+		json.RawMessage(encoded),
+		at,
+	)
+}
+
+func appendEvent(
+	path string,
+	runID string,
+	eventType string,
+	payload json.RawMessage,
+	at time.Time,
+) error {
 	if path == "" {
 		return errors.New("audit path is required")
 	}
@@ -35,7 +68,13 @@ func Append(path, runID, eventType string, at time.Time) error {
 	if err != nil {
 		return err
 	}
-	event := Event{At: at.UTC(), RunID: runID, Type: eventType, Previous: previous}
+	event := Event{
+		At:       at.UTC(),
+		RunID:    runID,
+		Type:     eventType,
+		Previous: previous,
+		Payload:  payload,
+	}
 	event.Hash = eventHash(event)
 	encoded, err := json.Marshal(event)
 	if err != nil {
@@ -103,7 +142,6 @@ func lastHash(path string) (string, error) {
 		return "", fmt.Errorf("read audit stream: %w", err)
 	}
 	defer file.Close()
-	var last Event
 	previous := ""
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -111,25 +149,29 @@ func lastHash(path string) (string, error) {
 		if line == "" {
 			continue
 		}
-		if err := json.Unmarshal([]byte(line), &last); err != nil {
+		var event Event
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
 			return "", fmt.Errorf("decode audit stream: %w", err)
 		}
-		if last.Previous != previous {
+		if event.Previous != previous {
 			return "", errors.New("audit stream chain is broken")
 		}
-		if last.Hash != eventHash(last) {
+		if event.Hash != eventHash(event) {
 			return "", errors.New("audit stream integrity check failed")
 		}
-		previous = last.Hash
+		previous = event.Hash
 	}
 	if err := scanner.Err(); err != nil {
 		return "", fmt.Errorf("scan audit stream: %w", err)
 	}
-	return last.Hash, nil
+	return previous, nil
 }
 
 func eventHash(event Event) string {
 	payload := event.At.UTC().Format(time.RFC3339Nano) + "\x00" + event.RunID + "\x00" + event.Type + "\x00" + event.Previous
+	if event.Payload != nil {
+		payload += "\x00payload-v1\x00" + string(event.Payload)
+	}
 	sum := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(sum[:])
 }

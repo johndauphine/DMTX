@@ -7,11 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/engine"
+	"github.com/johndauphine/dmtx/internal/schema"
+	"github.com/johndauphine/dmtx/internal/state"
 )
 
 func TestSQLServerToSQLiteCommonFixtureLive(t *testing.T) {
@@ -146,6 +149,217 @@ func TestSQLServerToSQLiteCommonFixtureLive(t *testing.T) {
 		targetDatabase,
 		accountsName,
 	)
+}
+
+// TestStage4SQLServerToSQLiteUpsertReplayLive exercises the actual verified-
+// TLS SQL Server source and native SQLite upsert writer through the bounded
+// Stage 4 runner. The initial conservative route materializes the exact
+// SQLite shape; the second run changes a source value, fails after its first
+// durable target write, and proves resume replays the issued page safely.
+func TestStage4SQLServerToSQLiteUpsertReplayLive(t *testing.T) {
+	sourceDSN := os.Getenv("DMTX_TEST_MSSQL_DSN")
+	sourceCA := os.Getenv("DMTX_TEST_MSSQL_CA")
+	if sourceDSN == "" || sourceCA == "" {
+		t.Skip(
+			"set DMTX_TEST_MSSQL_DSN and DMTX_TEST_MSSQL_CA " +
+				"to run the bounded SQL Server-to-SQLite upsert replay sentinel",
+		)
+	}
+	sourceEndpoint := sqlServerCommonFixtureEndpoint(t, sourceDSN, sourceCA)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	sourceDatabase, err := engine.OpenSQLServer2022Source(ctx, sourceEndpoint)
+	if err != nil {
+		t.Fatalf("open verified-TLS SQL Server source: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := sourceDatabase.Close(); err != nil {
+			t.Errorf("close verified-TLS SQL Server source: %v", err)
+		}
+	})
+
+	prefix := "dmtx_s4_ss_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	accountsName := prefix + "_accounts"
+	eventsName := prefix + "_events"
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(), 15*time.Second,
+		)
+		defer cleanupCancel()
+		for _, name := range []string{eventsName, accountsName} {
+			if _, err := sourceDatabase.ExecContext(
+				cleanupCtx,
+				"DROP TABLE IF EXISTS "+sqlServerQualified("dbo", name),
+			); err != nil {
+				t.Errorf("drop bounded SQL Server source table %s: %v", name, err)
+			}
+		}
+	})
+	createSQLServerSQLiteFixture(
+		t, ctx, sourceDatabase, prefix, accountsName, eventsName,
+	)
+	insertSQLServerSQLiteFixture(t, ctx, sourceDatabase, accountsName, eventsName)
+
+	targetPath := filepath.Join(t.TempDir(), "target.db")
+	bootstrap := config.Config{
+		Source: sourceEndpoint,
+		Target: config.Endpoint{Type: "sqlite", Database: targetPath},
+		Migration: config.Migration{
+			TargetMode:    "drop_recreate",
+			IncludeTables: []string{accountsName, eventsName},
+		},
+	}
+	if _, err := SQLServerToSQLiteWithObserver(ctx, bootstrap, nil); err != nil {
+		t.Fatalf("bootstrap SQL Server-to-SQLite target shape: %v", err)
+	}
+	if _, err := sourceDatabase.ExecContext(
+		ctx,
+		"UPDATE "+sqlServerQualified("dbo", accountsName)+
+			" SET [code] = 'replayed' WHERE [id] = 7",
+	); err != nil {
+		t.Fatalf("change SQL Server source before bounded upsert: %v", err)
+	}
+	if _, err := sourceDatabase.ExecContext(
+		ctx,
+		"UPDATE "+sqlServerQualified("dbo", eventsName)+
+			" SET [note] = 'replayed event' WHERE [tenant_id] = 1"+
+			" AND [event_id] = 9007199254740993",
+	); err != nil {
+		t.Fatalf("change composite SQL Server event before bounded upsert: %v", err)
+	}
+
+	source, err := openSQLServerSourceAdapter(ctx, sourceEndpoint)
+	if err != nil {
+		t.Fatalf("open bounded verified-TLS SQL Server source adapter: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := source.Close(); err != nil {
+			t.Errorf("close bounded SQL Server source adapter: %v", err)
+		}
+	})
+	openedTarget, err := openSQLiteTargetAdapter(
+		ctx, config.Endpoint{Type: "sqlite", Database: targetPath},
+	)
+	if err != nil {
+		t.Fatalf("open bounded SQLite target adapter: %v", err)
+	}
+	target := openedTarget.(*sqliteTargetAdapter)
+	t.Cleanup(func() {
+		if err := target.Close(); err != nil {
+			t.Errorf("close bounded SQLite target adapter: %v", err)
+		}
+	})
+	// Prove the exact projected SQL Server shapes are already contained in the
+	// independently re-read SQLite catalog before Stage 4 checkpoints work.
+	// This keeps an authority mismatch ahead of every target write.
+	var sourceTables []schema.Table
+	for _, name := range []string{accountsName, eventsName} {
+		table, err := source.InspectTable(ctx, name)
+		if err != nil {
+			t.Fatalf("inspect bounded SQL Server source table %s: %v", name, err)
+		}
+		sourceTables = append(sourceTables, table)
+	}
+	plannedTables, err := target.PlanTables("mssql", sourceTables, "upsert")
+	if err != nil {
+		t.Fatalf("plan bounded SQL Server-to-SQLite target shapes: %v", err)
+	}
+	catalog, err := target.ReadTargetSchemaEvolutionCatalog(ctx)
+	if err != nil {
+		t.Fatalf("read bounded SQLite target-shape catalog: %v", err)
+	}
+	for _, planned := range plannedTables {
+		var actual schema.Table
+		for _, candidate := range catalog.Tables() {
+			if candidate.Name == planned.Name {
+				actual = candidate
+				break
+			}
+		}
+		contains, containsErr := stage4TargetAuthorityTableContains(actual, planned)
+		if containsErr != nil || !contains {
+			t.Fatalf(
+				"bounded SQLite authority does not contain SQL Server table %s: contains=%v err=%v authority=%#v desired=%#v",
+				planned.Name, contains, containsErr, actual, planned,
+			)
+		}
+	}
+
+	rawBackend := state.YAMLStore{Path: filepath.Join(t.TempDir(), "state.yaml")}
+	backend := &sqlServerSQLiteFailAckBackend{
+		Stage4StateBackend: rawBackend,
+		failNext:           true,
+	}
+	runID := "stage4-mssql-sqlite-live-upsert-replay"
+	initializeStage4LifecycleRun(t, rawBackend, runID, time.Now().Add(-time.Minute))
+	cfg := stage4AdapterTestConfig(t, sourceEndpoint.Password, "")
+	cfg.Source = sourceEndpoint
+	cfg.Target = config.Endpoint{Type: "sqlite", Database: targetPath}
+	cfg.Migration.TargetMode = "upsert"
+	cfg.Migration.IncludeTables = []string{accountsName, eventsName}
+	cfg.Migration.Partitions = 1
+	cfg.Migration.ChunkSize = 1
+	cfg.Migration.Validation.Mode = config.ValidationCountOnly
+	run := stage4LifecycleRunContext(t, backend, runID, false)
+	events := make([]string, 0)
+	observer := stage4AdapterObserver{
+		recordingTableObserver: recordingTableObserver{events: &events},
+		run:                    run,
+	}
+	if result, err := migrateWithStage4Adapters(
+		ctx, cfg, observer, source, target, "upsert", run,
+	); err == nil || !strings.Contains(
+		err.Error(), "injected SQL Server-to-SQLite acknowledgement failure",
+	) {
+		t.Fatalf("first live SQL Server-to-SQLite upsert result=%#v err=%v", result, err)
+	}
+	var code string
+	if err := target.database.QueryRowContext(
+		ctx,
+		"SELECT [code] FROM "+sqliteSQLServerIdentifier(accountsName)+
+			" WHERE [id] = 7",
+	).Scan(&code); err != nil || code != "replayed" {
+		t.Fatalf("issued live SQL Server-to-SQLite page code=%q err=%v", code, err)
+	}
+	var note string
+	if err := target.database.QueryRowContext(
+		ctx,
+		"SELECT [note] FROM "+sqliteSQLServerIdentifier(eventsName)+
+			" WHERE [tenant_id] = 1 AND [event_id] = 9007199254740993",
+	).Scan(&note); err != nil || note == "replayed event" {
+		t.Fatalf("issued live composite SQL Server-to-SQLite event=%q err=%v", note, err)
+	}
+
+	run.Resume = true
+	resumeEvents := make([]string, 0)
+	resumeObserver := stage4AdapterObserver{
+		recordingTableObserver: recordingTableObserver{events: &resumeEvents},
+		run:                    run,
+	}
+	result, err := resumeWithStage4Adapters(
+		ctx, cfg, CompletedTableCheckpoints{}, resumeObserver, resumeObserver,
+		source, target, "upsert", run,
+	)
+	if err != nil {
+		t.Fatalf("resume live SQL Server-to-SQLite upsert: %v", err)
+	}
+	if result != (Result{Tables: 2, Rows: 4, Validated: true}) {
+		t.Fatalf("resumed live SQL Server-to-SQLite upsert result=%#v", result)
+	}
+	if err := target.database.QueryRowContext(
+		ctx,
+		"SELECT [code] FROM "+sqliteSQLServerIdentifier(accountsName)+
+			" WHERE [id] = 7",
+	).Scan(&code); err != nil || code != "replayed" {
+		t.Fatalf("resumed live SQL Server-to-SQLite code=%q err=%v", code, err)
+	}
+	if err := target.database.QueryRowContext(
+		ctx,
+		"SELECT [note] FROM "+sqliteSQLServerIdentifier(eventsName)+
+			" WHERE [tenant_id] = 1 AND [event_id] = 9007199254740993",
+	).Scan(&note); err != nil || note != "replayed event" {
+		t.Fatalf("resumed live composite SQL Server-to-SQLite event=%q err=%v", note, err)
+	}
 }
 
 func createSQLServerSQLiteFixture(

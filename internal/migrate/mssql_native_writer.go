@@ -2,11 +2,13 @@ package migrate
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -37,6 +39,25 @@ type sqlServerBatchWriter interface {
 		schema.Table,
 		[]string,
 		string,
+		[][]any,
+	) (WriteReceipt, error)
+}
+
+type sqlServerStage4NetworkBatchWriter interface {
+	WriteStage4NetworkBatch(
+		context.Context,
+		schema.Table,
+		[]string,
+		[][]any,
+	) (WriteReceipt, error)
+}
+
+type sqlServerStage4NetworkRebuildBatchWriter interface {
+	WriteStage4NetworkRebuildBatch(
+		context.Context,
+		schema.Table,
+		[]string,
+		NetworkWriteMode,
 		[][]any,
 	) (WriteReceipt, error)
 }
@@ -97,6 +118,23 @@ type sqlServerNativeTransaction interface {
 	Rollback() error
 }
 
+// sqlServerStage4NetworkTransaction binds the schema-stability proof to the
+// exact transaction that mutates a replayable page.
+type sqlServerStage4NetworkTransaction interface {
+	sqlServerNativeTransaction
+	AcquireStage4NetworkReplayFence(
+		context.Context,
+		schema.Table,
+	) error
+	PreflightStage4NetworkReplayIsolation(
+		context.Context,
+		schema.Table,
+	) error
+	// RollbackStage4Network must quarantine the physical connection before it
+	// returns a timeout or rollback error.
+	RollbackStage4Network(context.Context) error
+}
+
 type sqlServerNativeStatement interface {
 	Exec(context.Context, []any) (int64, error)
 	QueryBool(context.Context, []any) (bool, error)
@@ -120,6 +158,92 @@ func (writer *sqlServerNativeWriter) WriteBatch(
 	columns []string,
 	mode string,
 	rows [][]any,
+) (WriteReceipt, error) {
+	return writer.writeBatch(
+		ctx,
+		table,
+		columns,
+		mode,
+		rows,
+		false,
+		"",
+	)
+}
+
+// WriteStage4NetworkBatch forces the transactionally-fenced strict upsert
+// path required for durable page replay.
+func (writer *sqlServerNativeWriter) WriteStage4NetworkBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) (WriteReceipt, error) {
+	return writer.writeBatch(
+		ctx,
+		table,
+		columns,
+		"upsert",
+		rows,
+		true,
+		"",
+	)
+}
+
+// WriteStage4NetworkRebuildBatch uses strict bulk/prepared inserts for a fresh
+// page. Only an issued-page replay may stage the exact page and run an
+// insert-only MERGE on the complete primary key under the same serializable,
+// table-fenced transaction; the path has no matched/update clause and still
+// fails on any other UNIQUE collision.
+func (writer *sqlServerNativeWriter) WriteStage4NetworkRebuildBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	mode NetworkWriteMode,
+	rows [][]any,
+) (WriteReceipt, error) {
+	attempted := int64(len(rows))
+	notCommitted := WriteReceipt{
+		Certainty:     CommitNotCommitted,
+		AttemptedRows: attempted,
+	}
+	if mode != NetworkWriteFreshInsert &&
+		mode != NetworkWriteDuplicateSafeInsertOnly {
+		return notCommitted, NewTransferError(
+			ErrorClassState,
+			fmt.Errorf(
+				"SQL Server Stage 4 rebuild writer received unsupported mode %q",
+				mode,
+			),
+		)
+	}
+	// Every fresh page can later require replay, so reject keyless or partial
+	// primary-key projections before a target connection is acquired.
+	if err := validateSQLServerWriteShape(
+		table,
+		columns,
+		"upsert",
+	); err != nil {
+		return notCommitted, err
+	}
+	return writer.writeBatch(
+		ctx,
+		table,
+		columns,
+		"drop_recreate",
+		rows,
+		true,
+		mode,
+	)
+}
+
+func (writer *sqlServerNativeWriter) writeBatch(
+	ctx context.Context,
+	table schema.Table,
+	columns []string,
+	mode string,
+	rows [][]any,
+	stage4Network bool,
+	rebuildMode NetworkWriteMode,
 ) (WriteReceipt, error) {
 	attempted := int64(len(rows))
 	receipt := WriteReceipt{
@@ -170,6 +294,8 @@ func (writer *sqlServerNativeWriter) WriteBatch(
 				mode,
 				normalizedRows,
 				&receipt,
+				stage4Network,
+				rebuildMode,
 			)
 			return callbackError
 		},
@@ -259,6 +385,8 @@ func (writer *sqlServerNativeWriter) writeTransaction(
 	mode string,
 	rows [][]any,
 	receipt *WriteReceipt,
+	stage4Network bool,
+	rebuildMode NetworkWriteMode,
 ) (operationError error) {
 	transaction, err := connection.BeginSerializable(ctx)
 	if err != nil {
@@ -272,15 +400,51 @@ func (writer *sqlServerNativeWriter) writeTransaction(
 	committed := false
 	identityInsertEnabled := false
 	identityFrontierMayHaveChanged := false
+	writeMayHaveChangedTarget := false
 	defer func() {
 		rollbackUnsafe := false
+		stage4ConnectionQuarantined := false
 		if !committed {
-			if rollbackError := transaction.Rollback(); rollbackError != nil &&
+			var rollbackError error
+			if stage4Network {
+				stage4Transaction, ok :=
+					transaction.(sqlServerStage4NetworkTransaction)
+				if !ok || isNilInterface(stage4Transaction) {
+					rollbackError = NewTransferError(
+						ErrorClassState,
+						fmt.Errorf(
+							"clean up SQL Server Stage 4 network table %s: transaction has no bounded rollback",
+							table.Name,
+						),
+					)
+					connection.Discard()
+				} else {
+					cleanupContext, cancel := context.WithTimeout(
+						context.WithoutCancel(ctx),
+						sqlServerIdentityCleanupTimeout,
+					)
+					rollbackError =
+						stage4Transaction.RollbackStage4Network(
+							cleanupContext,
+						)
+					cancel()
+					stage4ConnectionQuarantined = true
+				}
+			} else {
+				rollbackError = transaction.Rollback()
+			}
+			if rollbackError != nil &&
 				!errors.Is(rollbackError, sql.ErrTxDone) {
 				if !sqlServerRollbackAlreadyCompletedByXACTAbort(
 					rollbackError,
 				) {
-					connection.Discard()
+					if stage4Network &&
+						writeMayHaveChangedTarget {
+						receipt.Certainty = CommitUnknown
+					}
+					if !stage4ConnectionQuarantined {
+						connection.Discard()
+					}
 					rollbackUnsafe = true
 					operationError = errors.Join(
 						operationError,
@@ -292,6 +456,12 @@ func (writer *sqlServerNativeWriter) writeTransaction(
 					)
 				}
 			}
+		}
+		if stage4ConnectionQuarantined {
+			// The Stage 4 cleanup transaction owns and closes its detached
+			// physical connection. Session-scoped IDENTITY_INSERT state
+			// cannot escape through the pool, even after a timeout.
+			return
 		}
 		if !identityInsertEnabled {
 			return
@@ -333,6 +503,46 @@ func (writer *sqlServerNativeWriter) writeTransaction(
 		)
 	}
 
+	if stage4Network {
+		proofTable := table
+		if mode == "drop_recreate" {
+			proofTable = stage4RebuildPreFinalizeTable(table)
+		}
+		stage4Transaction, ok :=
+			transaction.(sqlServerStage4NetworkTransaction)
+		if !ok || isNilInterface(stage4Transaction) {
+			return NewTransferError(
+				ErrorClassState,
+				fmt.Errorf(
+					"write SQL Server Stage 4 network table %s: transaction has no replay-isolation fence",
+					table.Name,
+				),
+			)
+		}
+		if err := stage4Transaction.
+			AcquireStage4NetworkReplayFence(
+				ctx,
+				table,
+			); err != nil {
+			return newSQLServerSafeOperationError(
+				"acquire SQL Server Stage 4 network replay fence for",
+				table.Name,
+				err,
+			)
+		}
+		if err := stage4Transaction.
+			PreflightStage4NetworkReplayIsolation(
+				ctx,
+				proofTable,
+			); err != nil {
+			return fmt.Errorf(
+				"prove SQL Server Stage 4 network replay isolation for table %s: %w",
+				table.Name,
+				err,
+			)
+		}
+	}
+
 	if table.Identity != nil {
 		// The server can apply this session setting and lose the response.
 		// Mark cleanup necessary before sending ON so every ambiguous response
@@ -357,7 +567,17 @@ func (writer *sqlServerNativeWriter) writeTransaction(
 	}
 
 	switch {
+	case rebuildMode == NetworkWriteDuplicateSafeInsertOnly:
+		writeMayHaveChangedTarget = true
+		err = writeSQLServerInsertOnlyReplayRows(
+			ctx,
+			transaction,
+			table,
+			columns,
+			rows,
+		)
 	case mode == "upsert":
+		writeMayHaveChangedTarget = true
 		err = writeSQLServerUpsertRows(
 			ctx,
 			transaction,
@@ -367,6 +587,7 @@ func (writer *sqlServerNativeWriter) writeTransaction(
 		)
 	case table.Identity != nil ||
 		sqlServerTableRequiresPreparedInsert(table, columns):
+		writeMayHaveChangedTarget = true
 		err = writeSQLServerInsertRows(
 			ctx,
 			transaction,
@@ -375,6 +596,7 @@ func (writer *sqlServerNativeWriter) writeTransaction(
 			rows,
 		)
 	default:
+		writeMayHaveChangedTarget = true
 		err = writeSQLServerBulkRows(
 			ctx,
 			transaction,
@@ -588,6 +810,99 @@ type sqlServerNativeUpsertPlan struct {
 	existsSQL       string
 	updatePositions []int
 	keyPositions    []int
+}
+
+type sqlServerNativeInsertOnlyReplayPlan struct {
+	createStageSQL string
+	stageInsertSQL string
+	mergeSQL       string
+	dropStageSQL   string
+}
+
+func writeSQLServerInsertOnlyReplayRows(
+	ctx context.Context,
+	transaction sqlServerNativeTransaction,
+	table schema.Table,
+	columns []string,
+	rows [][]any,
+) error {
+	plan, err := planSQLServerNativeInsertOnlyReplay(table, columns)
+	if err != nil {
+		return err
+	}
+	if _, err := transaction.Exec(ctx, plan.createStageSQL); err != nil {
+		return newSQLServerSafeOperationError(
+			"create SQL Server rebuild replay staging table for",
+			table.Name,
+			err,
+		)
+	}
+	stageInsert, err := transaction.Prepare(ctx, plan.stageInsertSQL)
+	if err != nil {
+		return newSQLServerSafeOperationError(
+			"prepare SQL Server rebuild replay staging insert for",
+			table.Name,
+			err,
+		)
+	}
+	stageInsertClosed := false
+	defer func() {
+		if !stageInsertClosed {
+			_ = stageInsert.Close()
+		}
+	}()
+
+	for _, row := range rows {
+		affected, insertErr := stageInsert.Exec(ctx, row)
+		if insertErr != nil {
+			return newSQLServerSafeOperationError(
+				"insert SQL Server rebuild replay staging row for",
+				table.Name,
+				insertErr,
+			)
+		}
+		if affected != 1 {
+			return fmt.Errorf(
+				"write SQL Server table %s: rebuild replay staging insert affected %d rows; expected exactly 1",
+				table.Name,
+				affected,
+			)
+		}
+	}
+
+	if err := stageInsert.Close(); err != nil {
+		return newSQLServerSafeOperationError(
+			"close SQL Server rebuild replay staging insert for",
+			table.Name,
+			err,
+		)
+	}
+	stageInsertClosed = true
+
+	merged, err := transaction.Exec(ctx, plan.mergeSQL)
+	if err != nil {
+		return newSQLServerSafeOperationError(
+			"merge SQL Server rebuild replay staging table for",
+			table.Name,
+			err,
+		)
+	}
+	if merged < 0 || merged > int64(len(rows)) {
+		return fmt.Errorf(
+			"replay SQL Server table %s inserted %d rows, expected between 0 and %d",
+			table.Name,
+			merged,
+			len(rows),
+		)
+	}
+	if _, err := transaction.Exec(ctx, plan.dropStageSQL); err != nil {
+		return newSQLServerSafeOperationError(
+			"drop SQL Server rebuild replay staging table for",
+			table.Name,
+			err,
+		)
+	}
+	return nil
 }
 
 func writeSQLServerUpsertRows(
@@ -915,6 +1230,82 @@ func planSQLServerNativeUpsert(
 	return plan, nil
 }
 
+func planSQLServerNativeInsertOnlyReplay(
+	table schema.Table,
+	columns []string,
+) (sqlServerNativeInsertOnlyReplayPlan, error) {
+	if err := validateSQLServerWriteShape(
+		table,
+		columns,
+		"upsert",
+	); err != nil {
+		return sqlServerNativeInsertOnlyReplayPlan{}, err
+	}
+	keys := primaryKeyColumns(table)
+	stage := sqlServerRebuildStageTableName(table, columns)
+	targetAlias := "dmtx_target"
+	sourceAlias := "dmtx_source"
+	conditions := make([]string, len(keys))
+	for index, key := range keys {
+		conditions[index] = sqlServerIdentifier(targetAlias) + "." +
+			sqlServerIdentifier(key) + " = " +
+			sqlServerIdentifier(sourceAlias) + "." +
+			sqlServerIdentifier(key)
+	}
+	selectedColumns := sqlServerQualifiedColumns("", columns)
+	sourceColumns := sqlServerQualifiedColumns(sourceAlias, columns)
+	return sqlServerNativeInsertOnlyReplayPlan{
+		// UNION ALL intentionally prevents SELECT INTO from propagating an
+		// IDENTITY property to the temporary stage while preserving exact
+		// target column types and nullability. Both branches are TOP (0), so
+		// no target row is materialized.
+		createStageSQL: "SELECT TOP (0) " + selectedColumns +
+			" INTO " + sqlServerIdentifier(stage) +
+			" FROM " + sqlServerQualified(table.Schema, table.Name) +
+			" UNION ALL SELECT TOP (0) " + selectedColumns +
+			" FROM " + sqlServerQualified(table.Schema, table.Name),
+		stageInsertSQL: "INSERT INTO " + sqlServerIdentifier(stage) +
+			" (" + sqlServerQuotedColumns(columns) + ") VALUES (" +
+			sqlServerPlaceholders(len(columns)) + ")",
+		mergeSQL: "MERGE INTO " +
+			sqlServerQualified(table.Schema, table.Name) +
+			" WITH (HOLDLOCK) AS " + sqlServerIdentifier(targetAlias) +
+			" USING " + sqlServerIdentifier(stage) + " AS " +
+			sqlServerIdentifier(sourceAlias) + " ON " +
+			strings.Join(conditions, " AND ") +
+			" WHEN NOT MATCHED BY TARGET THEN INSERT (" +
+			sqlServerQuotedColumns(columns) + ") VALUES (" +
+			sourceColumns + ");",
+		dropStageSQL: "DROP TABLE " + sqlServerIdentifier(stage),
+	}, nil
+}
+
+func sqlServerRebuildStageTableName(
+	table schema.Table,
+	columns []string,
+) string {
+	digest := sha256.Sum256([]byte(
+		table.Schema + "\x00" + table.Name + "\x00" +
+			strings.Join(columns, "\x00"),
+	))
+	return fmt.Sprintf("#dmtx_rebuild_%x", digest[:8])
+}
+
+func sqlServerQualifiedColumns(
+	alias string,
+	columns []string,
+) string {
+	qualified := make([]string, len(columns))
+	for index, column := range columns {
+		qualified[index] = sqlServerIdentifier(column)
+		if alias != "" {
+			qualified[index] = sqlServerIdentifier(alias) + "." +
+				qualified[index]
+		}
+	}
+	return strings.Join(qualified, ", ")
+}
+
 func sqlServerNativeBulkStatement(
 	table schema.Table,
 	columns []string,
@@ -988,12 +1379,18 @@ func (provider sqlServerSQLConnectionProvider) WithConnection(
 	if err != nil {
 		return err
 	}
-	defer connection.Close()
-	return operation(&sqlServerSQLConnection{connection: connection})
+	wrapped := &sqlServerSQLConnection{connection: connection}
+	defer func() {
+		if !wrapped.detached.Load() {
+			_ = connection.Close()
+		}
+	}()
+	return operation(wrapped)
 }
 
 type sqlServerSQLConnection struct {
 	connection *sql.Conn
+	detached   atomic.Bool
 }
 
 func (connection *sqlServerSQLConnection) BeginSerializable(
@@ -1006,7 +1403,10 @@ func (connection *sqlServerSQLConnection) BeginSerializable(
 	if err != nil {
 		return nil, err
 	}
-	return &sqlServerSQLTransaction{transaction: transaction}, nil
+	return &sqlServerSQLTransaction{
+		transaction: transaction,
+		owner:       connection,
+	}, nil
 }
 
 func (connection *sqlServerSQLConnection) Exec(
@@ -1028,6 +1428,43 @@ func (connection *sqlServerSQLConnection) Discard() {
 
 type sqlServerSQLTransaction struct {
 	transaction *sql.Tx
+	owner       *sqlServerSQLConnection
+}
+
+func (transaction *sqlServerSQLTransaction) AcquireStage4NetworkReplayFence(
+	ctx context.Context,
+	table schema.Table,
+) error {
+	// TABLOCKX is transaction-owned and blocks Sch-M/ALTER while remaining
+	// compatible with this transaction's later DML. TOP (1), rather than
+	// TOP (0), prevents the optimizer from removing the table access for an
+	// empty-result constant plan; an empty table still acquires the table lock.
+	rows, err := transaction.transaction.QueryContext(
+		ctx,
+		stage4SQLServerNetworkReplayFenceStatement(table),
+	)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		// At most one constant row is returned; no target value is observed.
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	return rows.Close()
+}
+
+func (transaction *sqlServerSQLTransaction) PreflightStage4NetworkReplayIsolation(
+	ctx context.Context,
+	table schema.Table,
+) error {
+	return preflightStage4SQLServerNetworkReplayIsolationTransaction(
+		ctx,
+		transaction.transaction,
+		table,
+	)
 }
 
 func (transaction *sqlServerSQLTransaction) Prepare(
@@ -1058,6 +1495,45 @@ func (transaction *sqlServerSQLTransaction) Commit() error {
 
 func (transaction *sqlServerSQLTransaction) Rollback() error {
 	return transaction.transaction.Rollback()
+}
+
+func (transaction *sqlServerSQLTransaction) RollbackStage4Network(
+	ctx context.Context,
+) error {
+	if ctx == nil {
+		return fmt.Errorf(
+			"SQL Server Stage 4 rollback context is required",
+		)
+	}
+	if transaction.owner == nil ||
+		transaction.owner.connection == nil {
+		return fmt.Errorf(
+			"SQL Server Stage 4 rollback has no pinned connection",
+		)
+	}
+	// Detach before starting rollback so the provider can return on the
+	// cleanup deadline without putting an active transaction back in the
+	// pool. The goroutine is the sole owner from this point onward.
+	transaction.owner.detached.Store(true)
+	result := make(chan error, 1)
+	go func() {
+		rollbackErr := transaction.transaction.Rollback()
+		if rollbackErr != nil &&
+			!errors.Is(rollbackErr, sql.ErrTxDone) {
+			transaction.owner.Discard()
+		}
+		closeErr := transaction.owner.connection.Close()
+		result <- errors.Join(rollbackErr, closeErr)
+	}()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf(
+			"SQL Server Stage 4 rollback did not complete before cleanup deadline: %w",
+			ctx.Err(),
+		)
+	}
 }
 
 type sqlServerSQLStatement struct {

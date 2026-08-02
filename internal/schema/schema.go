@@ -45,12 +45,58 @@ type Column struct {
 	Default            *Expression
 }
 
-// DeclaredType preserves a validated catalog type declaration without carrying
-// executable catalog text. Arguments are numeric SQLite type modifiers such as
-// VARCHAR(40) or DECIMAL(12,2).
+// DeclaredType preserves a catalog base type separately from its structured
+// modifiers without carrying executable catalog text. Arguments is the
+// Stage-3-compatible positional representation used by existing adapters.
+// New discovery must use the named fields so omitted values remain
+// distinguishable from explicit zeroes.
 type DeclaredType struct {
-	Base      string
-	Arguments []int
+	Base                      string
+	Arguments                 []int
+	Length                    *int64
+	Precision                 *int64
+	Scale                     *int64
+	FractionalSecondPrecision *int64
+	Spatial                   *SpatialTypeMetadata
+	MySQL                     *MySQLTypeMetadata
+}
+
+// CatalogType is the canonical name for DeclaredType. The alias keeps the
+// Stage 3 API source-compatible while adapters move to structured modifiers.
+type CatalogType = DeclaredType
+
+// SpatialSubtype is the closed geometry-shape vocabulary preserved by the
+// canonical catalog. Geography columns use the same shape vocabulary.
+type SpatialSubtype string
+
+const (
+	SpatialSubtypeGeometry           SpatialSubtype = "geometry"
+	SpatialSubtypePoint              SpatialSubtype = "point"
+	SpatialSubtypeLineString         SpatialSubtype = "linestring"
+	SpatialSubtypePolygon            SpatialSubtype = "polygon"
+	SpatialSubtypeMultiPoint         SpatialSubtype = "multipoint"
+	SpatialSubtypeMultiLineString    SpatialSubtype = "multilinestring"
+	SpatialSubtypeMultiPolygon       SpatialSubtype = "multipolygon"
+	SpatialSubtypeGeometryCollection SpatialSubtype = "geometrycollection"
+)
+
+// SpatialTypeMetadata preserves a validated geometry subtype and an optional
+// SRID. A non-nil SRID pointing to zero is intentionally different from an
+// unspecified SRID.
+type SpatialTypeMetadata struct {
+	Subtype SpatialSubtype
+	SRID    *uint32
+}
+
+// MySQLTypeMetadata preserves MySQL-family type facts that cannot be recovered
+// safely from a generic type or a rendered declaration.
+type MySQLTypeMetadata struct {
+	Unsigned    bool
+	Zerofill    bool
+	TinyIntOne  bool
+	BitWidth    *int64
+	EnumMembers []string
+	SetMembers  []string
 }
 
 type expressionKind uint8
@@ -98,6 +144,7 @@ type Index struct {
 type ForeignKey struct {
 	Name              string
 	Columns           []string
+	ReferencedSchema  string
 	ReferencedTable   string
 	ReferencedColumns []string
 	OnUpdate          string

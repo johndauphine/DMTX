@@ -3,12 +3,14 @@ package migrate
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -94,15 +96,50 @@ func TestSQLiteToPostgresComposedRouteLive(t *testing.T) {
 }
 
 func postgresRouteLiveRequiresTLS(parsed *pgx.ConnConfig) bool {
-	if parsed.TLSConfig == nil {
+	if parsed == nil ||
+		parsed.TLSConfig == nil ||
+		parsed.TLSConfig.InsecureSkipVerify ||
+		parsed.TLSConfig.RootCAs == nil ||
+		strings.TrimSpace(parsed.TLSConfig.ServerName) == "" {
 		return false
 	}
 	for _, fallback := range parsed.Fallbacks {
-		if fallback.TLSConfig == nil {
+		if fallback.TLSConfig == nil ||
+			fallback.TLSConfig.InsecureSkipVerify ||
+			fallback.TLSConfig.RootCAs == nil ||
+			strings.TrimSpace(fallback.TLSConfig.ServerName) == "" {
 			return false
 		}
 	}
 	return true
+}
+
+func TestPostgresRouteLiveRequiresVerifiedCertificateAndHostname(
+	t *testing.T,
+) {
+	parsed, err := pgx.ParseConfig(
+		"postgres://operator:secret@localhost:5432/dmtx?sslmode=require",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if postgresRouteLiveRequiresTLS(parsed) {
+		t.Fatal("sslmode=require was accepted as verified TLS")
+	}
+	if parsed.TLSConfig == nil {
+		t.Fatal("pgx did not construct the expected TLS configuration")
+	}
+	parsed.TLSConfig.InsecureSkipVerify = false
+	parsed.TLSConfig.RootCAs = x509.NewCertPool()
+	parsed.TLSConfig.ServerName = "localhost"
+	parsed.Fallbacks = nil
+	if !postgresRouteLiveRequiresTLS(parsed) {
+		t.Fatal("verified certificate and hostname configuration was rejected")
+	}
+	parsed.TLSConfig.ServerName = ""
+	if postgresRouteLiveRequiresTLS(parsed) {
+		t.Fatal("verified TLS without a hostname was accepted")
+	}
 }
 
 func testSQLiteToPostgresComposedRouteTLS(
