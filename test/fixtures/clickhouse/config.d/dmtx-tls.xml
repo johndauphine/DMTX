@@ -1,0 +1,35 @@
+<?xml version="1.0" ?>
+<!--
+  Enables the secure native port the fixtures connect on. The plain 9000 port
+  is deliberately not published: the suite must exercise verified TLS, and an
+  available plaintext port would let a misconfigured DSN silently succeed
+  without it.
+-->
+<clickhouse>
+    <listen_host>0.0.0.0</listen_host>
+    <listen_try>1</listen_try>
+    <tcp_port_secure>9440</tcp_port_secure>
+    <logger>
+        <console>1</console>
+    </logger>
+    <timezone>UTC</timezone>
+    <openSSL>
+        <server>
+            <certificateFile>/etc/clickhouse-server/certs/server.crt</certificateFile>
+            <privateKeyFile>/etc/clickhouse-server/certs/server.key</privateKeyFile>
+            <caConfig>/etc/clickhouse-server/certs/ca.pem</caConfig>
+            <verificationMode>relaxed</verificationMode>
+            <cacheSessions>true</cacheSessions>
+            <disableProtocols>sslv2,sslv3</disableProtocols>
+            <preferServerCiphers>true</preferServerCiphers>
+        </server>
+        <client>
+            <loadDefaultCAFile>false</loadDefaultCAFile>
+            <caConfig>/etc/clickhouse-server/certs/ca.pem</caConfig>
+            <verificationMode>relaxed</verificationMode>
+            <cacheSessions>true</cacheSessions>
+            <disableProtocols>sslv2,sslv3</disableProtocols>
+            <preferServerCiphers>true</preferServerCiphers>
+        </client>
+    </openSSL>
+</clickhouse>

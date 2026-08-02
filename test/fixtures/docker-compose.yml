@@ -1,0 +1,166 @@
+# Live test fixtures: five verified-TLS endpoints plus the databases and
+# accounts the Stage 4 suite expects.
+#
+# Run `./generate-certs.sh` first, then `docker compose up -d`, then
+# `./provision.sh`, then `source ./env.sh`.
+#
+# Ports are overridable so this stack can be brought up alongside an existing
+# one for comparison. Defaults match the ports the original ad-hoc fixtures
+# used, so an existing environment keeps working unchanged.
+
+name: dmtx-fixtures
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ${DMTX_FIXTURE_PREFIX:-dmtx}-postgres16-tls
+    environment:
+      POSTGRES_USER: dmtx
+      POSTGRES_PASSWORD: dmtx_test_only
+      POSTGRES_DB: dmtx_test
+    ports:
+      - "127.0.0.1:${DMTX_PG_PORT:-55432}:5432"
+    volumes:
+      - ./certs:/tls-host:ro
+    # PostgreSQL refuses a key it can read too widely, so it takes a private
+    # copy rather than using the shared mount directly.
+    command:
+      - sh
+      - -ec
+      - |
+        cp /tls-host/server.crt /var/lib/postgresql/server.crt
+        cp /tls-host/server.key /var/lib/postgresql/server.key
+        chown postgres:postgres /var/lib/postgresql/server.crt /var/lib/postgresql/server.key
+        chmod 600 /var/lib/postgresql/server.key
+        exec docker-entrypoint.sh postgres \
+          -c ssl=on \
+          -c ssl_cert_file=/var/lib/postgresql/server.crt \
+          -c ssl_key_file=/var/lib/postgresql/server.key \
+          -c ssl_min_protocol_version=TLSv1.2 \
+          -c listen_addresses=*
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dmtx -d dmtx_test"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  mysql:
+    image: mysql:8.0.46
+    container_name: ${DMTX_FIXTURE_PREFIX:-dmtx}-mysql80-tls
+    environment:
+      MYSQL_ROOT_PASSWORD: dmtx_root_test_only
+      MYSQL_DATABASE: dmtx
+      MYSQL_USER: dmtx
+      MYSQL_PASSWORD: dmtx_test_only
+    ports:
+      - "127.0.0.1:${DMTX_MYSQL_PORT:-53306}:3306"
+    volumes:
+      - ./certs:/etc/mysql/dmtx-certs:ro
+    command:
+      - --require-secure-transport=ON
+      - --ssl-ca=/etc/mysql/dmtx-certs/ca.pem
+      - --ssl-cert=/etc/mysql/dmtx-certs/server.crt
+      - --ssl-key=/etc/mysql/dmtx-certs/server.key
+      - --bind-address=0.0.0.0
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -pdmtx_root_test_only --silent"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  mariadb:
+    image: mariadb:10.11
+    container_name: ${DMTX_FIXTURE_PREFIX:-dmtx}-mariadb1011-tls
+    environment:
+      MARIADB_ROOT_PASSWORD: dmtx_root_test_only
+      MARIADB_DATABASE: dmtx_source
+      MARIADB_USER: dmtx
+      MARIADB_PASSWORD: dmtx_test_only
+    ports:
+      - "127.0.0.1:${DMTX_MARIADB_PORT:-54306}:3306"
+    volumes:
+      - ./certs:/certs:ro
+    # These server settings are load-bearing, not cosmetic. The suite asserts
+    # exact catalog metadata, so charset, collation, row format, timestamp
+    # handling, and identifier case all have to be pinned or comparisons drift
+    # between machines.
+    command:
+      - --ssl-ca=/certs/ca.pem
+      - --ssl-cert=/certs/server.crt
+      - --ssl-key=/certs/server.key
+      - --require-secure-transport=ON
+      - --default-time-zone=+00:00
+      - --sql-mode=STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_bin
+      - --innodb-default-row-format=DYNAMIC
+      - --auto-increment-increment=1
+      - --auto-increment-offset=1
+      - --lower-case-table-names=0
+      - --explicit-defaults-for-timestamp=ON
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -u root -pdmtx_root_test_only --silent"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: ${DMTX_FIXTURE_PREFIX:-dmtx}-mssql2022-tls
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: TestPass2024
+      MSSQL_PID: Developer
+    ports:
+      - "127.0.0.1:${DMTX_MSSQL_PORT:-51433}:1433"
+    volumes:
+      - ./certs:/var/opt/mssql/certs:ro
+      - ./mssql/mssql.conf:/var/opt/mssql/mssql.conf:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -C -Q "SELECT 1" -b
+      interval: 5s
+      timeout: 10s
+      retries: 40
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: ${DMTX_FIXTURE_PREFIX:-dmtx}-clickhouse248-tls
+    environment:
+      # Deliberately no CLICKHOUSE_USER/PASSWORD/DB. Those make the entrypoint
+      # create the database *as* the app account, which cannot work here: dmtx
+      # is least-privilege and holds no CREATE DATABASE grant. The original
+      # hand-built fixture only worked because it was restricted after the
+      # database already existed - an ordering a compose file cannot reproduce.
+      # So `default` stays the local admin, dmtx is defined entirely by
+      # users.d/dmtx.xml, and provision.sh creates the databases as admin.
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      TZ: UTC
+    ports:
+      - "127.0.0.1:${DMTX_CLICKHOUSE_PORT:-59440}:9440"
+    volumes:
+      - ./certs:/etc/clickhouse-server/certs:ro
+      # Individual files, not directories. The entrypoint writes
+      # users.d/default-user.xml at startup to replace the default account, so
+      # mounting users.d read-only makes the container exit before it serves
+      # anything. config.d is mounted the same way for symmetry.
+      - ./clickhouse/config.d/dmtx-tls.xml:/etc/clickhouse-server/config.d/dmtx-tls.xml:ro
+      - ./clickhouse/users.d/dmtx.xml:/etc/clickhouse-server/users.d/dmtx.xml:ro
+      - ./clickhouse/client-config.xml:/etc/clickhouse-client/config.xml:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test:
+        - CMD-SHELL
+        # Deliberately over the secure port, not the local socket. A plain
+        # local query succeeds even when TLS is misconfigured and 9440 never
+        # binds, which is exactly the failure this healthcheck must catch -
+        # 9440 is the only port published, so a healthy container that is not
+        # listening there is worse than a failed one.
+        - clickhouse-client --secure --host 127.0.0.1 --port 9440 --user dmtx --password dmtx_source_test --query 'SELECT 1' || exit 1
+      interval: 3s
+      timeout: 5s
+      retries: 40

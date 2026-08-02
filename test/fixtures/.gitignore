@@ -1,0 +1,4 @@
+# Generated TLS material. Reproducible via ./generate-certs.sh, so it is not
+# tracked: committing a key, even a worthless one, teaches the wrong habit and
+# trips secret scanners.
+certs/
