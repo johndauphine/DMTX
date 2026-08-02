@@ -137,6 +137,55 @@ cross-engine delete reconciliation stays refused, and `history_retention_days`
 has no Phase Four consumer because the stage boundary assigns retention to
 Stage 5.
 
+## Audit of the inherited tests — 2026-08-01
+
+The completion claim rests on tests, several written by earlier sessions and run
+but not read. They were audited for the one failure this repository keeps
+producing: a green result that does not depend on the thing being proven.
+
+**Two defects found and fixed.**
+
+1. `TestSQLiteToMySQLDatabaseValidationProbeLiveTLS` and
+   `TestMySQLToSQLServerDatabaseValidationProbeLiveTLS` gated on extra
+   `MYSQL_REQUIRED` / `MSSQL_REQUIRED` sentinels that nothing in the documented
+   environment sets, so both skipped in **every** armed run and those
+   cross-engine probe paths had never executed. They now gate on fixture
+   variables alone and fail rather than skip when armed. Both pass.
+2. The incremental route matrix asserts that a source row written after the
+   immutable upper fence never reaches the target. That row is written by a
+   mutation backend firing only when `BeginIncrementalAttempt` reports a newly
+   created attempt, and the test checked only that it returned no error. Had it
+   never run, the row would be absent for the trivial reason and all 16 cells
+   plus the MariaDB alias would have passed while proving nothing. The backend
+   now records that the write happened and the matrix asserts it. Verified the
+   write does fire today, so the exclusion assertions were genuine.
+
+**Audited and found sound**, with the property that makes each non-vacuous:
+
+- Delete process-kill matrix — asserts exact durable state: pending batch
+  present, last-success *not* advanced, frontier 0, candidates 1, native
+  receipt row present, target-only rows deleted.
+- Strict process-kill matrix — mutates the source after the kill and asserts
+  the source counts actually changed before relying on them, then requires the
+  resumed result to include the new row.
+- Strict concurrent-writer isolation — asserts the source reached 4 rows, which
+  proves the concurrent write landed, and the target stayed at 3, which proves
+  it was excluded. It cannot pass if the write never happened.
+- Validation route matrix — concrete counts, per-column NULL counts, scope
+  equality, and canonical sample values rather than "no error".
+- Rebuild writer cells — three were fixed earlier the same day; they described
+  a load-time state a real rebuild never occupies.
+
+**Skip audit.** With the gate armed, the only remaining skips are two
+helper-process entry points (`TestYAMLStoreWriterProcess`,
+`TestLeaseProcessHelper`) and `TestStage3LiveMatrixEnvironmentRequired`, which
+belongs to Stage 3 and has its own `DMTX_STAGE3_LIVE_REQUIRED` flag. No Stage 4
+test skips while armed.
+
+**Residual risk.** This audit targeted vacuity and skip-gating, not a line-by-line
+review of every assertion in the suite. It did not attempt mutation testing of
+product invariants, which would be the next level of assurance.
+
 ## Local armed live gate
 
 The final gate must use `DMTX_STAGE4_LIVE_REQUIRED=1`. The preflight requires
