@@ -48,6 +48,14 @@ jobs:
       - name: Run static analysis
         run: go vet ./...
 
+      - name: Detect unused code
+        # go vet does not report unreachable declarations. This gate exists
+        # because an unwired safety check hid that way; see .golangci.yml for
+        # why the configuration is deliberately narrow.
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.12.2
+
       - name: Detect data races
         run: go test -race ./...
 

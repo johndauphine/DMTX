@@ -1,0 +1,41 @@
+version: "2"
+
+# Deliberately narrow. This gate exists to catch one specific defect class, and
+# a gate that reports noise gets ignored or silenced, which is worse than no
+# gate at all.
+#
+# Why `unused` specifically: on 2026-08-01 it found
+# MySQLStrictConsistencyOpener.verifyLockPrivilege — a documented safety check,
+# implemented and never called. Its own comment said it existed so a missing
+# LOCK TABLES grant "surfaces as policy rather than as a mid-run error after the
+# target has been touched", which is exactly what happened while it sat unwired.
+# A test named for it covered a different rejection, so naming hid the gap too.
+# `go vet` does not report this class; it took a linter that does not share the
+# authors' assumptions.
+#
+# Deliberately NOT enabled, each for a reason rather than by omission:
+#
+#   errcheck     ~50 hits, effectively all idiomatic: fmt.Fprintln to stdout,
+#                deferred rows.Close, tx.Rollback after commit. The durability
+#                paths were checked by hand and do check their errors -
+#                copySQLiteReadOnlyArtifact checks output.Close on the success
+#                path. Enabling it would bury the signal.
+#   ineffassign  Penalises defensive style. The remaining hits are a redundant
+#                initializer before an exhaustive switch, and `discarded = true`
+#                in the final block of a cleanup chain, where the assignment is
+#                dead only until someone adds another step below it. Removing
+#                those would make the code more fragile, not less.
+#   staticcheck  Remaining hits are style (S1016, QF1001, ST1005). The three
+#                correctness ones were reviewed and are benign: SA4003 flags a
+#                redundant rather than missing bound, SA4004 flags a loop that
+#                correctly refuses on the first row found, SA1019 flags
+#                net.Error.Temporary in retry classification, which needs a
+#                deliberate replacement rather than a lint-driven one.
+#
+# Revisit these individually. Turning them on wholesale to look thorough would
+# just produce a wall of exclusions.
+
+linters:
+  default: none
+  enable:
+    - unused
