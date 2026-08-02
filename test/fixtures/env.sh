@@ -43,14 +43,18 @@ export DMTX_TEST_CLICKHOUSE_CA="${_certs}/ca.pem"
 export DMTX_TEST_MYSQL_DSN="dmtx:dmtx_test_only@tcp(127.0.0.1:${_mysql_port})/dmtx?tls=dmtx_test&parseTime=true"
 export DMTX_TEST_MYSQL_TARGET_DSN="dmtx:dmtx_test_only@tcp(127.0.0.1:${_mysql_port})/dmtx_target?tls=dmtx_test&parseTime=true"
 # Root is needed for the binary-log-safe trigger sentinel and for creating the
-# restricted account the LOCK TABLES rejection test uses. Note the suite fails
+# restricted account the LOCK TABLES rejection test uses. These select the
+# built-in `mysql` database rather than dmtx_target, which provision.sh creates:
+# every admin use is a global operation (CREATE USER, GRANT, CREATE DATABASE),
+# so pointing at a provisioned database would couple sourcing this file to
+# provisioning order for no benefit. Note the suite fails
 # rather than skips when the target DSN is set and this is not: partial
 # provisioning is treated as an error on purpose.
-export DMTX_TEST_MYSQL_ADMIN_DSN="root:dmtx_root_test_only@tcp(127.0.0.1:${_mysql_port})/dmtx_target?tls=dmtx_test&parseTime=true"
+export DMTX_TEST_MYSQL_ADMIN_DSN="root:dmtx_root_test_only@tcp(127.0.0.1:${_mysql_port})/mysql?tls=dmtx_test&parseTime=true"
 
 export DMTX_TEST_MARIADB_DSN="dmtx:dmtx_test_only@tcp(127.0.0.1:${_mariadb_port})/dmtx_source?tls=dmtx_mariadb_test&parseTime=true"
 export DMTX_TEST_MARIADB_TARGET_DSN="dmtx:dmtx_test_only@tcp(127.0.0.1:${_mariadb_port})/dmtx_target?tls=dmtx_mariadb_test&parseTime=true"
-export DMTX_TEST_MARIADB_ADMIN_DSN="root:dmtx_root_test_only@tcp(127.0.0.1:${_mariadb_port})/dmtx_target?tls=dmtx_mariadb_test&parseTime=true"
+export DMTX_TEST_MARIADB_ADMIN_DSN="root:dmtx_root_test_only@tcp(127.0.0.1:${_mariadb_port})/mysql?tls=dmtx_mariadb_test&parseTime=true"
 
 # SQL Server additionally requires guid conversion and a TLS floor.
 export DMTX_TEST_MSSQL_DSN="sqlserver://sa:TestPass2024@127.0.0.1:${_mssql_port}?database=master&encrypt=true&tlsmin=1.2&guid+conversion=true&certificate=${_certs}/ca.pem"
