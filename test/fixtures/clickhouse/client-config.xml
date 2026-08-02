@@ -1,0 +1,19 @@
+<?xml version="1.0" ?>
+<!--
+  clickhouse-client reads this, not the server's config.d, so the CA has to be
+  named again here. Without it the healthcheck cannot verify the chain and the
+  only way to make it pass is to stop verifying - which would defeat the point
+  of a healthcheck that exists to prove verified TLS actually works.
+-->
+<config>
+    <openSSL>
+        <client>
+            <loadDefaultCAFile>false</loadDefaultCAFile>
+            <caConfig>/etc/clickhouse-server/certs/ca.pem</caConfig>
+            <verificationMode>strict</verificationMode>
+            <invalidCertificateHandler>
+                <name>RejectCertificateHandler</name>
+            </invalidCertificateHandler>
+        </client>
+    </openSSL>
+</config>
