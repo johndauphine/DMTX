@@ -1,3 +1,25 @@
+# Offline verification only.
+#
+# This workflow does NOT prove Stage 4 semantics. It runs the suite with no
+# database endpoints configured, so every live test skips and the suite still
+# reports success. That is by design for a hosted runner, but it means a green
+# check here says: it compiles, offline tests pass, vet is clean, there are no
+# data races, and it cross-builds.
+#
+# The Stage 4 claim rests on the armed gate, which must currently be run
+# locally:
+#
+#   DMTX_STAGE4_LIVE_REQUIRED=1 go test ./... -count=1
+#   DMTX_STAGE4_LIVE_REQUIRED=1 go test -race ./... -count=1
+#
+# DMTX_STAGE4_LIVE_REQUIRED=1 turns an absent endpoint from a silent skip into
+# a failure. Without it a missing fixture is indistinguishable from a passing
+# test. See docs/STAGE4_CLOSEOUT_HANDOFF.md for the 16-variable environment.
+#
+# Arming this workflow needs TLS provisioning for PostgreSQL, MySQL, MariaDB,
+# SQL Server, and ClickHouse. That recipe does not exist in the repository yet;
+# the local containers were provisioned ad hoc. Capturing it is the prerequisite.
+
 name: Verify
 
 on:
@@ -20,7 +42,7 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Run tests
+      - name: Run offline tests (live endpoints absent, live tests skip)
         run: go test ./...
 
       - name: Run static analysis
@@ -34,3 +56,22 @@ jobs:
 
       - name: Build Windows command
         run: GOOS=windows GOARCH=amd64 go build -o dmtx.exe ./cmd/dmtx
+
+      - name: Record what this run did not cover
+        if: always()
+        run: |
+          {
+            echo "### Offline verification only"
+            echo
+            echo "This run had no database endpoints, so every live test skipped."
+            echo "A green check here does **not** verify Stage 4 semantics."
+            echo
+            echo "Stage 4 is proven by the armed gate, run locally:"
+            echo
+            echo '```'
+            echo "DMTX_STAGE4_LIVE_REQUIRED=1 go test ./... -count=1"
+            echo "DMTX_STAGE4_LIVE_REQUIRED=1 go test -race ./... -count=1"
+            echo '```'
+            echo
+            echo "See docs/STAGE4_CLOSEOUT_HANDOFF.md for the fixture environment."
+          } >> "$GITHUB_STEP_SUMMARY"

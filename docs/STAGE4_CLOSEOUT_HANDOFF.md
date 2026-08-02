@@ -227,6 +227,31 @@ survivors clustered in a guard-style helper whose failure branch needs an
 unusual input to reach, which is the shape worth probing first if this is
 extended: refusal and disagreement paths, not happy paths.
 
+## CI does not run the armed gate
+
+`.github/workflows/verify.yml` runs `go test ./...`, `go vet`, `-race`, and
+cross-builds Linux and Windows. It has **no database endpoints**, so every live
+test skips and the run still reports success. A green check on a pull request
+therefore proves compilation, offline tests, vet, race, and cross-platform
+build — and nothing about Stage 4's live semantics.
+
+The workflow now says so in its header and writes a job summary saying so, so a
+green check cannot be mistaken for live verification.
+
+**Arming it is a real task, not a config tweak.** The tests require verified
+TLS: a plaintext service container makes them fail rather than skip. That means
+generating certificates and configuring TLS for PostgreSQL, MySQL, MariaDB,
+SQL Server, and ClickHouse, then wiring all sixteen variables. The preflight is
+all-or-nothing — arming with a partial environment fails by design — so there is
+no useful halfway version.
+
+The blocker is that **the container provisioning recipe does not exist in this
+repository**. The local fixtures were created ad hoc and only their DSNs were
+written down. Capturing that provisioning, ideally as a compose file or script
+that reproduces the five TLS endpoints, is the prerequisite for arming CI and is
+worth doing on its own merits: today the entire Stage 4 claim depends on one
+machine's containers.
+
 ## Local armed live gate
 
 The final gate must use `DMTX_STAGE4_LIVE_REQUIRED=1`. The preflight requires
