@@ -2,6 +2,9 @@ package app
 
 import (
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"sort"
 	"strings"
 	"testing"
@@ -26,9 +29,9 @@ import (
 
 // wireFields returns every JSON path a marshalled value produces, sorted.
 //
-// Arrays are collapsed to a single element path: a list of runs has the same
-// contract as one run, and indexing every element would make the golden list
-// depend on fixture size rather than on shape.
+// Arrays contribute one element path: every element shares the shape, so only
+// the first is walked. Walking all of them would make these tests scale with
+// fixture size while proving nothing extra.
 func wireFields(t *testing.T, value any) []string {
 	t.Helper()
 	encoded, err := json.Marshal(value)
@@ -53,8 +56,9 @@ func wireFields(t *testing.T, value any) []string {
 				walk(path, child)
 			}
 		case []any:
-			for _, child := range typed {
-				walk(prefix+"[]", child)
+			// One element is enough: every element shares the shape.
+			if len(typed) > 0 {
+				walk(prefix+"[]", typed[0])
 			}
 		}
 	}
@@ -102,7 +106,10 @@ func TestOutcomeEnvelopeWireShape(t *testing.T) {
 		Command:  "status",
 		ExitCode: Success,
 		Messages: []Message{{Stream: StreamStdout, Text: "text"}},
-		Payload:  &Payload{Kind: PayloadRun, Data: json.RawMessage(`{"id":"r"}`)},
+		// An empty object: the envelope's contract is kind and data, not
+		// whatever a particular payload happens to contain. Pinning a field
+		// from a sample payload would make this fail when the sample changed.
+		Payload: &Payload{Kind: PayloadRun, Data: json.RawMessage(`{}`)},
 	}
 	assertWireShape(t, "Outcome", outcome, []string{
 		"command",
@@ -112,13 +119,16 @@ func TestOutcomeEnvelopeWireShape(t *testing.T) {
 		"messages[].text",
 		"payload",
 		"payload.data",
-		"payload.data.id",
 		"payload.kind",
 	})
 }
 
-// TestRequestWireShape pins what a surface may send. Adding a field here is
-// safe; removing or renaming one breaks callers that already send it.
+// TestRequestWireShape pins what a surface may send.
+//
+// Additions fail this test as well as removals. That is deliberate even though
+// an added field is backward-compatible for callers: the golden list is where a
+// reviewer sees the request contract grow, and a growth nobody reviewed is how
+// two surfaces end up accepting different things.
 func TestRequestWireShape(t *testing.T) {
 	request := Request{
 		Command:                "resume",
@@ -145,25 +155,40 @@ func TestRequestWireShape(t *testing.T) {
 }
 
 // TestResultPayloadWireShape pins what run, resume, and validate report.
+//
+// RuntimeTuning is populated deliberately. It carries omitempty, so a zero
+// Result omits it entirely and a golden list built from one would never pin it -
+// leaving the optional half of the contract free to be renamed silently. That is
+// exactly the blind spot these tests exist to close, so every optional field
+// must be present in the fixture.
 func TestResultPayloadWireShape(t *testing.T) {
-	assertWireShape(t, "migrate.Result", migrate.Result{}, []string{
-		"rows",
-		"tables",
-		"validated",
-	})
+	assertWireShape(t, "migrate.Result", resultFixture(), resultWireFields)
+}
+
+// resultFixture returns a Result with every optional field populated, including
+// one element in each nested slice. An empty slice pins the key but nothing
+// inside it, which would leave the deeper half of the contract unguarded.
+func resultFixture() migrate.Result {
+	return migrate.Result{
+		RuntimeTuning: &migrate.RuntimeTuningReport{
+			Reason: "populated so omitempty does not hide the field",
+			Tables: []migrate.RuntimeTuningTableReport{{
+				Adjustments: []migrate.RuntimeTuningAdjustmentReport{{}},
+			}},
+		},
+	}
 }
 
 // TestPartialResultPayloadWireShape pins the accepted-partial shape. It embeds
 // migrate.Result, so a field added there surfaces here too - which is the point:
 // the embedding is part of the contract, not an implementation detail.
 func TestPartialResultPayloadWireShape(t *testing.T) {
-	assertWireShape(t, "acceptedPartialResult", acceptedPartialResult{}, []string{
-		"outcome",
-		"resumable",
-		"rows",
-		"tables",
-		"validated",
-	})
+	assertWireShape(
+		t,
+		"acceptedPartialResult",
+		acceptedPartialResult{Result: resultFixture()},
+		append([]string{"outcome", "resumable"}, resultWireFields...),
+	)
 }
 
 // TestResumeAbandonmentPayloadWireShape pins the abandonment response, which is
@@ -207,34 +232,168 @@ func TestRunPayloadWireShapeExcludesSecrets(t *testing.T) {
 	}
 }
 
-// TestEveryPayloadKindIsPinned fails when a new payload kind is introduced
-// without a golden shape, so the wire format cannot grow unpinned.
+// TestEveryPayloadKindIsPinned fails when a payload kind is declared without a
+// pinned wire shape.
+//
+// It reads the constants out of the source rather than comparing against a
+// hand-written list. A list would have to be updated by the same person adding
+// the constant, which is exactly the step that gets forgotten - and the test
+// would then pass while the new shape went unpinned, proving nothing.
 func TestEveryPayloadKindIsPinned(t *testing.T) {
-	pinned := map[string]bool{
-		PayloadResult:         true,
-		PayloadPartialResult:  true,
-		PayloadResumeResponse: true,
-		PayloadRun:            true,
-		// Plan, runs, and the preflight report are pinned through their own
-		// packages' tests and the envelope above; they are listed so adding a
-		// kind here is a conscious decision rather than an omission.
-		PayloadPlan:            true,
-		PayloadRuns:            true,
-		PayloadPreflightReport: true,
+	pinned := map[string]string{
+		PayloadResult:          "TestResultPayloadWireShape",
+		PayloadPartialResult:   "TestPartialResultPayloadWireShape",
+		PayloadResumeResponse:  "TestResumeAbandonmentPayloadWireShape",
+		PayloadRun:             "TestRunPayloadWireShapeExcludesSecrets",
+		PayloadRuns:            "TestRunPayloadWireShapeExcludesSecrets (same element shape)",
+		PayloadPlan:            "migrate.Plan, pinned by its own package",
+		PayloadPreflightReport: "productionPreflightReport, pinned by preflight tests",
 	}
-	all := []string{
-		PayloadPlan, PayloadResult, PayloadPartialResult, PayloadRun,
-		PayloadRuns, PayloadPreflightReport, PayloadResumeResponse,
+
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, "request.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse request.go: %v", err)
 	}
-	for _, kind := range all {
-		if !pinned[kind] {
-			t.Errorf("payload kind %q has no pinned wire shape", kind)
+	declared := map[string]string{}
+	ast.Inspect(file, func(node ast.Node) bool {
+		spec, ok := node.(*ast.ValueSpec)
+		if !ok || len(spec.Names) == 0 || len(spec.Values) == 0 {
+			return true
+		}
+		name := spec.Names[0].Name
+		if !strings.HasPrefix(name, "Payload") {
+			return true
+		}
+		literal, ok := spec.Values[0].(*ast.BasicLit)
+		if !ok {
+			return true
+		}
+		declared[name] = strings.Trim(literal.Value, `"`)
+		return true
+	})
+	if len(declared) == 0 {
+		t.Fatal("found no Payload constants in request.go, so this proves nothing")
+	}
+	for name, value := range declared {
+		if _, ok := pinned[value]; !ok {
+			t.Errorf(
+				"%s = %q is declared but has no pinned wire shape; add one and record it here",
+				name, value,
+			)
 		}
 	}
-	if len(all) != len(pinned) {
-		t.Errorf(
-			"payload kinds and pinned shapes disagree: %d kinds, %d pinned",
-			len(all), len(pinned),
-		)
-	}
+}
+
+var resultWireFields = []string{
+	"rows",
+	"runtime_tuning",
+	"runtime_tuning.enabled",
+	"runtime_tuning.reason",
+	"runtime_tuning.tables",
+	"runtime_tuning.tables[].adjustments",
+	"runtime_tuning.tables[].adjustments[].after",
+	"runtime_tuning.tables[].adjustments[].after.buffer_depth",
+	"runtime_tuning.tables[].adjustments[].after.buffer_depth.intent_provenance",
+	"runtime_tuning.tables[].adjustments[].after.buffer_depth.intent_value",
+	"runtime_tuning.tables[].adjustments[].after.buffer_depth.live_provenance",
+	"runtime_tuning.tables[].adjustments[].after.buffer_depth.performance_pinned",
+	"runtime_tuning.tables[].adjustments[].after.buffer_depth.value",
+	"runtime_tuning.tables[].adjustments[].after.chunk_rows",
+	"runtime_tuning.tables[].adjustments[].after.chunk_rows.intent_provenance",
+	"runtime_tuning.tables[].adjustments[].after.chunk_rows.intent_value",
+	"runtime_tuning.tables[].adjustments[].after.chunk_rows.live_provenance",
+	"runtime_tuning.tables[].adjustments[].after.chunk_rows.performance_pinned",
+	"runtime_tuning.tables[].adjustments[].after.chunk_rows.value",
+	"runtime_tuning.tables[].adjustments[].after.writers",
+	"runtime_tuning.tables[].adjustments[].after.writers.intent_provenance",
+	"runtime_tuning.tables[].adjustments[].after.writers.intent_value",
+	"runtime_tuning.tables[].adjustments[].after.writers.live_provenance",
+	"runtime_tuning.tables[].adjustments[].after.writers.performance_pinned",
+	"runtime_tuning.tables[].adjustments[].after.writers.value",
+	"runtime_tuning.tables[].adjustments[].before",
+	"runtime_tuning.tables[].adjustments[].before.buffer_depth",
+	"runtime_tuning.tables[].adjustments[].before.buffer_depth.intent_provenance",
+	"runtime_tuning.tables[].adjustments[].before.buffer_depth.intent_value",
+	"runtime_tuning.tables[].adjustments[].before.buffer_depth.live_provenance",
+	"runtime_tuning.tables[].adjustments[].before.buffer_depth.performance_pinned",
+	"runtime_tuning.tables[].adjustments[].before.buffer_depth.value",
+	"runtime_tuning.tables[].adjustments[].before.chunk_rows",
+	"runtime_tuning.tables[].adjustments[].before.chunk_rows.intent_provenance",
+	"runtime_tuning.tables[].adjustments[].before.chunk_rows.intent_value",
+	"runtime_tuning.tables[].adjustments[].before.chunk_rows.live_provenance",
+	"runtime_tuning.tables[].adjustments[].before.chunk_rows.performance_pinned",
+	"runtime_tuning.tables[].adjustments[].before.chunk_rows.value",
+	"runtime_tuning.tables[].adjustments[].before.writers",
+	"runtime_tuning.tables[].adjustments[].before.writers.intent_provenance",
+	"runtime_tuning.tables[].adjustments[].before.writers.intent_value",
+	"runtime_tuning.tables[].adjustments[].before.writers.live_provenance",
+	"runtime_tuning.tables[].adjustments[].before.writers.performance_pinned",
+	"runtime_tuning.tables[].adjustments[].before.writers.value",
+	"runtime_tuning.tables[].adjustments[].boundary",
+	"runtime_tuning.tables[].adjustments[].boundary.attempt",
+	"runtime_tuning.tables[].adjustments[].boundary.chunk_sequence",
+	"runtime_tuning.tables[].adjustments[].boundary.ordinal",
+	"runtime_tuning.tables[].adjustments[].boundary.range_index",
+	"runtime_tuning.tables[].adjustments[].boundary.table_name",
+	"runtime_tuning.tables[].adjustments[].boundary.table_schema",
+	"runtime_tuning.tables[].adjustments[].reasons",
+	"runtime_tuning.tables[].schema",
+	"runtime_tuning.tables[].snapshot",
+	"runtime_tuning.tables[].snapshot.applied_boundaries",
+	"runtime_tuning.tables[].snapshot.effective",
+	"runtime_tuning.tables[].snapshot.effective.buffer_depth",
+	"runtime_tuning.tables[].snapshot.effective.buffer_depth.intent_provenance",
+	"runtime_tuning.tables[].snapshot.effective.buffer_depth.intent_value",
+	"runtime_tuning.tables[].snapshot.effective.buffer_depth.live_provenance",
+	"runtime_tuning.tables[].snapshot.effective.buffer_depth.performance_pinned",
+	"runtime_tuning.tables[].snapshot.effective.buffer_depth.value",
+	"runtime_tuning.tables[].snapshot.effective.chunk_rows",
+	"runtime_tuning.tables[].snapshot.effective.chunk_rows.intent_provenance",
+	"runtime_tuning.tables[].snapshot.effective.chunk_rows.intent_value",
+	"runtime_tuning.tables[].snapshot.effective.chunk_rows.live_provenance",
+	"runtime_tuning.tables[].snapshot.effective.chunk_rows.performance_pinned",
+	"runtime_tuning.tables[].snapshot.effective.chunk_rows.value",
+	"runtime_tuning.tables[].snapshot.effective.writers",
+	"runtime_tuning.tables[].snapshot.effective.writers.intent_provenance",
+	"runtime_tuning.tables[].snapshot.effective.writers.intent_value",
+	"runtime_tuning.tables[].snapshot.effective.writers.live_provenance",
+	"runtime_tuning.tables[].snapshot.effective.writers.performance_pinned",
+	"runtime_tuning.tables[].snapshot.effective.writers.value",
+	"runtime_tuning.tables[].snapshot.has_boundary",
+	"runtime_tuning.tables[].snapshot.healthy_boundaries",
+	"runtime_tuning.tables[].snapshot.initialization_reasons",
+	"runtime_tuning.tables[].snapshot.intent",
+	"runtime_tuning.tables[].snapshot.intent.buffer_depth",
+	"runtime_tuning.tables[].snapshot.intent.buffer_depth.provenance",
+	"runtime_tuning.tables[].snapshot.intent.buffer_depth.value",
+	"runtime_tuning.tables[].snapshot.intent.chunk_rows",
+	"runtime_tuning.tables[].snapshot.intent.chunk_rows.provenance",
+	"runtime_tuning.tables[].snapshot.intent.chunk_rows.value",
+	"runtime_tuning.tables[].snapshot.intent.connection_limit",
+	"runtime_tuning.tables[].snapshot.intent.connection_limit.provenance",
+	"runtime_tuning.tables[].snapshot.intent.connection_limit.value",
+	"runtime_tuning.tables[].snapshot.intent.detected_memory_limit_bytes",
+	"runtime_tuning.tables[].snapshot.intent.detected_memory_limit_bytes.provenance",
+	"runtime_tuning.tables[].snapshot.intent.detected_memory_limit_bytes.value",
+	"runtime_tuning.tables[].snapshot.intent.memory_budget_bytes",
+	"runtime_tuning.tables[].snapshot.intent.memory_budget_bytes.provenance",
+	"runtime_tuning.tables[].snapshot.intent.memory_budget_bytes.value",
+	"runtime_tuning.tables[].snapshot.intent.readers",
+	"runtime_tuning.tables[].snapshot.intent.readers.provenance",
+	"runtime_tuning.tables[].snapshot.intent.readers.value",
+	"runtime_tuning.tables[].snapshot.intent.target_mode",
+	"runtime_tuning.tables[].snapshot.intent.workers",
+	"runtime_tuning.tables[].snapshot.intent.workers.provenance",
+	"runtime_tuning.tables[].snapshot.intent.workers.value",
+	"runtime_tuning.tables[].snapshot.intent.writers",
+	"runtime_tuning.tables[].snapshot.intent.writers.provenance",
+	"runtime_tuning.tables[].snapshot.intent.writers.value",
+	"runtime_tuning.tables[].snapshot.interval",
+	"runtime_tuning.tables[].snapshot.retained_decisions",
+	"runtime_tuning.tables[].snapshot.total_decisions",
+	"runtime_tuning.tables[].snapshot.trusted_row_width_bytes",
+	"runtime_tuning.tables[].table",
+	"tables",
+	"validated",
 }
