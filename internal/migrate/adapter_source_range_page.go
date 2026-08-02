@@ -1272,26 +1272,6 @@ func adapterRangePageProjection(
 	}
 }
 
-func adapterRangePagePredicate(
-	engine string,
-	keys []KeySpec,
-	operator string,
-	values []int64,
-	position int,
-) (string, []any, int, error) {
-	typed := make(KeyTuple, len(values))
-	for index, value := range values {
-		typed[index] = IntegerKey(value)
-	}
-	return adapterRangePageKeyPredicate(
-		engine,
-		keys,
-		operator,
-		typed,
-		position,
-	)
-}
-
 func adapterRangePageKeyPredicate(
 	engine string,
 	keys []KeySpec,
@@ -1672,21 +1652,6 @@ func adapterRangePageEncodeKeyFrontier(
 		}
 	}
 	return encodeNetworkStateFrontier(tuple, true)
-}
-
-func adapterRangePageTupleCompare(left, right []int64) int {
-	if len(left) != len(right) {
-		return 0
-	}
-	for index := range left {
-		switch {
-		case left[index] < right[index]:
-			return -1
-		case left[index] > right[index]:
-			return 1
-		}
-	}
-	return 0
 }
 
 func adapterRangePageKeyTupleCompare(left, right KeyTuple) int {

@@ -1593,19 +1593,6 @@ func assertMySQLNativePreflightDidNotMutate(
 	}
 }
 
-func parseMySQLNativeTargetDSN(
-	t *testing.T,
-	role string,
-	dsn string,
-) *mysqlDriver.Config {
-	return parseMySQLNativeTargetDSNForTLS(
-		t,
-		role,
-		dsn,
-		"dmtx_test",
-	)
-}
-
 func parseMySQLNativeTargetDSNForTLS(
 	t *testing.T,
 	role string,

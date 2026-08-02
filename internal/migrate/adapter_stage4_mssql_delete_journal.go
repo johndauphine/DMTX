@@ -478,10 +478,6 @@ func readSQLServerDeleteJournalIndex(
 	return items[0], nil
 }
 
-func validateSQLServerDeleteJournalIndex(index sqlServerDeleteJournalIndex) error {
-	return validateSQLServerDeleteJournalExactIndex("receipt", index, sqlServerDeleteJournalPKConstraint)
-}
-
 func validateSQLServerDeleteJournalExactIndex(
 	label string,
 	index sqlServerDeleteJournalIndex,

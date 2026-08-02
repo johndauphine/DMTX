@@ -705,54 +705,6 @@ func appendPostgresObjectSpecs(
 	return destination
 }
 
-func plannedPostgresObjectNames(
-	tables []postgresObjectTable,
-	indexes []postgresObjectSpec,
-	checks []postgresObjectSpec,
-	foreignKeys []postgresObjectSpec,
-) ([]postgresPlannedObjectName, error) {
-	relations, constraints, err := reservePostgresObjectNames(tables)
-	if err != nil {
-		return nil, err
-	}
-	result := make(
-		[]postgresPlannedObjectName,
-		0,
-		len(indexes)+len(checks)+len(foreignKeys),
-	)
-	for _, spec := range indexes {
-		statement, err := planPostgresIndex(spec, relations)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, postgresPlannedObjectName{
-			key:  postgresObjectRetentionKey(spec),
-			name: statement.Name(),
-		})
-	}
-	for _, spec := range checks {
-		statement, err := planPostgresCheck(spec, constraints)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, postgresPlannedObjectName{
-			key:  postgresObjectRetentionKey(spec),
-			name: statement.Name(),
-		})
-	}
-	for _, spec := range foreignKeys {
-		statement, err := planPostgresForeignKey(spec, constraints)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, postgresPlannedObjectName{
-			key:  postgresObjectRetentionKey(spec),
-			name: statement.Name(),
-		})
-	}
-	return result, nil
-}
-
 func reserveStrictPostgresRigidNames(
 	tables []postgresObjectTable,
 ) (

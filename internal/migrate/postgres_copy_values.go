@@ -395,14 +395,6 @@ const (
 	postgresDecimalScale     int32 = 10
 )
 
-func normalizePostgresNumeric(value any) (pgtype.Numeric, error) {
-	return normalizePostgresNumericWithModifiers(
-		value,
-		postgresDecimalPrecision,
-		postgresDecimalScale,
-	)
-}
-
 func normalizePostgresNumericWithModifiers(
 	value any,
 	precision int64,
@@ -496,17 +488,6 @@ func parseExactPostgresNumeric(value string) (pgtype.Numeric, error) {
 		Exp:   -int32(len(fraction)),
 		Valid: true,
 	}, nil
-}
-
-// fitPostgresDecimal guarantees that PostgreSQL DECIMAL(38,10) can store the
-// value without rounding. Fractional zeros are removed only when necessary to
-// fit the target scale, so every accepted conversion is exact.
-func fitPostgresDecimal(numeric pgtype.Numeric) (pgtype.Numeric, error) {
-	return fitPostgresDecimalTo(
-		numeric,
-		postgresDecimalPrecision,
-		postgresDecimalScale,
-	)
 }
 
 func fitPostgresDecimalTo(

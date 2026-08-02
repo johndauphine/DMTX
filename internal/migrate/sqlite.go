@@ -100,77 +100,6 @@ func SQLiteToSQLiteWithObserver(ctx context.Context, cfg config.Config, observer
 	return runSQLiteToSQLite(ctx, cfg, nil, nil, observer, false)
 }
 
-func sqliteToSQLiteLegacyWithObserver(ctx context.Context, cfg config.Config, observer TableObserver) (Result, error) {
-	if err := requireStage4UpsertMergeComposition(cfg, false); err != nil {
-		return Result{}, err
-	}
-	if cfg.Source.Type != "sqlite" || cfg.Target.Type != "sqlite" {
-		return Result{}, fmt.Errorf("SQLite first pass requires source.type and target.type to be sqlite")
-	}
-	if cfg.Source.Database == "" || cfg.Target.Database == "" {
-		return Result{}, fmt.Errorf("SQLite source and target database paths are required")
-	}
-	if config.SameEndpoint(cfg.Source, cfg.Target) {
-		return Result{}, fmt.Errorf("source and target SQLite databases must differ")
-	}
-	source, err := sql.Open("sqlite", cfg.Source.Database)
-	if err != nil {
-		return Result{}, fmt.Errorf("open source: %w", err)
-	}
-	defer source.Close()
-	target, err := sql.Open("sqlite", cfg.Target.Database)
-	if err != nil {
-		return Result{}, fmt.Errorf("open target: %w", err)
-	}
-	defer target.Close()
-	names, err := userTables(ctx, source)
-	if err != nil {
-		return Result{}, err
-	}
-	names, err = selectedTables(names, cfg)
-	if err != nil {
-		return Result{}, err
-	}
-	if err := requireSQLiteDestructiveAcknowledgement(ctx, target, names, cfg.Migration); err != nil {
-		return Result{}, err
-	}
-	if err := validateSQLiteSchemaBeforeMutation(ctx, source, target, names, cfg.Migration.TargetMode); err != nil {
-		return Result{}, err
-	}
-	if setObserver, ok := observer.(TableSetObserver); ok {
-		tables := append([]string(nil), names...)
-		if err := setObserver.BeforeTables(ctx, tables); err != nil {
-			return Result{}, fmt.Errorf("checkpoint table set: %w", err)
-		}
-		if err := notifySQLiteWriteBoundary(ctx, observer, SQLiteBoundaryTableSetCheckpoint, ""); err != nil {
-			return Result{}, err
-		}
-	}
-	result := Result{Validated: true}
-	for _, name := range names {
-		if observer != nil {
-			if err := observer.BeforeTable(ctx, name); err != nil {
-				return Result{}, fmt.Errorf("checkpoint before %s: %w", name, err)
-			}
-		}
-		copied, err := copyTable(ctx, source, target, name, cfg.Migration.TargetMode, observer, TableProgress{}, false)
-		if err != nil {
-			return Result{}, err
-		}
-		if err := validateCount(ctx, source, target, name, cfg.Migration.TargetMode); err != nil {
-			return Result{}, err
-		}
-		if observer != nil {
-			if err := observer.AfterTable(ctx, name, copied); err != nil {
-				return Result{}, fmt.Errorf("checkpoint after %s: %w", name, err)
-			}
-		}
-		result.Tables++
-		result.Rows += copied
-	}
-	return result, nil
-}
-
 func selectedTables(names []string, cfg config.Config) ([]string, error) {
 	selected, err := config.SelectTables(names, cfg.Migration.IncludeTables, cfg.Migration.ExcludeTables)
 	if err != nil {
@@ -516,10 +445,6 @@ func retrySQLiteWriteAttempts(
 	return receipt, err
 }
 
-func writeBatch(ctx context.Context, target *sql.DB, table schema.Table, columns []string, mode string, rows [][]any) error {
-	return writeBatchWithObserver(ctx, target, table, columns, mode, rows, nil)
-}
-
 func writeBatchWithObserver(ctx context.Context, target *sql.DB, table schema.Table, columns []string, mode string, rows [][]any, observer TableObserver) error {
 	_, err := writeSQLiteBatchReceipt(ctx, target, table, columns, mode, rows, observer, nil)
 	return err
@@ -742,11 +667,6 @@ func contains(values []string, value string) bool {
 	}
 	return false
 }
-func prepareTarget(ctx context.Context, target *sql.DB, table schema.Table, mode string) error {
-	_, err := prepareTargetWithStatus(ctx, target, table, mode, nil)
-	return err
-}
-
 func prepareTargetWithStatus(ctx context.Context, target *sql.DB, table schema.Table, mode string, observer TableObserver) (bool, error) {
 	if mode == "drop_recreate" {
 		drop, err := schema.DropTable(schema.SQLite, table)

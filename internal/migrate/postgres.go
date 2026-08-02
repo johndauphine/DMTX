@@ -30,10 +30,6 @@ func PostgresToSQLiteWithObserver(
 	)
 }
 
-func postgresColumnNames(table schema.Table) []string {
-	return adapterColumnNames(table)
-}
-
 func postgresReadQuery(
 	namespace string,
 	table schema.Table,

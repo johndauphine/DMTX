@@ -401,11 +401,6 @@ func catalogPrecisionBase(base string) bool {
 	}
 }
 
-func catalogTemporalBase(base string) bool {
-	_, ok := catalogFractionalSecondMaximum(base)
-	return ok
-}
-
 func catalogFractionalSecondMaximum(base string) (int64, bool) {
 	switch base {
 	case "time", "datetime2", "datetimeoffset":

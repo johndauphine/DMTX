@@ -29,10 +29,6 @@ func MySQLToSQLiteWithObserver(
 	)
 }
 
-func mysqlColumnNames(table schema.Table) []string {
-	return adapterColumnNames(table)
-}
-
 func mySQLReadQuery(
 	namespace string,
 	table schema.Table,

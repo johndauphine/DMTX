@@ -952,24 +952,6 @@ func adapterPaginationTupleBoundaryQuery(
 		" WHERE " + rank + " = 1 ORDER BY " + bucket, nil
 }
 
-func adapterPaginationTupleAfter(
-	value []int64,
-	previous []int64,
-) bool {
-	if len(value) != len(previous) {
-		return false
-	}
-	for index := range value {
-		switch {
-		case value[index] > previous[index]:
-			return true
-		case value[index] < previous[index]:
-			return false
-		}
-	}
-	return false
-}
-
 func adapterPaginationKeyTupleAfter(
 	value KeyTuple,
 	previous KeyTuple,

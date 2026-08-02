@@ -102,13 +102,6 @@ func materializeSchemaSnapshot(
 	return tables, nil
 }
 
-func materializeSnapshotTable(snapshot SnapshotTable) (Table, error) {
-	return materializeSnapshotTableWithCheck(
-		snapshot,
-		materializeSnapshotCheck,
-	)
-}
-
 func materializeSnapshotTableWithCheck(
 	snapshot SnapshotTable,
 	checkMaterializer func(string, []Column) (Expression, error),

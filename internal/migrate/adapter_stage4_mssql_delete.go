@@ -27,16 +27,6 @@ const (
 	sqlServerDeleteCleanupTimeout    = 15 * time.Second
 )
 
-// sqlServerDeleteReconciliationCapabilities is intentionally built from
-// independently constructible source and target halves. A future mixed-engine
-// route must provide its own canonical equality proof; it must not inherit
-// same-engine admission merely because it can open both endpoints.
-type sqlServerDeleteReconciliationCapabilities struct {
-	source        deleteKeySource
-	target        deleteKeyTarget
-	canonicalizer deleteKeyCanonicalizer
-}
-
 type sqlServerDeleteSourceCapability struct {
 	adapter   *relationalSourceAdapter
 	authority sqlServerDeleteCatalogAuthority

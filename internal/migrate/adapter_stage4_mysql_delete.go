@@ -22,16 +22,6 @@ const (
 	mysqlDeleteMaximumBatchBytes = 64 << 20
 )
 
-// mysqlDeleteReconciliationCapabilities is deliberately reached only through
-// the existing Stage 4 delete-capability constructor.  Both endpoints use the
-// canonical mysql adapter name, so live flavor equality is an explicit part of
-// this capability rather than an assumption made from configuration aliases.
-type mysqlDeleteReconciliationCapabilities struct {
-	source        deleteKeySource
-	target        deleteKeyTarget
-	canonicalizer deleteKeyCanonicalizer
-}
-
 type mysqlDeleteSourceCapability struct {
 	adapter          *relationalSourceAdapter
 	authority        mysqlDeleteCatalogAuthority
