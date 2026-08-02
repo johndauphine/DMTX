@@ -186,6 +186,47 @@ test skips while armed.
 review of every assertion in the suite. It did not attempt mutation testing of
 product invariants, which would be the next level of assurance.
 
+## Mutation testing — 2026-08-01
+
+The audit above checked tests for vacuity by reading them. Mutation testing
+checks the same claim from the other side: break a production invariant on
+purpose, and see whether the armed suite notices. A mutant that survives is a
+guarantee nothing is defending.
+
+Method: apply a one-line mutation, run `DMTX_STAGE4_LIVE_REQUIRED=1 go test
+./internal/migrate -count=1 -failfast`, revert with `git checkout --`. A
+**positive control** was run first — breaking PostgreSQL replay insert-only —
+and failed within seconds, which is what makes the survivals below meaningful
+rather than an artifact of the harness.
+
+| Mutation | Result |
+| --- | --- |
+| PostgreSQL rebuild replay no longer insert-only (control) | caught |
+| `validateAdapterCount` rebuild equality check disabled | **survived** |
+| `validateAdapterCount` upsert under-count check disabled | **survived** |
+| Delete reconciliation always due, interval ignored | caught |
+| PostgreSQL strict readers skip `SET TRANSACTION SNAPSHOT` | caught |
+| Schema-contract `freeze` no longer blocks drift | caught |
+
+**The two survivors were the same function**, `validateAdapterCount`, which runs
+on both the transfer path and the resume path. With both comparisons disabled,
+the adapter route could never report a row-count disagreement: a target that
+silently lost rows would still have been reported as validated, and the entire
+armed suite stayed green.
+
+Closed by `TestValidateAdapterCountReportsRowCountDisagreement`, which pins both
+modes in both directions. Rebuild requires exact equality because the target was
+recreated from the source; upsert requires only that the target not hold *fewer*
+rows, since retained target-only rows are correct there. That non-failure case
+is asserted deliberately — an over-strict fix demanding equality under upsert
+would break every migration that keeps target-only data. Re-applying each mutant
+now fails the test, which is the only evidence that the gap is actually closed.
+
+**Residual risk.** Six mutations is a sample, not exhaustive coverage. The
+survivors clustered in a guard-style helper whose failure branch needs an
+unusual input to reach, which is the shape worth probing first if this is
+extended: refusal and disagreement paths, not happy paths.
+
 ## Local armed live gate
 
 The final gate must use `DMTX_STAGE4_LIVE_REQUIRED=1`. The preflight requires
