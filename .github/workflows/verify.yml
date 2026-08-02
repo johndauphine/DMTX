@@ -16,9 +16,9 @@
 # a failure. Without it a missing fixture is indistinguishable from a passing
 # test. See docs/STAGE4_CLOSEOUT_HANDOFF.md for the 16-variable environment.
 #
-# Arming this workflow needs TLS provisioning for PostgreSQL, MySQL, MariaDB,
-# SQL Server, and ClickHouse. That recipe does not exist in the repository yet;
-# the local containers were provisioned ad hoc. Capturing it is the prerequisite.
+# The `live` job below runs the armed gate against real containers built from
+# test/fixtures. This `test` job stays offline and fast so ordinary pushes are
+# not gated on a fifteen-minute database matrix.
 
 name: Verify
 
@@ -72,15 +72,76 @@ jobs:
           {
             echo "### Offline verification only"
             echo
-            echo "This run had no database endpoints, so every live test skipped."
-            echo "A green check here does **not** verify Stage 4 semantics."
+            echo "This job had no database endpoints, so every live test skipped."
+            echo "It proves compilation, offline tests, vet, race, and cross-build."
             echo
-            echo "Stage 4 is proven by the armed gate, run locally:"
-            echo
-            echo '```'
-            echo "DMTX_STAGE4_LIVE_REQUIRED=1 go test ./... -count=1"
-            echo "DMTX_STAGE4_LIVE_REQUIRED=1 go test -race ./... -count=1"
-            echo '```'
-            echo
-            echo "See docs/STAGE4_CLOSEOUT_HANDOFF.md for the fixture environment."
+            echo "Stage 4 semantics are proven by the **live** job in this same"
+            echo "workflow, which runs the armed gate against real containers."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  live:
+    name: Armed live gate
+    runs-on: ubuntu-latest
+    # Longer than the observed runtime by a wide margin: a hang here should end
+    # as a failure rather than burn the job limit.
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate fixture TLS material
+        working-directory: test/fixtures
+        run: ./generate-certs.sh
+
+      - name: Start database fixtures
+        working-directory: test/fixtures
+        run: docker compose up -d
+
+      - name: Wait for fixtures to report healthy
+        working-directory: test/fixtures
+        run: |
+          for _ in $(seq 1 120); do
+            healthy=$(docker ps --filter 'name=dmtx-' --filter 'health=healthy' --quiet | wc -l)
+            if [ "$healthy" -eq 5 ]; then
+              echo "all five fixtures healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "fixtures did not become healthy:"
+          docker ps -a --filter 'name=dmtx-' --format '{{.Names}}\t{{.Status}}'
+          docker compose logs --tail 50
+          exit 1
+
+      - name: Provision databases and grants
+        working-directory: test/fixtures
+        run: ./provision.sh
+
+      # DMTX_STAGE4_LIVE_REQUIRED=1 is the point of this job. Without it a
+      # missing endpoint would skip and the run would still report success,
+      # which is the failure mode the whole gate exists to prevent.
+      - name: Run armed live tests
+        run: |
+          source test/fixtures/env.sh
+          DMTX_STAGE4_LIVE_REQUIRED=1 go test ./... -count=1
+
+      - name: Run armed live tests with the race detector
+        run: |
+          source test/fixtures/env.sh
+          DMTX_STAGE4_LIVE_REQUIRED=1 go test -race ./... -count=1
+
+      - name: Collect fixture logs on failure
+        if: failure()
+        working-directory: test/fixtures
+        run: docker compose logs --tail 200
+
+      - name: Stop fixtures
+        if: always()
+        working-directory: test/fixtures
+        run: docker compose down -v
