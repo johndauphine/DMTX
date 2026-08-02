@@ -57,7 +57,10 @@ rm -f server.csr server.ext ca.srl
 # work on one and break on the other; for throwaway material the portable
 # choice is the right one. PostgreSQL is the exception and re-secures its own
 # copy at startup, because it refuses a group- or world-readable key.
-chmod 644 ca.pem server.crt server.key ca.key
+chmod 644 ca.pem server.crt server.key
+# The CA private key is used only by this script to sign, and is never read by
+# any container, so it stays private even though the rest is deliberately open.
+chmod 600 ca.key
 
 echo "wrote CA and server certificate to $directory"
 openssl x509 -in server.crt -noout -subject -ext subjectAltName

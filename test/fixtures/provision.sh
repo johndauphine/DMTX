@@ -6,6 +6,12 @@
 # create one database from their environment, so the second is made here.
 #
 # Safe to run repeatedly.
+#
+# The root password travels via MYSQL_PWD rather than -p. That silences the
+# client's "password on the command line is insecure" warning without also
+# silencing real errors: redirecting stderr to /dev/null would hide a genuine
+# grant or syntax failure and leave provisioning silently incomplete, which is
+# far worse in CI than a noisy warning.
 set -euo pipefail
 
 prefix="${DMTX_FIXTURE_PREFIX:-dmtx}"
@@ -15,16 +21,16 @@ mssql_container="${prefix}-mssql2022-tls"
 clickhouse_container="${prefix}-clickhouse248-tls"
 
 echo "provisioning MySQL target database"
-docker exec "$mysql_container" mysql -uroot -pdmtx_root_test_only -e "
+docker exec -e MYSQL_PWD=dmtx_root_test_only "$mysql_container" mysql -uroot -e "
   CREATE DATABASE IF NOT EXISTS dmtx_target;
   GRANT ALL ON dmtx_target.* TO 'dmtx'@'%';
-  FLUSH PRIVILEGES;" 2>/dev/null
+  FLUSH PRIVILEGES;"
 
 echo "provisioning MariaDB target database"
-docker exec "$mariadb_container" mariadb -uroot -pdmtx_root_test_only -e "
+docker exec -e MYSQL_PWD=dmtx_root_test_only "$mariadb_container" mariadb -uroot -e "
   CREATE DATABASE IF NOT EXISTS dmtx_target;
   GRANT ALL ON dmtx_target.* TO 'dmtx'@'%';
-  FLUSH PRIVILEGES;" 2>/dev/null
+  FLUSH PRIVILEGES;"
 
 # Source identity detection reads replication metadata from performance_schema.
 # The image grants the app account nothing there, so without this the MySQL and
@@ -37,21 +43,21 @@ docker exec "$mariadb_container" mariadb -uroot -pdmtx_root_test_only -e "
 # privilege to prove complete foreign-key metadata visibility". REFERENCES is
 # the narrower of the two options the tool accepts.
 echo "granting MySQL performance_schema read and global REFERENCES"
-docker exec "$mysql_container" mysql -uroot -pdmtx_root_test_only -e "
+docker exec -e MYSQL_PWD=dmtx_root_test_only "$mysql_container" mysql -uroot -e "
   GRANT SELECT ON performance_schema.* TO 'dmtx'@'%';
   GRANT REPLICATION CLIENT ON *.* TO 'dmtx'@'%';
   GRANT REFERENCES ON *.* TO 'dmtx'@'%';
   GRANT SHOW VIEW ON *.* TO 'dmtx'@'%';
-  FLUSH PRIVILEGES;" 2>/dev/null
+  FLUSH PRIVILEGES;"
 
 echo "granting MariaDB performance_schema and global REFERENCES"
-docker exec "$mariadb_container" mariadb -uroot -pdmtx_root_test_only -e "
+docker exec -e MYSQL_PWD=dmtx_root_test_only "$mariadb_container" mariadb -uroot -e "
   GRANT SELECT ON performance_schema.* TO 'dmtx'@'%';
   GRANT REPLICATION CLIENT ON *.* TO 'dmtx'@'%';
   GRANT REFERENCES ON *.* TO 'dmtx'@'%';
   GRANT SHOW VIEW ON *.* TO 'dmtx'@'%';
   GRANT SLAVE MONITOR ON *.* TO 'dmtx'@'%';
-  FLUSH PRIVILEGES;" 2>/dev/null
+  FLUSH PRIVILEGES;"
 
 echo "provisioning SQL Server target database"
 docker exec "$mssql_container" /opt/mssql-tools18/bin/sqlcmd \

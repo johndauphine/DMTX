@@ -12,6 +12,13 @@
 # them was the blocker that kept the Stage 4 claim tied to a single machine.
 # They protect nothing and must never be reused.
 
+# This file uses bash-only syntax below. Say so plainly rather than letting a
+# dash or sh user hit an opaque "bad substitution".
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "env.sh must be sourced from bash: bash -c 'source env.sh && ...'" >&2
+  return 1 2>/dev/null || exit 1
+fi
+
 _fixtures_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 _certs="${_fixtures_dir}/certs"
 
