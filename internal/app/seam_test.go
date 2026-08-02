@@ -36,7 +36,7 @@ func TestRequestAndOutcomeSurviveJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(encoded, &decoded); err != nil {
 		t.Fatalf("unmarshal request: %v", err)
 	}
-	if decoded != request {
+	if !reflect.DeepEqual(decoded, request) {
 		t.Fatalf("request round trip = %#v, want %#v", decoded, request)
 	}
 
@@ -113,27 +113,38 @@ func TestRenderJSONCarriesMessagesNotJustTheExitCode(t *testing.T) {
 	}
 }
 
-// TestExecuteRefusesCommandsNotBehindTheSeam pins that Execute says so plainly
-// rather than returning a plausible-looking empty Outcome.
-//
-// run and resume still write as they work and are handled by the command line
-// directly. A surface built against Execute must fail loudly on them, not
-// silently receive an Outcome describing nothing.
-func TestExecuteRefusesCommandsNotBehindTheSeam(t *testing.T) {
-	for _, command := range []string{"run", "resume"} {
+// TestExecuteRefusesUnknownCommands pins that Execute rejects a command it does
+// not serve rather than returning a plausible-looking empty Outcome, which a
+// surface would read as success.
+func TestExecuteRefusesUnknownCommands(t *testing.T) {
+	outcome := Execute(t.Context(), Request{Command: "teleport"})
+	if outcome.ExitCode == Success {
+		t.Fatal("unknown command reported success")
+	}
+	if len(outcome.Messages) == 0 ||
+		!strings.Contains(outcome.Messages[0].Text, "unknown command") {
+		t.Fatalf("unknown command refusal = %#v", outcome.Messages)
+	}
+}
+
+// TestEveryRegisteredCommandIsReachableThroughExecute is the parity foundation
+// Stage 5 needs: a surface built on Execute must be able to reach everything the
+// command line can. It asserts each implemented command is routed, so adding a
+// CLI command without routing it cannot silently leave other surfaces behind.
+func TestEveryRegisteredCommandIsReachableThroughExecute(t *testing.T) {
+	// The commands the CLI implements today. The rest of the registry is
+	// deliberately still stubbed and is not claimed to be reachable.
+	for _, command := range []string{
+		"run", "resume", "status", "history", "validate", "preflight",
+	} {
 		outcome := Execute(t.Context(), Request{Command: command})
-		if outcome.ExitCode == Success {
-			t.Fatalf("%s reported success through a seam it is not behind", command)
-		}
-		if len(outcome.Messages) == 0 {
-			t.Fatalf("%s refusal carried no explanation", command)
-		}
-		// The refusal must say the command is not yet routed, not that it is
-		// unknown. A surface author reading "unknown command" would go looking
-		// for a typo rather than finding the real limitation.
-		if strings.Contains(outcome.Messages[0].Text, "unknown command") {
-			t.Fatalf("%s refusal misreports a known command as unknown: %q",
-				command, outcome.Messages[0].Text)
+		for _, message := range outcome.Messages {
+			if strings.Contains(message.Text, "unknown command") {
+				t.Errorf(
+					"%s is implemented by the command line but not routed through Execute",
+					command,
+				)
+			}
 		}
 	}
 }

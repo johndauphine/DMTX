@@ -24,6 +24,14 @@ type Request struct {
 
 	// Latest distinguishes status from history, which share an implementation.
 	Latest bool `json:"latest,omitempty"`
+
+	// Resume-only. Abandon and AbandonReason travel together: abandoning
+	// without a reason, or giving a reason without abandoning, is refused,
+	// because an abandoned run with no recorded why is not a decision anyone
+	// can audit later.
+	ForceResume   bool   `json:"force_resume,omitempty"`
+	Abandon       bool   `json:"abandon,omitempty"`
+	AbandonReason string `json:"abandon_reason,omitempty"`
 }
 
 // Stream names where a message belongs. They exist because the CLI contract
