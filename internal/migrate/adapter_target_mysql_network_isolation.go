@@ -731,7 +731,10 @@ func preflightStage4MySQLRetainedReplayTarget(
 			err,
 		)
 	}
-	for triggerRows.Next() {
+	// One trigger is enough to refuse, so this reads a single row rather than
+	// iterating: every path below returns. Written as a loop it looked like it
+	// scanned all triggers, which it never did.
+	if triggerRows.Next() {
 		var catalogSchema, catalogTable, triggerName string
 		if err := triggerRows.Scan(
 			&catalogSchema,

@@ -234,8 +234,16 @@ func transportRetryEvidence(err error) (
 	case errors.Is(err, syscall.EPIPE):
 		return "broken_pipe", "connection_interrupted", false
 	}
+	// net.Error.Temporary is deprecated and deliberately retained. Go's guidance
+	// is that most temporary errors are timeouts, which Timeout covers, and the
+	// rest are ill-defined. For a migration tool the asymmetry matters: treating
+	// a transient network fault as permanent fails a migration outright, while
+	// retrying an unretryable one costs an attempt. Dropping this narrows retry
+	// classification for a lint result, which is the wrong trade. Revisit only
+	// with evidence about which concrete errors it still admits.
 	var networkError net.Error
 	if errors.As(err, &networkError) &&
+		//nolint:staticcheck // SA1019: see the note above.
 		(networkError.Timeout() || networkError.Temporary()) {
 		return "network_temporary", "temporary_network_failure", false
 	}

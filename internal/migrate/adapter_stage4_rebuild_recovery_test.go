@@ -408,7 +408,7 @@ func stage4RebuildFixtureTables() (schema.Table, schema.Table) {
 func stage4RebuildFixtureSource(events *[]string) *recordingAdapterSource {
 	parent, child := stage4RebuildFixtureTables()
 	return &recordingAdapterSource{
-		events: &*events,
+		events: events,
 		// The source catalog is already topologically ordered, matching the
 		// rebuild contract for a target that re-enables FK enforcement on load.
 		tables: []schema.Table{parent, child},

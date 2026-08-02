@@ -837,9 +837,7 @@ func discoverPostgresSourceIdentity(
 		state.cache != 1 ||
 		state.cycle ||
 		!state.canRead ||
-		state.lastValue.Valid &&
-			(state.lastValue.Int64 < 1 ||
-				state.lastValue.Int64 > math.MaxInt64) {
+		state.lastValue.Valid && state.lastValue.Int64 < 1 {
 		return nil, postgresSourcePolicy(
 			"identity sequence",
 			table.Schema+"."+table.Name+"."+columnName,

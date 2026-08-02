@@ -948,6 +948,8 @@ func TestTargetSchemaEvolutionLifecycleFailsClosedAtEveryBoundary(
 				tables: priorCatalog.tables,
 			}},
 		}
+		// The nil context is deliberate: this asserts the guard rejects it.
+		// Replacing it with context.TODO would remove what is being tested.
 		if _, err := PreflightTargetSchemaEvolution(
 			nil,
 			request,

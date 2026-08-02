@@ -52,7 +52,8 @@ jobs:
         # go vet does not report unreachable declarations. This gate exists
         # because an unwired safety check hid that way; see .golangci.yml for
         # why the configuration is deliberately narrow.
-        uses: golangci/golangci-lint-action@v6
+        # v7 is required: the action gained golangci-lint v2 support there.
+        uses: golangci/golangci-lint-action@v7
         with:
           version: v2.12.2
 

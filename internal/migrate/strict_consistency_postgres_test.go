@@ -483,6 +483,9 @@ func TestPostgresStrictCloseFailureRemainsOperationallyVisible(
 		t.Fatal(err)
 	}
 	session := raw.(*PostgresStrictConsistencySession)
+	// The nil context is the subject of this assertion: Close must refuse it.
+	// Static analysis flags nil contexts generically, so do not "fix" this by
+	// passing context.TODO — that would delete the coverage.
 	if nilContext := session.Close(nil); nilContext == nil ||
 		!strings.Contains(nilContext.Error(), "cleanup context is required") {
 		t.Fatalf("nil cleanup context error = %v", nilContext)

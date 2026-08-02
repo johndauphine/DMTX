@@ -1059,8 +1059,17 @@ func TestValidationCoreDeepTimeoutsHonorLogOnlyPolicy(t *testing.T) {
 			probe := validationCoreMatchingProbe(table)
 			test.mutate(probe)
 			options := validationCoreTestOptions(test.mode)
-			options.ExactCountTimeout = 5 * time.Millisecond
-			options.TableTimeout = 25 * time.Millisecond
+			// What this test asserts is the ordering of two deadlines, not
+			// their absolute size: the exact count must finish well inside the
+			// table budget so the deep phase is actually reached and can time
+			// out. The original 5ms/25ms was too tight to survive a loaded
+			// machine — under -race in the full suite, scheduler jitter alone
+			// exceeded the count budget, the run short-circuited before
+			// sampling, and the expected finding never appeared. These values
+			// keep the same 1:5 ratio with enough headroom that ordinary jitter
+			// cannot invert it, and still bound the test to well under a second.
+			options.ExactCountTimeout = 50 * time.Millisecond
+			options.TableTimeout = 250 * time.Millisecond
 			options.FailOnTimeout = false
 			report, err := RunValidationCore(
 				context.Background(),

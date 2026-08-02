@@ -403,7 +403,12 @@ func TestMySQLStrictTableSnapshotLive(t *testing.T) {
 	})
 }
 
-func TestMySQLStrictRejectsEngineOrLockPrivilegeLive(t *testing.T) {
+// TestMySQLStrictRejectsNonInnoDBEngineLive covers the storage-engine rejection
+// only. It was previously named ...RejectsEngineOrLockPrivilegeLive, which
+// implied it also covered the LOCK TABLES grant; it never did, and that naming
+// helped hide the fact that verifyLockPrivilege was not wired at all. The
+// privilege half is covered by TestMySQLStrictRejectsMissingLockPrivilegeLive.
+func TestMySQLStrictRejectsNonInnoDBEngineLive(t *testing.T) {
 	testMySQLFamilyStrictRejectsNonInnoDBLive(t, mysqlStrictLiveFixture{
 		name:      "MySQL",
 		dsnEnv:    "DMTX_TEST_MYSQL_DSN",

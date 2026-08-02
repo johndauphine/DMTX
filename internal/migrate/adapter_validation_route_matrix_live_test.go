@@ -450,7 +450,7 @@ func stage4ValidationLiveAddBinaryColumn(
 	ctx context.Context,
 	fixture *stage4IncrementalLiveRouteFixture,
 ) error {
-	statements := make([]string, 0, 3)
+	var statements []string
 	switch fixture.sourceEngine {
 	case adapterValidationPostgres:
 		statements = []string{
