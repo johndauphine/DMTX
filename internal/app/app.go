@@ -137,6 +137,18 @@ func Execute(ctx context.Context, request Request) Outcome {
 		return executePreflight(ctx, request)
 	case "status", "history":
 		return executeShowState(request)
+	case "run", "resume":
+		// Valid commands that are simply not behind the seam yet. Reporting
+		// them as unknown would send a surface author looking for a typo
+		// instead of telling them the truth.
+		out := newOutcome(request.Command)
+		return out.failWith(
+			ConfigurationError,
+			fmt.Sprintf(
+				"%s is not yet available through Execute; it still writes as it works and is handled by the command line directly",
+				request.Command,
+			),
+		)
 	default:
 		out := newOutcome(request.Command)
 		return out.failWith(

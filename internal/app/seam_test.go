@@ -128,6 +128,13 @@ func TestExecuteRefusesCommandsNotBehindTheSeam(t *testing.T) {
 		if len(outcome.Messages) == 0 {
 			t.Fatalf("%s refusal carried no explanation", command)
 		}
+		// The refusal must say the command is not yet routed, not that it is
+		// unknown. A surface author reading "unknown command" would go looking
+		// for a typo rather than finding the real limitation.
+		if strings.Contains(outcome.Messages[0].Text, "unknown command") {
+			t.Fatalf("%s refusal misreports a known command as unknown: %q",
+				command, outcome.Messages[0].Text)
+		}
 	}
 }
 
@@ -140,6 +147,11 @@ func TestExecuteRefusesCommandsNotBehindTheSeam(t *testing.T) {
 // is the failure the "present, do not re-decide" rule exists to prevent. The
 // check runs over the surface packages that exist plus the ones Stage 5 will
 // add, so it starts guarding them the moment they appear.
+//
+// Verified to have teeth rather than passing vacuously: a temporary
+// internal/webui importing internal/migrate makes this fail with the message
+// below. Most of these packages do not exist yet, so "passes" would otherwise
+// prove nothing.
 func TestNoSurfacePackageImportsMigrateDirectly(t *testing.T) {
 	surfaces := []string{"tui", "webui", "cli", "api", "notify", "metrics"}
 	const dataPlane = "internal/migrate"
