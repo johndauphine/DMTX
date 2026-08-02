@@ -118,15 +118,18 @@ func TestPreflightRejectsComposedStage4PolicyBeforeEndpointProbe(t *testing.T) {
 	)
 	var stdout, stderr bytes.Buffer
 	probed := false
-	code := preflightWithProbe(
-		[]string{"--config", configPath},
-		&stdout,
-		&stderr,
+	outcome := executePreflightWithProbe(
+		context.Background(),
+		Request{Command: "preflight", ConfigPath: configPath},
 		func(context.Context, config.Config) ([]productionPreflightFact, bool) {
 			probed = true
 			return nil, false
 		},
 	)
+	if err := RenderText(&stdout, &stderr, outcome); err != nil {
+		t.Fatalf("render preflight: %v", err)
+	}
+	code := outcome.ExitCode
 	if code != ConfigurationError || probed || stderr.Len() != 0 {
 		t.Fatalf("preflight code=%d probed=%t stderr=%q", code, probed, stderr.String())
 	}

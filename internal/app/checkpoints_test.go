@@ -80,11 +80,16 @@ func TestRunStoresCompletedTableCheckpoint(t *testing.T) {
 		t.Fatalf("bound run lease = %#v", boundLease)
 	}
 	var status bytes.Buffer
-	if code := showState(
-		[]string{"--state", configPath + ".state.db"},
-		&status,
-		true,
-	); code != Success {
+	// Exercise the seam the way a surface does: execute, then render.
+	statusOutcome := executeShowState(Request{
+		Command:   "status",
+		StatePath: configPath + ".state.db",
+		Latest:    true,
+	})
+	if err := RenderText(&status, &status, statusOutcome); err != nil {
+		t.Fatalf("render status: %v", err)
+	}
+	if code := statusOutcome.ExitCode; code != Success {
 		t.Fatalf("status exit code = %d", code)
 	}
 	if strings.Contains(status.String(), boundLease.OwnerToken) ||

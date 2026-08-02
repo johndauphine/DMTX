@@ -2,9 +2,7 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"sort"
@@ -26,124 +24,106 @@ type resumeOptions struct {
 	abandonReason           string
 }
 
-func resume(args []string, stdout, stderr io.Writer) int {
+func executeResume(ctx context.Context, request Request) Outcome {
+	out := newOutcome(request.Command)
 	migrationContext, stopSignals := signal.NotifyContext(
-		context.Background(),
+		ctx,
 		os.Interrupt,
 		syscall.SIGTERM,
 	)
 	defer stopSignals()
 
-	options, ok := resumeArguments(args)
+	options, ok := resumeOptionsFrom(request)
 	if !ok {
-		fmt.Fprintln(stderr, "usage: dmtx resume --config migration.yaml [--state migration.state.yaml] [--acknowledge-destructive] [--force-resume] [--abandon --abandon-reason TEXT]")
-		return ConfigurationError
+		return out.failWith(
+			ConfigurationError,
+			"usage: dmtx resume --config migration.yaml [--state migration.state.yaml] [--acknowledge-destructive] [--force-resume] [--abandon --abandon-reason TEXT]",
+		)
 	}
 	configPath, statePath := options.configPath, options.statePath
 	data, err := os.ReadFile(options.configPath)
 	if err != nil {
-		fmt.Fprintf(stderr, "read configuration: %v\n", err)
-		return FileError
+		return out.failWith(FileError, "read configuration: "+err.Error())
 	}
 	cfg, err := config.Parse(data)
 	if err != nil {
-		fmt.Fprintf(stderr, "configuration: %v\n", err)
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "configuration: "+err.Error())
 	}
 	if err := config.ValidateBoundedStage4Settings(cfg.Migration); err != nil {
-		fmt.Fprintf(stderr, "configuration: %v\n", err)
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "configuration: "+err.Error())
 	}
 	if err := migrate.ValidateMigration(cfg); err != nil {
-		fmt.Fprintf(stderr, "configuration: %v\n", err)
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "configuration: "+err.Error())
 	}
 	store, err := state.NewBackend(statePath)
 	if err != nil {
-		fmt.Fprintf(stderr, "state backend: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "state backend: "+err.Error())
 	}
 
 	run, found, err := latestRunForTarget(store, cfg.Target)
 	if err != nil {
-		fmt.Fprintf(stderr, "read migration run: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "read migration run: "+err.Error())
 	}
 	if !found {
-		fmt.Fprintln(stderr, "no resumable run exists for this target")
-		return StateError
+		return out.failWith(StateError, "no resumable run exists for this target")
 	}
 	sourceMatches, err := runSourceMatchesEndpoint(run, cfg.Source)
 	if err != nil {
-		fmt.Fprintf(stderr, "compare resumable run source identity: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "compare resumable run source identity: "+err.Error())
 	}
 	if !sourceMatches {
-		fmt.Fprintln(stderr, "resumable run source does not match the supplied configuration")
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "resumable run source does not match the supplied configuration")
 	}
 	if options.abandon {
 		if err := appLifecycleBoundary("resume_candidate_selected"); err != nil {
-			fmt.Fprintf(stderr, "resume lifecycle: %v\n", err)
-			return StateError
+			return out.failWith(StateError, "resume lifecycle: "+err.Error())
 		}
-		return abandonResumeRun(configPath, cfg, run, store, options.abandonReason, stdout, stderr)
+		return abandonResumeRun(out, configPath, cfg, run, store, options.abandonReason)
 	}
 	hashConfig := cfg
 	hashConfig.Source.Database = run.Source
 	hashConfig.Target.Database = run.Target
 	configHash, err := config.Hash(hashConfig)
 	if err != nil {
-		fmt.Fprintf(stderr, "configuration hash: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "configuration hash: "+err.Error())
 	}
 	configHashCandidates, err :=
 		config.SQLiteIdentityHashCandidates(hashConfig)
 	if err != nil {
-		fmt.Fprintf(stderr, "SQLite identity configuration hashes: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "SQLite identity configuration hashes: "+err.Error())
 	}
 	resumeCompatibilityHash, err := config.ResumeCompatibilityHash(hashConfig)
 	if err != nil {
-		fmt.Fprintf(stderr, "resume compatibility hash: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "resume compatibility hash: "+err.Error())
 	}
 	resumeCompatibilityHashCandidates, err :=
 		config.SQLiteIdentityResumeCompatibilityHashCandidates(hashConfig)
 	if err != nil {
-		fmt.Fprintf(
-			stderr,
-			"SQLite identity resume compatibility hashes: %v\n",
-			err,
-		)
-		return StateError
+		out.fail("SQLite identity resume compatibility hashes: " + err.Error())
+		return out.done(StateError)
 	}
 	if run.Outcome == state.Success {
 		return finalizePersistedSuccess(
+			out,
 			configPath,
 			cfg,
 			configHashCandidates,
 			run,
 			store,
-			stdout,
-			stderr,
 		)
 	}
 	if !run.Resumable || run.Outcome != state.Running && run.Outcome != state.Failed &&
 		run.Outcome != state.Cancelled && run.Outcome != state.Partial {
-		fmt.Fprintln(stderr, "no resumable run exists for this target")
-		return StateError
+		return out.failWith(StateError, "no resumable run exists for this target")
 	}
 	if err := appLifecycleBoundary("resume_candidate_selected"); err != nil {
-		fmt.Fprintf(stderr, "resume lifecycle: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "resume lifecycle: "+err.Error())
 	}
 
 	cfg.Migration.DestructiveAcknowledged = options.destructiveAcknowledged
 	leaseStore, lease, err := acquireTargetLease(cfg.Target, run.ID)
 	if err != nil {
-		fmt.Fprintf(stderr, "acquire target lease: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "acquire target lease: "+err.Error())
 	}
 	guard := state.NewLeaseGuard(leaseStore, lease)
 	leaseReleased := false
@@ -154,35 +134,28 @@ func resume(args []string, stdout, stderr io.Writer) int {
 	}()
 	store, err = newStage4FencedStateBackend(store, guard)
 	if err != nil {
-		fmt.Fprintf(stderr, "fence Stage 4 state backend: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "fence Stage 4 state backend: "+err.Error())
 	}
 	authoritative, found, err := latestRunForTarget(store, cfg.Target)
 	if err != nil {
-		fmt.Fprintf(stderr, "reselect migration run: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "reselect migration run: "+err.Error())
 	}
 	if !found {
-		fmt.Fprintln(stderr, "resume candidate disappeared after target lease acquisition")
-		return StateError
+		return out.failWith(StateError, "resume candidate disappeared after target lease acquisition")
 	}
 	if authoritative.Outcome == state.Success {
-		fmt.Fprintln(stderr, "resume candidate was superseded by a successful run after target lease acquisition")
-		return StateError
+		return out.failWith(StateError, "resume candidate was superseded by a successful run after target lease acquisition")
 	}
 	if !sameResumeCandidate(run, authoritative) {
-		fmt.Fprintln(stderr, "resume candidate changed after target lease acquisition")
-		return StateError
+		return out.failWith(StateError, "resume candidate changed after target lease acquisition")
 	}
 	run = authoritative
 	storedHash, hashFound, err := store.ConfigHash(run.ID)
 	if err != nil {
-		fmt.Fprintf(stderr, "read configuration hash: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "read configuration hash: "+err.Error())
 	}
 	if !hashFound {
-		fmt.Fprintln(stderr, "resumable run is missing its data-plane configuration hash")
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "resumable run is missing its data-plane configuration hash")
 	}
 	configOverride := !matchesHashCandidate(
 		storedHash,
@@ -190,31 +163,26 @@ func resume(args []string, stdout, stderr io.Writer) int {
 	)
 	if configOverride {
 		if !options.forceResume {
-			fmt.Fprintln(stderr, "resumable run configuration does not match the supplied data-plane settings")
-			return ConfigurationError
+			return out.failWith(ConfigurationError, "resumable run configuration does not match the supplied data-plane settings")
 		}
 		storedCompatibility, compatibilityFound, compatibilityErr :=
 			store.ResumeCompatibilityHash(run.ID)
 		if compatibilityErr != nil {
-			fmt.Fprintf(stderr, "read resume compatibility hash: %v\n", compatibilityErr)
-			return StateError
+			return out.failWith(StateError, "read resume compatibility hash: "+compatibilityErr.Error())
 		}
 		if !compatibilityFound ||
 			!matchesHashCandidate(
 				storedCompatibility,
 				resumeCompatibilityHashCandidates,
 			) {
-			fmt.Fprintln(stderr, "force-resume cannot override a structurally incompatible data-plane change")
-			return ConfigurationError
+			return out.failWith(ConfigurationError, "force-resume cannot override a structurally incompatible data-plane change")
 		}
 	}
 	if err := store.BindRunLease(run.ID, lease); err != nil {
-		fmt.Fprintf(stderr, "bind resumed run to target lease: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "bind resumed run to target lease: "+err.Error())
 	}
 	if err := store.ReactivateRun(run.ID, "migration resume in progress"); err != nil {
-		fmt.Fprintf(stderr, "reactivate migration run: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "reactivate migration run: "+err.Error())
 	}
 	spoolDirectory, err := stage4SpoolDirectory(statePath, run.ID)
 	if err != nil {
@@ -223,23 +191,19 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			run.ID,
 			err,
 		); stateErr != nil {
-			fmt.Fprintf(stderr, "record Stage 4 spool preparation failure: %v\n", stateErr)
-			return StateError
+			return out.failWith(StateError, "record Stage 4 spool preparation failure: "+stateErr.Error())
 		}
-		fmt.Fprintf(stderr, "Stage 4 spool directory: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "Stage 4 spool directory: "+err.Error())
 	}
 	if err := appLifecycleBoundary("resume_reactivated"); err != nil {
-		fmt.Fprintf(stderr, "resume lifecycle: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "resume lifecycle: "+err.Error())
 	}
 	if err := migrationContext.Err(); err != nil {
 		disposition := migrationAttemptDisposition(migrate.Result{}, err, cfg.Migration)
 		if stateErr := persistAttemptDisposition(
 			store, run.ID, disposition, err.Error(), time.Now().UTC(),
 		); stateErr != nil {
-			fmt.Fprintf(stderr, "record resume outcome: %v\n", stateErr)
-			return StateError
+			return out.failWith(StateError, "record resume outcome: "+stateErr.Error())
 		}
 		if auditErr := appendAttemptTerminalAudit(
 			configPath,
@@ -249,38 +213,32 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			disposition,
 			err,
 		); auditErr != nil {
-			fmt.Fprintf(stderr, "%v\n", auditErr)
-			return StateError
+			return out.failWith(StateError, auditErr.Error())
 		}
 		if releaseErr := guard.Release(); releaseErr != nil {
-			fmt.Fprintf(stderr, "release target lease: %v\n", releaseErr)
-			return StateError
+			return out.failWith(StateError, "release target lease: "+releaseErr.Error())
 		}
 		leaseReleased = true
-		fmt.Fprintf(stderr, "resume: %v\n", err)
-		return disposition.exitCode
+		out.fail("resume: " + err.Error())
+		return out.done(disposition.exitCode)
 	}
 	if err := appendAudit(configPath, run.ID, "resume_started"); err != nil {
-		fmt.Fprintf(stderr, "%v\n", err)
-		return StateError
+		return out.failWith(StateError, err.Error())
 	}
 	if configOverride {
 		if err := store.AcknowledgeConfigOverride(
 			run.ID, configHash, resumeCompatibilityHash,
 		); err != nil {
-			fmt.Fprintf(stderr, "record forced configuration override: %v\n", err)
-			return StateError
+			return out.failWith(StateError, "record forced configuration override: "+err.Error())
 		}
 		if err := appendAudit(configPath, run.ID, "resume_config_override"); err != nil {
-			fmt.Fprintf(stderr, "%v\n", err)
-			return StateError
+			return out.failWith(StateError, err.Error())
 		}
 	}
 
 	tasks, err := store.ListTasks(run.ID)
 	if err != nil {
-		fmt.Fprintf(stderr, "read table checkpoints: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "read table checkpoints: "+err.Error())
 	}
 	completed, existing := make(migrate.CompletedTableCheckpoints), make(map[string]bool)
 	progress := make(map[string]migrate.TableProgress)
@@ -340,8 +298,7 @@ func resume(args []string, stdout, stderr io.Writer) int {
 		if stateErr := persistAttemptDisposition(
 			store, run.ID, disposition, err.Error(), endedAt,
 		); stateErr != nil {
-			fmt.Fprintf(stderr, "record resume outcome: %v\n", stateErr)
-			return StateError
+			return out.failWith(StateError, "record resume outcome: "+stateErr.Error())
 		}
 		if auditErr := appendAttemptTerminalAudit(
 			configPath,
@@ -351,63 +308,82 @@ func resume(args []string, stdout, stderr io.Writer) int {
 			disposition,
 			err,
 		); auditErr != nil {
-			fmt.Fprintf(stderr, "%v\n", auditErr)
-			return StateError
+			return out.failWith(StateError, auditErr.Error())
 		}
 		if releaseErr := guard.Release(); releaseErr != nil {
-			fmt.Fprintf(stderr, "release target lease: %v\n", releaseErr)
-			return StateError
+			return out.failWith(StateError, "release target lease: "+releaseErr.Error())
 		}
 		leaseReleased = true
 		if disposition.acceptedPartial {
 			result.Validated = false
-			if encodeErr := json.NewEncoder(stdout).Encode(acceptedPartialResult{
+			if encodeErr := out.setPayload(PayloadPartialResult, acceptedPartialResult{
 				Result: result, Outcome: state.Partial, Resumable: false,
 			}); encodeErr != nil {
-				fmt.Fprintf(stderr, "write partial result: %v\n", encodeErr)
-				return FileError
+				return out.failWith(FileError, "write partial result: "+encodeErr.Error())
 			}
-			return Success
+			return out.done(Success)
 		}
-		fmt.Fprintf(stderr, "resume: %v\n", err)
-		return disposition.exitCode
+		out.fail("resume: " + err.Error())
+		return out.done(disposition.exitCode)
 	}
 	if err := appendAudit(configPath, run.ID, "validation_completed"); err != nil {
-		fmt.Fprintf(stderr, "%v\n", err)
-		return StateError
+		return out.failWith(StateError, err.Error())
 	}
 	published, err := publishStage4RunSuccess(
 		observer.tableCheckpointObserver,
 		resumeSuccessReason,
 	)
 	if err != nil {
-		fmt.Fprintf(stderr, "publish resumed migration state: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "publish resumed migration state: "+err.Error())
 	}
 	if !published {
 		if err := store.Append(state.Run{ID: run.ID, Source: run.Source, Target: run.Target, Outcome: state.Success, Resumable: false, Reason: resumeSuccessReason, StartedAt: run.StartedAt, EndedAt: time.Now().UTC()}); err != nil {
-			fmt.Fprintf(stderr, "record resumed migration state: %v\n", err)
-			return StateError
+			return out.failWith(StateError, "record resumed migration state: "+err.Error())
 		}
 	}
 	if err := appLifecycleBoundary("resume_success_persisted"); err != nil {
-		fmt.Fprintf(stderr, "resume lifecycle: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "resume lifecycle: "+err.Error())
 	}
 	if err := guard.Release(); err != nil {
-		fmt.Fprintf(stderr, "release target lease: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "release target lease: "+err.Error())
 	}
 	leaseReleased = true
 	if err := appendAudit(configPath, run.ID, "resume_succeeded"); err != nil {
-		fmt.Fprintf(stderr, "%v\n", err)
-		return StateError
+		return out.failWith(StateError, err.Error())
 	}
-	if err := json.NewEncoder(stdout).Encode(result); err != nil {
-		fmt.Fprintf(stderr, "write result: %v\n", err)
-		return FileError
+	if err := out.setPayload(PayloadResult, result); err != nil {
+		return out.failWith(FileError, "write result: "+err.Error())
 	}
-	return Success
+	return out.done(Success)
+}
+
+// resumeOptionsFrom builds the options from a Request rather than argv, so a
+// surface with no command line can resume. The validity rules are shared with
+// argv parsing rather than duplicated: a WebUI must not be able to request a
+// combination the CLI refuses.
+func resumeOptionsFrom(request Request) (resumeOptions, bool) {
+	options := resumeOptions{
+		configPath:              request.ConfigPath,
+		statePath:               request.StatePath,
+		destructiveAcknowledged: request.AcknowledgeDestructive,
+		forceResume:             request.ForceResume,
+		abandon:                 request.Abandon,
+		abandonReason:           request.AbandonReason,
+	}
+	return validResumeOptions(options)
+}
+
+// validResumeOptions holds the rules both entry points must obey, so a surface
+// with no command line cannot request a combination the CLI refuses.
+func validResumeOptions(options resumeOptions) (resumeOptions, bool) {
+	if options.configPath == "" || options.abandon != (options.abandonReason != "") ||
+		options.abandon && (options.forceResume || options.destructiveAcknowledged) {
+		return resumeOptions{}, false
+	}
+	if options.statePath == "" {
+		options.statePath = options.configPath + ".state.db"
+	}
+	return options, true
 }
 
 func resumeArguments(args []string) (resumeOptions, bool) {
@@ -451,14 +427,7 @@ func resumeArguments(args []string) (resumeOptions, bool) {
 			return resumeOptions{}, false
 		}
 	}
-	if options.configPath == "" || options.abandon != (options.abandonReason != "") ||
-		options.abandon && (options.forceResume || options.destructiveAcknowledged) {
-		return resumeOptions{}, false
-	}
-	if options.statePath == "" {
-		options.statePath = options.configPath + ".state.db"
-	}
-	return options, true
+	return validResumeOptions(options)
 }
 
 func latestRunForTarget(
@@ -599,11 +568,10 @@ func sameResumeCandidate(left, right state.Run) bool {
 		left.EndedAt.Equal(right.EndedAt)
 }
 
-func abandonResumeRun(configPath string, cfg config.Config, run state.Run, store state.Backend, reason string, stdout, stderr io.Writer) int {
+func abandonResumeRun(out *outcomeBuilder, configPath string, cfg config.Config, run state.Run, store state.Backend, reason string) Outcome {
 	leaseStore, lease, err := acquireTargetLease(cfg.Target, run.ID)
 	if err != nil {
-		fmt.Fprintf(stderr, "acquire target lease for abandonment: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "acquire target lease for abandonment: "+err.Error())
 	}
 	guard := state.NewLeaseGuard(leaseStore, lease)
 	store = state.FenceBackend(store, guard)
@@ -615,37 +583,29 @@ func abandonResumeRun(configPath string, cfg config.Config, run state.Run, store
 	}()
 	authoritative, found, err := latestRunForTarget(store, cfg.Target)
 	if err != nil {
-		fmt.Fprintf(stderr, "reselect migration run for abandonment: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "reselect migration run for abandonment: "+err.Error())
 	}
 	if !found {
-		fmt.Fprintln(stderr, "abandon candidate disappeared after target lease acquisition")
-		return StateError
+		return out.failWith(StateError, "abandon candidate disappeared after target lease acquisition")
 	}
 	if authoritative.Outcome == state.Success {
-		fmt.Fprintln(stderr, "abandon candidate was superseded by a successful run after target lease acquisition")
-		return StateError
+		return out.failWith(StateError, "abandon candidate was superseded by a successful run after target lease acquisition")
 	}
 	if !sameResumeCandidate(run, authoritative) {
-		fmt.Fprintln(stderr, "abandon candidate changed after target lease acquisition")
-		return StateError
+		return out.failWith(StateError, "abandon candidate changed after target lease acquisition")
 	}
 	run = authoritative
 	if err := store.BindRunLease(run.ID, lease); err != nil {
-		fmt.Fprintf(stderr, "bind abandoned run to target lease: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "bind abandoned run to target lease: "+err.Error())
 	}
 	if err := store.AbandonRun(run.ID, reason, time.Now().UTC()); err != nil {
-		fmt.Fprintf(stderr, "abandon run: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "abandon run: "+err.Error())
 	}
 	if err := appendAudit(configPath, run.ID, "run_abandoned"); err != nil {
-		fmt.Fprintf(stderr, "%v\n", err)
-		return StateError
+		return out.failWith(StateError, err.Error())
 	}
 	if err := guard.Release(); err != nil {
-		fmt.Fprintf(stderr, "release abandonment lease: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "release abandonment lease: "+err.Error())
 	}
 	released = true
 	response := struct {
@@ -658,28 +618,25 @@ func abandonResumeRun(configPath string, cfg config.Config, run state.Run, store
 	if run.Outcome == state.Partial {
 		response.Outcome = string(state.Partial)
 	}
-	if err := json.NewEncoder(stdout).Encode(response); err != nil {
-		fmt.Fprintf(stderr, "write abandonment result: %v\n", err)
-		return FileError
+	if err := out.setPayload(PayloadResumeResponse, response); err != nil {
+		return out.failWith(FileError, "write abandonment result: "+err.Error())
 	}
-	return Success
+	return out.done(Success)
 }
 func finalizePersistedSuccess(
+	out *outcomeBuilder,
 	configPath string,
 	cfg config.Config,
 	configHashCandidates []string,
 	run state.Run,
 	store state.Backend,
-	stdout, stderr io.Writer,
-) int {
+) Outcome {
 	if err := appLifecycleBoundary("resume_terminal_candidate_selected"); err != nil {
-		fmt.Fprintf(stderr, "resume lifecycle: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "resume lifecycle: "+err.Error())
 	}
 	leaseStore, lease, err := acquireTargetLease(cfg.Target, run.ID)
 	if err != nil {
-		fmt.Fprintf(stderr, "acquire target lease for terminal repair: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "acquire target lease for terminal repair: "+err.Error())
 	}
 	guard := state.NewLeaseGuard(leaseStore, lease)
 	store = state.FenceBackend(store, guard)
@@ -696,45 +653,33 @@ func finalizePersistedSuccess(
 	}()
 	authoritative, found, err := latestRunForTarget(store, cfg.Target)
 	if err != nil {
-		fmt.Fprintf(stderr, "reselect successful migration run: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "reselect successful migration run: "+err.Error())
 	}
 	if !found || authoritative.Outcome != state.Success ||
 		!sameResumeCandidate(run, authoritative) {
-		fmt.Fprintln(
-			stderr,
-			"terminal repair candidate changed after target lease acquisition",
-		)
-		return StateError
+		out.fail("terminal repair candidate changed after target lease acquisition")
+		return out.done(StateError)
 	}
 	run = authoritative
 	storedHash, hashFound, err := store.ConfigHash(run.ID)
 	if err != nil {
-		fmt.Fprintf(stderr, "read configuration hash: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "read configuration hash: "+err.Error())
 	}
 	if !hashFound {
-		fmt.Fprintln(stderr, "successful run is missing its data-plane configuration hash")
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "successful run is missing its data-plane configuration hash")
 	}
 	if !matchesHashCandidate(storedHash, configHashCandidates) {
-		fmt.Fprintln(
-			stderr,
-			"force-resume cannot rewrite configuration evidence for terminal-state repair",
-		)
-		return ConfigurationError
+		out.fail("force-resume cannot rewrite configuration evidence for terminal-state repair")
+		return out.done(ConfigurationError)
 	}
 	auditPath := configPath + ".audit.ndjson"
 	for _, terminalType := range []string{"run_succeeded", "resume_succeeded"} {
 		found, err := audit.HasEvent(auditPath, run.ID, terminalType)
 		if err != nil {
-			fmt.Fprintf(stderr, "inspect terminal audit: %v\n", err)
-			return StateError
+			return out.failWith(StateError, "inspect terminal audit: "+err.Error())
 		}
 		if found {
-			fmt.Fprintln(stderr, "no resumable run exists for this target")
-
-			return StateError
+			return out.failWith(StateError, "no resumable run exists for this target")
 		}
 	}
 	var terminalType string
@@ -744,71 +689,60 @@ func finalizePersistedSuccess(
 	case resumeSuccessReason:
 		terminalType = "resume_succeeded"
 	default:
-		fmt.Fprintf(stderr, "successful run has unknown completion provenance %q; refusing terminal repair\n", run.Reason)
-		return StateError
+		out.fail(fmt.Sprintf("successful run has unknown completion provenance %q; refusing terminal repair", run.Reason))
+		return out.done(StateError)
 	}
 	validated, err := audit.HasEvent(auditPath, run.ID, "validation_completed")
 	if err != nil {
-		fmt.Fprintf(stderr, "inspect validation audit: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "inspect validation audit: "+err.Error())
 	}
 	if !validated {
-		fmt.Fprintln(stderr, "successful run is missing its validation audit; refusing terminal repair")
-		return StateError
+		return out.failWith(StateError, "successful run is missing its validation audit; refusing terminal repair")
 	}
 	tasks, err := store.ListTasks(run.ID)
 	if err != nil {
-		fmt.Fprintf(stderr, "read completed table checkpoints: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "read completed table checkpoints: "+err.Error())
 	}
 	if len(tasks) == 0 {
-		fmt.Fprintln(stderr, "successful run has no completed table checkpoints; refusing terminal repair")
-		return StateError
+		return out.failWith(StateError, "successful run has no completed table checkpoints; refusing terminal repair")
 	}
 	result := migrate.Result{Validated: true}
 	for _, task := range tasks {
 		if task.Status != "completed" {
-			fmt.Fprintf(stderr, "successful run has incomplete table checkpoint %q; refusing terminal repair\n", task.Table)
-			return StateError
+			out.fail(fmt.Sprintf("successful run has incomplete table checkpoint %q; refusing terminal repair", task.Table))
+			return out.done(StateError)
 		}
 		result.Tables++
 		result.Rows += task.RowsDone
 	}
 
 	if err := store.BindRunLease(run.ID, lease); err != nil {
-		fmt.Fprintf(stderr, "bind terminal repair to target lease: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "bind terminal repair to target lease: "+err.Error())
 	}
 	if err := appendAudit(configPath, run.ID, "resume_finalization_started"); err != nil {
 		_ = heartbeat.Stop()
 		heartbeatStopped = true
-		fmt.Fprintf(stderr, "%v\n", err)
-		return StateError
+		return out.failWith(StateError, err.Error())
 	}
 	heartbeatErr := heartbeat.Stop()
 	heartbeatStopped = true
 	if heartbeatErr != nil {
-		fmt.Fprintf(stderr, "terminal repair lease heartbeat: %v\n", heartbeatErr)
-		return StateError
+		return out.failWith(StateError, "terminal repair lease heartbeat: "+heartbeatErr.Error())
 	}
 	if err := guard.Renew(); err != nil {
-		fmt.Fprintf(stderr, "verify terminal repair lease: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "verify terminal repair lease: "+err.Error())
 	}
 	if err := appendAudit(configPath, run.ID, terminalType); err != nil {
-		fmt.Fprintf(stderr, "%v\n", err)
-		return StateError
+		return out.failWith(StateError, err.Error())
 	}
 	if err := guard.Release(); err != nil {
-		fmt.Fprintf(stderr, "release terminal repair lease: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "release terminal repair lease: "+err.Error())
 	}
 	leaseReleased = true
-	if err := json.NewEncoder(stdout).Encode(result); err != nil {
-		fmt.Fprintf(stderr, "write result: %v\n", err)
-		return FileError
+	if err := out.setPayload(PayloadResult, result); err != nil {
+		return out.failWith(FileError, "write result: "+err.Error())
 	}
-	return Success
+	return out.done(Success)
 }
 
 func matchesHashCandidate(stored string, candidates []string) bool {

@@ -2,45 +2,43 @@ package app
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"os"
 
 	"github.com/johndauphine/dmtx/internal/config"
 	"github.com/johndauphine/dmtx/internal/migrate"
 )
 
-func validate(args []string, stdout, stderr io.Writer) int {
-	if len(args) != 2 || args[0] != "--config" {
-		fmt.Fprintln(stderr, "usage: dmtx validate --config migration.yaml")
-		return ConfigurationError
+// executeValidate produces the validation outcome without deciding how it is
+// shown. Every message keeps the exact text and stream the command line used,
+// so the existing CLI tests remain the check that this changed no behaviour.
+func executeValidate(ctx context.Context, request Request) Outcome {
+	out := newOutcome(request.Command)
+	if request.ConfigPath == "" {
+		return out.failWith(
+			ConfigurationError,
+			"usage: dmtx validate --config migration.yaml",
+		)
 	}
-	data, err := os.ReadFile(args[1])
+	data, err := os.ReadFile(request.ConfigPath)
 	if err != nil {
-		fmt.Fprintf(stderr, "read configuration: %v\n", err)
-		return FileError
+		return out.failWith(FileError, "read configuration: "+err.Error())
 	}
 	cfg, err := config.Parse(data)
 	if err != nil {
-		fmt.Fprintf(stderr, "configuration: %v\n", err)
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "configuration: "+err.Error())
 	}
 	if err := config.ValidateBoundedStage4Settings(cfg.Migration); err != nil {
-		fmt.Fprintf(stderr, "configuration: %v\n", err)
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "configuration: "+err.Error())
 	}
-	result, err := migrate.ValidateSQLite(context.Background(), cfg)
+	result, err := migrate.ValidateSQLite(ctx, cfg)
 	if err != nil {
-		fmt.Fprintf(stderr, "validation: %v\n", err)
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "validation: "+err.Error())
 	}
-	if err := json.NewEncoder(stdout).Encode(result); err != nil {
-		fmt.Fprintf(stderr, "write validation: %v\n", err)
-		return FileError
+	if err := out.setPayload(PayloadResult, result); err != nil {
+		return out.failWith(FileError, "write validation: "+err.Error())
 	}
 	if !result.Passed {
-		return ValidationError
+		return out.done(ValidationError)
 	}
-	return Success
+	return out.done(Success)
 }

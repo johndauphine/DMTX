@@ -2,9 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"os"
 	"time"
 
@@ -12,67 +9,62 @@ import (
 	"github.com/johndauphine/dmtx/internal/migrate"
 )
 
-func preflight(args []string, stdout, stderr io.Writer) int {
-	return preflightWithProbe(args, stdout, stderr, probeProductionPreflight)
+func executePreflight(ctx context.Context, request Request) Outcome {
+	return executePreflightWithProbe(ctx, request, probeProductionPreflight)
 }
 
-func preflightWithProbe(
-	args []string,
-	stdout, stderr io.Writer,
+// executePreflightWithProbe keeps the probe injectable so tests can supply
+// evidence without live endpoints, exactly as before the seam existed.
+func executePreflightWithProbe(
+	ctx context.Context,
+	request Request,
 	probe func(context.Context, config.Config) ([]productionPreflightFact, bool),
-) int {
-	if len(args) != 2 || args[0] != "--config" {
-		fmt.Fprintln(
-			stderr,
+) Outcome {
+	out := newOutcome(request.Command)
+	if request.ConfigPath == "" {
+		return out.failWith(
+			ConfigurationError,
 			"usage: dmtx preflight --config migration.yaml",
 		)
-		return ConfigurationError
 	}
-	data, err := os.ReadFile(args[1])
+	data, err := os.ReadFile(request.ConfigPath)
 	if err != nil {
-		fmt.Fprintf(stderr, "read configuration: %v\n", err)
-		return FileError
+		return out.failWith(FileError, "read configuration: "+err.Error())
 	}
 	cfg, err := config.Parse(data)
 	if err != nil {
-		fmt.Fprintf(stderr, "configuration: %v\n", err)
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "configuration: "+err.Error())
 	}
 	if err := migrate.ValidateStage4ComposedConfiguration(cfg); err != nil {
+		// A refused configuration still produces a report: the operator asked
+		// what would happen, and "here is why not" is the answer.
 		report := stage4ConfigurationPreflightReport(err)
-		if encodeErr := json.NewEncoder(stdout).Encode(report); encodeErr != nil {
-			fmt.Fprintf(stderr, "write preflight: %v\n", encodeErr)
-			return FileError
+		if encodeErr := out.setPayload(PayloadPreflightReport, report); encodeErr != nil {
+			return out.failWith(FileError, "write preflight: "+encodeErr.Error())
 		}
-		return ConfigurationError
+		return out.done(ConfigurationError)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	facts, sourceSizeEvidence := probe(ctx, cfg)
+	facts, sourceSizeEvidence := probe(probeCtx, cfg)
 	report, err := composeProductionPreflightReport(
 		cfg,
 		facts,
 		sourceSizeEvidence,
 	)
 	if err != nil {
-		fmt.Fprintf(stderr, "preflight evidence: %v\n", err)
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "preflight evidence: "+err.Error())
 	}
-	if err := json.NewEncoder(stdout).Encode(report); err != nil {
-		fmt.Fprintf(stderr, "write preflight: %v\n", err)
-		return FileError
+	if err := out.setPayload(PayloadPreflightReport, report); err != nil {
+		return out.failWith(FileError, "write preflight: "+err.Error())
 	}
 	if !report.Proceed {
-		return ConfigurationError
+		return out.done(ConfigurationError)
 	}
-	return Success
+	return out.done(Success)
 }
 
-// stage4ConfigurationPreflightReport represents a policy failure that is
-// known before an endpoint can be opened. Skip selectors intentionally do not
-// apply: a composed Stage 4 runner will reject this configuration regardless
-// of endpoint health or operator skip policy.
 func stage4ConfigurationPreflightReport(err error) productionPreflightReport {
 	return productionPreflightReport{
 		Proceed:       false,

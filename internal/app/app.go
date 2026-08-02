@@ -3,7 +3,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,72 +30,162 @@ const (
 	FileError
 )
 
+// Run is the command-line surface: parse argv, execute, render. It is
+// deliberately thin. Everything it does that is not parsing or rendering
+// belongs in Execute, so a second surface can reach the same behaviour without
+// synthesising an argv or scraping bytes back out of a stream.
 func Run(args []string, stdout, stderr io.Writer) int {
+	request, outcome, dispatched := parseRequest(args)
+	if !dispatched {
+		_ = RenderText(stdout, stderr, outcome)
+		return outcome.ExitCode
+	}
+	outcome = Execute(context.Background(), request)
+	if err := RenderText(stdout, stderr, outcome); err != nil {
+		fmt.Fprintf(stderr, "write output: %v\n", err)
+		return FileError
+	}
+	return outcome.ExitCode
+}
+
+// parseRequest turns argv into a Request. It returns dispatched=false for the
+// cases that are answered by argv alone - version, help, an unknown command -
+// because those have no orchestration to perform and should not pretend to.
+func parseRequest(args []string) (Request, Outcome, bool) {
+	out := newOutcome("")
 	if !contract.Valid() {
-		fmt.Fprintln(stderr, "internal command registry is invalid")
-		return StateError
+		return Request{}, out.failWith(
+			StateError,
+			"internal command registry is invalid",
+		), false
 	}
 	if len(args) == 0 {
-		fmt.Fprintln(stdout, "DMTX terminal UI is planned; use --help for automation commands.")
-		return Success
+		out.out("DMTX terminal UI is planned; use --help for automation commands.")
+		return Request{}, out.done(Success), false
 	}
 	switch args[0] {
 	case "--version", "version":
-		fmt.Fprintln(stdout, Version)
-		return Success
+		out.out(Version)
+		return Request{}, out.done(Success), false
 	case "--help", "help":
-		printHelp(stdout)
-		return Success
+		for _, line := range helpLines() {
+			out.out(line)
+		}
+		return Request{}, out.done(Success), false
 	case "run":
-		return run(args[1:], stdout, stderr)
+		configPath, statePath, dryRun, acknowledge, ok := runArguments(args[1:])
+		if !ok {
+			return Request{}, out.failWith(
+				ConfigurationError,
+				"usage: dmtx run --config migration.yaml [--state migration.state.yaml] [--dry-run] [--acknowledge-destructive]",
+			), false
+		}
+		return Request{
+			Command:                "run",
+			ConfigPath:             configPath,
+			StatePath:              statePath,
+			DryRun:                 dryRun,
+			AcknowledgeDestructive: acknowledge,
+		}, Outcome{}, true
 	case "resume":
-		return resume(args[1:], stdout, stderr)
-	case "status":
-		return showState(args[1:], stdout, true)
-	case "history":
-		return showState(args[1:], stdout, false)
+		options, ok := resumeArguments(args[1:])
+		if !ok {
+			return Request{}, out.failWith(
+				ConfigurationError,
+				"usage: dmtx resume --config migration.yaml [--state migration.state.yaml] [--acknowledge-destructive] [--force-resume] [--abandon --abandon-reason TEXT]",
+			), false
+		}
+		return Request{
+			Command:                "resume",
+			ConfigPath:             options.configPath,
+			StatePath:              options.statePath,
+			AcknowledgeDestructive: options.destructiveAcknowledged,
+			ForceResume:            options.forceResume,
+			Abandon:                options.abandon,
+			AbandonReason:          options.abandonReason,
+		}, Outcome{}, true
+	case "status", "history":
+		request := Request{Command: args[0], Latest: args[0] == "status"}
+		if len(args) == 3 && args[1] == "--state" {
+			request.StatePath = args[2]
+		}
+		return request, Outcome{}, true
 	case "validate":
-		return validate(args[1:], stdout, stderr)
+		request := Request{Command: "validate"}
+		if len(args) == 3 && args[1] == "--config" {
+			request.ConfigPath = args[2]
+		}
+		return request, Outcome{}, true
 	case "preflight", "health-check":
-		return preflight(args[1:], stdout, stderr)
+		// The alias is resolved here so nothing downstream has to know it
+		// exists.
+		request := Request{Command: "preflight"}
+		if len(args) == 3 && args[1] == "--config" {
+			request.ConfigPath = args[2]
+		}
+		return request, Outcome{}, true
 	default:
 		for _, command := range contract.Commands {
 			if command.Name == args[0] {
-				fmt.Fprintf(stdout, "%s is planned in this stage.\n", command.Name)
-				return Success
+				out.out(command.Name + " is planned in this stage.")
+				return Request{}, out.done(Success), false
 			}
 		}
-		fmt.Fprintf(stderr, "unknown command %q; use --help\n", args[0])
-		return ConfigurationError
+		return Request{}, out.failWith(
+			ConfigurationError,
+			fmt.Sprintf("unknown command %q; use --help", args[0]),
+		), false
 	}
 }
 
-func run(args []string, stdout, stderr io.Writer) int {
-	configPath, statePath, dryRun, destructiveAcknowledged, ok := runArguments(args)
-	if !ok {
-		fmt.Fprintln(stderr, "usage: dmtx run --config migration.yaml [--state migration.state.yaml] [--dry-run] [--acknowledge-destructive]")
-		return ConfigurationError
+// Execute performs a request and reports what happened. This is the seam every
+// surface shares: the CLI renders the Outcome as text, an API renders it as
+// JSON, and a parity test compares two Outcomes rather than two transcripts.
+// Every command is behind the seam. An unrecognised one is refused rather than
+// silently producing an empty Outcome.
+func Execute(ctx context.Context, request Request) Outcome {
+	switch request.Command {
+	case "validate":
+		return executeValidate(ctx, request)
+	case "preflight":
+		return executePreflight(ctx, request)
+	case "status", "history":
+		return executeShowState(request)
+	case "run":
+		return executeRun(ctx, request)
+	case "resume":
+		return executeResume(ctx, request)
+	default:
+		out := newOutcome(request.Command)
+		return out.failWith(
+			ConfigurationError,
+			fmt.Sprintf("unknown command %q; use --help", request.Command),
+		)
 	}
+}
+
+func executeRun(ctx context.Context, request Request) Outcome {
+	out := newOutcome(request.Command)
+	configPath := request.ConfigPath
+	statePath := request.StatePath
+	dryRun := request.DryRun
+	destructiveAcknowledged := request.AcknowledgeDestructive
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		fmt.Fprintf(stderr, "read configuration: %v\n", err)
-		return FileError
+		return out.failWith(FileError, "read configuration: "+err.Error())
 	}
 	cfg, err := config.Parse(data)
 	if err != nil {
-		fmt.Fprintf(stderr, "configuration: %v\n", err)
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "configuration: "+err.Error())
 	}
 	if err := migrate.ValidateMigration(cfg); err != nil {
-		fmt.Fprintf(stderr, "configuration: %v\n", err)
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "configuration: "+err.Error())
 	}
 	cfg.Migration.DestructiveAcknowledged = destructiveAcknowledged
 	if dryRun {
-		plan, err := migrate.DryRun(context.Background(), cfg)
+		plan, err := migrate.DryRun(ctx, cfg)
 		if err != nil {
-			fmt.Fprintf(stderr, "dry run: %v\n", err)
-			return ConfigurationError
+			return out.failWith(ConfigurationError, "dry run: "+err.Error())
 		}
 		if plan.Admission != nil && plan.Admission.Supported {
 			applyDryRunSchemaDriftState(cfg, statePath, &plan)
@@ -114,48 +203,42 @@ func run(args []string, stdout, stderr io.Writer) int {
 					"durable delete due-state could not be inspected read-only"
 			}
 			migrate.ApplyDryRunDeleteCandidateImpact(
-				context.Background(),
+				ctx,
 				cfg,
 				&plan,
 			)
 		}
-		if err := json.NewEncoder(stdout).Encode(plan); err != nil {
-			fmt.Fprintf(stderr, "write dry run: %v\n", err)
-			return FileError
+		if err := out.setPayload(PayloadPlan, plan); err != nil {
+			return out.failWith(FileError, "write dry run: "+err.Error())
 		}
 		if !plan.Proceed {
-			return ConfigurationError
+			return out.done(ConfigurationError)
 		}
-		return Success
+		return out.done(Success)
 	}
 	if err := config.ValidateBoundedStage4Settings(cfg.Migration); err != nil {
-		fmt.Fprintf(stderr, "configuration: %v\n", err)
-		return ConfigurationError
+		return out.failWith(ConfigurationError, "configuration: "+err.Error())
 	}
 	configHash, err := config.Hash(cfg)
 	if err != nil {
-		fmt.Fprintf(stderr, "configuration hash: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "configuration hash: "+err.Error())
 	}
 	resumeCompatibilityHash, err := config.ResumeCompatibilityHash(cfg)
 	if err != nil {
-		fmt.Fprintf(stderr, "resume compatibility hash: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "resume compatibility hash: "+err.Error())
 	}
-	migrationContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	migrationContext, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
 	store, err := state.NewBackend(statePath)
 	if err != nil {
-		fmt.Fprintf(stderr, "state backend: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "state backend: "+err.Error())
 	}
 	started := time.Now().UTC()
 	runID := started.Format("20060102T150405.000000000Z")
 	leaseStore, lease, err := acquireTargetLease(cfg.Target, runID)
 	if err != nil {
-		fmt.Fprintf(stderr, "acquire target lease: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "acquire target lease: "+err.Error())
 	}
 	guard := state.NewLeaseGuard(leaseStore, lease)
 	leaseReleased := false
@@ -166,18 +249,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}()
 	store, err = newStage4FencedStateBackend(store, guard)
 	if err != nil {
-		fmt.Fprintf(stderr, "fence Stage 4 state backend: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "fence Stage 4 state backend: "+err.Error())
 	}
 	sourceIdentity, err := endpointWorkloadIdentity(cfg.Source)
 	if err != nil {
-		fmt.Fprintf(stderr, "source workload identity: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "source workload identity: "+err.Error())
 	}
 	targetIdentity, err := endpointWorkloadIdentity(cfg.Target)
 	if err != nil {
-		fmt.Fprintf(stderr, "target workload identity: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "target workload identity: "+err.Error())
 	}
 	if err := store.InitializeRun(state.Run{
 		ID:             runID,
@@ -191,12 +271,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		Reason:         "migration in progress",
 		StartedAt:      started,
 	}, configHash); err != nil {
-		fmt.Fprintf(stderr, "record migration state: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "record migration state: "+err.Error())
 	}
 	if err := store.SaveResumeCompatibilityHash(runID, resumeCompatibilityHash); err != nil {
-		fmt.Fprintf(stderr, "record resume compatibility: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "record resume compatibility: "+err.Error())
 	}
 	spoolDirectory, err := stage4SpoolDirectory(statePath, runID)
 	if err != nil {
@@ -205,19 +283,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 			runID,
 			err,
 		); stateErr != nil {
-			fmt.Fprintf(stderr, "record Stage 4 spool preparation failure: %v\n", stateErr)
-			return StateError
+			return out.failWith(StateError, "record Stage 4 spool preparation failure: "+stateErr.Error())
 		}
-		fmt.Fprintf(stderr, "Stage 4 spool directory: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "Stage 4 spool directory: "+err.Error())
 	}
 	if err := appendAudit(configPath, runID, "run_started"); err != nil {
-		fmt.Fprintf(stderr, "%v\n", err)
-		return StateError
+		return out.failWith(StateError, err.Error())
 	}
 	if err := appLifecycleBoundary("run_initialized"); err != nil {
-		fmt.Fprintf(stderr, "run lifecycle: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "run lifecycle: "+err.Error())
 	}
 	migrationContext, heartbeat := startLeaseHeartbeat(migrationContext, guard, 30*time.Second)
 	observer := tableCheckpointObserver{
@@ -243,8 +317,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if stateErr := persistAttemptDisposition(
 			store, runID, disposition, err.Error(), endedAt,
 		); stateErr != nil {
-			fmt.Fprintf(stderr, "record migration outcome: %v\n", stateErr)
-			return StateError
+			return out.failWith(StateError, "record migration outcome: "+stateErr.Error())
 		}
 		if auditErr := appendAttemptTerminalAudit(
 			configPath,
@@ -254,35 +327,30 @@ func run(args []string, stdout, stderr io.Writer) int {
 			disposition,
 			err,
 		); auditErr != nil {
-			fmt.Fprintf(stderr, "%v\n", auditErr)
-			return StateError
+			return out.failWith(StateError, auditErr.Error())
 		}
 		if releaseErr := guard.Release(); releaseErr != nil {
-			fmt.Fprintf(stderr, "release target lease: %v\n", releaseErr)
-			return StateError
+			return out.failWith(StateError, "release target lease: "+releaseErr.Error())
 		}
 		leaseReleased = true
 		if disposition.acceptedPartial {
 			result.Validated = false
-			if encodeErr := json.NewEncoder(stdout).Encode(acceptedPartialResult{
+			if encodeErr := out.setPayload(PayloadPartialResult, acceptedPartialResult{
 				Result: result, Outcome: state.Partial, Resumable: false,
 			}); encodeErr != nil {
-				fmt.Fprintf(stderr, "write partial result: %v\n", encodeErr)
-				return FileError
+				return out.failWith(FileError, "write partial result: "+encodeErr.Error())
 			}
-			return Success
+			return out.done(Success)
 		}
-		fmt.Fprintf(stderr, "migration: %v\n", err)
-		return disposition.exitCode
+		out.fail("migration: " + err.Error())
+		return out.done(disposition.exitCode)
 	}
 	if err := appendAudit(configPath, runID, "validation_completed"); err != nil {
-		fmt.Fprintf(stderr, "%v\n", err)
-		return StateError
+		return out.failWith(StateError, err.Error())
 	}
 	published, err := publishStage4RunSuccess(observer, runSuccessReason)
 	if err != nil {
-		fmt.Fprintf(stderr, "publish completed migration state: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "publish completed migration state: "+err.Error())
 	}
 	if !published {
 		if err := store.Append(state.Run{
@@ -298,28 +366,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 			StartedAt:      started,
 			EndedAt:        time.Now().UTC(),
 		}); err != nil {
-			fmt.Fprintf(stderr, "record completed migration state: %v\n", err)
-			return StateError
+			return out.failWith(StateError, "record completed migration state: "+err.Error())
 		}
 	}
 	if err := appLifecycleBoundary("run_success_persisted"); err != nil {
-		fmt.Fprintf(stderr, "run lifecycle: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "run lifecycle: "+err.Error())
 	}
 	if err := guard.Release(); err != nil {
-		fmt.Fprintf(stderr, "release target lease: %v\n", err)
-		return StateError
+		return out.failWith(StateError, "release target lease: "+err.Error())
 	}
 	leaseReleased = true
 	if err := appendAudit(configPath, runID, "run_succeeded"); err != nil {
-		fmt.Fprintf(stderr, "%v\n", err)
-		return StateError
+		return out.failWith(StateError, err.Error())
 	}
-	if err := json.NewEncoder(stdout).Encode(result); err != nil {
-		fmt.Fprintf(stderr, "write result: %v\n", err)
-		return FileError
+	if err := out.setPayload(PayloadResult, result); err != nil {
+		return out.failWith(FileError, "write result: "+err.Error())
 	}
-	return Success
+	return out.done(Success)
 }
 
 // applyDryRunSchemaDriftState reads only the latest successful aggregate
@@ -564,47 +627,52 @@ func runArguments(args []string) (configPath, statePath string, dryRun, destruct
 	return configPath, statePath, dryRun, destructiveAcknowledged, true
 }
 
-func showState(args []string, stdout io.Writer, latest bool) int {
-	if len(args) != 2 || args[0] != "--state" {
-		fmt.Fprintln(stdout, "usage: dmtx status --state migration.yaml.state.db")
-		return ConfigurationError
+// executeShowState serves both status and history; Latest distinguishes them.
+//
+// The original wrote its errors to stdout rather than stderr. That is preserved
+// exactly - it is the observable contract, and correcting it here would make
+// this refactor a behaviour change wearing a refactor's clothes.
+func executeShowState(request Request) Outcome {
+	out := newOutcome(request.Command)
+	if request.StatePath == "" {
+		out.out("usage: dmtx status --state migration.yaml.state.db")
+		return out.done(ConfigurationError)
 	}
-	store, err := state.NewBackend(args[1])
+	store, err := state.NewBackend(request.StatePath)
 	if err != nil {
-		fmt.Fprintln(stdout, err)
-		return StateError
+		out.out(err.Error())
+		return out.done(StateError)
 	}
-
-	if latest {
+	if request.Latest {
 		run, found, err := store.Latest()
 		if err != nil {
-			fmt.Fprintln(stdout, err)
-			return StateError
+			out.out(err.Error())
+			return out.done(StateError)
 		}
 		if !found {
-			fmt.Fprintln(stdout, "no runs recorded")
-			return Success
+			out.out("no runs recorded")
+			return out.done(Success)
 		}
-		if err := json.NewEncoder(stdout).Encode(publicRun(run)); err != nil {
-			fmt.Fprintln(stdout, err)
-			return FileError
+		if err := out.setPayload(PayloadRun, publicRun(run)); err != nil {
+			out.out(err.Error())
+			return out.done(FileError)
 		}
-		return Success
+		return out.done(Success)
 	}
 	runs, err := store.List()
 	if err != nil {
-		fmt.Fprintln(stdout, err)
-		return StateError
+		out.out(err.Error())
+		return out.done(StateError)
 	}
 	publicRuns := make([]state.Run, len(runs))
 	for index, run := range runs {
 		publicRuns[index] = publicRun(run)
 	}
-	if err := json.NewEncoder(stdout).Encode(publicRuns); err != nil {
-		fmt.Fprintln(stdout, err)
-		return FileError
+	if err := out.setPayload(PayloadRuns, publicRuns); err != nil {
+		out.out(err.Error())
+		return out.done(FileError)
 	}
-	return Success
+	return out.done(Success)
 }
 
 func publicRun(run state.Run) state.Run {
@@ -612,11 +680,16 @@ func publicRun(run state.Run) state.Run {
 	return run
 }
 
-func printHelp(output io.Writer) {
-	fmt.Fprintln(output, "dmtx - deterministic database migration tool")
-	fmt.Fprintln(output, "SQLite first pass: dmtx run --config migration.yaml")
-	fmt.Fprintln(output, "Commands:")
-	for _, command := range contract.Commands {
-		fmt.Fprintf(output, "  %s\n", command.Name)
+// helpLines is the help text as data. A surface that is not a terminal needs
+// the same content without a writer to push it into.
+func helpLines() []string {
+	lines := []string{
+		"dmtx - deterministic database migration tool",
+		"SQLite first pass: dmtx run --config migration.yaml",
+		"Commands:",
 	}
+	for _, command := range contract.Commands {
+		lines = append(lines, "  "+command.Name)
+	}
+	return lines
 }
