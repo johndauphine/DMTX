@@ -777,13 +777,19 @@ func migrateWithStage4SQLServerMigrationStrictAdapters(
 	owner, found := strictExecution.MigrationSnapshot()
 	if !found || owner.SourceEngine != "mssql" ||
 		owner.SnapshotReference == "" || owner.EpochID == "" {
-		closeErr := strictExecution.Close(ctx)
-		if closeErr != nil {
-			err = errors.Join(err, closeErr)
+		// Report a close failure alongside the ownership failure. Joining it
+		// into err discarded it, because the return below builds a fresh
+		// error — so a strict execution that failed to release its snapshot
+		// and locks did so silently.
+		ownershipErr := errors.New(
+			"SQL Server migration strict execution lacks durable snapshot ownership",
+		)
+		if closeErr := strictExecution.Close(ctx); closeErr != nil {
+			ownershipErr = errors.Join(ownershipErr, closeErr)
 		}
 		return resultForValidatedAdapterCheckpoints(completed), NewTransferError(
 			ErrorClassState,
-			errors.New("SQL Server migration strict execution lacks durable snapshot ownership"),
+			ownershipErr,
 		)
 	}
 	strictPrepared := prepared

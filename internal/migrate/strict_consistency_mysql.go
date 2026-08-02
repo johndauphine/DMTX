@@ -149,6 +149,13 @@ func (opener *MySQLStrictConsistencyOpener) OpenStrictConsistency(
 	if err := opener.verifyInnoDBTables(ctx, normalized.Tables); err != nil {
 		return nil, err
 	}
+	// Prove the grant before opening any connection or taking any lock. This
+	// call was missing: verifyLockPrivilege was implemented and documented but
+	// never wired, so a caller without LOCK TABLES reached the lock statement
+	// and failed mid-run — the exact outcome the check exists to prevent.
+	if err := opener.verifyLockPrivilege(ctx); err != nil {
+		return nil, err
+	}
 	// The lock holder must be a distinct connection: LOCK TABLES implicitly
 	// commits, so the session holding the lock can never be one of the readers.
 	holder, err := opener.source.Conn(ctx)
