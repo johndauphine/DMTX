@@ -31,43 +31,118 @@ const (
 	FileError
 )
 
+// Run is the command-line surface: parse argv, execute, render. It is
+// deliberately thin. Everything it does that is not parsing or rendering
+// belongs in Execute, so a second surface can reach the same behaviour without
+// synthesising an argv or scraping bytes back out of a stream.
 func Run(args []string, stdout, stderr io.Writer) int {
+	// run and resume are not yet behind the seam. They remain on their
+	// original path so this refactor changes no behaviour, and are routed here
+	// rather than through Execute so nothing has to pretend they produce a
+	// structured Outcome. Converting them is the remaining work.
+	if len(args) > 0 {
+		switch args[0] {
+		case "run":
+			return run(args[1:], stdout, stderr)
+		case "resume":
+			return resume(args[1:], stdout, stderr)
+		}
+	}
+	request, outcome, dispatched := parseRequest(args)
+	if !dispatched {
+		_ = RenderText(stdout, stderr, outcome)
+		return outcome.ExitCode
+	}
+	outcome = Execute(context.Background(), request)
+	if err := RenderText(stdout, stderr, outcome); err != nil {
+		fmt.Fprintf(stderr, "write output: %v\n", err)
+		return FileError
+	}
+	return outcome.ExitCode
+}
+
+// parseRequest turns argv into a Request. It returns dispatched=false for the
+// cases that are answered by argv alone - version, help, an unknown command -
+// because those have no orchestration to perform and should not pretend to.
+func parseRequest(args []string) (Request, Outcome, bool) {
+	out := newOutcome("")
 	if !contract.Valid() {
-		fmt.Fprintln(stderr, "internal command registry is invalid")
-		return StateError
+		return Request{}, out.failWith(
+			StateError,
+			"internal command registry is invalid",
+		), false
 	}
 	if len(args) == 0 {
-		fmt.Fprintln(stdout, "DMTX terminal UI is planned; use --help for automation commands.")
-		return Success
+		out.out("DMTX terminal UI is planned; use --help for automation commands.")
+		return Request{}, out.done(Success), false
 	}
 	switch args[0] {
 	case "--version", "version":
-		fmt.Fprintln(stdout, Version)
-		return Success
+		out.out(Version)
+		return Request{}, out.done(Success), false
 	case "--help", "help":
-		printHelp(stdout)
-		return Success
-	case "run":
-		return run(args[1:], stdout, stderr)
+		for _, line := range helpLines() {
+			out.out(line)
+		}
+		return Request{}, out.done(Success), false
 	case "resume":
-		return resume(args[1:], stdout, stderr)
-	case "status":
-		return showState(args[1:], stdout, true)
-	case "history":
-		return showState(args[1:], stdout, false)
+		// Not yet converted: resume still writes as it works. Handled below by
+		// the legacy path rather than pretending to produce a structured
+		// Outcome it cannot yet build.
+		return Request{Command: "resume"}, Outcome{}, true
+	case "status", "history":
+		request := Request{Command: args[0], Latest: args[0] == "status"}
+		if len(args) == 3 && args[1] == "--state" {
+			request.StatePath = args[2]
+		}
+		return request, Outcome{}, true
 	case "validate":
-		return validate(args[1:], stdout, stderr)
+		request := Request{Command: "validate"}
+		if len(args) == 3 && args[1] == "--config" {
+			request.ConfigPath = args[2]
+		}
+		return request, Outcome{}, true
 	case "preflight", "health-check":
-		return preflight(args[1:], stdout, stderr)
+		// The alias is resolved here so nothing downstream has to know it
+		// exists.
+		request := Request{Command: "preflight"}
+		if len(args) == 3 && args[1] == "--config" {
+			request.ConfigPath = args[2]
+		}
+		return request, Outcome{}, true
 	default:
 		for _, command := range contract.Commands {
 			if command.Name == args[0] {
-				fmt.Fprintf(stdout, "%s is planned in this stage.\n", command.Name)
-				return Success
+				out.out(command.Name + " is planned in this stage.")
+				return Request{}, out.done(Success), false
 			}
 		}
-		fmt.Fprintf(stderr, "unknown command %q; use --help\n", args[0])
-		return ConfigurationError
+		return Request{}, out.failWith(
+			ConfigurationError,
+			fmt.Sprintf("unknown command %q; use --help", args[0]),
+		), false
+	}
+}
+
+// Execute performs a request and reports what happened. This is the seam every
+// surface shares: the CLI renders the Outcome as text, an API renders it as
+// JSON, and a parity test compares two Outcomes rather than two transcripts.
+// Commands not listed here are not yet behind the seam; Execute refuses them
+// explicitly rather than returning a plausible-looking empty Outcome.
+func Execute(ctx context.Context, request Request) Outcome {
+	switch request.Command {
+	case "validate":
+		return executeValidate(ctx, request)
+	case "preflight":
+		return executePreflight(ctx, request)
+	case "status", "history":
+		return executeShowState(request)
+	default:
+		out := newOutcome(request.Command)
+		return out.failWith(
+			ConfigurationError,
+			fmt.Sprintf("unknown command %q; use --help", request.Command),
+		)
 	}
 }
 
@@ -564,47 +639,52 @@ func runArguments(args []string) (configPath, statePath string, dryRun, destruct
 	return configPath, statePath, dryRun, destructiveAcknowledged, true
 }
 
-func showState(args []string, stdout io.Writer, latest bool) int {
-	if len(args) != 2 || args[0] != "--state" {
-		fmt.Fprintln(stdout, "usage: dmtx status --state migration.yaml.state.db")
-		return ConfigurationError
+// executeShowState serves both status and history; Latest distinguishes them.
+//
+// The original wrote its errors to stdout rather than stderr. That is preserved
+// exactly - it is the observable contract, and correcting it here would make
+// this refactor a behaviour change wearing a refactor's clothes.
+func executeShowState(request Request) Outcome {
+	out := newOutcome(request.Command)
+	if request.StatePath == "" {
+		out.out("usage: dmtx status --state migration.yaml.state.db")
+		return out.done(ConfigurationError)
 	}
-	store, err := state.NewBackend(args[1])
+	store, err := state.NewBackend(request.StatePath)
 	if err != nil {
-		fmt.Fprintln(stdout, err)
-		return StateError
+		out.out(err.Error())
+		return out.done(StateError)
 	}
-
-	if latest {
+	if request.Latest {
 		run, found, err := store.Latest()
 		if err != nil {
-			fmt.Fprintln(stdout, err)
-			return StateError
+			out.out(err.Error())
+			return out.done(StateError)
 		}
 		if !found {
-			fmt.Fprintln(stdout, "no runs recorded")
-			return Success
+			out.out("no runs recorded")
+			return out.done(Success)
 		}
-		if err := json.NewEncoder(stdout).Encode(publicRun(run)); err != nil {
-			fmt.Fprintln(stdout, err)
-			return FileError
+		if err := out.setPayload(PayloadRun, publicRun(run)); err != nil {
+			out.out(err.Error())
+			return out.done(FileError)
 		}
-		return Success
+		return out.done(Success)
 	}
 	runs, err := store.List()
 	if err != nil {
-		fmt.Fprintln(stdout, err)
-		return StateError
+		out.out(err.Error())
+		return out.done(StateError)
 	}
 	publicRuns := make([]state.Run, len(runs))
 	for index, run := range runs {
 		publicRuns[index] = publicRun(run)
 	}
-	if err := json.NewEncoder(stdout).Encode(publicRuns); err != nil {
-		fmt.Fprintln(stdout, err)
-		return FileError
+	if err := out.setPayload(PayloadRuns, publicRuns); err != nil {
+		out.out(err.Error())
+		return out.done(FileError)
 	}
-	return Success
+	return out.done(Success)
 }
 
 func publicRun(run state.Run) state.Run {
@@ -612,11 +692,16 @@ func publicRun(run state.Run) state.Run {
 	return run
 }
 
-func printHelp(output io.Writer) {
-	fmt.Fprintln(output, "dmtx - deterministic database migration tool")
-	fmt.Fprintln(output, "SQLite first pass: dmtx run --config migration.yaml")
-	fmt.Fprintln(output, "Commands:")
-	for _, command := range contract.Commands {
-		fmt.Fprintf(output, "  %s\n", command.Name)
+// helpLines is the help text as data. A surface that is not a terminal needs
+// the same content without a writer to push it into.
+func helpLines() []string {
+	lines := []string{
+		"dmtx - deterministic database migration tool",
+		"SQLite first pass: dmtx run --config migration.yaml",
+		"Commands:",
 	}
+	for _, command := range contract.Commands {
+		lines = append(lines, "  "+command.Name)
+	}
+	return lines
 }
