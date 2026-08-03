@@ -79,9 +79,11 @@ func defaultStatePath() (string, error) {
 
 // writeInstanceState records this server so a second invocation can find it.
 //
-// Written 0600 in a 0700 directory. That is not what protects the secret - the
-// handshake is - but a credential file readable by other accounts is a bad
-// habit regardless of whether this particular one can be used directly.
+// The file ends up 0600. The directory is created 0700 when it is missing; an
+// existing one is left as the operator has it, because tightening a directory
+// this tool did not create is not its decision to make. Neither is what
+// protects the secret - the handshake is - but a credential file readable by
+// other accounts is a bad habit regardless.
 func writeInstanceState(path string, state instanceState) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create state directory: %w", err)
@@ -90,8 +92,34 @@ func writeInstanceState(path string, state instanceState) error {
 	if err != nil {
 		return fmt.Errorf("encode instance state: %w", err)
 	}
-	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+
+	// Written to a new file and renamed into place, for two reasons.
+	//
+	// A mode argument applies only when a file is created, so writing straight
+	// over an existing serve.json would keep whatever mode that file already
+	// had - 0600 would be a hope, not a guarantee. A file that cannot already
+	// exist cannot inherit anything.
+	//
+	// The rename is also atomic, so a second invocation reading at the same
+	// moment sees the old record or the new one, never half of one.
+	temporary, err := os.CreateTemp(filepath.Dir(path), "serve-*.json")
+	if err != nil {
+		return fmt.Errorf("create instance state: %w", err)
+	}
+	defer func() { _ = os.Remove(temporary.Name()) }()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("restrict instance state: %w", err)
+	}
+	if _, err := temporary.Write(encoded); err != nil {
+		_ = temporary.Close()
 		return fmt.Errorf("write instance state: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("write instance state: %w", err)
+	}
+	if err := os.Rename(temporary.Name(), path); err != nil {
+		return fmt.Errorf("install instance state: %w", err)
 	}
 	return nil
 }

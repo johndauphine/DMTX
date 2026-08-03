@@ -40,9 +40,15 @@ func RunCommand(args []string, stdout, stderr io.Writer) int {
 	// and no indication which is which.
 	if !options.NewInstance && pathErr == nil {
 		if target, handedOff := handOff(path, options.Port); handedOff {
-			fmt.Fprintf(stdout, "dmtx is already serving; opening %s\n", target)
+			// The message has to match what actually happens. Saying "opening"
+			// under --no-browser would leave an operator waiting for a window
+			// that was never going to appear.
 			if options.OpenBrowser {
+				fmt.Fprintf(stdout, "dmtx is already serving; opening %s\n", target)
 				launchBrowser(target)
+			} else {
+				fmt.Fprintf(stdout, "dmtx is already serving at %s\n", target)
+				fmt.Fprintln(stdout, "That link carries a one-time token, exchanged for a session on first use.")
 			}
 			return success
 		}

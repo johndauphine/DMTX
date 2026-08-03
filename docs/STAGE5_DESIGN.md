@@ -81,12 +81,13 @@ command, and the process should not outlive their attention.
   databases. `--new-instance` overrides it, and a `--port` that disagrees with
   the running instance is read as a request for a different server.
 
-**[proposed]** One more, not yet built:
-
-- **Chromeless window.** Open via the browser's app mode so the console gets its
-  own window and icon, with a graceful fallback to an ordinary tab. The PWA
-  shell reaches the same result through the operator's own browser, so this is
-  a stopgap rather than the primary route.
+- **Chromeless window.** **[decided]** Delivered by the PWA shell, not by a
+  launcher flag. Both routes end at a console with its own window, own icon,
+  and no browser chrome, but an `--app-window` flag would have to name a
+  Chromium binary and launch *that* — so an operator whose default browser is
+  Firefox or Safari would find their console opening in a browser they did not
+  choose. Installing the PWA reaches the same place through the browser they
+  already use. Tracked with the console frontend rather than here.
 
 ### The handoff handshake
 

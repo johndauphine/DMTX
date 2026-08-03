@@ -329,6 +329,90 @@ func TestStateFileIsNotReadableByOtherAccounts(t *testing.T) {
 	}
 }
 
+// TestRecordingOverAnExistingFileDoesNotInheritItsMode pins the case the
+// mode test above cannot reach.
+//
+// A mode argument applies only when a file is created, so writing over a
+// serve.json left world-readable by an earlier version - or by a hand edit -
+// would silently keep that mode. TestStateFileIsNotReadableByOtherAccounts
+// writes into an empty directory and so never exercises this at all.
+func TestRecordingOverAnExistingFileDoesNotInheritItsMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not how Windows restricts a file")
+	}
+	path := filepath.Join(t.TempDir(), "serve.json")
+	if err := os.WriteFile(path, []byte(`{"port":1,"secret":"old"}`), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := writeInstanceState(path, instanceState{Port: 2, Secret: "new"}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		t.Errorf(
+			"rewriting an existing state file left it %04o; the secret is "+
+				"readable by other accounts",
+			mode,
+		)
+	}
+	recorded, found := readInstanceState(path)
+	if !found || recorded.Port != 2 {
+		t.Errorf("the rewrite did not take: %+v found=%v", recorded, found)
+	}
+}
+
+// TestRecordingLeavesNoTemporaryFilesBehind pins that the write-and-rename does
+// not litter the operator's config directory.
+func TestRecordingLeavesNoTemporaryFilesBehind(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "serve.json")
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := writeInstanceState(path, instanceState{Port: 8484, Secret: "s"}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 1 {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Errorf("expected only serve.json, found %v", names)
+	}
+}
+
+// TestHandoffDoesNotClaimToOpenABrowserItWillNotOpen pins that the handoff
+// message matches what happens.
+//
+// Only the --no-browser path is driven here: the other one launches a real
+// browser, which a test suite has no business doing.
+func TestHandoffDoesNotClaimToOpenABrowserItWillNotOpen(t *testing.T) {
+	_, path := startTestServer(t)
+	redirectStatePath(t, path)
+
+	var out bytes.Buffer
+	if code := RunCommand([]string{"--no-browser"}, &out, io.Discard); code != success {
+		t.Fatalf("handoff returned %d", code)
+	}
+
+	if strings.Contains(strings.ToLower(out.String()), "opening") {
+		t.Errorf("--no-browser handoff said it was opening a browser: %q", out.String())
+	}
+	// It still has to hand over the URL, or --no-browser leaves the operator
+	// with nothing to act on.
+	if !strings.Contains(out.String(), "/login?token=") {
+		t.Errorf("--no-browser handoff printed no usable URL: %q", out.String())
+	}
+}
+
 // TestReadInstanceStateRefusesNonsense pins that a damaged or hand-edited file
 // means "there is nobody to hand off to" rather than a crash or a probe of
 // something arbitrary.
