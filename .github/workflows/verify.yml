@@ -129,12 +129,16 @@ jobs:
       - name: Run armed live tests
         run: |
           source test/fixtures/env.sh
-          DMTX_STAGE4_LIVE_REQUIRED=1 go test ./... -count=1
+          DMTX_STAGE4_LIVE_REQUIRED=1 go test ./... -count=1 -timeout 30m
 
       - name: Run armed live tests with the race detector
         run: |
           source test/fixtures/env.sh
-          DMTX_STAGE4_LIVE_REQUIRED=1 go test -race ./... -count=1
+          # 30m, not Go's 10m default. The race run of internal/migrate takes
+          # roughly five minutes on a developer machine and far longer on a
+          # four-core runner, so the default sat close enough to the limit that
+          # the job passed or timed out depending on runner load.
+          DMTX_STAGE4_LIVE_REQUIRED=1 go test -race ./... -count=1 -timeout 30m
 
       - name: Collect fixture logs on failure
         if: failure()
