@@ -24,6 +24,13 @@ var Commands = []Command{
 	{"profile", nil, Planned, Planned}, {"ai", nil, Planned, Planned},
 	{"init", nil, Planned, Planned}, {"init-secrets", nil, Planned, Planned},
 	{"setup", nil, Planned, Planned}, {"cache", nil, Planned, Planned},
+	// config was in DMT's slash-command surface but missing here; without it a
+	// front end built from this registry would silently lack it.
+	{"config", nil, Planned, Planned},
+	// serve starts the browser front end. It is Omitted for both interactive
+	// surfaces because it is the thing that launches them: a command to start
+	// the WebUI, offered inside the WebUI, is nonsense rather than a gap.
+	{"serve", []string{"webui", "gui"}, Omitted, Omitted},
 }
 
 func Valid() bool {
