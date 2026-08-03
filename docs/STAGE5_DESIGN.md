@@ -76,20 +76,51 @@ command, and the process should not outlive their attention.
   started — otherwise a run longer than the timeout would be followed by an
   immediate shutdown while the operator is still reading the result.
 
-**[proposed]** Two more, not yet built:
+- **Single-instance handoff.** A second `dmtx serve` finds the running instance
+  and opens a browser at it rather than starting a rival console onto the same
+  databases. `--new-instance` overrides it, and a `--port` that disagrees with
+  the running instance is read as a request for a different server.
 
-- **Single-instance handoff.** A second `dmtx serve` should hand the operator to
-  the running instance rather than starting a second server or failing on a port
-  conflict.
+**[proposed]** One more, not yet built:
+
 - **Chromeless window.** Open via the browser's app mode so the console gets its
-  own window and icon, with a graceful fallback to an ordinary tab.
+  own window and icon, with a graceful fallback to an ordinary tab. The PWA
+  shell reaches the same result through the operator's own browser, so this is
+  a stopgap rather than the primary route.
 
-The threat model throughout is that other processes running as the same user are
-trusted. They can already read this process's memory and replace its binary, so
-defending against them is not achievable here and pretending otherwise would buy
-complexity without safety. What *is* defended is the browser: any page the
-operator visits can issue requests to `127.0.0.1`, which is why loopback is not
-treated as an authorization boundary and every route requires a secret.
+### The handoff handshake
+
+A running instance records its port and a secret in `serve.json`, mode `0600`.
+The secret is **never sent**. Both sides prove they hold it, over a nonce the
+client picks, with distinct labels for each direction so a reply cannot be
+replayed as a request.
+
+The reason is that the recorded port belongs to this instance only while it is
+alive. Once it dies, anything on the machine — including another account — can
+bind that port. A handoff carrying a bearer token would hand a console
+credential to whoever answered; a handoff that trusted the reply would open the
+operator's browser at an impostor's page, on loopback, looking exactly like the
+real console. Proving instead of telling closes both.
+
+The launch token a handoff returns is freshly minted and single-use, like the
+one printed at startup. A `--new-instance` server records nothing, and a server
+removes only a record it wrote itself — otherwise the second server would
+strand the first by taking over its record and then deleting it on exit.
+
+### Threat model
+
+Other processes running as the **same user** are trusted. They can already read
+this process's memory and replace its binary, so defending against them is not
+achievable here and pretending otherwise would buy complexity without safety.
+
+What *is* defended:
+
+- **The browser.** Any page the operator visits can issue requests to
+  `127.0.0.1`, so loopback is not treated as an authorization boundary and every
+  route requires a secret.
+- **Other accounts on the same machine.** They cannot read `0600` state, and the
+  handshake means that even if they could, or if they seized a released port,
+  they learn nothing and cannot impersonate a server.
 
 ## What the WebUI must preserve
 
