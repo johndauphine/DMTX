@@ -297,6 +297,71 @@ func TestStaleStateIsForgotten(t *testing.T) {
 	}
 }
 
+// TestASlowServerIsNotTreatedAsAnAbsentOne pins that a timeout leaves the
+// record alone.
+//
+// A server that is merely slow to answer - a loaded machine, a busy moment - is
+// still running and still serving. Deleting its record would leave it
+// undiscoverable, and the next invocation would start a second console onto the
+// same databases, which is the outcome this whole feature exists to prevent.
+func TestASlowServerIsNotTreatedAsAnAbsentOne(t *testing.T) {
+	blocked := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(
+		func(http.ResponseWriter, *http.Request) { <-blocked },
+	))
+	// Released before Close, which waits for handlers still in flight.
+	defer func() { close(blocked); slow.Close() }()
+
+	path := recordState(t, portOf(t, slow.URL), "a-secret")
+
+	previous := handoffTimeout
+	handoffTimeout = 50 * time.Millisecond
+	defer func() { handoffTimeout = previous }()
+
+	if _, handedOff := handOff(path, 0); handedOff {
+		t.Fatal("handoff claimed success against a server that never replied")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf(
+			"a timeout deleted the record of a server that may still be "+
+				"running: %v",
+			err,
+		)
+	}
+}
+
+// TestHandoffRejectsTrailingDocuments pins that the one unauthenticated write
+// on the server is at least as strict as the authenticated one.
+//
+// The first document here carries a valid proof, so without the check the
+// server would answer it with a token and silently discard the rest.
+func TestHandoffRejectsTrailingDocuments(t *testing.T) {
+	server := newTestServer(t)
+	nonce, err := newToken()
+	if err != nil {
+		t.Fatalf("nonce: %v", err)
+	}
+	first, err := json.Marshal(handoffRequest{
+		Nonce: nonce,
+		Proof: proof(server.handoffSecret, clientProofLabel, nonce),
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	body := append(first, []byte(`{"nonce":"and-another"}`)...)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/handoff", bytes.NewReader(body))
+	recorder := httptest.NewRecorder()
+	server.routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("a trailing document returned %d, want 400", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "token") {
+		t.Errorf("a refused handoff still returned a token: %s", recorder.Body)
+	}
+}
+
 // TestHandoffDeclinesWhenAnExplicitPortDisagrees pins that asking for a
 // specific port is a request for a server there, not a request to be sent
 // somewhere else.

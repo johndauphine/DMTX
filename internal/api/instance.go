@@ -34,9 +34,11 @@ const (
 )
 
 // handoffTimeout bounds the probe. A running instance on loopback answers
-// immediately; anything slower is something else holding the port, and waiting
-// on it would just delay starting the server the operator asked for.
-const handoffTimeout = 3 * time.Second
+// immediately, and waiting longer would just delay starting the server the
+// operator asked for.
+//
+// A variable so tests can shorten it; nothing else reassigns it.
+var handoffTimeout = 3 * time.Second
 
 // proof is one side's evidence that it holds the secret.
 //
@@ -212,9 +214,20 @@ func handOff(path string, wantPort int) (string, bool) {
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		// Nothing is listening. The record is stale, so clear it rather than
-		// probing a dead port on every future start.
-		_ = os.Remove(path)
+		// A slow answer is not an absent server. Deleting the record because a
+		// loaded machine took longer than handoffTimeout would leave a healthy
+		// instance running and undiscoverable, so the next invocation would
+		// start a second console onto the same databases - the outcome this
+		// whole feature exists to prevent.
+		//
+		// Anything else means nothing usable is on that port, and clearing the
+		// record saves every future start from probing it. Being wrong in this
+		// direction is cheap: the server about to start records itself, so a
+		// record deleted in error is replaced seconds later.
+		var timeout net.Error
+		if !errors.As(err, &timeout) || !timeout.Timeout() {
+			_ = os.Remove(path)
+		}
 		return "", false
 	}
 	defer func() { _ = response.Body.Close() }()
@@ -222,6 +235,12 @@ func handOff(path string, wantPort int) (string, bool) {
 		return "", false
 	}
 
+	// Decoded leniently, deliberately. Requests are parsed strictly, but a
+	// reply is written by a peer that may be a newer dmtx than this one: an
+	// operator who upgrades still has the old binary on PATH in another shell.
+	// Rejecting a field this version does not know would break handoff across
+	// exactly that upgrade. Nothing is trusted on the strength of the reply's
+	// shape anyway - the proof below is what admits it.
 	var reply handoffReply
 	decoder := json.NewDecoder(io.LimitReader(response.Body, maxRequestBytes))
 	if err := decoder.Decode(&reply); err != nil {
@@ -254,6 +273,15 @@ func (server *Server) handoff(writer http.ResponseWriter, request *http.Request)
 	if err := decoder.Decode(&asked); err != nil {
 		writeJSON(writer, http.StatusBadRequest, map[string]string{
 			"error": "malformed handoff request",
+		})
+		return
+	}
+	// Exactly one document, as execute requires. This is the only
+	// unauthenticated write on the server, so it should be the stricter of the
+	// two about what it accepts, not the laxer.
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeJSON(writer, http.StatusBadRequest, map[string]string{
+			"error": "handoff request holds more than one JSON document",
 		})
 		return
 	}
