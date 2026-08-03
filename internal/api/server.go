@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,6 +36,14 @@ type Options struct {
 	// OpenBrowser launches the operator's browser at the authenticated URL once
 	// the listener is up.
 	OpenBrowser bool
+
+	// IdleTimeout stops the server once it has gone this long without a
+	// request. Zero disables it, which is what a caller that never wants an
+	// unattended shutdown asks for.
+	//
+	// A command in flight is never idle, so this cannot end a running
+	// migration; see activity.idleFor.
+	IdleTimeout time.Duration
 }
 
 // Server owns the listener and the routes behind it.
@@ -45,6 +54,13 @@ type Server struct {
 	url      string
 
 	openBrowser bool
+	idleTimeout time.Duration
+	activity    activity
+
+	// exitedIdle records that the watchdog, not the operator, stopped the
+	// server, so the terminal can say why rather than silently returning to a
+	// prompt.
+	exitedIdle atomic.Bool
 }
 
 // New binds a loopback listener and prepares the routes. It does not serve
@@ -79,6 +95,7 @@ func New(options Options) (*Server, error) {
 		listener:    listener,
 		auth:        auth,
 		openBrowser: options.OpenBrowser,
+		idleTimeout: options.IdleTimeout,
 		url: (&url.URL{
 			Scheme:   "http",
 			Host:     address.String(),
@@ -86,11 +103,26 @@ func New(options Options) (*Server, error) {
 			RawQuery: url.Values{"token": {launch}}.Encode(),
 		}).String(),
 	}
+	// Started now rather than left at the zero time, or a server that has not
+	// yet had its first request would look infinitely idle and the watchdog
+	// would stop it before the browser finished opening.
+	server.activity.last = time.Now()
+
 	server.http = &http.Server{
 		Handler: server.routes(),
-		// A migration can run for a long time, so the write timeout has to be
-		// generous; the read timeout does not, because requests are small.
+		// WriteTimeout is deliberately unset. It bounds the whole exchange, so
+		// any value would also be a cap on how long a migration may run, and
+		// the first run that outlived it would be cut off mid-write.
+		//
+		// The read side has no such constraint: requests are a handful of short
+		// strings, bounded again at 64KB by maxRequestBytes.
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// Bounds a kept-alive connection between requests, so a client that
+		// opens sockets and goes quiet does not hold them for the life of the
+		// process. Unrelated to Options.IdleTimeout, which stops the server
+		// itself.
+		IdleTimeout: 120 * time.Second,
 	}
 	return server, nil
 }
@@ -102,6 +134,10 @@ func (server *Server) URL() string { return server.url }
 // Addr is where the server is actually listening, which matters when Port was
 // zero.
 func (server *Server) Addr() string { return server.listener.Addr().String() }
+
+// ExitedIdle reports whether Serve returned because the server went unused
+// rather than because it was asked to stop. Read after Serve returns.
+func (server *Server) ExitedIdle() bool { return server.exitedIdle.Load() }
 
 func (server *Server) routes() http.Handler {
 	mux := http.NewServeMux()
@@ -117,12 +153,17 @@ func (server *Server) routes() http.Handler {
 	mux.Handle("GET /", server.auth.require(
 		http.HandlerFunc(server.placeholder),
 	))
-	return mux
+	return server.activity.track(mux)
 }
 
 // Serve runs until ctx is cancelled, then shuts down gracefully so an in-flight
 // command is not cut off mid-write.
 func (server *Server) Serve(ctx context.Context) error {
+	// Derived so the idle watchdog can stop the server through the same path a
+	// signal takes; there is one shutdown sequence, not two.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	errs := make(chan error, 1)
 	go func() {
 		err := server.http.Serve(server.listener)
@@ -133,6 +174,9 @@ func (server *Server) Serve(ctx context.Context) error {
 	}()
 	if server.openBrowser {
 		go launchBrowser(server.url)
+	}
+	if server.idleTimeout > 0 {
+		go server.watchIdle(ctx, cancel)
 	}
 	select {
 	case err := <-errs:

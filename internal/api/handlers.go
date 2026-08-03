@@ -90,10 +90,22 @@ func (server *Server) placeholder(writer http.ResponseWriter, request *http.Requ
 }
 
 func writeJSON(writer http.ResponseWriter, status int, value any) {
+	// Encoded before the status is written, because WriteHeader commits the
+	// status permanently and nothing after it can take a 200 back.
+	//
+	// json.Encoder buffers rather than streams, so the old ordering did not
+	// truncate a body - it sent 200 and then, on a marshalling failure, wrote
+	// nothing at all. A client reading an empty 200 has no way to tell that
+	// answer from a command that legitimately returned nothing.
+	body, err := json.Marshal(value)
+	if err != nil {
+		body = []byte(`{"error":"response could not be encoded"}`)
+		status = http.StatusInternalServerError
+	}
 	writer.Header().Set("Content-Type", "application/json")
 	// Browsers must not sniff a JSON body as HTML; without this a reflected
 	// error string could be rendered as markup.
 	writer.Header().Set("X-Content-Type-Options", "nosniff")
 	writer.WriteHeader(status)
-	_ = json.NewEncoder(writer).Encode(value)
+	_, _ = writer.Write(body)
 }
