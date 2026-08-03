@@ -2,6 +2,8 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 
 	"github.com/johndauphine/dmtx/internal/app"
@@ -30,6 +32,15 @@ func (server *Server) execute(writer http.ResponseWriter, request *http.Request)
 	if err := decoder.Decode(&decoded); err != nil {
 		writeJSON(writer, http.StatusBadRequest, map[string]string{
 			"error": "malformed request: " + err.Error(),
+		})
+		return
+	}
+	// Exactly one document. Without this a body holding two requests would run
+	// the first and silently discard the second, so a caller could believe it
+	// had asked for something that never happened.
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeJSON(writer, http.StatusBadRequest, map[string]string{
+			"error": "request body holds more than one JSON document",
 		})
 		return
 	}

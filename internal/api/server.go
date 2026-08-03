@@ -51,11 +51,15 @@ type Server struct {
 // until Serve is called, so a caller can read URL first and know where to point
 // a browser.
 func New(options Options) (*Server, error) {
-	token, err := newToken()
+	launch, err := newToken()
 	if err != nil {
 		return nil, err
 	}
-	auth := &authenticator{token: token}
+	session, err := newToken()
+	if err != nil {
+		return nil, err
+	}
+	auth := &authenticator{launch: launch, session: session}
 
 	// Explicitly 127.0.0.1 rather than localhost: the name can resolve to an
 	// interface that is not loopback, and this listener must never be one.
@@ -79,7 +83,7 @@ func New(options Options) (*Server, error) {
 			Scheme:   "http",
 			Host:     address.String(),
 			Path:     "/login",
-			RawQuery: url.Values{"token": {token}}.Encode(),
+			RawQuery: url.Values{"token": {launch}}.Encode(),
 		}).String(),
 	}
 	server.http = &http.Server{

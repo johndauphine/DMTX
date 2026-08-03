@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 // sessionCookie names the cookie exchanged for the launch token.
@@ -28,10 +29,19 @@ func newToken() (string, error) {
 	return hex.EncodeToString(raw), nil
 }
 
-// authenticator holds the launch token and decides whether a request carries
-// it.
+// authenticator holds the launch token and the session secret it is exchanged
+// for.
+//
+// They are separate values, and the launch token really is single-use: it is
+// cleared the first time it is redeemed. Reusing one secret for both would make
+// the URL a long-lived bearer credential, so anywhere that URL came to rest -
+// a shell history, a pasted message, a screenshot - would stay usable for as
+// long as the server ran. Describing it as one-time while accepting it forever
+// is the kind of claim this codebase keeps finding in its own tests.
 type authenticator struct {
-	token string
+	mutex   sync.Mutex
+	launch  string
+	session string
 }
 
 // grant exchanges a correct launch token for a session cookie and redirects to
@@ -42,13 +52,13 @@ type authenticator struct {
 // when an operator shares one.
 func (auth *authenticator) grant(writer http.ResponseWriter, request *http.Request) {
 	supplied := request.URL.Query().Get("token")
-	if !auth.matches(supplied) {
+	if !auth.redeem(supplied) {
 		http.Error(writer, "invalid or missing token", http.StatusUnauthorized)
 		return
 	}
 	http.SetCookie(writer, &http.Cookie{
 		Name:     sessionCookie,
-		Value:    auth.token,
+		Value:    auth.session,
 		Path:     "/",
 		HttpOnly: true,
 		// Strict rather than Lax: no cross-site navigation should ever arrive
@@ -61,13 +71,30 @@ func (auth *authenticator) grant(writer http.ResponseWriter, request *http.Reque
 	http.Redirect(writer, request, "/", http.StatusFound)
 }
 
-// matches compares in constant time. A token check that returns early on the
-// first differing byte leaks its position to anything that can time it.
-func (auth *authenticator) matches(supplied string) bool {
-	if supplied == "" || auth.token == "" {
+// redeem consumes the launch token. It succeeds at most once: the second
+// caller, whoever they are, finds nothing to redeem.
+func (auth *authenticator) redeem(supplied string) bool {
+	auth.mutex.Lock()
+	defer auth.mutex.Unlock()
+	if !constantTimeEqual(supplied, auth.launch) {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(supplied), []byte(auth.token)) == 1
+	auth.launch = ""
+	return true
+}
+
+// holdsSession reports whether a value is the session secret.
+func (auth *authenticator) holdsSession(supplied string) bool {
+	return constantTimeEqual(supplied, auth.session)
+}
+
+// constantTimeEqual compares without returning early on the first differing
+// byte, which would leak its position to anything that can time the call.
+func constantTimeEqual(supplied, expected string) bool {
+	if supplied == "" || expected == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(supplied), []byte(expected)) == 1
 }
 
 // require wraps a handler so it only runs for an authenticated request.
@@ -77,13 +104,13 @@ func (auth *authenticator) matches(supplied string) bool {
 func (auth *authenticator) require(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if cookie, err := request.Cookie(sessionCookie); err == nil &&
-			auth.matches(cookie.Value) {
+			auth.holdsSession(cookie.Value) {
 			next.ServeHTTP(writer, request)
 			return
 		}
 		header := request.Header.Get("Authorization")
 		if supplied, found := strings.CutPrefix(header, "Bearer "); found &&
-			auth.matches(supplied) {
+			auth.holdsSession(supplied) {
 			next.ServeHTTP(writer, request)
 			return
 		}

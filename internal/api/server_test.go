@@ -83,7 +83,7 @@ func TestLoginExchangesTokenForASessionAndHidesIt(t *testing.T) {
 	server := newTestServer(t)
 	request := httptest.NewRequest(
 		http.MethodGet,
-		"/login?token="+server.auth.token,
+		"/login?token="+server.auth.launch,
 		nil,
 	)
 	recorder := httptest.NewRecorder()
@@ -117,7 +117,7 @@ func TestLoginExchangesTokenForASessionAndHidesIt(t *testing.T) {
 func TestSessionCookieAuthenticatesSubsequentRequests(t *testing.T) {
 	server := newTestServer(t)
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/commands", nil)
-	request.AddCookie(&http.Cookie{Name: sessionCookie, Value: server.auth.token})
+	request.AddCookie(&http.Cookie{Name: sessionCookie, Value: server.auth.session})
 	recorder := httptest.NewRecorder()
 	server.routes().ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
@@ -132,7 +132,7 @@ func TestExecuteRejectsUnknownFields(t *testing.T) {
 	server := newTestServer(t)
 	body := strings.NewReader(`{"command":"status","not_a_field":true}`)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/execute", body)
-	request.Header.Set("Authorization", "Bearer "+server.auth.token)
+	request.Header.Set("Authorization", "Bearer "+server.auth.session)
 	recorder := httptest.NewRecorder()
 	server.routes().ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusBadRequest {
@@ -151,7 +151,7 @@ func TestFailedCommandIsNotAnHTTPError(t *testing.T) {
 	// No config path: the command refuses.
 	body := strings.NewReader(`{"command":"validate"}`)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/execute", body)
-	request.Header.Set("Authorization", "Bearer "+server.auth.token)
+	request.Header.Set("Authorization", "Bearer "+server.auth.session)
 	recorder := httptest.NewRecorder()
 	server.routes().ServeHTTP(recorder, request)
 
@@ -200,18 +200,16 @@ func TestAPIAndCLIProduceIdenticalOutcomes(t *testing.T) {
 				"/api/v1/execute",
 				bytes.NewReader(body),
 			)
-			httpRequest.Header.Set("Authorization", "Bearer "+server.auth.token)
+			httpRequest.Header.Set("Authorization", "Bearer "+server.auth.session)
 			recorder := httptest.NewRecorder()
 			server.routes().ServeHTTP(recorder, httpRequest)
 
-			var served app.Outcome
-			if err := json.NewDecoder(recorder.Body).Decode(&served); err != nil {
-				t.Fatalf("decode served outcome: %v", err)
-			}
-			actual, err := json.Marshal(served)
-			if err != nil {
-				t.Fatalf("marshal served outcome: %v", err)
-			}
+			// The response body verbatim. Decoding and re-marshalling would
+			// normalise away exactly the differences worth catching - encoder
+			// settings, field order, whitespace - and leave a test that claims
+			// to compare emitted bytes while comparing Go values.
+			actual := bytes.TrimSpace(recorder.Body.Bytes())
+			expected = bytes.TrimSpace(expected)
 			if string(actual) != string(expected) {
 				t.Errorf(
 					"surfaces disagree for %q:\n  cli: %s\n  api: %s",
@@ -247,5 +245,62 @@ func TestParseArgumentsRefusesABindAddress(t *testing.T) {
 		if _, ok := parseArguments(args); ok {
 			t.Errorf("serve accepted %v; there must be no way to bind off loopback", args)
 		}
+	}
+}
+
+// TestLaunchTokenIsRedeemableOnce pins that the token in the URL really is
+// single-use.
+//
+// It is described that way to the operator, and the description has to be true:
+// a URL that stays valid is a long-lived bearer secret wherever it comes to
+// rest - shell history, a pasted message, a screenshot.
+func TestLaunchTokenIsRedeemableOnce(t *testing.T) {
+	server := newTestServer(t)
+	launch := server.auth.launch
+
+	first := httptest.NewRecorder()
+	server.routes().ServeHTTP(
+		first,
+		httptest.NewRequest(http.MethodGet, "/login?token="+launch, nil),
+	)
+	if first.Code != http.StatusFound {
+		t.Fatalf("first redemption returned %d, want a redirect", first.Code)
+	}
+
+	second := httptest.NewRecorder()
+	server.routes().ServeHTTP(
+		second,
+		httptest.NewRequest(http.MethodGet, "/login?token="+launch, nil),
+	)
+	if second.Code != http.StatusUnauthorized {
+		t.Fatalf("launch token was redeemable twice: second attempt returned %d", second.Code)
+	}
+}
+
+// TestLaunchTokenIsNotABearerCredential pins that the two secrets are separate.
+// If the launch token also authenticated API calls, redeeming it once would not
+// stop a leaked URL from driving migrations.
+func TestLaunchTokenIsNotABearerCredential(t *testing.T) {
+	server := newTestServer(t)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/commands", nil)
+	request.Header.Set("Authorization", "Bearer "+server.auth.launch)
+	recorder := httptest.NewRecorder()
+	server.routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("launch token authenticated an API call: %d", recorder.Code)
+	}
+}
+
+// TestExecuteRejectsTrailingDocuments pins that a body holding two requests is
+// refused rather than half-obeyed.
+func TestExecuteRejectsTrailingDocuments(t *testing.T) {
+	server := newTestServer(t)
+	body := strings.NewReader(`{"command":"status"}{"command":"run"}`)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/execute", body)
+	request.Header.Set("Authorization", "Bearer "+server.auth.session)
+	recorder := httptest.NewRecorder()
+	server.routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("trailing document returned %d, want 400", recorder.Code)
 	}
 }
