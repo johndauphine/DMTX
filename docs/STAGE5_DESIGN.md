@@ -53,6 +53,44 @@ aspirational.
 The effort not spent on a TUI should go into CLI progress output, which serves
 the "tailing a long migration over SSH" case better than a TUI would.
 
+## Getting to the console
+
+**[decided]** A laptop operator should reach an authenticated console in one
+command, and the process should not outlive their attention.
+
+- **One-click launch.** `dmtx serve` generates a random launch token, prints the
+  URL, and opens a browser at it. The token is exchanged for a session cookie
+  and the response redirects to `/`, so it does not linger in the address bar,
+  history, or a shared screenshot. `--no-browser` opts out.
+- **The launch token is single-use.** It authenticates exactly one redemption
+  and is cleared. The session secret is a separate value, so the URL is never a
+  bearer credential — a URL that stayed valid would be a long-lived secret
+  wherever it came to rest.
+- **Loopback only, with no bind flag.** The remote path is an SSH forward. There
+  is deliberately no way to ask for a reachable listener, so exposing a console
+  that starts destructive migrations cannot be a mistyped flag. Anyone who truly
+  needs it puts a reverse proxy in front — a decision they make and audit.
+- **Exit when idle.** `--idle-timeout` (default 30m, `0` disables) stops an
+  unused server. A command in flight is never idle, so this cannot end a running
+  migration, and the clock restarts when work *finishes* rather than when it
+  started — otherwise a run longer than the timeout would be followed by an
+  immediate shutdown while the operator is still reading the result.
+
+**[proposed]** Two more, not yet built:
+
+- **Single-instance handoff.** A second `dmtx serve` should hand the operator to
+  the running instance rather than starting a second server or failing on a port
+  conflict.
+- **Chromeless window.** Open via the browser's app mode so the console gets its
+  own window and icon, with a graceful fallback to an ordinary tab.
+
+The threat model throughout is that other processes running as the same user are
+trusted. They can already read this process's memory and replace its binary, so
+defending against them is not achievable here and pretending otherwise would buy
+complexity without safety. What *is* defended is the browser: any page the
+operator visits can issue requests to `127.0.0.1`, which is why loopback is not
+treated as an authorization boundary and every route requires a secret.
+
 ## What the WebUI must preserve
 
 **[decided]** Base it on DMT's TUI, which is a **console REPL**, not a form

@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 )
 
 // Exit codes mirror internal/app's taxonomy for the cases serve can produce.
@@ -29,7 +30,8 @@ const (
 func RunCommand(args []string, stdout, stderr io.Writer) int {
 	options, ok := parseArguments(args)
 	if !ok {
-		fmt.Fprintln(stderr, "usage: dmtx serve [--port N] [--no-browser]")
+		fmt.Fprintln(stderr,
+			"usage: dmtx serve [--port N] [--no-browser] [--idle-timeout D]")
 		return configurationError
 	}
 	server, err := New(options)
@@ -42,6 +44,9 @@ func RunCommand(args []string, stdout, stderr io.Writer) int {
 	// whose browser did not open.
 	fmt.Fprintf(stdout, "dmtx is serving at %s\n", server.URL())
 	fmt.Fprintln(stdout, "That link carries a one-time token, exchanged for a session on first use.")
+	if options.IdleTimeout > 0 {
+		fmt.Fprintf(stdout, "It will stop on its own after %s unused.\n", options.IdleTimeout)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -49,8 +54,21 @@ func RunCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "serve: %v\n", err)
 		return stateError
 	}
+	// Said plainly, because otherwise an operator returning to the terminal
+	// finds a prompt and no explanation for where the server went.
+	if server.ExitedIdle() {
+		fmt.Fprintf(stdout, "dmtx stopped after %s without a request.\n", options.IdleTimeout)
+	}
 	return success
 }
+
+// defaultIdleTimeout is how long an unused server waits before stopping.
+//
+// Long enough that reading a plan, thinking, and coming back does not kill the
+// session; short enough that a console able to start destructive migrations is
+// not still listening on a laptop the next morning. It is a default rather than
+// a rule: --idle-timeout 0 turns it off for a host meant to keep serving.
+const defaultIdleTimeout = 30 * time.Minute
 
 // parseArguments reads the serve flags. There is deliberately no bind address;
 // see Options.
@@ -58,9 +76,24 @@ func parseArguments(args []string) (Options, bool) {
 	// Opening a browser is the default: one command landing the operator in an
 	// authenticated session is the point. --no-browser turns it off for
 	// headless hosts and for anyone driving the API directly.
-	options := Options{OpenBrowser: true}
+	options := Options{OpenBrowser: true, IdleTimeout: defaultIdleTimeout}
+	idleGiven := false
 	for index := 0; index < len(args); index++ {
 		switch args[index] {
+		case "--idle-timeout":
+			if index+1 >= len(args) || idleGiven {
+				return Options{}, false
+			}
+			timeout, err := time.ParseDuration(args[index+1])
+			// Negative is refused rather than read as "off": an operator who
+			// typed it meant something, and guessing which is worse than
+			// saying the flag was wrong.
+			if err != nil || timeout < 0 {
+				return Options{}, false
+			}
+			options.IdleTimeout = timeout
+			idleGiven = true
+			index++
 		case "--port":
 			if index+1 >= len(args) || options.Port != 0 {
 				return Options{}, false

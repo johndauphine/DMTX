@@ -90,10 +90,20 @@ func (server *Server) placeholder(writer http.ResponseWriter, request *http.Requ
 }
 
 func writeJSON(writer http.ResponseWriter, status int, value any) {
+	// Encoded before the status is written, not streamed into the response.
+	// An encoder writing straight to the ResponseWriter commits 200 and then
+	// discovers it cannot encode, leaving a truncated body that reads as
+	// success - and Outcome carries a json.RawMessage payload, which is exactly
+	// the kind of field that can hold bytes that fail to marshal.
+	body, err := json.Marshal(value)
+	if err != nil {
+		body = []byte(`{"error":"response could not be encoded"}`)
+		status = http.StatusInternalServerError
+	}
 	writer.Header().Set("Content-Type", "application/json")
 	// Browsers must not sniff a JSON body as HTML; without this a reflected
 	// error string could be rendered as markup.
 	writer.Header().Set("X-Content-Type-Options", "nosniff")
 	writer.WriteHeader(status)
-	_ = json.NewEncoder(writer).Encode(value)
+	_, _ = writer.Write(body)
 }
