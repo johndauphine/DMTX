@@ -83,6 +83,25 @@ func (auth *authenticator) redeem(supplied string) bool {
 	return true
 }
 
+// remint issues a replacement launch token, so a second invocation can be sent
+// to this server with a URL that is single-use like the original.
+//
+// It replaces rather than adds: at most one launch token is outstanding, so two
+// handoffs racing leave only the later one usable. The operator whose browser
+// arrives with the older token is told the token is invalid and runs the
+// command again, which is a worse morning than a queue of valid tokens would
+// give them but a much better one than a URL that stays live.
+func (auth *authenticator) remint() (string, error) {
+	token, err := newToken()
+	if err != nil {
+		return "", err
+	}
+	auth.mutex.Lock()
+	defer auth.mutex.Unlock()
+	auth.launch = token
+	return token, nil
+}
+
 // holdsSession reports whether a value is the session secret.
 func (auth *authenticator) holdsSession(supplied string) bool {
 	return constantTimeEqual(supplied, auth.session)

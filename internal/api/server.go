@@ -44,6 +44,11 @@ type Options struct {
 	// A command in flight is never idle, so this cannot end a running
 	// migration; see activity.idleFor.
 	IdleTimeout time.Duration
+
+	// NewInstance starts a server even when one is already running, instead of
+	// handing the operator to it. The escape hatch matters because handoff is a
+	// guess about intent, and a guess with no way to override it is a trap.
+	NewInstance bool
 }
 
 // Server owns the listener and the routes behind it.
@@ -56,6 +61,12 @@ type Server struct {
 	openBrowser bool
 	idleTimeout time.Duration
 	activity    activity
+
+	// handoffSecret authenticates the handoff handshake. It is a third secret,
+	// separate from the launch and session values, because it authenticates a
+	// different party for a different purpose: another process on this machine
+	// asking to be let in, not a browser that is already in.
+	handoffSecret string
 
 	// exitedIdle records that the watchdog, not the operator, stopped the
 	// server, so the terminal can say why rather than silently returning to a
@@ -91,17 +102,19 @@ func New(options Options) (*Server, error) {
 		)
 	}
 
+	handoffSecret, err := newToken()
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+
 	server := &Server{
-		listener:    listener,
-		auth:        auth,
-		openBrowser: options.OpenBrowser,
-		idleTimeout: options.IdleTimeout,
-		url: (&url.URL{
-			Scheme:   "http",
-			Host:     address.String(),
-			Path:     "/login",
-			RawQuery: url.Values{"token": {launch}}.Encode(),
-		}).String(),
+		listener:      listener,
+		auth:          auth,
+		openBrowser:   options.OpenBrowser,
+		idleTimeout:   options.IdleTimeout,
+		handoffSecret: handoffSecret,
+		url:           loginURL(address.Port, launch),
 	}
 	// Started now rather than left at the zero time, or a server that has not
 	// yet had its first request would look infinitely idle and the watchdog
@@ -127,6 +140,20 @@ func New(options Options) (*Server, error) {
 	return server, nil
 }
 
+// loginURL is the one place a launch URL is built, so the address a handoff
+// sends an operator to cannot drift from the one a fresh server prints.
+//
+// 127.0.0.1 rather than localhost, for the same reason the listener uses it:
+// the name can resolve somewhere that is not loopback.
+func loginURL(port int, token string) string {
+	return (&url.URL{
+		Scheme:   "http",
+		Host:     fmt.Sprintf("127.0.0.1:%d", port),
+		Path:     "/login",
+		RawQuery: url.Values{"token": {token}}.Encode(),
+	}).String()
+}
+
 // URL is the authenticated address to open. It carries the launch token, which
 // is exchanged for a session cookie on first request.
 func (server *Server) URL() string { return server.url }
@@ -144,6 +171,10 @@ func (server *Server) routes() http.Handler {
 	// The login route is deliberately unauthenticated: it is where a request
 	// becomes authenticated. It accepts only the launch token.
 	mux.HandleFunc("GET /login", server.auth.grant)
+	// Also unauthenticated, for the same reason: it is where a second dmtx
+	// process becomes authenticated. It proves itself with the handoff secret
+	// instead of a session; see Server.handoff.
+	mux.HandleFunc("POST /api/v1/handoff", server.handoff)
 	mux.Handle("POST /api/v1/execute", server.auth.require(
 		http.HandlerFunc(server.execute),
 	))
