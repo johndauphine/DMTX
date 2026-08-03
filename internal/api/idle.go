@@ -74,6 +74,14 @@ func (server *Server) watchIdle(ctx context.Context, stop func()) {
 		case <-timer.C:
 			remaining := server.idleTimeout - server.activity.idleFor(time.Now())
 			if remaining <= 0 {
+				// A cancelled context wins even when the timer is also ready.
+				// select chooses arbitrarily between ready cases, so without
+				// this an operator pressing Ctrl-C at the wrong instant would
+				// be told the server stopped for idleness - a plausible,
+				// confident, wrong account of what just happened.
+				if ctx.Err() != nil {
+					return
+				}
 				server.exitedIdle.Store(true)
 				stop()
 				return

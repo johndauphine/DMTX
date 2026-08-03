@@ -56,7 +56,11 @@ func RunCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	// Said plainly, because otherwise an operator returning to the terminal
 	// finds a prompt and no explanation for where the server went.
-	if server.ExitedIdle() {
+	//
+	// Not claimed when a signal arrived: ctx is the signal context, so a
+	// non-nil error means the operator stopped this, whatever the watchdog
+	// concluded a moment earlier.
+	if server.ExitedIdle() && ctx.Err() == nil {
 		fmt.Fprintf(stdout, "dmtx stopped after %s without a request.\n", options.IdleTimeout)
 	}
 	return success

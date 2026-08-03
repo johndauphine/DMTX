@@ -126,6 +126,36 @@ func TestCancellationIsNotReportedAsIdleness(t *testing.T) {
 	}
 }
 
+// TestCancellationWinsWhenBothAreReady pins the tie-break between the two ways
+// the server can stop.
+//
+// watchIdle selects over ctx.Done() and the timer, and select chooses
+// arbitrarily when both are ready. Without an explicit rule, an operator
+// pressing Ctrl-C at the moment the timer fires would be told the server
+// stopped for idleness. That is worse than saying nothing: it is a confident
+// account of something that did not happen.
+//
+// The loop is deliberate. One iteration of a coin flip proves nothing, so this
+// runs the tie repeatedly; before the tie-break existed roughly half of these
+// stored the wrong reason.
+func TestCancellationWinsWhenBothAreReady(t *testing.T) {
+	for attempt := 0; attempt < 200; attempt++ {
+		server := newIdleTestServer(t, time.Nanosecond)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // already stopping when the watchdog wakes
+
+		server.watchIdle(ctx, func() {})
+
+		if server.ExitedIdle() {
+			t.Fatalf(
+				"attempt %d: the server was cancelled but reported that it "+
+					"stopped for idleness",
+				attempt,
+			)
+		}
+	}
+}
+
 // TestEveryRouteCountsAsActivity pins that the tracking middleware wraps the
 // whole mux rather than some of it.
 //

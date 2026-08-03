@@ -10,10 +10,17 @@ import (
 // TestWriteJSONDoesNotCommitSuccessItCannotDeliver pins that a response is
 // encoded before its status is written.
 //
-// Streaming an encoder straight into the ResponseWriter sends 200, then fails
-// partway, and the client reads a truncated body as a successful answer.
-// Outcome.Payload is a json.RawMessage, so bytes that fail to marshal are a
-// real shape this function can be handed rather than a contrived one.
+// Writing the status first commits a 200 that cannot be withdrawn, so a value
+// that fails to marshal leaves the client holding an empty body it must read as
+// success.
+//
+// No caller can reach this today: Outcome.Payload is filled by
+// outcomeBuilder.setPayload, which marshals through json.Marshal and returns
+// the error, so payload bytes are valid by construction. That is a property of
+// the callers rather than of writeJSON, and it is one refactor away from
+// changing - a payload assembled from a template, a cache, or another process
+// would not carry the same guarantee. This pins writeJSON's own contract so
+// that change stays a bug in one place instead of a silent empty 200.
 func TestWriteJSONDoesNotCommitSuccessItCannotDeliver(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	writeJSON(recorder, http.StatusOK, json.RawMessage("this is not json"))

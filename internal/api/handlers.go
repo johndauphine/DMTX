@@ -90,11 +90,13 @@ func (server *Server) placeholder(writer http.ResponseWriter, request *http.Requ
 }
 
 func writeJSON(writer http.ResponseWriter, status int, value any) {
-	// Encoded before the status is written, not streamed into the response.
-	// An encoder writing straight to the ResponseWriter commits 200 and then
-	// discovers it cannot encode, leaving a truncated body that reads as
-	// success - and Outcome carries a json.RawMessage payload, which is exactly
-	// the kind of field that can hold bytes that fail to marshal.
+	// Encoded before the status is written, because WriteHeader commits the
+	// status permanently and nothing after it can take a 200 back.
+	//
+	// json.Encoder buffers rather than streams, so the old ordering did not
+	// truncate a body - it sent 200 and then, on a marshalling failure, wrote
+	// nothing at all. A client reading an empty 200 has no way to tell that
+	// answer from a command that legitimately returned nothing.
 	body, err := json.Marshal(value)
 	if err != nil {
 		body = []byte(`{"error":"response could not be encoded"}`)
