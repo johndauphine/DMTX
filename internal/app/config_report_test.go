@@ -208,6 +208,94 @@ func collectPaths(prefix string, value map[string]any, into map[string]bool) {
 	}
 }
 
+// TestNoIndentedLineIsOrphaned pins that every indented line sits under a
+// header.
+//
+// An indented line with no section above it reads as belonging to whatever
+// section came before. A configuration with workers but no target mode used to
+// print "  workers: 4" straight after the target block, which says the target
+// has four workers - a confident, wrong answer.
+func TestNoIndentedLineIsOrphaned(t *testing.T) {
+	for name, cfg := range map[string]config.Config{
+		"migration settings but no target mode": {
+			Source:    config.Endpoint{Type: "sqlite", Database: "a.db"},
+			Target:    config.Endpoint{Type: "sqlite", Database: "b.db"},
+			Migration: config.Migration{Workers: 4},
+		},
+		"only table filters": {
+			Source:    config.Endpoint{Type: "sqlite", Database: "a.db"},
+			Target:    config.Endpoint{Type: "sqlite", Database: "b.db"},
+			Migration: config.Migration{IncludeTables: []string{"orders"}},
+		},
+		"nothing at all": {
+			Source: config.Endpoint{Type: "sqlite", Database: "a.db"},
+			Target: config.Endpoint{Type: "sqlite", Database: "b.db"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			lines := describeConfig("migration.yaml", cfg).lines()
+
+			// Each indented line is attributed to the header above it, and the
+			// migration settings must be attributed to "migration:".
+			//
+			// Checking only that *some* header exists is not enough, and that
+			// is not hypothetical: the first version of this test did exactly
+			// that and passed against the very defect it was written for,
+			// because the orphaned line landed under "target:" and a header
+			// was technically present.
+			section := ""
+			for _, line := range lines {
+				if !strings.HasPrefix(line, "  ") {
+					section = line
+					continue
+				}
+				if section == "" {
+					t.Fatalf("indented line %q has no section above it:\n%s",
+						line, strings.Join(lines, "\n"))
+				}
+				if isMigrationSetting(line) && section != "migration:" {
+					t.Errorf(
+						"migration setting %q is attributed to %q, so it reads "+
+							"as belonging to that section:\n%s",
+						line, section, strings.Join(lines, "\n"),
+					)
+				}
+			}
+		})
+	}
+}
+
+// isMigrationSetting reports whether a rendered line is one of the migration
+// settings, so a test can check where it ended up.
+func isMigrationSetting(line string) bool {
+	for _, setting := range []string{
+		"  target mode:", "  workers:", "  connection limit:",
+		"  included tables:", "  excluded tables:",
+	} {
+		if strings.HasPrefix(line, setting) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestMigrationSectionAppearsOnlyWhenItHasContent pins the other half: a
+// header with nothing under it is its own kind of wrong.
+func TestMigrationSectionAppearsOnlyWhenItHasContent(t *testing.T) {
+	bare := describeConfig("migration.yaml", config.Config{
+		Source: config.Endpoint{Type: "sqlite", Database: "a.db"},
+		Target: config.Endpoint{Type: "sqlite", Database: "b.db"},
+	}).lines()
+	for index, line := range bare {
+		if line != "migration:" {
+			continue
+		}
+		if index == len(bare)-1 || !strings.HasPrefix(bare[index+1], "  ") {
+			t.Errorf("an empty migration section was printed:\n%s", strings.Join(bare, "\n"))
+		}
+	}
+}
+
 // TestConfigRefusesWithoutAPath pins the usage message, and that the command
 // does not invent a default file to read.
 func TestConfigRefusesWithoutAPath(t *testing.T) {

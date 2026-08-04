@@ -123,24 +123,39 @@ func (report ConfigReport) lines() []string {
 	lines = append(lines, report.Source.lines("source")...)
 	lines = append(lines, report.Target.lines("target")...)
 
-	if report.Migration.TargetMode != "" {
+	// The section is built first and its header added only if it has content,
+	// rather than the header being written on a condition of its own. Written
+	// the other way the two can disagree: a configuration with workers but no
+	// target mode printed an indented "  workers: 4" under the target section,
+	// reading as though it belonged to the target.
+	if settings := report.Migration.lines(); len(settings) > 0 {
 		lines = append(lines, "migration:")
-		lines = append(lines, "  target mode: "+report.Migration.TargetMode)
-	}
-	if report.Migration.Workers > 0 {
-		lines = append(lines, fmt.Sprintf("  workers: %d", report.Migration.Workers))
-	}
-	if report.Migration.ConnectionLimit > 0 {
-		lines = append(lines, fmt.Sprintf("  connection limit: %d", report.Migration.ConnectionLimit))
-	}
-	if count := len(report.Migration.IncludeTables); count > 0 {
-		lines = append(lines, fmt.Sprintf("  included tables: %d", count))
-	}
-	if count := len(report.Migration.ExcludeTables); count > 0 {
-		lines = append(lines, fmt.Sprintf("  excluded tables: %d", count))
+		lines = append(lines, settings...)
 	}
 	for _, note := range report.Notes {
 		lines = append(lines, fmt.Sprintf("%s: %s", note.Severity, note.Message))
+	}
+	return lines
+}
+
+// lines renders the migration settings without a header, so the caller can
+// decide whether there is a section to head.
+func (migration MigrationReport) lines() []string {
+	var lines []string
+	if migration.TargetMode != "" {
+		lines = append(lines, "  target mode: "+migration.TargetMode)
+	}
+	if migration.Workers > 0 {
+		lines = append(lines, fmt.Sprintf("  workers: %d", migration.Workers))
+	}
+	if migration.ConnectionLimit > 0 {
+		lines = append(lines, fmt.Sprintf("  connection limit: %d", migration.ConnectionLimit))
+	}
+	if count := len(migration.IncludeTables); count > 0 {
+		lines = append(lines, fmt.Sprintf("  included tables: %d", count))
+	}
+	if count := len(migration.ExcludeTables); count > 0 {
+		lines = append(lines, fmt.Sprintf("  excluded tables: %d", count))
 	}
 	return lines
 }
