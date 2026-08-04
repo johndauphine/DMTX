@@ -144,6 +144,24 @@ func parseRequest(args []string) (Request, Outcome, bool) {
 // Every command is behind the seam. An unrecognised one is refused rather than
 // silently producing an empty Outcome.
 func Execute(ctx context.Context, request Request) Outcome {
+	return ExecuteWithProgress(ctx, request, nil)
+}
+
+// ExecuteWithProgress runs a command and reports how far it has got.
+//
+// Separate from Execute rather than an extra parameter on it, because the
+// overwhelming majority of callers - every CLI invocation - have nobody to
+// report to, and because Request is a transport type pinned by golden wire
+// tests. A function is not something that survives being serialised, so it does
+// not belong in the request; it belongs beside it.
+//
+// progress may be nil, and a nil sink costs one nil check per checkpoint.
+func ExecuteWithProgress(
+	ctx context.Context,
+	request Request,
+	progress ProgressFunc,
+) Outcome {
+	reporter := newProgressReporter(progress)
 	switch request.Command {
 	case "validate":
 		return executeValidate(ctx, request)
@@ -152,9 +170,9 @@ func Execute(ctx context.Context, request Request) Outcome {
 	case "status", "history":
 		return executeShowState(request)
 	case "run":
-		return executeRun(ctx, request)
+		return executeRun(ctx, request, reporter)
 	case "resume":
-		return executeResume(ctx, request)
+		return executeResume(ctx, request, reporter)
 	default:
 		out := newOutcome(request.Command)
 		return out.failWith(
@@ -164,7 +182,7 @@ func Execute(ctx context.Context, request Request) Outcome {
 	}
 }
 
-func executeRun(ctx context.Context, request Request) Outcome {
+func executeRun(ctx context.Context, request Request, progress *progressReporter) Outcome {
 	out := newOutcome(request.Command)
 	configPath := request.ConfigPath
 	statePath := request.StatePath
@@ -301,6 +319,7 @@ func executeRun(ctx context.Context, request Request) Outcome {
 		resume:         false,
 		spoolDirectory: spoolDirectory,
 		configPath:     configPath,
+		progress:       progress,
 	}
 	result, err := migrate.Execute(migrationContext, cfg, observer)
 	if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
