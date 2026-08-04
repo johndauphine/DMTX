@@ -262,11 +262,34 @@ Two consequences worth stating:
   commands ran inside handlers; once they do not, a migration nobody is
   watching produces no requests, and the server would have stopped itself in
   the middle of one.
-- **Progress is not streamed yet.** `app.Execute` is synchronous and a run's
-  messages are terminal, so a job emits `started` and `finished` and nothing
-  between. Real per-table progress needs an observer seam threaded from
-  `internal/migrate` through `internal/app`, which is its own change; the
-  transport is in place to carry it.
+- **Progress is reported per table.** A job emits `started`, then a `progress`
+  event as each table is planned, begins, and completes, then `finished`.
+
+### Reporting progress
+
+**[decided]** `internal/migrate` needed no change. `app`'s checkpoint observer
+already receives `BeforeTables`, `BeforeTable` and `AfterTable(table, rows)`
+from `migrate.Execute`; what was missing was turning those calls into reports.
+
+`app.ExecuteWithProgress(ctx, request, sink)` sits beside `Execute`, which
+delegates with a nil sink. Separate rather than an extra parameter, because
+every command-line invocation has nobody to report to, and because `Request` is
+a transport type pinned by golden wire tests — a function does not survive
+serialisation, so it belongs beside the request rather than in it.
+
+**A watcher cannot stop a migration.** This is the property that makes the
+feature safe to have. Reports are raised from inside observer hooks, and those
+hooks run at durable checkpoint boundaries where a returned error aborts the
+run. So the sink returns no error, and a sink that panics — a closed channel, a
+nil map, a bug in a front end — is contained rather than unwound into the
+engine. Reporting also happens *after* the checkpoint each hook exists to write,
+so a watcher sees what has durably happened rather than what is about to be
+attempted.
+
+Every report carries the running tally, so a client that missed events can still
+render correctly from one recent event. That is what makes the job event buffer
+safe to trim: a large migration would otherwise retain two events per table for
+an hour after finishing.
 
 ## Suggested build order
 

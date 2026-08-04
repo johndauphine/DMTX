@@ -20,6 +20,7 @@ type blockingCommand struct {
 	entered  chan struct{}
 	release  chan struct{}
 	observed chan context.Context
+	report   app.ProgressFunc
 }
 
 func newBlockingCommand() *blockingCommand {
@@ -31,7 +32,8 @@ func newBlockingCommand() *blockingCommand {
 }
 
 // run is the executor a test installs in place of app.Execute.
-func (command *blockingCommand) run(ctx context.Context, request app.Request) app.Outcome {
+func (command *blockingCommand) run(ctx context.Context, request app.Request, report app.ProgressFunc) app.Outcome {
+	command.report = report
 	select {
 	case command.entered <- struct{}{}:
 	default:
@@ -533,6 +535,97 @@ func TestAJobNeverReportsEndingBeforeItsFinishedEventExists(t *testing.T) {
 				attempt, last,
 			)
 		default:
+		}
+	}
+}
+
+// TestProgressReportsBecomeStreamEvents pins the last link in the chain: what
+// the engine reports has to reach the client watching.
+func TestProgressReportsBecomeStreamEvents(t *testing.T) {
+	server := newTestServer(t)
+	reported := make(chan struct{})
+	server.jobs.execute = func(
+		_ context.Context, request app.Request, report app.ProgressFunc,
+	) app.Outcome {
+		report(app.Progress{
+			Kind:   app.ProgressTablesPlanned,
+			Tables: []string{"orders", "customers"},
+			Total:  2,
+		})
+		report(app.Progress{
+			Kind: app.ProgressTableFinished, Table: "orders", Rows: 7, Done: 1, Total: 2,
+		})
+		close(reported)
+		return app.Outcome{Command: request.Command}
+	}
+
+	running, err := server.jobs.start(app.Request{Command: "run"})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	<-reported
+	if !waitFor(func() bool { _, ok := running.result(); return ok }) {
+		t.Fatal("job never finished")
+	}
+
+	events := streamEvents(t, server, running.ID(), 0)
+	var progress []app.Progress
+	for _, event := range events {
+		if event.Kind != eventProgress {
+			continue
+		}
+		var decoded app.Progress
+		if err := json.Unmarshal(event.Data, &decoded); err != nil {
+			t.Fatalf("progress event is not a Progress: %s", event.Data)
+		}
+		progress = append(progress, decoded)
+	}
+	if len(progress) != 2 {
+		t.Fatalf("expected two progress events, got %d of %d total", len(progress), len(events))
+	}
+	if progress[0].Kind != app.ProgressTablesPlanned || len(progress[0].Tables) != 2 {
+		t.Errorf("the planned report lost its table set: %+v", progress[0])
+	}
+	if progress[1].Table != "orders" || progress[1].Rows != 7 || progress[1].Done != 1 {
+		t.Errorf("the finished report lost its detail: %+v", progress[1])
+	}
+	// Ordering matters: a client renders these as they arrive.
+	if events[0].Kind != eventStarted || events[len(events)-1].Kind != eventFinished {
+		t.Errorf("progress did not arrive between started and finished: %v", events)
+	}
+}
+
+// TestTheEventBufferIsBounded pins that a migration with a great many tables
+// does not hold every report it ever made for an hour after finishing.
+func TestTheEventBufferIsBounded(t *testing.T) {
+	running := &job{
+		id:      "under-test",
+		changed: make(chan struct{}),
+		done:    make(chan struct{}),
+		cancel:  func() {},
+	}
+	running.emit(eventStarted, nil)
+	for index := 0; index < maxRetainedEvents*2; index++ {
+		running.emit(eventProgress, nil)
+	}
+
+	events, _, _ := running.next(0)
+	if len(events) > maxRetainedEvents {
+		t.Errorf("the buffer holds %d events, over the cap of %d", len(events), maxRetainedEvents)
+	}
+	// The started event survives trimming: it is what tells a late arrival
+	// which command it is watching.
+	if events[0].Kind != eventStarted {
+		t.Errorf("trimming dropped the started event; the buffer begins with %s", events[0].Kind)
+	}
+	// Sequences stay strictly increasing, or a resuming client would be sent
+	// events it has already seen.
+	for index := 1; index < len(events); index++ {
+		if events[index].Sequence <= events[index-1].Sequence {
+			t.Fatalf(
+				"sequences repeat after trimming: %d then %d",
+				events[index-1].Sequence, events[index].Sequence,
+			)
 		}
 	}
 }

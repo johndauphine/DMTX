@@ -22,7 +22,7 @@ type resumeOptions struct {
 	abandonReason           string
 }
 
-func executeResume(ctx context.Context, request Request) Outcome {
+func executeResume(ctx context.Context, request Request, reporter *progressReporter) Outcome {
 	out := newOutcome(request.Command)
 	migrationContext, stopSignals := signal.NotifyContext(
 		ctx,
@@ -261,6 +261,7 @@ func executeResume(ctx context.Context, request Request) Outcome {
 			resume:         true,
 			spoolDirectory: spoolDirectory,
 			configPath:     configPath,
+			progress:       reporter,
 		},
 		existing: existing,
 	}

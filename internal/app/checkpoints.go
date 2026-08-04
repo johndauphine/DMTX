@@ -23,6 +23,12 @@ type tableCheckpointObserver struct {
 	resume         bool
 	spoolDirectory string
 	configPath     string
+
+	// progress reports where the run has got to. Nil when nobody is watching,
+	// which is every CLI invocation. Reporting happens after the checkpoint
+	// each hook exists to write, never before: a watcher sees what has durably
+	// happened, not what is about to be attempted.
+	progress *progressReporter
 }
 
 // stage4FencedStateBackend is private proof that the application wrapped the
@@ -277,6 +283,7 @@ func (observer tableCheckpointObserver) BeforeTables(_ context.Context, tables [
 	if err := observer.store.CreateTasks(tasks); err != nil {
 		return stateCheckpointError("create table checkpoints", err)
 	}
+	observer.progress.planned(tables)
 	return nil
 }
 
@@ -292,6 +299,7 @@ func (observer tableCheckpointObserver) BeforeTable(_ context.Context, table str
 		if task.Status != "running" {
 			return stateCheckpointError("reuse table checkpoint", fmt.Errorf("task %q is %s", table, task.Status))
 		}
+		observer.progress.starting(table)
 		return nil
 	}
 	if err := observer.store.CreateTask(state.Task{
@@ -301,6 +309,7 @@ func (observer tableCheckpointObserver) BeforeTable(_ context.Context, table str
 	}); err != nil {
 		return stateCheckpointError("create table checkpoint", err)
 	}
+	observer.progress.starting(table)
 	return nil
 }
 
@@ -308,6 +317,7 @@ func (observer tableCheckpointObserver) AfterTable(_ context.Context, table stri
 	if err := observer.store.CompleteTask(observer.runID, table, rowsDone, time.Now().UTC()); err != nil {
 		return stateCheckpointError("complete table checkpoint", err)
 	}
+	observer.progress.finished(table, rowsDone)
 	return nil
 }
 
@@ -347,6 +357,11 @@ func (observer tableCheckpointObserver) AfterStage4TablePublication(
 				),
 			)
 		}
+		// Reported here as well as in AfterTable, not twice for one table: the
+		// two hooks are mutually exclusive, the ordinary one owning legacy
+		// routes and this one composed routes that already committed the same
+		// advance with their range evidence.
+		observer.progress.finished(table, rowsDone)
 		return nil
 	}
 	return stateCheckpointError(

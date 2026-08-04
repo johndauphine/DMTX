@@ -22,8 +22,19 @@ var jobRetention = time.Hour
 // finished; anything between them is progress, which nothing produces yet.
 const (
 	eventStarted  = "started"
+	eventProgress = "progress"
 	eventFinished = "finished"
 )
+
+// maxRetainedEvents bounds a job's replay buffer.
+//
+// A migration reports two events per table, so a large workload would otherwise
+// hold tens of thousands of them for an hour after it finished. Trimming loses
+// a reconnecting client some history, which costs it little: every progress
+// report carries the running tally, so one recent event is enough to render the
+// state correctly. Sequence numbers come from a counter rather than the buffer
+// length so that trimming cannot make them repeat.
+const maxRetainedEvents = 2048
 
 var errNoSuchJob = errors.New("no such job")
 
@@ -45,6 +56,7 @@ type job struct {
 
 	mutex    sync.Mutex
 	events   []jobEvent
+	sequence int
 	outcome  *app.Outcome
 	finished time.Time
 	changed  chan struct{}
@@ -66,16 +78,39 @@ func (running *job) emit(kind string, data json.RawMessage) {
 // lock, so a caller with more than one thing to change can make all of it
 // visible at once.
 func (running *job) appendLocked(kind string, data json.RawMessage) {
+	running.sequence++
 	running.events = append(running.events, jobEvent{
-		Sequence: len(running.events) + 1,
+		Sequence: running.sequence,
 		Kind:     kind,
 		Data:     data,
 	})
+	if len(running.events) > maxRetainedEvents {
+		// The oldest go first, but never the started event: it is what tells a
+		// late arrival which command it is watching.
+		keep := make([]jobEvent, 0, maxRetainedEvents)
+		keep = append(keep, running.events[0])
+		keep = append(keep, running.events[len(running.events)-maxRetainedEvents+1:]...)
+		running.events = keep
+	}
 	// Closing the current channel and replacing it broadcasts to everyone
 	// selecting on it, which a buffered channel could not do without knowing
 	// how many readers there are.
 	close(running.changed)
 	running.changed = make(chan struct{})
+}
+
+// reportProgress turns an engine report into an event on this job's stream.
+//
+// A report that cannot be encoded is dropped rather than raised. This is called
+// from the migration's own goroutine at durable checkpoint boundaries, so
+// anything that escaped here would be a watcher interfering with the work being
+// watched.
+func (running *job) reportProgress(event app.Progress) {
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		return
+	}
+	running.emit(eventProgress, encoded)
 }
 
 // complete records the outcome and closes the job.
@@ -155,17 +190,17 @@ type jobs struct {
 	activity *activity
 
 	// execute is the seam between the job machinery and the command layer.
-	// Tests replace it to drive a command they control - one that blocks, or
-	// notices cancellation - which is the only way to check that a job outlives
-	// its request without standing up a database to be slow at.
-	execute func(context.Context, app.Request) app.Outcome
+	// Tests replace it to drive a command they control - one that blocks,
+	// notices cancellation, or reports progress - which is the only way to
+	// check this machinery without standing up a database to be slow at.
+	execute func(context.Context, app.Request, app.ProgressFunc) app.Outcome
 }
 
 func newJobs(tracker *activity) *jobs {
 	return &jobs{
 		byID:     make(map[string]*job),
 		activity: tracker,
-		execute:  app.Execute,
+		execute:  app.ExecuteWithProgress,
 	}
 }
 
@@ -212,7 +247,7 @@ func (registry *jobs) start(request app.Request) (*job, error) {
 	go func() {
 		defer registry.activity.end()
 		defer cancel()
-		running.complete(registry.execute(ctx, request))
+		running.complete(registry.execute(ctx, request, running.reportProgress))
 	}()
 	return running, nil
 }
