@@ -233,11 +233,46 @@ If Wails is adopted later, build it as a **separate binary** over the same
 frontend assets. Revisit only if the laptop experience concretely needs native
 menus, file dialogs, or a system tray.
 
+## Long-running commands
+
+**[decided]** Commands run as **jobs**, not inside the HTTP handler, and the
+console watches them over **server-sent events** rather than a WebSocket.
+
+The defect this fixes was live: `execute` passed the request's context into
+`app.Execute`, so closing the browser tab cancelled the migration. Hours of work
+could be discarded by a lid closing. A job's context comes from the process, not
+the request, so losing the client ends the response and nothing else. Stopping
+is something an operator asks for — `POST /api/v1/jobs/{id}/cancel` — not
+something their network does to them.
+
+SSE over WebSocket because the traffic is one-directional: the server reports,
+the client watches, and commands are ordinary authenticated POSTs. SSE also
+reconnects by itself — a browser's `EventSource` resends `Last-Event-ID` with no
+help from the page, so a closed lid resumes where it left off, which is exactly
+the case that matters. A WebSocket would add a second protocol, its own auth
+story, and hand-written reconnection to buy bidirectionality nothing needs.
+
+`POST /api/v1/execute` is kept and now waits on a job internally, so the
+synchronous and streaming surfaces cannot drift into deciding things
+differently, and the CLI/WebUI parity test keeps meaning what it says.
+
+Two consequences worth stating:
+
+- **A running job counts as activity.** The idle watchdog's guard assumed
+  commands ran inside handlers; once they do not, a migration nobody is
+  watching produces no requests, and the server would have stopped itself in
+  the middle of one.
+- **Progress is not streamed yet.** `app.Execute` is synchronous and a run's
+  messages are terminal, so a job emits `started` and `finished` and nothing
+  between. Real per-table progress needs an observer seam threaded from
+  `internal/migrate` through `internal/app`, which is its own change; the
+  transport is in place to carry it.
+
 ## Suggested build order
 
 **[proposed]**
 
-1. Surface-agnostic command layer and JSON/WebSocket API — the parity seam.
+1. Surface-agnostic command layer and JSON API — the parity seam.
 2. Root-confined, authenticated path-completion endpoint.
 3. Console component: input line, slash autocomplete from the registry, history,
    `@` completion against the endpoint from step 2.
