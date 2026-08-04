@@ -136,13 +136,37 @@ func TestDiscoveryDoesNotDescendForever(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = server.listener.Close() })
 
-	for _, found := range discovered(t, server) {
-		if depth := strings.Count(found, "/"); depth > maxDiscoveryDepth {
-			t.Errorf("discovered %q at depth %d, past the bound of %d", found, depth, maxDiscoveryDepth)
+	// Both sides of the bound. Checking only that nothing came back too deep
+	// lets an off-by-one through, because a walk that stopped one level early
+	// satisfies it just as well as a correct one - and this test did exactly
+	// that until a reviewer pointed it out.
+	names := discovered(t, server)
+	if len(names) == 0 {
+		t.Fatal("the depth bound excluded everything, including what is in the root")
+	}
+
+	segments := make([]string, 0, maxDiscoveryDepth)
+	for level := 1; level <= maxDiscoveryDepth; level++ {
+		segments = append(segments, fmt.Sprintf("level%d", level))
+	}
+	atBound := strings.Join(segments, "/") + "/config.yaml"
+	beyond := strings.Join(append(segments, fmt.Sprintf("level%d", maxDiscoveryDepth+1)), "/") + "/config.yaml"
+
+	found := map[string]bool{}
+	for _, name := range names {
+		found[name] = true
+		if depth := strings.Count(name, "/"); depth > maxDiscoveryDepth {
+			t.Errorf("discovered %q at depth %d, past the bound of %d", name, depth, maxDiscoveryDepth)
 		}
 	}
-	if names := discovered(t, server); len(names) == 0 || names[len(names)-1] == "" {
-		t.Error("the depth bound excluded everything, including what is in the root")
+	if !found[atBound] {
+		t.Errorf(
+			"a config at exactly the depth bound was not discovered: %q\nfound: %v",
+			atBound, names,
+		)
+	}
+	if found[beyond] {
+		t.Errorf("a config past the depth bound was discovered: %q", beyond)
 	}
 }
 

@@ -15,8 +15,10 @@ import (
 // rather than a filesystem walk.
 const (
 	maxDiscoveredConfigs = 100
-	maxDiscoveryDepth    = 3
-	configProbeBytes     = 8 << 10
+	// Inclusive: a config in a directory this many levels below the root is
+	// found, one level deeper is not.
+	maxDiscoveryDepth = 3
+	configProbeBytes  = 8 << 10
 )
 
 // discoveredConfig is one candidate an operator could pick.
@@ -81,7 +83,10 @@ func (server *Server) discoverConfigs() ([]discoveredConfig, error) {
 			if path == root {
 				return nil
 			}
-			if depthUnder(root, path) >= maxDiscoveryDepth {
+			// Deeper than the bound, not at it. Skipping a directory stops its
+			// contents being read, so refusing at exactly maxDiscoveryDepth
+			// would make the effective depth one less than the name promises.
+			if depthUnder(root, path) > maxDiscoveryDepth {
 				return fs.SkipDir
 			}
 			return nil
