@@ -249,6 +249,7 @@ func TestEveryPayloadKindIsPinned(t *testing.T) {
 		PayloadPlan:            "migrate.Plan, pinned by its own package",
 		PayloadPreflightReport: "productionPreflightReport, pinned by preflight tests",
 		PayloadConfig:          "TestConfigPayloadWireShapeExcludesSecrets",
+		PayloadDiagnosis:       "TestDiagnosisPayloadWireShape",
 	}
 
 	fileSet := token.NewFileSet()

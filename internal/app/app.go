@@ -122,6 +122,17 @@ func parseRequest(args []string) (Request, Outcome, bool) {
 			request.ConfigPath = args[2]
 		}
 		return request, Outcome{}, true
+	case "diagnose":
+		request := Request{Command: "diagnose"}
+		for index := 1; index+1 < len(args); index += 2 {
+			switch args[index] {
+			case "--state":
+				request.StatePath = args[index+1]
+			case "--run":
+				request.RunID = args[index+1]
+			}
+		}
+		return request, Outcome{}, true
 	case "preflight", "health-check":
 		// The alias is resolved here so nothing downstream has to know it
 		// exists.
@@ -199,6 +210,8 @@ func ExecuteWithProgress(
 		return executeShowState(request)
 	case "config":
 		return executeConfig(request)
+	case "diagnose":
+		return executeDiagnose(request)
 	case "run":
 		return executeRun(ctx, request, reporter)
 	case "resume":
