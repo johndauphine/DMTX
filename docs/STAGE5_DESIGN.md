@@ -145,6 +145,46 @@ Source material in `~/repos/dmt`:
 `@` is optional sugar in DMT: `args.go` strips the prefix, so `@cfg.yaml` and
 `cfg.yaml` both work. Preserve that — it is forgiving in the right direction.
 
+### The WebUI is not only the TUI in a browser
+
+**[decided]** DMT's web UI has capability its TUI does not, and reaching parity
+means recreating that too. Basing the console on the TUI was the right call for
+its *shape*; it is not the whole obligation.
+
+Auditing DMT's `internal/webui` routes against DMTX found that most of the gap
+is **not front-end work**. Nine capabilities are registered in
+`internal/contract` and unimplemented in `internal/app`:
+
+| DMT web UI route | DMTX |
+| --- | --- |
+| `/api/run`, `/api/resume`, `/api/status`, `/api/history`, `/api/validate`, `/api/preflight` | implemented |
+| `/api/diagnose` | registered, unimplemented |
+| `/api/analyze` | registered, unimplemented |
+| `/api/profiles` (list, save, delete, export) | registered, unimplemented |
+| `/api/ai/config-review` | registered, unimplemented |
+| `/api/init-secrets` | registered, unimplemented |
+| `/api/setup/{prompt,start,input}` | registered, unimplemented |
+| `/api/cache/clear` | registered, unimplemented |
+| `/api/configs`, `/api/config/check` | registered, unimplemented |
+| `/api/session` (get, set, delete defaults) | **absent from the registry** |
+| `/api/health` | absent |
+
+**[decided]** All of it is in scope, including the four that carry real design
+weight — session defaults, the setup wizard, profiles, and AI config review.
+Commands are built before the console, so the console arrives able to render a
+whole surface rather than mostly reporting "planned".
+
+Three of those do not fit the `Request`/`Outcome` seam as it stands and need
+their own design before implementation:
+
+- **Session defaults** are not a command. DMT's `resolveOrigin` gives explicit
+  argument, then session default, then built-in — state the console needs so an
+  operator is not retyping a config path into every command.
+- **The setup wizard** is a stateful conversation (`prompt`, `start`, `input`),
+  closer to the job model than to a command that answers once.
+- **Profile export** writes credentials somewhere, so redaction and encryption
+  are decisions to take before it is built, not after.
+
 ### Domain commands versus shell commands
 
 **[proposed]** DMT's 24 commands are two different things, and only one is a
