@@ -439,13 +439,21 @@ func TestCompletionRootPrefersConfigThenWorkingDirectory(t *testing.T) {
 		options Options
 		want    string
 	}{
+		// Written through FromSlash rather than as literals. completionRoot
+		// returns what filepath.Dir produced, which on Windows is separated
+		// with backslashes, so a hard-coded "/project" would fail there for a
+		// reason that has nothing to do with the resolution order this test is
+		// about.
 		"explicit root wins": {
-			options: Options{Root: "/explicit", configPath: "/project/cfg.yaml"},
-			want:    "/explicit",
+			options: Options{
+				Root:       filepath.FromSlash("/explicit"),
+				configPath: filepath.FromSlash("/project/cfg.yaml"),
+			},
+			want: filepath.FromSlash("/explicit"),
 		},
 		"config directory next": {
 			options: Options{configPath: filepath.Join("/project", "cfg.yaml")},
-			want:    "/project",
+			want:    filepath.FromSlash("/project"),
 		},
 		"working directory last": {
 			options: Options{},
