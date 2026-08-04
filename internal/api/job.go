@@ -59,6 +59,13 @@ func (running *job) ID() string { return running.id }
 func (running *job) emit(kind string, data json.RawMessage) {
 	running.mutex.Lock()
 	defer running.mutex.Unlock()
+	running.appendLocked(kind, data)
+}
+
+// appendLocked records an event and wakes every reader. The caller holds the
+// lock, so a caller with more than one thing to change can make all of it
+// visible at once.
+func (running *job) appendLocked(kind string, data json.RawMessage) {
 	running.events = append(running.events, jobEvent{
 		Sequence: len(running.events) + 1,
 		Kind:     kind,
@@ -72,6 +79,12 @@ func (running *job) emit(kind string, data json.RawMessage) {
 }
 
 // complete records the outcome and closes the job.
+//
+// The outcome and the finished event become visible together, under one lock.
+// Set apart, a reader can see a job that has ended while its finished event has
+// not been appended yet - so the stream reports the end and returns without
+// ever sending it, and the operator watches a completed migration that never
+// says how it went.
 func (running *job) complete(outcome app.Outcome) {
 	encoded, err := json.Marshal(outcome)
 	if err != nil {
@@ -82,9 +95,9 @@ func (running *job) complete(outcome app.Outcome) {
 	running.mutex.Lock()
 	running.outcome = &outcome
 	running.finished = time.Now()
+	running.appendLocked(eventFinished, encoded)
 	running.mutex.Unlock()
 
-	running.emit(eventFinished, encoded)
 	close(running.done)
 }
 
@@ -104,6 +117,13 @@ func (running *job) complete(outcome app.Outcome) {
 // comment. A test written to hold that order honest could not catch it being
 // reversed, because the window is microseconds wide. Removing the window beat
 // testing for it.
+//
+// Ended is read from the events rather than from the outcome field for the same
+// reason. Two sources of truth can disagree for an instant, and the instant
+// that matters is the one where a job reports it has ended before the event
+// saying so exists - a stream would report the end and return without ever
+// sending it. Taking the answer from the events makes that unsayable: the
+// finished event is what ending means.
 func (running *job) next(sequence int) ([]jobEvent, bool, <-chan struct{}) {
 	running.mutex.Lock()
 	defer running.mutex.Unlock()
@@ -113,7 +133,9 @@ func (running *job) next(sequence int) ([]jobEvent, bool, <-chan struct{}) {
 			pending = append(pending, event)
 		}
 	}
-	return pending, running.outcome != nil, running.changed
+	ended := len(running.events) > 0 &&
+		running.events[len(running.events)-1].Kind == eventFinished
+	return pending, ended, running.changed
 }
 
 // result reports the outcome, once there is one.

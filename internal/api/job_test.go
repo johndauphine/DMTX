@@ -475,6 +475,68 @@ func TestAStreamFollowsAJobThatFinishesWhileItIsWatching(t *testing.T) {
 	}
 }
 
+// TestAJobNeverReportsEndingBeforeItsFinishedEventExists pins the invariant the
+// stream loop depends on.
+//
+// jobEvents writes whatever next returns and then stops if it says the job has
+// ended. So a moment where ended is true and the finished event is not yet
+// among the events is a stream that reports the end without ever sending it -
+// the operator watches a completed migration that never says how it went.
+//
+// Hammered concurrently because that moment, if it exists, is narrow.
+func TestAJobNeverReportsEndingBeforeItsFinishedEventExists(t *testing.T) {
+	for attempt := 0; attempt < 300; attempt++ {
+		running := &job{
+			id:      "under-test",
+			changed: make(chan struct{}),
+			done:    make(chan struct{}),
+			cancel:  func() {},
+		}
+		running.emit(eventStarted, nil)
+
+		violations := make(chan string, 1)
+		watching := make(chan struct{})
+		go func() {
+			close(watching)
+			for {
+				events, ended, _ := running.next(0)
+				if ended {
+					last := ""
+					if len(events) > 0 {
+						last = events[len(events)-1].Kind
+					}
+					if last != eventFinished {
+						select {
+						case violations <- last:
+						default:
+						}
+					}
+					return
+				}
+				select {
+				case <-running.done:
+					// The job ended and the watcher never saw it; the final
+					// read below settles whether that is a violation.
+				default:
+				}
+			}
+		}()
+
+		<-watching
+		running.complete(app.Outcome{Command: "run"})
+
+		select {
+		case last := <-violations:
+			t.Fatalf(
+				"attempt %d: a job reported ending while its last event was %q; "+
+					"a stream would return without sending the outcome",
+				attempt, last,
+			)
+		default:
+		}
+	}
+}
+
 // streamEvents reads a job's stream to its end.
 func streamEvents(t *testing.T, server *Server, id string, from int) []jobEvent {
 	t.Helper()
