@@ -97,6 +97,7 @@ const (
 	PayloadRuns            = "runs"
 	PayloadPreflightReport = "preflight_report"
 	PayloadResumeResponse  = "resume_response"
+	PayloadConfig          = "config"
 )
 
 // outcomeBuilder accumulates messages while an operation runs.

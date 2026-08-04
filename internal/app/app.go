@@ -116,6 +116,12 @@ func parseRequest(args []string) (Request, Outcome, bool) {
 			request.ConfigPath = args[2]
 		}
 		return request, Outcome{}, true
+	case "config":
+		request := Request{Command: "config"}
+		if len(args) == 3 && args[1] == "--config" {
+			request.ConfigPath = args[2]
+		}
+		return request, Outcome{}, true
 	case "preflight", "health-check":
 		// The alias is resolved here so nothing downstream has to know it
 		// exists.
@@ -191,6 +197,8 @@ func ExecuteWithProgress(
 		return executePreflight(ctx, request)
 	case "status", "history":
 		return executeShowState(request)
+	case "config":
+		return executeConfig(request)
 	case "run":
 		return executeRun(ctx, request, reporter)
 	case "resume":
