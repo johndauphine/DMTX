@@ -15,11 +15,13 @@ import (
 // Long enough that an operator whose laptop slept through the end of a run can
 // wake up and still see how it went; short enough that a server left running
 // for weeks does not accumulate every outcome it ever produced.
+//
 // A variable so tests can shorten it; nothing else reassigns it.
 var jobRetention = time.Hour
 
 // Event kinds. A job emits exactly one started and, eventually, exactly one
-// finished; anything between them is progress, which nothing produces yet.
+// finished. Between them come progress reports: one naming the planned table
+// set, then a pair as each table begins and completes.
 const (
 	eventStarted  = "started"
 	eventProgress = "progress"
@@ -28,12 +30,13 @@ const (
 
 // maxRetainedEvents bounds a job's replay buffer.
 //
-// A migration reports two events per table, so a large workload would otherwise
-// hold tens of thousands of them for an hour after it finished. Trimming loses
-// a reconnecting client some history, which costs it little: every progress
-// report carries the running tally, so one recent event is enough to render the
-// state correctly. Sequence numbers come from a counter rather than the buffer
-// length so that trimming cannot make them repeat.
+// A migration reports once for the planned table set and twice per table, so a
+// large workload would otherwise hold tens of thousands of events for an hour
+// after it finished. Trimming loses a reconnecting client some history, which
+// costs it little: every progress report carries the running tally, so one
+// recent event is enough to render the state correctly. Sequence numbers come
+// from a counter rather than the buffer length so that trimming cannot make
+// them repeat.
 const maxRetainedEvents = 2048
 
 var errNoSuchJob = errors.New("no such job")
