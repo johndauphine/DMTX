@@ -23,6 +23,38 @@ const maxRequestBytes = 64 << 10
 // re-decide what the engine already decided, which is the one thing Stage 5
 // must not do.
 func (server *Server) execute(writer http.ResponseWriter, request *http.Request) {
+	decoded, ok := server.decodeRequest(writer, request)
+	if !ok {
+		return
+	}
+
+	// Started as a job and waited for, rather than run here. One execution path
+	// means the synchronous and streaming surfaces cannot drift into deciding
+	// things differently - and it is what stops a closed tab from killing a
+	// migration, because the job's context is not this request's.
+	running, err := server.jobs.start(decoded)
+	if err != nil {
+		writeJSON(writer, http.StatusInternalServerError, map[string]string{
+			"error": "could not start the command",
+		})
+		return
+	}
+	select {
+	case <-running.done:
+		outcome, _ := running.result()
+		writeJSON(writer, http.StatusOK, outcome)
+	case <-request.Context().Done():
+		// The caller has gone. The command keeps running and its outcome stays
+		// readable at /api/v1/jobs/{id}; there is nobody left to write to.
+	}
+}
+
+// decodeRequest reads a command request, or answers the client and reports
+// false.
+func (server *Server) decodeRequest(
+	writer http.ResponseWriter,
+	request *http.Request,
+) (app.Request, bool) {
 	var decoded app.Request
 	decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, maxRequestBytes))
 	// Unknown fields are refused rather than ignored. A client sending
@@ -33,7 +65,7 @@ func (server *Server) execute(writer http.ResponseWriter, request *http.Request)
 		writeJSON(writer, http.StatusBadRequest, map[string]string{
 			"error": "malformed request: " + err.Error(),
 		})
-		return
+		return app.Request{}, false
 	}
 	// Exactly one document. Without this a body holding two requests would run
 	// the first and silently discard the second, so a caller could believe it
@@ -42,16 +74,15 @@ func (server *Server) execute(writer http.ResponseWriter, request *http.Request)
 		writeJSON(writer, http.StatusBadRequest, map[string]string{
 			"error": "request body holds more than one JSON document",
 		})
-		return
+		return app.Request{}, false
 	}
 	if decoded.Command == "" {
 		writeJSON(writer, http.StatusBadRequest, map[string]string{
 			"error": "request has no command",
 		})
-		return
+		return app.Request{}, false
 	}
-	outcome := app.Execute(request.Context(), decoded)
-	writeJSON(writer, http.StatusOK, outcome)
+	return decoded, true
 }
 
 // commands reports the command registry, so a front end can build its own

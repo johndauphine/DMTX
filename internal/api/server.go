@@ -76,6 +76,11 @@ type Server struct {
 	// root bounds @ path completion. Nil means completion is off.
 	root *pathRoot
 
+	// jobs holds every command this server has started. Commands run here
+	// rather than inside a handler so that losing the client does not lose the
+	// work.
+	jobs *jobs
+
 	// handoffSecret authenticates the handoff handshake. It is a third secret,
 	// separate from the launch and session values, because it authenticates a
 	// different party for a different purpose: another process on this machine
@@ -140,6 +145,8 @@ func New(options Options) (*Server, error) {
 			server.root = root
 		}
 	}
+	server.jobs = newJobs(&server.activity)
+
 	// Started now rather than left at the zero time, or a server that has not
 	// yet had its first request would look infinitely idle and the watchdog
 	// would stop it before the browser finished opening.
@@ -216,6 +223,18 @@ func (server *Server) routes() http.Handler {
 	))
 	mux.Handle("GET /api/v1/complete", server.auth.require(
 		http.HandlerFunc(server.complete),
+	))
+	mux.Handle("POST /api/v1/jobs", server.auth.require(
+		http.HandlerFunc(server.startJob),
+	))
+	mux.Handle("GET /api/v1/jobs/{id}", server.auth.require(
+		http.HandlerFunc(server.jobStatus),
+	))
+	mux.Handle("GET /api/v1/jobs/{id}/events", server.auth.require(
+		http.HandlerFunc(server.jobEvents),
+	))
+	mux.Handle("POST /api/v1/jobs/{id}/cancel", server.auth.require(
+		http.HandlerFunc(server.cancelJob),
 	))
 	mux.Handle("GET /", server.auth.require(
 		http.HandlerFunc(server.placeholder),
