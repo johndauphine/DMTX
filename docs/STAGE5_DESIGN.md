@@ -171,19 +171,33 @@ In the TUI, `@` completes against the local filesystem as the invoking user. In
 a remote WebUI the files live on the **server**, so completion means exposing a
 path-enumeration endpoint. That is an attack surface the TUI never had.
 
-Requirements for that endpoint:
+**[decided]** Built as `GET /api/v1/complete`, before the console, so the
+console is written against a confined API rather than retrofitted onto a
+permissive one. DMT has no precedent to copy here: its WebUI never accepts a
+client-supplied path at all — `handlers_configs.go` scans a fixed set of
+directories precisely so that "there is no directory-traversal surface".
 
-- **Root-confined.** An explicit allowed root, with `..` traversal and absolute
-  paths outside it refused. Resolve symlinks before checking containment.
-- **Authenticated.** SSH access to the host is not authorization to run a
-  destructive migration, and a forwarded port must not be treated as implicit
-  trust. DMT already has `internal/webui/session.go` and a trusted-proxy module;
-  carry those decisions over deliberately.
-- **Non-leaking.** Errors must not disclose whether a path outside the root
-  exists.
-
-Implement this endpoint before the console component, so the console is built
-against the confined API rather than retrofitted onto a permissive one.
+- **Root-confined.** The root is `--root`, else the directory of `--config`,
+  else the working directory. It is resolved once at startup with symlinks
+  followed. Containment is checked with `filepath.Rel`, not a string prefix:
+  `/base/root-evil` starts with `/base/root` and is not inside it.
+- **Symlinks resolved before the check, not after.** A link inside the root
+  looks contained until it is followed. Entries whose target escapes are not
+  offered either, or completion becomes a way to enumerate the disk by planting
+  one link.
+- **Absolute prefixes are read relative to the root**, the way a path inside a
+  chroot is. There is therefore no spelling of an absolute path that reaches
+  out. An entry's returned path is the real absolute one, so nothing is
+  mis-sent as a result.
+- **Regular files and directories only.** A FIFO offered here could be opened by
+  whatever the operator does next, and reading one blocks until something else
+  writes.
+- **Authenticated**, like every other route.
+- **Non-leaking.** One status and one sentence for every failure. Telling
+  "outside the root" apart from "does not exist" would make the endpoint an
+  oracle for mapping the filesystem above the root without reading a byte of it.
+- **Fails closed.** A root that will not resolve leaves completion off rather
+  than widening to the working directory.
 
 ## Parity enforcement
 
