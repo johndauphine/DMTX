@@ -125,17 +125,39 @@ func parseRequest(args []string) (Request, Outcome, bool) {
 		}
 		return request, Outcome{}, true
 	default:
-		for _, command := range contract.Commands {
-			if command.Name == args[0] {
-				out.out(command.Name + " is planned in this stage.")
-				return Request{}, out.done(Success), false
-			}
-		}
-		return Request{}, out.failWith(
-			ConfigurationError,
-			fmt.Sprintf("unknown command %q; use --help", args[0]),
-		), false
+		return Request{}, classifyUnhandled(out, args[0]), false
 	}
+}
+
+// classifyUnhandled answers for a command no surface implements yet.
+//
+// Both surfaces call this, which is the point. When the command line said a
+// command was "planned in this stage" and Execute called the same command
+// unknown, dmtx was telling an operator two different things about what it can
+// do depending on where they asked - the one thing the parity criterion
+// forbids. Restating the rule in two places is how that happened; there is one
+// place now.
+func classifyUnhandled(out *outcomeBuilder, command string) Outcome {
+	for _, registered := range contract.Commands {
+		if registered.Name != command {
+			continue
+		}
+		if registered.WebUI == contract.Omitted && registered.TUI == contract.Omitted {
+			// Registered but deliberately not an interactive command. serve is
+			// the case: it starts a front end, so offering it as something a
+			// front end can run is nonsense rather than a gap.
+			return out.failWith(
+				ConfigurationError,
+				fmt.Sprintf("%s is not available through this interface", command),
+			)
+		}
+		out.out(command + " is planned in this stage.")
+		return out.done(Success)
+	}
+	return out.failWith(
+		ConfigurationError,
+		fmt.Sprintf("unknown command %q; use --help", command),
+	)
 }
 
 // Execute performs a request and reports what happened. This is the seam every
@@ -174,11 +196,7 @@ func ExecuteWithProgress(
 	case "resume":
 		return executeResume(ctx, request, reporter)
 	default:
-		out := newOutcome(request.Command)
-		return out.failWith(
-			ConfigurationError,
-			fmt.Sprintf("unknown command %q; use --help", request.Command),
-		)
+		return classifyUnhandled(newOutcome(request.Command), request.Command)
 	}
 }
 
