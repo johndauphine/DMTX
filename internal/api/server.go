@@ -224,6 +224,9 @@ func (server *Server) routes() http.Handler {
 	mux.Handle("GET /api/v1/complete", server.auth.require(
 		http.HandlerFunc(server.complete),
 	))
+	mux.Handle("GET /api/v1/configs", server.auth.require(
+		http.HandlerFunc(server.configs),
+	))
 	mux.Handle("POST /api/v1/jobs", server.auth.require(
 		http.HandlerFunc(server.startJob),
 	))
