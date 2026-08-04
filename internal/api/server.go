@@ -49,6 +49,17 @@ type Options struct {
 	// handing the operator to it. The escape hatch matters because handoff is a
 	// guess about intent, and a guess with no way to override it is a trap.
 	NewInstance bool
+
+	// Root confines @ path completion. Empty disables completion rather than
+	// widening it: an endpoint that enumerates the filesystem is worth having
+	// only when someone has said which part of it.
+	Root string
+
+	// configPath names the migration project this console is for. Today it only
+	// supplies Root's default - serve does not load it - so it is unexported
+	// and resolved by RunCommand rather than offered as a knob that promises
+	// more than it does.
+	configPath string
 }
 
 // Server owns the listener and the routes behind it.
@@ -61,6 +72,9 @@ type Server struct {
 	openBrowser bool
 	idleTimeout time.Duration
 	activity    activity
+
+	// root bounds @ path completion. Nil means completion is off.
+	root *pathRoot
 
 	// handoffSecret authenticates the handoff handshake. It is a third secret,
 	// separate from the launch and session values, because it authenticates a
@@ -116,6 +130,16 @@ func New(options Options) (*Server, error) {
 		handoffSecret: handoffSecret,
 		url:           loginURL(address.Port, launch),
 	}
+
+	// A root that will not resolve leaves completion off. Refusing to serve
+	// would be worse - the operator asked for a console, and completion is one
+	// convenience within it - but silently completing against somewhere else
+	// would be worse still, so the caller is told; see RunCommand.
+	if options.Root != "" {
+		if root, err := newPathRoot(options.Root); err == nil {
+			server.root = root
+		}
+	}
 	// Started now rather than left at the zero time, or a server that has not
 	// yet had its first request would look infinitely idle and the watchdog
 	// would stop it before the browser finished opening.
@@ -162,6 +186,15 @@ func (server *Server) URL() string { return server.url }
 // zero.
 func (server *Server) Addr() string { return server.listener.Addr().String() }
 
+// CompletionRoot is the directory @ completion may enumerate, or empty when
+// completion is off.
+func (server *Server) CompletionRoot() string {
+	if server.root == nil {
+		return ""
+	}
+	return server.root.resolved
+}
+
 // ExitedIdle reports whether Serve returned because the server went unused
 // rather than because it was asked to stop. Read after Serve returns.
 func (server *Server) ExitedIdle() bool { return server.exitedIdle.Load() }
@@ -180,6 +213,9 @@ func (server *Server) routes() http.Handler {
 	))
 	mux.Handle("GET /api/v1/commands", server.auth.require(
 		http.HandlerFunc(server.commands),
+	))
+	mux.Handle("GET /api/v1/complete", server.auth.require(
+		http.HandlerFunc(server.complete),
 	))
 	mux.Handle("GET /", server.auth.require(
 		http.HandlerFunc(server.placeholder),

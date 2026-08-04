@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -33,6 +34,7 @@ func RunCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, usage)
 		return configurationError
 	}
+	options.Root = completionRoot(options)
 	path, pathErr := statePath()
 
 	// A server is already running unless proven otherwise. Starting a second
@@ -58,6 +60,14 @@ func RunCommand(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "start server: %v\n", err)
 		return stateError
+	}
+
+	// Completion failing closed is worth a line, because the alternative is an
+	// operator typing @ into a console that silently never answers.
+	if options.Root != "" && server.CompletionRoot() == "" {
+		fmt.Fprintf(stderr,
+			"warning: %s is not a usable completion root, so @ completion is off\n",
+			options.Root)
 	}
 
 	// Recorded here rather than inside Serve because failing to record is not a
@@ -111,6 +121,31 @@ func RunCommand(args []string, stdout, stderr io.Writer) int {
 	return success
 }
 
+// completionRoot decides which directory @ completion may enumerate.
+//
+// --root is taken literally. Otherwise the root is the directory holding the
+// config the console is for, because that is where the files an operator
+// references with @ actually live - the config and the SQL beside it. Failing
+// both, it is the working directory, on the reasoning that someone who ran
+// dmtx serve in a directory is working in it.
+//
+// The working-directory fallback is the loosest of the three, which is the
+// argument for naming a config or a root when the console is served from
+// somewhere broad like a home directory.
+func completionRoot(options Options) string {
+	if options.Root != "" {
+		return options.Root
+	}
+	if options.configPath != "" {
+		return filepath.Dir(options.configPath)
+	}
+	working, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return working
+}
+
 // defaultIdleTimeout is how long an unused server waits before stopping.
 //
 // Long enough that reading a plan, thinking, and coming back does not kill the
@@ -122,7 +157,7 @@ const defaultIdleTimeout = 30 * time.Minute
 // usage is one string so the flags an operator is offered cannot drift from the
 // flags parseArguments accepts without both changing in the same edit.
 const usage = "usage: dmtx serve [--port N] [--no-browser] " +
-	"[--idle-timeout D] [--new-instance]"
+	"[--idle-timeout D] [--new-instance] [--config PATH] [--root DIR]"
 
 // parseArguments reads the serve flags. There is deliberately no bind address;
 // see Options.
@@ -170,6 +205,18 @@ func parseArguments(args []string) (Options, bool) {
 				return Options{}, false
 			}
 			options.NewInstance = true
+		case "--config":
+			if index+1 >= len(args) || options.configPath != "" {
+				return Options{}, false
+			}
+			options.configPath = args[index+1]
+			index++
+		case "--root":
+			if index+1 >= len(args) || options.Root != "" {
+				return Options{}, false
+			}
+			options.Root = args[index+1]
+			index++
 		default:
 			return Options{}, false
 		}
