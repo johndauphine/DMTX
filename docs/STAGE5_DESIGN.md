@@ -166,8 +166,13 @@ is **not front-end work**. Nine capabilities are registered in
 | `/api/setup/{prompt,start,input}` | registered, unimplemented |
 | `/api/cache/clear` | registered, unimplemented |
 | `/api/configs`, `/api/config/check` | registered, unimplemented |
+| no distinct route; part of `/api/setup/*` | `init`: registered, unimplemented |
 | `/api/session` (get, set, delete defaults) | **absent from the registry** |
 | `/api/health` | absent |
+
+The count is of commands, not rows above it: `init` is registered in DMTX and
+unimplemented, but DMT reaches it through the setup flow rather than a route of
+its own, which is why it has no left-hand entry.
 
 **[decided]** All of it is in scope, including the four that carry real design
 weight — session defaults, the setup wizard, profiles, and AI config review.

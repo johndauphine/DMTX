@@ -36,10 +36,7 @@ func TestNoSurfaceCallsARegisteredCommandUnknown(t *testing.T) {
 			commandLine := out.String() + errOut.String()
 
 			outcome := Execute(context.Background(), Request{Command: registered.Name})
-			seam := ""
-			for _, message := range outcome.Messages {
-				seam += message.Text
-			}
+			seam := saidBy(outcome)
 
 			for surface, said := range map[string]string{
 				"the command line": commandLine,
@@ -73,10 +70,7 @@ func TestUnimplementedCommandsAreCalledPlannedByBothSurfaces(t *testing.T) {
 		planned++
 
 		outcome := Execute(context.Background(), Request{Command: registered.Name})
-		seam := ""
-		for _, message := range outcome.Messages {
-			seam += message.Text
-		}
+		seam := saidBy(outcome)
 		if !strings.Contains(seam, "is planned in this stage") {
 			t.Errorf(
 				"the command line calls %q planned but Execute says %q",
@@ -122,14 +116,24 @@ func TestServeIsNotOfferedThroughTheSeam(t *testing.T) {
 	if outcome.ExitCode == Success {
 		t.Fatal("serve ran through the seam")
 	}
-	said := ""
-	for _, message := range outcome.Messages {
-		said += message.Text
-	}
+	said := saidBy(outcome)
 	if strings.Contains(said, "planned") {
 		t.Errorf("serve is reported as planned, but it exists: %q", said)
 	}
 	if !strings.Contains(said, "not available through this interface") {
 		t.Errorf("serve's refusal does not say why: %q", said)
 	}
+}
+
+// saidBy joins an Outcome's messages for substring checks.
+//
+// Newline-separated rather than run together: concatenation can manufacture a
+// match across a message boundary - two messages ending and beginning mid-word
+// - and it makes a failure unreadable, which is when the text matters most.
+func saidBy(outcome Outcome) string {
+	lines := make([]string, 0, len(outcome.Messages))
+	for _, message := range outcome.Messages {
+		lines = append(lines, message.Text)
+	}
+	return strings.Join(lines, "\n")
 }
