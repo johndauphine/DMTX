@@ -23,6 +23,7 @@ import (
 // contract.Commands, so a command added to the registry is covered the day it
 // is added rather than the day someone remembers to list it.
 func TestNoSurfaceCallsARegisteredCommandUnknown(t *testing.T) {
+	runEveryCommandSomewhereDisposable(t)
 	if len(contract.Commands) < 10 {
 		t.Fatalf(
 			"only %d registered commands; the registry is not being read",
@@ -56,6 +57,7 @@ func TestNoSurfaceCallsARegisteredCommandUnknown(t *testing.T) {
 // TestUnimplementedCommandsAreCalledPlannedByBothSurfaces pins the agreement
 // itself, not merely the absence of "unknown".
 func TestUnimplementedCommandsAreCalledPlannedByBothSurfaces(t *testing.T) {
+	runEveryCommandSomewhereDisposable(t)
 	planned := 0
 	for _, registered := range contract.Commands {
 		if registered.TUI == contract.Omitted && registered.WebUI == contract.Omitted {
@@ -121,6 +123,7 @@ func TestAnUnregisteredCommandIsStillUnknown(t *testing.T) {
 // A test that walks a collection by one field cannot hold a property of the
 // other fields, however thorough the walk looks.
 func TestAnAliasAnswersLikeTheCommandItNames(t *testing.T) {
+	runEveryCommandSomewhereDisposable(t)
 	aliases := 0
 	for _, registered := range contract.Commands {
 		for _, alias := range registered.Aliases {
@@ -249,4 +252,19 @@ func saidBy(outcome Outcome) string {
 		lines = append(lines, message.Text)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// runEveryCommandSomewhereDisposable moves a test into a temporary directory.
+//
+// These tests invoke every registered command, and not every command is a
+// reader: init writes a configuration relative to the working directory, so
+// enumerating commands from the package directory leaves a migration.yaml in
+// the source tree - which is exactly what happened, and reached a commit.
+//
+// t.Chdir rather than os.Chdir: it restores the directory itself and refuses to
+// run in a parallel test, which is the failure mode that makes hand-rolled
+// directory switching in tests a hazard to whatever runs beside it.
+func runEveryCommandSomewhereDisposable(t *testing.T) {
+	t.Helper()
+	t.Chdir(t.TempDir())
 }

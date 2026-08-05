@@ -124,23 +124,18 @@ func TestTheTemplateShipsNoPlaceholderPassword(t *testing.T) {
 
 // TestInitNamesADefaultFile pins that init with no arguments does something
 // useful rather than asking for a path the operator does not have yet.
+//
+// It checks the resolution rather than running the write. An earlier version
+// ran init with no path and changed the process's working directory to keep the
+// file out of the repository - and a stray internal/app/migration.yaml, which
+// reached a commit, is what that costs when it goes wrong. Changing
+// process-wide state for one test's benefit is a hazard to every test near it.
 func TestInitNamesADefaultFile(t *testing.T) {
-	directory := t.TempDir()
-	previous, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
+	if got := configPathFor(Request{Command: "init"}); got != defaultConfigFilename {
+		t.Errorf("init with no path would write %q, want %q", got, defaultConfigFilename)
 	}
-	if err := os.Chdir(directory); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(previous) })
-
-	outcome := executeInit(Request{Command: "init"})
-	if outcome.ExitCode != Success {
-		t.Fatalf("init with no path failed: %+v", outcome.Messages)
-	}
-	if _, err := os.Stat(filepath.Join(directory, defaultConfigFilename)); err != nil {
-		t.Errorf("init with no path wrote nothing named %s: %v", defaultConfigFilename, err)
+	if got := configPathFor(Request{Command: "init", ConfigPath: "envs/prod.yaml"}); got != "envs/prod.yaml" {
+		t.Errorf("init ignored the path it was given: %q", got)
 	}
 }
 

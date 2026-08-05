@@ -69,10 +69,7 @@ migration:
 // replacing one that should not have been is their afternoon.
 func executeInit(request Request) Outcome {
 	out := newOutcome(request.Command)
-	path := request.ConfigPath
-	if path == "" {
-		path = defaultConfigFilename
-	}
+	path := configPathFor(request)
 
 	switch _, err := os.Stat(path); {
 	case err == nil:
@@ -109,6 +106,21 @@ func executeInit(request Request) Outcome {
 	// finished yet.
 	out.out("edit it, then: dmtx validate --config " + path)
 	return out.done(Success)
+}
+
+// configPathFor is the file init will write.
+//
+// Separate from the writing so a test can check the default without running a
+// command that creates a file relative to the working directory. The test that
+// did that changed the process's directory to keep the file out of the
+// repository, and a stray migration.yaml in internal/app is what happens when
+// that goes wrong - process-wide state changed for one test's benefit is a
+// hazard to every test that runs near it.
+func configPathFor(request Request) string {
+	if request.ConfigPath != "" {
+		return request.ConfigPath
+	}
+	return defaultConfigFilename
 }
 
 // starterConfigIsValid reports whether the template dmtx ships actually parses.
