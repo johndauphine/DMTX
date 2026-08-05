@@ -121,8 +121,16 @@ func (defaults *sessionDefaults) clear(key string) error {
 // Written to a new file and renamed. That is what guarantees the mode: a mode
 // argument applies only when a file is created, so writing over an existing one
 // would keep whatever mode it had, while a file that cannot already exist has
-// nothing to inherit. The rename also means a reader sees one set of defaults
-// or the other, never half of a write.
+// nothing to inherit.
+//
+// On unix the rename also means a reader sees one set of defaults or the other
+// and never half of a write. That is a unix guarantee and is not claimed
+// elsewhere: Go's os.Rename on Windows is MoveFileEx, which replaces but can
+// refuse when the destination is open in another process, where a POSIX rename
+// would not. internal/state has a Windows-specific replacement for state that
+// must not be lost; this is a convenience file, so the weaker behaviour is
+// accepted rather than matched. A refusal surfaces as an error from set, not as
+// a half-written file.
 //
 // The Chmod below is belt and braces rather than the guarantee - os.CreateTemp
 // already creates at 0600 - and it is kept because that is a promise of a

@@ -126,16 +126,38 @@ func TestTheCommandLineIgnoresSessionDefaults(t *testing.T) {
 	// app.Execute is what the command line calls, and it has no way to reach
 	// these: they live in internal/api. The import boundary is the guarantee,
 	// so this asserts the boundary rather than a behaviour.
-	source, err := os.ReadFile("../app/app.go")
+	//
+	// Every file in the package, not just app.go. internal/app is a dozen
+	// files; scanning one of them would pass while another referenced these,
+	// which is the assertion looking thorough and holding almost nothing.
+	entries, err := os.ReadDir("../app")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(source), "sessionDefaults") ||
-		strings.Contains(string(source), "SessionConfig") {
-		t.Error(
-			"internal/app refers to session defaults; the command line would " +
-				"then act on state that does not appear in the command",
-		)
+	scanned := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") ||
+			strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		source, err := os.ReadFile(filepath.Join("../app", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		scanned++
+		for _, forbidden := range []string{"sessionDefaults", "SessionConfig", "SessionState"} {
+			if strings.Contains(string(source), forbidden) {
+				t.Errorf(
+					"internal/app/%s refers to %s; the command line would then "+
+						"act on state that does not appear in the command",
+					name, forbidden,
+				)
+			}
+		}
+	}
+	if scanned < 5 {
+		t.Fatalf("scanned only %d files in internal/app; the reader is broken", scanned)
 	}
 }
 
