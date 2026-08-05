@@ -104,6 +104,7 @@ const (
 	PayloadResumeResponse  = "resume_response"
 	PayloadConfig          = "config"
 	PayloadDiagnosis       = "diagnosis"
+	PayloadAnalysis        = "analysis"
 )
 
 // outcomeBuilder accumulates messages while an operation runs.

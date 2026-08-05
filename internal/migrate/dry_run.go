@@ -164,6 +164,43 @@ type PlannedTuning struct {
 	MemoryBudget    PlannedSetting `json:"memory_budget_bytes"`
 }
 
+// DiscloseTuning resolves the resource plan a migration would run under,
+// reading host memory evidence and nothing else. It opens no database, takes no
+// lease, and writes nothing.
+//
+// Exported so that dry run and analyze disclose the same numbers in the same
+// shape from one code path. Two paths producing "the effective plan" would be
+// two chances to disagree about it, and an operator comparing them would have
+// no way to tell which was right.
+func DiscloseTuning(ctx context.Context, cfg config.Config) (*PlannedTuning, error) {
+	resources, err := config.ResolveSystemEffectiveTransferPlan(
+		ctx,
+		cfg.Migration,
+		config.TransferPlanOptions{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("disclose tuning: %w", err)
+	}
+	fromInt := func(value config.EffectiveInt) PlannedSetting {
+		return PlannedSetting{
+			Value:      int64(value.Value),
+			Provenance: string(value.Provenance),
+		}
+	}
+	return &PlannedTuning{
+		ConnectionLimit: fromInt(resources.ConnectionLimit),
+		Workers:         fromInt(resources.Workers),
+		Readers:         fromInt(resources.Readers),
+		Writers:         fromInt(resources.Writers),
+		QueueDepth:      fromInt(resources.QueueDepth),
+		ChunkRows:       fromInt(resources.ChunkRows),
+		MemoryBudget: PlannedSetting{
+			Value:      resources.MemoryBudget.Value,
+			Provenance: string(resources.MemoryBudget.Provenance),
+		},
+	}, nil
+}
+
 // PlannedDelete discloses the configured delete policy and, when the caller
 // supplies a state path, the read-only durable due-state evidence.
 type PlannedDelete struct {
@@ -229,31 +266,9 @@ func planDryRunDisclosure(
 	ctx context.Context,
 	cfg config.Config,
 ) (*PlannedTuning, *PlannedDelete, error) {
-	resources, err := config.ResolveSystemEffectiveTransferPlan(
-		ctx,
-		cfg.Migration,
-		config.TransferPlanOptions{},
-	)
+	tuning, err := DiscloseTuning(ctx, cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("disclose dry run tuning: %w", err)
-	}
-	fromInt := func(value config.EffectiveInt) PlannedSetting {
-		return PlannedSetting{
-			Value:      int64(value.Value),
-			Provenance: string(value.Provenance),
-		}
-	}
-	tuning := &PlannedTuning{
-		ConnectionLimit: fromInt(resources.ConnectionLimit),
-		Workers:         fromInt(resources.Workers),
-		Readers:         fromInt(resources.Readers),
-		Writers:         fromInt(resources.Writers),
-		QueueDepth:      fromInt(resources.QueueDepth),
-		ChunkRows:       fromInt(resources.ChunkRows),
-		MemoryBudget: PlannedSetting{
-			Value:      resources.MemoryBudget.Value,
-			Provenance: string(resources.MemoryBudget.Provenance),
-		},
+		return nil, nil, err
 	}
 	deletes := &PlannedDelete{
 		Mode:              string(cfg.Migration.Deletes.Mode),
