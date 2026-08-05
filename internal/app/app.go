@@ -185,13 +185,17 @@ func classifyUnhandled(out *outcomeBuilder, command string) Outcome {
 			continue
 		}
 		if registered.WebUI == contract.Omitted && registered.TUI == contract.Omitted {
-			// Registered but deliberately not an interactive command. serve is
-			// the case: it starts a front end, so offering it as something a
-			// front end can run is nonsense rather than a gap.
-			return out.failWith(
-				ConfigurationError,
-				fmt.Sprintf("%s is not available through this interface", command),
-			)
+			// Registered but deliberately not something to run. The reason
+			// comes from the registry rather than from here, because Omitted
+			// covers two different situations - a command that exists but is
+			// not a front end's to run, and one that does not apply to dmtx at
+			// all - and answering both with the same sentence sends an operator
+			// looking for a flag that will never exist.
+			refusal := command + " is not available"
+			if registered.Note != "" {
+				refusal += ": " + registered.Note
+			}
+			return out.failWith(ConfigurationError, refusal)
 		}
 		out.out(command + " is planned in this stage.")
 		return out.done(Success)

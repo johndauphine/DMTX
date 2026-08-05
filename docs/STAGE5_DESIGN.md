@@ -164,7 +164,7 @@ is **not front-end work**. Nine capabilities are registered in
 | `/api/ai/config-review` | registered, unimplemented |
 | `/api/init-secrets` | registered, unimplemented |
 | `/api/setup/{prompt,start,input}` | registered, unimplemented |
-| `/api/cache/clear` | registered, unimplemented |
+| `/api/cache/clear` | **[decided]** Omitted — see below |
 | `/api/configs`, `/api/config/check` | registered, unimplemented |
 | no distinct route; part of `/api/setup/*` | `init`: registered, unimplemented |
 | `/api/session` (get, set, delete defaults) | **absent from the registry** |
@@ -179,8 +179,30 @@ weight — session defaults, the setup wizard, profiles, and AI config review.
 Commands are built before the console, so the console arrives able to render a
 whole surface rather than mostly reporting "planned".
 
-Three of those do not fit the `Request`/`Outcome` seam as it stands and need
-their own design before implementation:
+### Two commands scoped differently from DMT
+
+**[decided]** `cache` is **Omitted**, not planned. DMT's clears a type-mapping
+cache; dmtx has none, and the only thing it keeps under the user cache directory
+is lease coordination state — durable, and harmful to clear during a run. A
+command that clears nothing is worse than an absent one, because it tells an
+operator something happened. Reinstate it the day there is a cache worth
+clearing.
+
+**[decided]** `analyze` reports the **effective transfer plan and why each
+setting is what it is**, offline, using the same resolver the migration uses.
+Source-derived *suggestions* — DMT's `--apply`-able recommendations — are a
+later, separate piece. Inventing a suggestion policy now would mean dmtx
+asserting tuning advice it cannot justify from measurement. The offline report
+is distinct from `run --dry-run`'s disclosure despite the overlap: dry run
+connects to the source, and this answers "why four workers?" with no database at
+all.
+
+Both are recorded because they are reductions against DMT, and a reduction
+nobody wrote down is rediscovered as a gap.
+
+### Design needed before implementation
+
+Three do not fit the `Request`/`Outcome` seam as it stands:
 
 - **Session defaults** are not a command. DMT's `resolveOrigin` gives explicit
   argument, then session default, then built-in — state the console needs so an
