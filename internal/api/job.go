@@ -35,8 +35,9 @@ const (
 // large workload would otherwise hold tens of thousands of events for an hour
 // after it finished. Trimming costs a reconnecting client little, because every
 // progress report carries its own running tally - but only for the events that
-// restate themselves. See announcedOnce: the ones that do not are held back
-// from trimming, because losing one cannot be recovered from anything later.
+// restate themselves. See the retention labels below: the events that do not
+// restate themselves are held back from trimming, because losing one cannot be
+// recovered from anything later.
 //
 // Sequence numbers come from a counter rather than the buffer length so that
 // trimming cannot make them repeat. They are therefore not contiguous after a
