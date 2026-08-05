@@ -176,48 +176,158 @@ func TestFailedCommandIsNotAnHTTPError(t *testing.T) {
 // orchestration outcomes across surfaces. This compares the serialised Outcome
 // the API returns against the one the CLI path produces for the same Request -
 // bytes, not Go values, because bytes are what each surface actually emits.
+// TestAPIAndCLIProduceIdenticalOutcomes is the §21.1 criterion.
+//
+// It used to hold only where session defaults were switched off. newTestServer
+// builds with Options{}, so SessionPath is empty, so sessionDefaults is empty,
+// so applyTo is the identity function - and the test compared Execute(request)
+// against an API that had done nothing to request. Once the console makes
+// defaults routine the two surfaces legitimately diverge, and this would have
+// gone on passing while saying nothing about the case that had started to
+// matter.
+//
+// The claim is therefore stated against the resolved request: whatever the API
+// would run, the command line running that same thing produces the same bytes.
+// That reduces to the old assertion when no defaults are set, and is the actual
+// property when some are.
+//
+// The subtest at the bottom is what stops this becoming the same test again: it
+// asserts the configurations produce *different* bytes. Without it, a defaults
+// case that silently stopped applying defaults would pass by matching a command
+// line that also had none.
 func TestAPIAndCLIProduceIdenticalOutcomes(t *testing.T) {
-	server := newTestServer(t)
-	for _, request := range []app.Request{
+	// Paths that do not exist. Both surfaces then fail identically and the
+	// failure names the path, which is what makes an applied default visible in
+	// the bytes rather than something the test has to take on trust.
+	const defaultConfig = "session-default.yaml"
+	const defaultState = "session-default.state.db"
+
+	configurations := []struct {
+		name     string
+		defaults map[string]string
+	}{
+		{name: "no session defaults"},
+		{name: "a config default", defaults: map[string]string{SessionConfig: defaultConfig}},
+		{name: "a state default", defaults: map[string]string{SessionState: defaultState}},
+		{name: "both defaults", defaults: map[string]string{
+			SessionConfig: defaultConfig,
+			SessionState:  defaultState,
+		}},
+	}
+	requests := []app.Request{
 		{Command: "validate"},
 		{Command: "preflight"},
 		{Command: "status"},
 		{Command: "history"},
-	} {
-		t.Run(request.Command, func(t *testing.T) {
-			direct := app.Execute(context.Background(), request)
-			expected, err := json.Marshal(direct)
-			if err != nil {
-				t.Fatalf("marshal direct outcome: %v", err)
+		// Explicit paths, to pin that a default does not overwrite one. The
+		// precedence is the whole reason applyTo is not a merge.
+		{Command: "validate", ConfigPath: "explicit.yaml"},
+		{Command: "status", StatePath: "explicit.state.db"},
+	}
+
+	// Kept so the last subtest can prove the defaults did something.
+	responses := map[string][]byte{}
+
+	for _, configuration := range configurations {
+		t.Run(configuration.name, func(t *testing.T) {
+			// status and history create the state database they are pointed
+			// at, and these paths are relative, so without this the test
+			// deposits .state.db files in the package directory and they get
+			// committed. Per configuration rather than for the whole test, so
+			// one configuration's artifacts cannot change another's answers -
+			// while both surfaces within a configuration still share a
+			// directory, which is what makes their comparison meaningful.
+			t.Chdir(t.TempDir())
+			server := newTestServer(t)
+			for key, value := range configuration.defaults {
+				if err := server.defaults.set(key, value); err != nil {
+					t.Fatalf("set %s: %v", key, err)
+				}
 			}
 
-			body, err := json.Marshal(request)
-			if err != nil {
-				t.Fatalf("marshal request: %v", err)
-			}
-			httpRequest := httptest.NewRequest(
-				http.MethodPost,
-				"/api/v1/execute",
-				bytes.NewReader(body),
-			)
-			httpRequest.Header.Set("Authorization", "Bearer "+server.auth.session)
-			recorder := httptest.NewRecorder()
-			server.routes().ServeHTTP(recorder, httpRequest)
+			for _, request := range requests {
+				name := request.Command
+				if request.ConfigPath != "" || request.StatePath != "" {
+					name += " with an explicit path"
+				}
+				t.Run(name, func(t *testing.T) {
+					// The command line consults no session defaults - see
+					// applyTo - so the comparison is against what the API
+					// resolved the request to, not against what was sent.
+					direct := app.Execute(
+						context.Background(),
+						server.defaults.applyTo(request),
+					)
+					expected, err := json.Marshal(direct)
+					if err != nil {
+						t.Fatalf("marshal direct outcome: %v", err)
+					}
 
-			// The response body verbatim. Decoding and re-marshalling would
-			// normalise away exactly the differences worth catching - encoder
-			// settings, field order, whitespace - and leave a test that claims
-			// to compare emitted bytes while comparing Go values.
-			actual := bytes.TrimSpace(recorder.Body.Bytes())
-			expected = bytes.TrimSpace(expected)
-			if string(actual) != string(expected) {
-				t.Errorf(
-					"surfaces disagree for %q:\n  cli: %s\n  api: %s",
-					request.Command, expected, actual,
-				)
+					body, err := json.Marshal(request)
+					if err != nil {
+						t.Fatalf("marshal request: %v", err)
+					}
+					httpRequest := httptest.NewRequest(
+						http.MethodPost,
+						"/api/v1/execute",
+						bytes.NewReader(body),
+					)
+					httpRequest.Header.Set("Authorization", "Bearer "+server.auth.session)
+					recorder := httptest.NewRecorder()
+					server.routes().ServeHTTP(recorder, httpRequest)
+
+					// The response body verbatim. Decoding and re-marshalling
+					// would normalise away exactly the differences worth
+					// catching - encoder settings, field order, whitespace -
+					// and leave a test that claims to compare emitted bytes
+					// while comparing Go values.
+					actual := bytes.TrimSpace(recorder.Body.Bytes())
+					expected = bytes.TrimSpace(expected)
+					if string(actual) != string(expected) {
+						t.Errorf(
+							"surfaces disagree for %q:\n  cli: %s\n  api: %s",
+							request.Command, expected, actual,
+						)
+					}
+					responses[configuration.name+"/"+name] = actual
+				})
 			}
 		})
 	}
+
+	// Without this the defaults cases could pass by doing nothing.
+	t.Run("the defaults changed what ran", func(t *testing.T) {
+		for _, command := range []string{"validate", "preflight"} {
+			without := responses["no session defaults/"+command]
+			with := responses["a config default/"+command]
+			if len(without) == 0 || len(with) == 0 {
+				t.Fatalf("no recorded response for %q", command)
+			}
+			if bytes.Equal(without, with) {
+				t.Errorf(
+					"%q answered identically with and without a config default,"+
+						" so the default case proves nothing: %s",
+					command, without,
+				)
+			}
+			if !bytes.Contains(with, []byte(defaultConfig)) {
+				t.Errorf("%q did not name the default config it used: %s", command, with)
+			}
+		}
+		for _, command := range []string{"status", "history"} {
+			without := responses["no session defaults/"+command]
+			with := responses["a state default/"+command]
+			if bytes.Equal(without, with) {
+				t.Errorf("%q answered identically with and without a state default", command)
+			}
+		}
+		// And an explicit path is untouched by a default that would have
+		// filled it.
+		explicit := responses["both defaults/validate with an explicit path"]
+		if bytes.Contains(explicit, []byte(defaultConfig)) {
+			t.Errorf("a session default overwrote an explicit config path: %s", explicit)
+		}
+	})
 }
 
 // TestServeStopsWhenContextIsCancelled pins that the server shuts down rather
