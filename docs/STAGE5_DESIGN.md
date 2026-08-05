@@ -200,6 +200,54 @@ all.
 Both are recorded because they are reductions against DMT, and a reduction
 nobody wrote down is rediscovered as a gap.
 
+### Credentials
+
+**[decided]** dmtx has no secrets store today — passwords sit in
+`migration.yaml`, which is the file people share. `init-secrets` creates one at
+**`~/.secrets/dmtx/config.yaml`**.
+
+The `~/.secrets` convention comes from DMT, so an operator moving between the
+tools finds it where they expect and their backup exclusions carry over. The
+per-tool subdirectory does not: that convention predates several tools sharing
+the directory, and on this machine `~/.secrets` already holds DMT's config and
+thirty-five files belonging to a third tool.
+
+**Partitioning is what makes the protections enforceable.** dmtx owns
+`~/.secrets/dmtx` and can tighten it; it cannot tighten `~/.secrets` without
+changing permissions on other tools' files. The rule throughout is: **enforce
+what dmtx owns, report what it does not.**
+
+`os.UserHomeDir` works on Windows, so this is portable even though the
+convention is unix-flavoured. It does mean dmtx keeps its own files in two
+places: `serve.json` stays in `os.UserConfigDir`.
+
+**[decided]** Protection is **`0600`, and a refusal to load a file with group or
+world bits set** — naming the `chmod` to run. This is DMT's model
+(`internal/secrets/permissions.go`). No key to manage and nothing to lose.
+
+Being honest about what that buys: it keeps *other accounts on the machine* out.
+It does not protect against someone holding the disk — that is what full-disk
+encryption is for, and the comments should say so rather than implying more.
+
+Rejected, with reasons, so they are not re-proposed:
+
+- **Passphrase encryption.** Prompting on every command that touches credentials
+  breaks unattended runs, and a passphrase cached to avoid that is a file on
+  disk again.
+- **OS keychain.** Strongest, and what a desktop tool's users expect — but three
+  implementations, awkward on the server-next-to-the-database deployment, and
+  hard to test without mocking the platform.
+
+DMT stores an AES-GCM master key *inside* that `0600` file and uses it to
+encrypt **profiles**. So encryption there protects profiles that move, not the
+file itself. Carry that split into the profiles work rather than inventing a
+different one.
+
+**A writer with no reader is the `cache` problem in reverse.** `init-secrets`
+has to land with the loader and the wiring into endpoint resolution, so a
+password absent from `migration.yaml` is taken from the store. Otherwise it
+creates a file nothing consumes.
+
 ### Design needed before implementation
 
 Three do not fit the `Request`/`Outcome` seam as it stands:
