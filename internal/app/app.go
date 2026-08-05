@@ -48,6 +48,30 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	return outcome.ExitCode
 }
 
+// ParseRequest turns argv into a Request, for a surface that has words to parse
+// but no command line to have parsed them.
+//
+// Exported so the browser console does not have to reimplement it. The flag
+// rules are not decoration: run refuses a repeated --config, diagnose refuses an
+// unknown flag rather than skipping it, resume refuses --abandon without a
+// reason. Every one of those is a wrong answer prevented, and a second
+// implementation in JavaScript would be a second place for them to be subtly
+// different - unreachable by any Go test, which is where every other rule in
+// this package is held.
+//
+// It is also what gives the §21.1 parity criterion something to stand on.
+// Before this, "both surfaces offer the same commands" was a claim about two
+// separate parsers agreeing. Now there is one parser, and agreement is not a
+// thing that can lapse.
+//
+// dispatched=false means argv answered itself - version, help, an unknown
+// command - and the Outcome holds what to say. There is nothing to Execute in
+// that case, and a caller that executes anyway will be told the command is
+// unknown.
+func ParseRequest(args []string) (Request, Outcome, bool) {
+	return parseRequest(args)
+}
+
 // parseRequest turns argv into a Request. It returns dispatched=false for the
 // cases that are answered by argv alone - version, help, an unknown command -
 // because those have no orchestration to perform and should not pretend to.
