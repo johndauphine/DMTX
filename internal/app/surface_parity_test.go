@@ -3,10 +3,13 @@ package app
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/johndauphine/dmtx/internal/contract"
+	"github.com/johndauphine/dmtx/internal/secrets"
 )
 
 // TestNoSurfaceCallsARegisteredCommandUnknown is the parity criterion applied
@@ -254,17 +257,84 @@ func saidBy(outcome Outcome) string {
 	return strings.Join(lines, "\n")
 }
 
-// runEveryCommandSomewhereDisposable moves a test into a temporary directory.
+// runEveryCommandSomewhereDisposable isolates a test from the real machine.
 //
 // These tests invoke every registered command, and not every command is a
-// reader: init writes a configuration relative to the working directory, so
-// enumerating commands from the package directory leaves a migration.yaml in
-// the source tree - which is exactly what happened, and reached a commit.
+// reader. Two have caught me out, in the same way and a day apart:
 //
-// t.Chdir rather than os.Chdir: it restores the directory itself and refuses to
-// run in a parallel test, which is the failure mode that makes hand-rolled
-// directory switching in tests a hazard to whatever runs beside it.
+//   - init writes a configuration relative to the working directory, so
+//     enumerating commands from the package directory left a migration.yaml in
+//     the source tree. That reached a commit.
+//   - init-secrets writes to ~/.secrets, which the working directory does not
+//     govern at all. That reached the author's actual home directory, alongside
+//     their real credentials for two other tools.
+//
+// The second is the lesson: redirecting the working directory looked like
+// isolation and was not, because the next command derived its path from
+// somewhere else entirely. A test that enumerates commands has to assume the
+// next one added will reach somewhere new, so both the directory and the home
+// are moved rather than only the one that has bitten so far.
+//
+// t.Chdir and t.Setenv rather than the os equivalents: they restore themselves
+// and refuse to run in a parallel test, which is the failure mode that makes
+// hand-rolled process-state changes a hazard to whatever runs beside them.
 func runEveryCommandSomewhereDisposable(t *testing.T) {
 	t.Helper()
-	t.Chdir(t.TempDir())
+	elsewhere := t.TempDir()
+	t.Chdir(elsewhere)
+	// os.UserHomeDir reads HOME on unix and USERPROFILE on Windows.
+	t.Setenv("HOME", elsewhere)
+	t.Setenv("USERPROFILE", elsewhere)
+}
+
+// TestTheIsolationActuallyIsolates holds the helper above to its claim.
+//
+// Redirecting the working directory looked like isolation until a command
+// derived its path from the home directory instead, and the file landed beside
+// the author's real credentials. So the isolation is checked rather than
+// assumed, and checked against a path a command actually computes rather than
+// only against the environment it reads.
+//
+// This cannot catch a future command that derives a path from somewhere neither
+// of these covers. Nothing here can. What it can do is fail the moment the
+// redirection stops working, instead of the moment somebody notices a file in
+// their home directory.
+func TestTheIsolationActuallyIsolates(t *testing.T) {
+	realHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	realWorkingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runEveryCommandSomewhereDisposable(t)
+
+	isolatedHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isolatedHome == realHome {
+		t.Errorf("the home directory is not redirected; it is still %s", realHome)
+	}
+	isolatedWorkingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isolatedWorkingDirectory == realWorkingDirectory {
+		t.Errorf("the working directory is not redirected; it is still %s", realWorkingDirectory)
+	}
+
+	// The path a command computes, not merely the environment it reads.
+	secretsPath, err := secrets.Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(secretsPath, realHome+string(filepath.Separator)) {
+		t.Errorf(
+			"init-secrets would write to %s, inside the real home directory",
+			secretsPath,
+		)
+	}
 }

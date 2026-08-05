@@ -137,6 +137,14 @@ func parseRequest(args []string) (Request, Outcome, bool) {
 			), false
 		}
 		return request, Outcome{}, true
+	case "init-secrets":
+		if len(args) > 2 || (len(args) == 2 && args[1] != "--force") {
+			return Request{}, out.failWith(
+				ConfigurationError,
+				"usage: dmtx init-secrets [--force]",
+			), false
+		}
+		return Request{Command: "init-secrets", Force: len(args) == 2}, Outcome{}, true
 	case "diagnose":
 		request, ok := diagnoseArguments(args[1:])
 		if !ok {
@@ -291,6 +299,8 @@ func ExecuteWithProgress(
 		return executeAnalyze(ctx, request)
 	case "init":
 		return executeInit(request)
+	case "init-secrets":
+		return executeInitSecrets(request)
 	case "run":
 		return executeRun(ctx, request, reporter)
 	case "resume":
