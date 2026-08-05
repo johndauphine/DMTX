@@ -123,14 +123,12 @@ func parseRequest(args []string) (Request, Outcome, bool) {
 		}
 		return request, Outcome{}, true
 	case "diagnose":
-		request := Request{Command: "diagnose"}
-		for index := 1; index+1 < len(args); index += 2 {
-			switch args[index] {
-			case "--state":
-				request.StatePath = args[index+1]
-			case "--run":
-				request.RunID = args[index+1]
-			}
+		request, ok := diagnoseArguments(args[1:])
+		if !ok {
+			return Request{}, out.failWith(
+				ConfigurationError,
+				"usage: dmtx diagnose --state migration.yaml.state.db [--run ID]",
+			), false
 		}
 		return request, Outcome{}, true
 	case "preflight", "health-check":
@@ -144,6 +142,33 @@ func parseRequest(args []string) (Request, Outcome, bool) {
 	default:
 		return Request{}, classifyUnhandled(out, args[0]), false
 	}
+}
+
+// diagnoseArguments reads diagnose's flags, refusing anything it does not know.
+//
+// Refusing matters more here than the flags do. Skipping an unrecognised flag
+// would make "dmtx diagnose --state X --ruun abc" diagnose a different run than
+// the operator asked about and say nothing about it - a wrong answer delivered
+// confidently, which is worse than the error they would have fixed in seconds.
+func diagnoseArguments(args []string) (Request, bool) {
+	request := Request{Command: "diagnose"}
+	for index := 0; index < len(args); index++ {
+		var target *string
+		switch args[index] {
+		case "--state":
+			target = &request.StatePath
+		case "--run":
+			target = &request.RunID
+		default:
+			return Request{}, false
+		}
+		if index+1 >= len(args) || *target != "" {
+			return Request{}, false
+		}
+		*target = args[index+1]
+		index++
+	}
+	return request, true
 }
 
 // classifyUnhandled answers for a command no surface implements yet.

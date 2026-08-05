@@ -120,6 +120,84 @@ func TestDiagnoseCountsWhatSurvivesAResume(t *testing.T) {
 	}
 }
 
+// TestATableWithNoRowsIsNotCountedAsStarted pins the distinction the tally
+// claims to make.
+//
+// Every task is created with status "running" before any work begins, so status
+// alone cannot separate a table that transferred rows from one that was never
+// reached. Reading it from status made the tally confidently wrong in the
+// direction that matters: an interrupted run looked further along than it was.
+func TestATableWithNoRowsIsNotCountedAsStarted(t *testing.T) {
+	now := time.Now().UTC()
+	path := diagnosisFixture(t,
+		[]state.Run{{ID: "run", Outcome: state.Partial, Resumable: true, StartedAt: now}},
+		[]state.Task{
+			{RunID: "run", Table: "done", StartedAt: now},
+			{RunID: "run", Table: "partial", StartedAt: now},
+			{RunID: "run", Table: "frontier_only", StartedAt: now},
+			{RunID: "run", Table: "never_reached", StartedAt: now},
+		},
+	)
+	store := state.SQLiteStore{Path: path}
+	if err := store.CompleteTask("run", "done", 100, now); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	// Rows recorded against one table, which is the ordinary evidence that
+	// work began.
+	if err := store.AdvanceIntegerKeysetTask("run", "partial", 50, 500); err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+	// And a frontier acknowledged with no rows behind it, which happens when a
+	// page's rows are all filtered out. The engine has been through that part
+	// of the table, so the table has started even though nothing moved.
+	if err := store.AdvanceIntegerKeysetTask("run", "frontier_only", 0, 900); err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+
+	_, diagnosis := diagnosisOf(t, Request{Command: "diagnose", StatePath: path})
+	if diagnosis.Tables.Completed != 1 {
+		t.Errorf("completed = %d, want 1", diagnosis.Tables.Completed)
+	}
+	if diagnosis.Tables.InProgress != 2 {
+		t.Errorf(
+			"in progress = %d, want 2 - the table with rows and the one with a "+
+				"frontier acknowledged but no rows behind it",
+			diagnosis.Tables.InProgress,
+		)
+	}
+	if diagnosis.Tables.NotStarted != 1 {
+		t.Errorf(
+			"not started = %d, want 1 - a task row is written for every table "+
+				"before any work begins, so its presence is not evidence of progress",
+			diagnosis.Tables.NotStarted,
+		)
+	}
+}
+
+// TestDiagnoseRefusesFlagsItDoesNotKnow pins that a typo is refused rather than
+// skipped.
+//
+// Skipping "--ruun abc" would diagnose a different run than the operator asked
+// about and say nothing - a wrong answer delivered confidently, which is worse
+// than the error they would have fixed in seconds.
+func TestDiagnoseRefusesFlagsItDoesNotKnow(t *testing.T) {
+	if _, ok := diagnoseArguments([]string{"--state", "s.db", "--run", "abc"}); !ok {
+		t.Fatal("diagnose refused its own flags")
+	}
+	for _, refused := range [][]string{
+		{"--state", "s.db", "--ruun", "abc"},
+		{"--state"},
+		{"--state", "s.db", "--run"},
+		{"--state", "s.db", "--state", "other.db"},
+		{"s.db"},
+		{"--state", "s.db", "extra"},
+	} {
+		if _, ok := diagnoseArguments(refused); ok {
+			t.Errorf("diagnose accepted %v", refused)
+		}
+	}
+}
+
 // TestDiagnoseSaysWhatToDoNext pins that every diagnosis ends with an action,
 // because "it failed" without "so do this" leaves the operator where they
 // started.
@@ -201,7 +279,7 @@ func TestDiagnoseNamesOnlyASampleOfAWideMigration(t *testing.T) {
 		t.Error("the list was cut without saying so, which reads as a short problem")
 	}
 	// The full count must still be visible, or the cap hides the scale.
-	if diagnosis.Tables.Started+diagnosis.Tables.Untouched != len(tasks) {
+	if diagnosis.Tables.InProgress+diagnosis.Tables.NotStarted != len(tasks) {
 		t.Errorf("the tally lost tables: %+v", diagnosis.Tables)
 	}
 }
@@ -249,7 +327,7 @@ func TestDiagnosisPayloadWireShape(t *testing.T) {
 
 	for _, path := range []string{
 		"run", "run.id", "run.outcome", "run.resumable", "run.resumability_reason",
-		"tables", "tables.total", "tables.completed", "tables.started", "tables.untouched",
+		"tables", "tables.total", "tables.completed", "tables.in_progress", "tables.not_started",
 		"incomplete", "findings", "next_step",
 	} {
 		if !present[path] {

@@ -36,11 +36,18 @@ type Diagnosis struct {
 }
 
 // TableTally counts a run's tables by how far each got.
+//
+// The split between started and not started is read from recorded progress,
+// not from task status. Every task is created with status "running" before any
+// work begins, so status alone cannot tell a table that transferred half a
+// million rows from one that was never reached - and a tally that claimed to
+// would be confidently wrong in the direction that matters, making an
+// interrupted run look further along than it was.
 type TableTally struct {
-	Total     int `json:"total"`
-	Completed int `json:"completed"`
-	Started   int `json:"started"`
-	Untouched int `json:"untouched"`
+	Total      int `json:"total"`
+	Completed  int `json:"completed"`
+	InProgress int `json:"in_progress"`
+	NotStarted int `json:"not_started"`
 }
 
 // maxNamedIncompleteTables bounds the named sample. A list longer than this is
@@ -127,14 +134,14 @@ func diagnose(run state.Run, tasks []state.Task) Diagnosis {
 	var incomplete []string
 	for _, task := range tasks {
 		diagnosis.Tables.Total++
-		switch task.Status {
-		case "completed":
+		switch {
+		case task.Status == "completed":
 			diagnosis.Tables.Completed++
-		case "running":
-			diagnosis.Tables.Started++
+		case startedWork(task):
+			diagnosis.Tables.InProgress++
 			incomplete = append(incomplete, task.Table)
 		default:
-			diagnosis.Tables.Untouched++
+			diagnosis.Tables.NotStarted++
 			incomplete = append(incomplete, task.Table)
 		}
 	}
@@ -148,6 +155,17 @@ func diagnose(run state.Run, tasks []state.Task) Diagnosis {
 
 	diagnosis.Findings, diagnosis.NextStep = interpret(run, diagnosis.Tables)
 	return diagnosis
+}
+
+// startedWork reports whether a task got anywhere before the run stopped.
+//
+// Rows or a watermark are the only durable evidence of that. A task row alone
+// proves the table was planned, since one is written for every table before the
+// first byte moves.
+func startedWork(task state.Task) bool {
+	return task.RowsDone > 0 ||
+		task.IntegerWatermark != nil ||
+		task.RowNumberWatermark != nil
 }
 
 // interpret states what happened and what to do, in that order.
@@ -195,7 +213,7 @@ func (diagnosis Diagnosis) lines() []string {
 			heading = fmt.Sprintf(
 				"incomplete tables (first %d of %d):",
 				len(diagnosis.Incomplete),
-				diagnosis.Tables.Started+diagnosis.Tables.Untouched,
+				diagnosis.Tables.InProgress+diagnosis.Tables.NotStarted,
 			)
 		}
 		lines = append(lines, heading)
