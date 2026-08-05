@@ -248,6 +248,44 @@ has to land with the loader and the wiring into endpoint resolution, so a
 password absent from `migration.yaml` is taken from the store. Otherwise it
 creates a file nothing consumes.
 
+### Profiles
+
+**[decided]** A profile is a whole configuration saved under a name, referenced
+as `--profile NAME` where a config path would go. That is DMT's model and it
+carries over unchanged.
+
+**Storage: SQLite at `~/.secrets/dmtx/profiles.db`.** Matching DMT's shape means
+its behaviour and edge cases carry over rather than being rediscovered. One file
+to back up, and replacing several profiles is atomic. It sits in the directory
+dmtx owns and enforces at `0700`, not in the per-migration state database, which
+is the wrong lifetime — profiles outlive any one migration.
+
+**Sealing: AES-GCM under a master key**, with a versioned cipher prefix so the
+format can change later. The key comes from the environment or
+`~/.secrets/dmtx/config.yaml`, which is why that file's `encryption:` section
+exists. An absent key is generated on first seal and written back — and the
+write must preserve the rest of the file, because losing the key makes every
+stored profile unrecoverable. DMT guards this explicitly; carry the guard.
+
+**Export re-encrypts under a passphrase supplied at export time.** The exported
+file is portable to another machine without the master key ever leaving this
+one: the recipient needs only the passphrase. Plaintext export was rejected —
+§21.2 exists to stop credentials being written to an arbitrary path in the
+clear, and "export" is exactly where an operator would expect that to be fine.
+
+Open sub-decisions, to settle when this is built rather than in passing:
+
+- **Which key-derivation function** turns the passphrase into a key. Argon2id or
+  scrypt, both from `golang.org/x/crypto`, which is a new dependency for a
+  module that currently has almost none. PBKDF2 is in `x/crypto` too and is the
+  weakest of the three. Whichever is chosen, the parameters belong in the file
+  format so they can be raised later without breaking old exports.
+- **How the passphrase reaches dmtx.** A flag puts it in shell history; a prompt
+  breaks unattended use; an environment variable is the usual compromise and is
+  visible in a process listing on some systems.
+- **Whether import exists.** An export nothing can read is a backup, not a
+  transfer. If import is in scope, it is the same decisions in reverse.
+
 ### Design needed before implementation
 
 Three do not fit the `Request`/`Outcome` seam as it stands:
