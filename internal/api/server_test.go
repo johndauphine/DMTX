@@ -297,12 +297,25 @@ func TestAPIAndCLIProduceIdenticalOutcomes(t *testing.T) {
 
 	// Without this the defaults cases could pass by doing nothing.
 	t.Run("the defaults changed what ran", func(t *testing.T) {
-		for _, command := range []string{"validate", "preflight"} {
-			without := responses["no session defaults/"+command]
-			with := responses["a config default/"+command]
-			if len(without) == 0 || len(with) == 0 {
-				t.Fatalf("no recorded response for %q", command)
+		// Every lookup goes through this, because a missing key is the way
+		// this subtest would fail to do its job while reporting that it had.
+		// bytes.Contains(nil, x) is false and bytes.Equal(nil, x) is false, so
+		// a key that was never recorded - a renamed subtest, an early
+		// t.Fatalf - reads as "the default did not leak" and "the answers
+		// differed". Both are the conclusion this test exists to reach, drawn
+		// from no evidence.
+		recorded := func(key string) []byte {
+			t.Helper()
+			response, ok := responses[key]
+			if !ok || len(response) == 0 {
+				t.Fatalf("no recorded response for %q", key)
 			}
+			return response
+		}
+
+		for _, command := range []string{"validate", "preflight"} {
+			without := recorded("no session defaults/" + command)
+			with := recorded("a config default/" + command)
 			if bytes.Equal(without, with) {
 				t.Errorf(
 					"%q answered identically with and without a config default,"+
@@ -315,17 +328,31 @@ func TestAPIAndCLIProduceIdenticalOutcomes(t *testing.T) {
 			}
 		}
 		for _, command := range []string{"status", "history"} {
-			without := responses["no session defaults/"+command]
-			with := responses["a state default/"+command]
+			without := recorded("no session defaults/" + command)
+			with := recorded("a state default/" + command)
 			if bytes.Equal(without, with) {
 				t.Errorf("%q answered identically with and without a state default", command)
+			}
+			// Named differently from the config case above, because the
+			// evidence is different. status and history do not echo the path;
+			// with no state they answer with usage and a non-zero exit, and
+			// with one they succeed against a database that has no runs yet.
+			// Going from refusal to success is what shows the default arrived.
+			if !bytes.Contains(without, []byte(`"exit_code":1`)) {
+				t.Errorf("%q without a state default did not refuse: %s", command, without)
+			}
+			if !bytes.Contains(with, []byte(`"exit_code":0`)) {
+				t.Errorf("%q with a state default did not succeed: %s", command, with)
 			}
 		}
 		// And an explicit path is untouched by a default that would have
 		// filled it.
-		explicit := responses["both defaults/validate with an explicit path"]
+		explicit := recorded("both defaults/validate with an explicit path")
 		if bytes.Contains(explicit, []byte(defaultConfig)) {
 			t.Errorf("a session default overwrote an explicit config path: %s", explicit)
+		}
+		if !bytes.Contains(explicit, []byte("explicit.yaml")) {
+			t.Errorf("the explicit config path is not in the answer: %s", explicit)
 		}
 	})
 }
