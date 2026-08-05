@@ -122,6 +122,12 @@ func parseRequest(args []string) (Request, Outcome, bool) {
 			request.ConfigPath = args[2]
 		}
 		return request, Outcome{}, true
+	case "analyze":
+		request := Request{Command: "analyze"}
+		if len(args) == 3 && args[1] == "--config" {
+			request.ConfigPath = args[2]
+		}
+		return request, Outcome{}, true
 	case "diagnose":
 		request, ok := diagnoseArguments(args[1:])
 		if !ok {
@@ -249,6 +255,8 @@ func ExecuteWithProgress(
 		return executeConfig(request)
 	case "diagnose":
 		return executeDiagnose(request)
+	case "analyze":
+		return executeAnalyze(ctx, request)
 	case "run":
 		return executeRun(ctx, request, reporter)
 	case "resume":
