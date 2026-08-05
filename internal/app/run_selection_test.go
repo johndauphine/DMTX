@@ -23,13 +23,19 @@ func writeRunnableSQLiteConfig(t *testing.T, directory string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Cleanup rather than a Close after the Exec below: that Exec can t.Fatal,
+	// and a Close placed after it would be skipped on exactly the path where
+	// the handle would otherwise be held for the rest of the run. The migration
+	// opens its own connection, so leaving this one open until the test ends
+	// costs nothing.
+	t.Cleanup(func() { _ = source.Close() })
 	if _, err := source.Exec(
 		`CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);` +
 			` INSERT INTO notes (body) VALUES ('first')`,
 	); err != nil {
 		t.Fatal(err)
 	}
-	source.Close()
+
 	configuration := "source:\n  type: sqlite\n  database: " + sourcePath +
 		"\ntarget:\n  type: sqlite\n  database: " + targetPath + "\n"
 	if err := os.WriteFile(configPath, []byte(configuration), 0o600); err != nil {

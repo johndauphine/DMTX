@@ -15,6 +15,12 @@ package app
 // in the same edit. Both were duplicated across two files before this - the
 // parser's copy and the executor's - which is two places to update and one to
 // forget.
+//
+// The --state example is a .yaml deliberately, though the derived default is
+// .state.db. state.NewBackend selects the YAML store for .yaml and .yml and
+// SQLite for everything else, so the example shows the thing --state is for:
+// naming a state file the default would not have produced. An example matching
+// the default would demonstrate only what happens without the flag.
 const runUsage = "usage: dmtx run --config migration.yaml " +
 	"[--state migration.state.yaml] [--dry-run] [--acknowledge-destructive]"
 
