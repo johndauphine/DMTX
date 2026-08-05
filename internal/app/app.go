@@ -180,18 +180,22 @@ func diagnoseArguments(args []string) (Request, bool) {
 // forbids. Restating the rule in two places is how that happened; there is one
 // place now.
 func classifyUnhandled(out *outcomeBuilder, command string) Outcome {
-	for _, registered := range contract.Commands {
-		if registered.Name != command {
-			continue
-		}
+	// Resolve, not a name comparison: aliases are registry entries too, and
+	// looking up only names made "webui" unknown while "serve", which it is an
+	// alias of, was refused with a reason.
+	if registered, ok := contract.Resolve(command); ok {
 		if registered.WebUI == contract.Omitted && registered.TUI == contract.Omitted {
-			// Registered but deliberately not an interactive command. serve is
-			// the case: it starts a front end, so offering it as something a
-			// front end can run is nonsense rather than a gap.
-			return out.failWith(
-				ConfigurationError,
-				fmt.Sprintf("%s is not available through this interface", command),
-			)
+			// Registered but deliberately not something to run. The reason
+			// comes from the registry rather than from here, because Omitted
+			// covers two different situations - a command that exists but is
+			// not a front end's to run, and one that does not apply to dmtx at
+			// all - and answering both with the same sentence sends an operator
+			// looking for a flag that will never exist.
+			refusal := command + " is not available"
+			if registered.Note != "" {
+				refusal += ": " + registered.Note
+			}
+			return out.failWith(ConfigurationError, refusal)
 		}
 		out.out(command + " is planned in this stage.")
 		return out.done(Success)
@@ -226,6 +230,14 @@ func ExecuteWithProgress(
 	progress ProgressFunc,
 ) Outcome {
 	reporter := newProgressReporter(progress)
+	// An alias is canonicalised before dispatch, the way parseRequest already
+	// does it for argv. Without this the seam refused "health-check" as unknown
+	// while the command line accepted it, so the two surfaces disagreed about
+	// what dmtx can do - and the Outcome would name a command nothing else
+	// downstream recognises.
+	if resolved, ok := contract.Resolve(request.Command); ok {
+		request.Command = resolved.Name
+	}
 	switch request.Command {
 	case "validate":
 		return executeValidate(ctx, request)

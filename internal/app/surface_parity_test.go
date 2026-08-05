@@ -109,19 +109,132 @@ func TestAnUnregisteredCommandIsStillUnknown(t *testing.T) {
 	}
 }
 
-// TestServeIsNotOfferedThroughTheSeam pins the one registered command a front
-// end must not be able to run: it is what starts a front end.
-func TestServeIsNotOfferedThroughTheSeam(t *testing.T) {
-	outcome := Execute(context.Background(), Request{Command: "serve"})
-	if outcome.ExitCode == Success {
-		t.Fatal("serve ran through the seam")
+// TestAnAliasAnswersLikeTheCommandItNames pins that a registered alias is not a
+// second-class spelling.
+//
+// "health-check" is an alias of preflight. The command line accepted it and the
+// seam called it unknown, so the two surfaces disagreed about what dmtx can do -
+// the thing the parity criterion forbids, and the thing the parity test above
+// was written to catch. It did not, because it iterates contract.Commands by
+// Name, and aliases are registry entries the name loop never visits.
+//
+// A test that walks a collection by one field cannot hold a property of the
+// other fields, however thorough the walk looks.
+func TestAnAliasAnswersLikeTheCommandItNames(t *testing.T) {
+	aliases := 0
+	for _, registered := range contract.Commands {
+		for _, alias := range registered.Aliases {
+			aliases++
+			t.Run(alias, func(t *testing.T) {
+				byAlias := Execute(context.Background(), Request{Command: alias})
+				byName := Execute(context.Background(), Request{Command: registered.Name})
+
+				if strings.Contains(saidBy(byAlias), "unknown command") {
+					t.Fatalf(
+						"the registered alias %q of %q is refused as unknown: %q",
+						alias, registered.Name, saidBy(byAlias),
+					)
+				}
+				if byAlias.ExitCode != byName.ExitCode {
+					t.Errorf(
+						"%q exits %d but %q exits %d",
+						alias, byAlias.ExitCode, registered.Name, byName.ExitCode,
+					)
+				}
+				// The Outcome names the canonical command, so nothing
+				// downstream has to know the alias exists - which is the rule
+				// parseRequest already follows for argv.
+				if byAlias.Command != registered.Name {
+					t.Errorf(
+						"an outcome for %q names the command %q; it should be canonicalised to %q",
+						alias, byAlias.Command, registered.Name,
+					)
+				}
+			})
+		}
 	}
-	said := saidBy(outcome)
-	if strings.Contains(said, "planned") {
-		t.Errorf("serve is reported as planned, but it exists: %q", said)
+	if aliases == 0 {
+		t.Fatal("no command has an alias, so this test proved nothing")
 	}
-	if !strings.Contains(said, "not available through this interface") {
-		t.Errorf("serve's refusal does not say why: %q", said)
+}
+
+// TestTheRegistryIsValid pins that the runtime guard actually holds the
+// invariants, rather than leaving them to tests that production never runs.
+func TestTheRegistryIsValid(t *testing.T) {
+	if !contract.Valid() {
+		t.Fatal("the command registry is invalid")
+	}
+}
+
+// TestCacheIsOmittedBecauseThereIsNothingToClear pins the decision itself.
+//
+// The test below iterates the Omitted commands, so it cannot hold membership of
+// that set: flipping cache back to Planned drops it out of the loop and passes,
+// which is exactly what happened until this test existed. A decision that stops
+// being checked the moment it is reversed is not being checked.
+//
+// DMT's cache command clears a type-mapping cache. dmtx has none, and the only
+// thing it keeps under the user cache directory is lease coordination state,
+// which is durable and would be harmful to clear during a run. If dmtx gains a
+// cache worth clearing, change this deliberately.
+func TestCacheIsOmittedBecauseThereIsNothingToClear(t *testing.T) {
+	for _, registered := range contract.Commands {
+		if registered.Name != "cache" {
+			continue
+		}
+		if registered.TUI != contract.Omitted || registered.WebUI != contract.Omitted {
+			t.Fatalf(
+				"cache is offered as %s/%s, but dmtx has no cache to clear. "+
+					"A command that clears nothing tells an operator something "+
+					"happened. If dmtx now has a cache, say so here.",
+				registered.TUI, registered.WebUI,
+			)
+		}
+		return
+	}
+	t.Fatal("cache is no longer registered at all, which is a different decision again")
+}
+
+// TestAnOmittedCommandIsRefusedWithItsOwnReason pins that a command dmtx will
+// not run says why, in its own words.
+//
+// Omitted covers two different situations - serve exists but is not a front
+// end's to run, cache does not apply to dmtx at all - and one sentence for both
+// sends an operator looking for a flag that will never exist. The reason lives
+// in the registry beside the disposition, so a command marked Omitted without
+// one fails here rather than shipping a refusal that explains nothing.
+func TestAnOmittedCommandIsRefusedWithItsOwnReason(t *testing.T) {
+	omitted := 0
+	for _, registered := range contract.Commands {
+		if registered.TUI != contract.Omitted || registered.WebUI != contract.Omitted {
+			continue
+		}
+		omitted++
+		t.Run(registered.Name, func(t *testing.T) {
+			if registered.Note == "" {
+				t.Fatalf(
+					"%s is Omitted with no Note, so its refusal cannot say why",
+					registered.Name,
+				)
+			}
+			outcome := Execute(context.Background(), Request{Command: registered.Name})
+			if outcome.ExitCode == Success {
+				t.Fatalf("%s ran through the seam", registered.Name)
+			}
+			said := saidBy(outcome)
+			if strings.Contains(said, "planned") {
+				t.Errorf("%s is reported as planned, but it is omitted: %q", registered.Name, said)
+			}
+			if !strings.Contains(said, registered.Note) {
+				t.Errorf(
+					"the refusal for %s does not carry its reason %q: %q",
+					registered.Name, registered.Note, said,
+				)
+			}
+		})
+	}
+	if omitted == 0 {
+		t.Fatal("no command is Omitted, so this test proved nothing")
 	}
 }
 
