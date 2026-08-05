@@ -36,6 +36,10 @@ func RunCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	options.Root = completionRoot(options)
 	path, pathErr := statePath()
+	// Beside serve.json, in the directory dmtx already keeps its own state in.
+	if pathErr == nil {
+		options.SessionPath = filepath.Join(filepath.Dir(path), "session.json")
+	}
 
 	// A server is already running unless proven otherwise. Starting a second
 	// one would leave the operator with two consoles onto the same databases

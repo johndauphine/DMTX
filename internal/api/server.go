@@ -50,6 +50,10 @@ type Options struct {
 	// guess about intent, and a guess with no way to override it is a trap.
 	NewInstance bool
 
+	// SessionPath is where console defaults are remembered. Empty keeps them in
+	// memory only, which is what a caller that is not the serve command wants.
+	SessionPath string
+
 	// Root confines @ path completion. Empty disables completion rather than
 	// widening it: an endpoint that enumerates the filesystem is worth having
 	// only when someone has said which part of it.
@@ -75,6 +79,11 @@ type Server struct {
 
 	// root bounds @ path completion. Nil means completion is off.
 	root *pathRoot
+
+	// defaults are the paths a console operator would otherwise retype into
+	// every command. Held here rather than in internal/app because the command
+	// line deliberately does not consult them.
+	defaults *sessionDefaults
 
 	// jobs holds every command this server has started. Commands run here
 	// rather than inside a handler so that losing the client does not lose the
@@ -146,6 +155,7 @@ func New(options Options) (*Server, error) {
 		}
 	}
 	server.jobs = newJobs(&server.activity)
+	server.defaults = newSessionDefaults(options.SessionPath)
 
 	// Started now rather than left at the zero time, or a server that has not
 	// yet had its first request would look infinitely idle and the watchdog
@@ -226,6 +236,15 @@ func (server *Server) routes() http.Handler {
 	))
 	mux.Handle("GET /api/v1/configs", server.auth.require(
 		http.HandlerFunc(server.configs),
+	))
+	mux.Handle("GET /api/v1/session", server.auth.require(
+		http.HandlerFunc(server.session),
+	))
+	mux.Handle("POST /api/v1/session", server.auth.require(
+		http.HandlerFunc(server.setSession),
+	))
+	mux.Handle("DELETE /api/v1/session/{key}", server.auth.require(
+		http.HandlerFunc(server.clearSession),
 	))
 	mux.Handle("POST /api/v1/jobs", server.auth.require(
 		http.HandlerFunc(server.startJob),
