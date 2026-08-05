@@ -82,7 +82,10 @@ func (server *Server) decodeRequest(
 		})
 		return app.Request{}, false
 	}
-	return decoded, true
+	// Session defaults fill in what the request did not say, and only here.
+	// The command line resolves its own arguments and never consults these, so
+	// a destructive command typed in a terminal always names what it acts on.
+	return server.defaults.applyTo(decoded), true
 }
 
 // commands reports the command registry, so a front end can build its own
