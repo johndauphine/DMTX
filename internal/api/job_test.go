@@ -494,7 +494,7 @@ func TestAJobNeverReportsEndingBeforeItsFinishedEventExists(t *testing.T) {
 			done:    make(chan struct{}),
 			cancel:  func() {},
 		}
-		running.emit(eventStarted, nil)
+		running.emit(eventStarted, nil, announcedOnce)
 
 		violations := make(chan string, 1)
 		watching := make(chan struct{})
@@ -604,9 +604,9 @@ func TestTheEventBufferIsBounded(t *testing.T) {
 		done:    make(chan struct{}),
 		cancel:  func() {},
 	}
-	running.emit(eventStarted, nil)
+	running.emit(eventStarted, nil, announcedOnce)
 	for index := 0; index < maxRetainedEvents*2; index++ {
-		running.emit(eventProgress, nil)
+		running.emit(eventProgress, nil, trimmable)
 	}
 
 	events, _, _ := running.next(0)
@@ -690,4 +690,93 @@ func statusOf(t *testing.T, server *Server, id string) map[string]any {
 		t.Fatalf("decode status: %v", err)
 	}
 	return body
+}
+
+// TestTrimmingKeepsThePlannedTableSet is the claim in docs/STAGE5_DESIGN.md
+// stated where it can fail: "a client that missed events can still render
+// correctly from one recent event".
+//
+// That was true of Done and Total, which every report restates, and false of
+// the planned table set, which is sent once. Trimming kept events[0] and
+// nothing else, so on any migration wide enough to trim - about a thousand
+// tables, since each emits two events - a reconnecting client got the run's
+// tail with no idea which tables were in it.
+//
+// Driven through reportProgress rather than emit, because the decision this
+// protects is the one reportProgress makes. Calling emit directly would pass
+// with that decision deleted.
+func TestTrimmingKeepsThePlannedTableSet(t *testing.T) {
+	running := &job{
+		id:      "under-test",
+		changed: make(chan struct{}),
+		done:    make(chan struct{}),
+		cancel:  func() {},
+	}
+	running.emit(eventStarted, nil, announcedOnce)
+
+	planned := []string{"alpha", "beta", "gamma"}
+	running.reportProgress(app.Progress{
+		Kind:   app.ProgressTablesPlanned,
+		Tables: planned,
+		Total:  len(planned),
+	})
+	for index := 0; index < maxRetainedEvents*2; index++ {
+		running.reportProgress(app.Progress{
+			Kind:  app.ProgressTableFinished,
+			Table: "alpha",
+			Done:  1,
+			Total: len(planned),
+		})
+	}
+
+	events, _, _ := running.next(0)
+	if len(events) > maxRetainedEvents {
+		t.Errorf("the buffer holds %d events, over the cap of %d", len(events), maxRetainedEvents)
+	}
+
+	var found *app.Progress
+	seen := 0
+	for _, event := range events {
+		if event.Kind != eventProgress {
+			continue
+		}
+		var report app.Progress
+		if err := json.Unmarshal(event.Data, &report); err != nil {
+			t.Fatal(err)
+		}
+		if report.Kind == app.ProgressTablesPlanned {
+			seen++
+			found = &report
+		}
+	}
+	if found == nil {
+		t.Fatal("trimming dropped the planned table set")
+	}
+	// Exactly once. Held back from trimming and also still present in the tail
+	// would have a client counting the same tables twice.
+	if seen != 1 {
+		t.Fatalf("the planned set appears %d times", seen)
+	}
+	if len(found.Tables) != len(planned) {
+		t.Fatalf("planned set = %v, want %v", found.Tables, planned)
+	}
+	for index, table := range planned {
+		if found.Tables[index] != table {
+			t.Fatalf("planned set = %v, want %v", found.Tables, planned)
+		}
+	}
+
+	// And it still arrives before the reports that depend on it.
+	if events[0].Kind != eventStarted {
+		t.Fatalf("the buffer begins with %s", events[0].Kind)
+	}
+	for index := 1; index < len(events); index++ {
+		if events[index].Sequence <= events[index-1].Sequence {
+			t.Fatalf(
+				"sequence went backwards: %d then %d",
+				events[index-1].Sequence,
+				events[index].Sequence,
+			)
+		}
+	}
 }

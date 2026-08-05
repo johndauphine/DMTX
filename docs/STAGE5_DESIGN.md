@@ -457,10 +457,18 @@ engine. Reporting also happens *after* the checkpoint each hook exists to write,
 so a watcher sees what has durably happened rather than what is about to be
 attempted.
 
-Every report carries the running tally, so a client that missed events can still
-render correctly from one recent event. That is what makes the job event buffer
-safe to trim: a large migration would otherwise retain two events per table for
-an hour after finishing.
+Every *per-table* report carries the running tally, so a client that missed
+events can still render a fraction correctly from one recent event. That is what
+makes the job event buffer safe to trim: a large migration would otherwise
+retain two events per table for an hour after finishing.
+
+It is not true of every event, and the earlier wording said it was. The planned
+table set is announced once and never restated, so trimming it away left a
+reconnecting client the tail of a run with no idea which tables were in it —
+about a thousand tables in, since each emits two events. Events like that are
+held back from trimming rather than the claim being narrowed: see
+`announcedOnce` in `internal/api/job.go`. The corollary is that sequence numbers
+have holes after a trim, and nothing may assume they are contiguous.
 
 ## Suggested build order
 

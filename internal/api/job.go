@@ -32,11 +32,14 @@ const (
 //
 // A migration reports once for the planned table set and twice per table, so a
 // large workload would otherwise hold tens of thousands of events for an hour
-// after it finished. Trimming loses a reconnecting client some history, which
-// costs it little: every progress report carries the running tally, so one
-// recent event is enough to render the state correctly. Sequence numbers come
-// from a counter rather than the buffer length so that trimming cannot make
-// them repeat.
+// after it finished. Trimming costs a reconnecting client little, because every
+// progress report carries its own running tally - but only for the events that
+// restate themselves. See announcedOnce: the ones that do not are held back
+// from trimming, because losing one cannot be recovered from anything later.
+//
+// Sequence numbers come from a counter rather than the buffer length so that
+// trimming cannot make them repeat. They are therefore not contiguous after a
+// trim, and nothing may assume they are.
 const maxRetainedEvents = 2048
 
 var errNoSuchJob = errors.New("no such job")
@@ -59,6 +62,7 @@ type job struct {
 
 	mutex    sync.Mutex
 	events   []jobEvent
+	kept     []jobEvent
 	sequence int
 	outcome  *app.Outcome
 	finished time.Time
@@ -70,30 +74,67 @@ type job struct {
 // ID identifies the job in URLs.
 func (running *job) ID() string { return running.id }
 
+// Whether an event survives trimming, named at the call sites so the decision
+// reads there rather than having to be inferred from a bare true.
+//
+// An announced-once event is one the engine sends a single time and never
+// restates: which command is running, and which tables are planned. A client
+// that reconnects after it has been trimmed away cannot recover it from any
+// later event, so it is held. Everything else carries enough of its own state
+// to be read on its own.
+const (
+	trimmable     = false
+	announcedOnce = true
+)
+
+// maxAnnouncedOnce bounds how many events a job may hold back from trimming.
+//
+// Two are expected: started, and tables_planned. The bound exists so that a
+// future emitter marking events announcedOnce in a loop cannot grow the buffer
+// past its cap or shorten the trim window to nothing - it would fail loudly at
+// the slice bound instead, which is a worse way to find out.
+const maxAnnouncedOnce = 8
+
 // emit appends an event and wakes every reader waiting on this job.
-func (running *job) emit(kind string, data json.RawMessage) {
+func (running *job) emit(kind string, data json.RawMessage, retention bool) {
 	running.mutex.Lock()
 	defer running.mutex.Unlock()
-	running.appendLocked(kind, data)
+	running.appendLocked(kind, data, retention)
 }
 
 // appendLocked records an event and wakes every reader. The caller holds the
 // lock, so a caller with more than one thing to change can make all of it
 // visible at once.
-func (running *job) appendLocked(kind string, data json.RawMessage) {
+func (running *job) appendLocked(kind string, data json.RawMessage, retention bool) {
 	running.sequence++
-	running.events = append(running.events, jobEvent{
-		Sequence: running.sequence,
-		Kind:     kind,
-		Data:     data,
-	})
+	event := jobEvent{Sequence: running.sequence, Kind: kind, Data: data}
+	running.events = append(running.events, event)
+	if retention && len(running.kept) < maxAnnouncedOnce {
+		running.kept = append(running.kept, event)
+	}
 	if len(running.events) > maxRetainedEvents {
-		// The oldest go first, but never the started event: it is what tells a
-		// late arrival which command it is watching.
+		// The newest events, then whichever announced-once events fell out of
+		// that window put back in front of them.
+		//
+		// This used to keep events[0] and nothing else, which kept the started
+		// event and dropped tables_planned - event two - so a reconnect to any
+		// migration wide enough to trim lost the planned set, and with it the
+		// denominator of every later report.
+		//
+		// The window is shortened by the number of announced-once events rather
+		// than the buffer being allowed to grow past the cap, and the events
+		// still inside it are not put back a second time. Written as a
+		// comparison against the window's oldest sequence rather than as index
+		// arithmetic, because the arithmetic is only correct while every
+		// announced-once event happens to arrive first.
+		tail := running.events[len(running.events)-(maxRetainedEvents-len(running.kept)):]
 		keep := make([]jobEvent, 0, maxRetainedEvents)
-		keep = append(keep, running.events[0])
-		keep = append(keep, running.events[len(running.events)-maxRetainedEvents+1:]...)
-		running.events = keep
+		for _, kept := range running.kept {
+			if kept.Sequence < tail[0].Sequence {
+				keep = append(keep, kept)
+			}
+		}
+		running.events = append(keep, tail...)
 	}
 	// Closing the current channel and replacing it broadcasts to everyone
 	// selecting on it, which a buffered channel could not do without knowing
@@ -113,7 +154,13 @@ func (running *job) reportProgress(event app.Progress) {
 	if err != nil {
 		return
 	}
-	running.emit(eventProgress, encoded)
+	// The planned set is sent once and never restated, unlike the per-table
+	// reports which each carry Done and Total.
+	retention := trimmable
+	if event.Kind == app.ProgressTablesPlanned {
+		retention = announcedOnce
+	}
+	running.emit(eventProgress, encoded, retention)
 }
 
 // complete records the outcome and closes the job.
@@ -133,7 +180,9 @@ func (running *job) complete(outcome app.Outcome) {
 	running.mutex.Lock()
 	running.outcome = &outcome
 	running.finished = time.Now()
-	running.appendLocked(eventFinished, encoded)
+	// Trimmable, and it makes no difference: nothing follows it, so it can
+	// never be trimmed away.
+	running.appendLocked(eventFinished, encoded, trimmable)
 	running.mutex.Unlock()
 
 	close(running.done)
@@ -240,7 +289,7 @@ func (registry *jobs) start(request app.Request) (*job, error) {
 		cancel()
 		return nil, err
 	}
-	running.emit(eventStarted, started)
+	running.emit(eventStarted, started, announcedOnce)
 
 	// Counted as activity for as long as it runs. The idle watchdog's guard was
 	// written when commands ran inside the handler; without this a migration
