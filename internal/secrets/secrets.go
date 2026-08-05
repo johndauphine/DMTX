@@ -38,6 +38,18 @@ const (
 // ErrInsecurePermissions means the file is readable beyond its owner.
 var ErrInsecurePermissions = errors.New("secret file permissions are too open")
 
+// ErrAlreadyExists means Create found a file and would not replace it.
+//
+// Distinguishable because the caller answers it quite differently from a
+// failure: one is a normal second run, the other is something wrong. Reporting
+// an I/O error as "already exists" would send an operator looking at a file
+// that may not be there.
+var ErrAlreadyExists = errors.New("secret file already exists")
+
+// ErrInsecureDirectory means the directory holding the file is listable by
+// other accounts.
+var ErrInsecureDirectory = errors.New("secrets directory permissions are too open")
+
 // Config is what the file holds.
 //
 // Only Encryption is read by anything today, and only once profiles exist. The
@@ -84,6 +96,35 @@ func Load(path string) (Config, error) {
 	return value, nil
 }
 
+// ValidateDirectoryPermissions reports whether the directory holding the file
+// can be listed by other accounts.
+//
+// Reported rather than corrected. ~/.secrets is shared with whatever else keeps
+// files there - DMT's own config lives beside this one - so tightening it would
+// change permissions on somebody else's data to fix ours. The operator is told
+// and decides.
+//
+// A listable directory does not disclose the file's contents, but it does
+// disclose that dmtx is configured here and what else is, which is worth
+// knowing about even though it is not worth acting on unasked.
+func ValidateDirectoryPermissions(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	info, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("check secrets directory permissions: %w", err)
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		return fmt.Errorf(
+			"%w: %s is %04o; run: chmod %03o %s",
+			ErrInsecureDirectory, filepath.Dir(path), mode,
+			directoryMode, filepath.Dir(path),
+		)
+	}
+	return nil
+}
+
 // ValidatePermissions reports whether the file is readable beyond its owner.
 //
 // os.Stat rather than os.Lstat, so a symlink is judged by what it points at: a
@@ -117,12 +158,17 @@ func Create(path string, force bool) error {
 	switch _, err := os.Stat(path); {
 	case err == nil:
 		if !force {
-			return fmt.Errorf("%s already exists", path)
+			return fmt.Errorf("%w: %s", ErrAlreadyExists, path)
 		}
 	case !errors.Is(err, os.ErrNotExist):
 		return fmt.Errorf("check %s: %w", path, err)
 	}
 
+	// Created 0700 when it is missing. An existing directory is left as the
+	// operator has it: this one is shared with whatever else keeps files in
+	// ~/.secrets, and tightening a directory dmtx did not create is not its
+	// decision to make. ValidateDirectoryPermissions reports a loose one so the
+	// operator can decide instead.
 	if err := os.MkdirAll(filepath.Dir(path), directoryMode); err != nil {
 		return fmt.Errorf("create secrets directory: %w", err)
 	}

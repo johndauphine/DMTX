@@ -20,21 +20,52 @@ func TestTheTemplateSaysNothingReadsItYet(t *testing.T) {
 	if !strings.Contains(Template, "NOTHING IN DMTX READS ANY OF THIS YET") {
 		t.Error("the template does not say that nothing reads it")
 	}
+	// Each section is checked against the line above it, not against the
+	// template as a whole. Looking for "Read by: nothing yet" anywhere passed
+	// while only one section carried it - a single note vouching for every
+	// section, which is not what it says.
+	lines := strings.Split(Template, "\n")
 	for _, section := range []string{"ai:", "notifications:"} {
-		if !strings.Contains(Template, section) {
-			t.Errorf("the template no longer mentions %q; this test is stale", section)
-			continue
+		found := false
+		for index, line := range lines {
+			if !strings.Contains(line, section) {
+				continue
+			}
+			found = true
+			if index == 0 || !strings.Contains(lines[index-1], "Read by:") {
+				above := ""
+				if index > 0 {
+					above = lines[index-1]
+				}
+				t.Errorf(
+					"the section %q is not preceded by a line saying what reads "+
+						"it; the line above is %q",
+					section, above,
+				)
+			}
 		}
-		if !strings.Contains(Template, "Read by: nothing yet") {
-			t.Errorf("the section %q does not say what reads it", section)
+		if !found {
+			t.Errorf("the template no longer mentions %q; this test is stale", section)
 		}
 	}
-	// The unbuilt sections stay commented, so a parse cannot silently accept a
-	// key nothing will use.
-	for _, line := range strings.Split(Template, "\n") {
+
+	// Every unbuilt section stays commented, so a parse cannot silently accept
+	// a key nothing will use. Checked by walking the lines rather than naming
+	// the sections twice, because the list I named by hand omitted
+	// "notifications:" and would not have noticed it going live.
+	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "ai:" || strings.HasPrefix(trimmed, "slack:") {
-			t.Errorf("an unread section is uncommented and looks live: %q", line)
+		if strings.HasPrefix(trimmed, "#") || trimmed == "" {
+			continue
+		}
+		if !strings.HasPrefix(trimmed, "encryption:") &&
+			!strings.HasPrefix(trimmed, "master_key:") {
+			t.Errorf(
+				"an unread section is uncommented and looks live: %q\n"+
+					"only encryption is real; everything else must stay commented "+
+					"until something reads it",
+				line,
+			)
 		}
 	}
 }
@@ -222,5 +253,94 @@ func TestLoadReadsWhatCreateWrote(t *testing.T) {
 	// generated when a profile is first sealed.
 	if loaded.Encryption.MasterKey != "" {
 		t.Errorf("the template ships a master key: %q", loaded.Encryption.MasterKey)
+	}
+}
+
+// TestCreateDistinguishesAnExistingFileFromAFailure pins that a second run and
+// something going wrong are told apart.
+//
+// The caller answers them quite differently, and reporting an I/O failure as
+// "already exists" sends an operator to look at a file that may not be there.
+func TestCreateDistinguishesAnExistingFileFromAFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".secrets", fileName)
+	if err := Create(path, false); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	err := Create(path, false)
+	if !errors.Is(err, ErrAlreadyExists) {
+		t.Errorf("a second create is not identifiable as already-exists: %v", err)
+	}
+
+	// A path that cannot be created at all must not look like a second run.
+	// A file standing where the directory should be does it.
+	blocked := filepath.Join(t.TempDir(), "in-the-way")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = Create(filepath.Join(blocked, fileName), false)
+	if err == nil {
+		t.Fatal("create succeeded through a file standing where a directory should be")
+	}
+	if errors.Is(err, ErrAlreadyExists) {
+		t.Errorf("a creation failure is reported as already-exists: %v", err)
+	}
+}
+
+// TestALooseDirectoryIsReportedNotCorrected pins the decision not to change
+// permissions on a directory dmtx did not create.
+//
+// ~/.secrets is shared - DMT's own config lives beside this one - so tightening
+// it would change permissions on somebody else's data to fix ours.
+func TestALooseDirectoryIsReportedNotCorrected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX mode bits do not represent Windows ACLs")
+	}
+	directory := filepath.Join(t.TempDir(), ".secrets")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, fileName)
+	if err := Create(path, false); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// The file is still owner-only whatever the directory is.
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		t.Errorf("the file is %04o inside a loose directory", mode)
+	}
+	// The directory is left alone...
+	before, err := os.Stat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Mode().Perm() != 0o755 {
+		t.Errorf(
+			"create changed the directory to %04o; it is shared with other "+
+				"tools and is not dmtx's to tighten",
+			before.Mode().Perm(),
+		)
+	}
+	// ...and reported.
+	if err := ValidateDirectoryPermissions(path); !errors.Is(err, ErrInsecureDirectory) {
+		t.Errorf("a listable secrets directory was not reported: %v", err)
+	}
+}
+
+// TestATightDirectoryIsNotReported pins that the warning is about exposure
+// rather than about directories, so it does not cry wolf on a correct setup.
+func TestATightDirectoryIsNotReported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX mode bits do not represent Windows ACLs")
+	}
+	path := filepath.Join(t.TempDir(), ".secrets", fileName)
+	if err := Create(path, false); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := ValidateDirectoryPermissions(path); err != nil {
+		t.Errorf("a directory dmtx created 0700 was reported as loose: %v", err)
 	}
 }

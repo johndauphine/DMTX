@@ -21,29 +21,37 @@ func executeInitSecrets(request Request) Outcome {
 	}
 
 	if err := secrets.Create(path, request.Force); err != nil {
-		if request.Force {
+		// Only an existing file is an ordinary second run. Anything else is
+		// something wrong, and reporting it as "already exists" would send the
+		// operator to look at a file that may not be there.
+		if !errors.Is(err, secrets.ErrAlreadyExists) {
 			return out.failWith(FileError, err.Error())
 		}
-		// Already there. Say where it is and whether it is safe, then say how
-		// to replace it - with the warning that matters, because replacing this
-		// file is not like replacing a configuration.
 		out.out(path + " already exists")
-		switch permissionErr := secrets.ValidatePermissions(path); {
-		case permissionErr == nil:
-			out.out("permissions are correct")
-		case errors.Is(permissionErr, secrets.ErrInsecurePermissions):
-			out.fail(permissionErr.Error())
-			return out.done(FileError)
-		default:
+		if permissionErr := secrets.ValidatePermissions(path); permissionErr != nil {
 			out.fail(permissionErr.Error())
 			return out.done(FileError)
 		}
+		out.out("permissions are correct")
+		reportDirectory(out, path)
 		out.out("to replace it: dmtx init-secrets --force")
 		out.out("replacing it discards any key sealed profiles were written with")
 		return out.done(Success)
 	}
 
 	out.out("wrote " + path)
+	reportDirectory(out, path)
 	out.out("nothing reads it yet; it is here so its protections exist first")
 	return out.done(Success)
+}
+
+// reportDirectory mentions a listable secrets directory without changing it.
+//
+// A warning rather than a failure: the file itself is still owner-only, and
+// ~/.secrets is shared with whatever else keeps files there, so this is the
+// operator's call to make on their own directory.
+func reportDirectory(out *outcomeBuilder, path string) {
+	if err := secrets.ValidateDirectoryPermissions(path); err != nil {
+		out.out("warning: " + err.Error())
+	}
 }
