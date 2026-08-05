@@ -73,27 +73,21 @@ func parseRequest(args []string) (Request, Outcome, bool) {
 		}
 		return Request{}, out.done(Success), false
 	case "run":
-		configPath, statePath, dryRun, acknowledge, ok := runArguments(args[1:])
+		options, ok := runArguments(args[1:])
 		if !ok {
-			return Request{}, out.failWith(
-				ConfigurationError,
-				"usage: dmtx run --config migration.yaml [--state migration.state.yaml] [--dry-run] [--acknowledge-destructive]",
-			), false
+			return Request{}, out.failWith(ConfigurationError, runUsage), false
 		}
 		return Request{
 			Command:                "run",
-			ConfigPath:             configPath,
-			StatePath:              statePath,
-			DryRun:                 dryRun,
-			AcknowledgeDestructive: acknowledge,
+			ConfigPath:             options.configPath,
+			StatePath:              options.statePath,
+			DryRun:                 options.dryRun,
+			AcknowledgeDestructive: options.destructiveAcknowledged,
 		}, Outcome{}, true
 	case "resume":
 		options, ok := resumeArguments(args[1:])
 		if !ok {
-			return Request{}, out.failWith(
-				ConfigurationError,
-				"usage: dmtx resume --config migration.yaml [--state migration.state.yaml] [--acknowledge-destructive] [--force-resume] [--abandon --abandon-reason TEXT]",
-			), false
+			return Request{}, out.failWith(ConfigurationError, resumeUsage), false
 		}
 		return Request{
 			Command:                "resume",
@@ -312,10 +306,14 @@ func ExecuteWithProgress(
 
 func executeRun(ctx context.Context, request Request, progress *progressReporter) Outcome {
 	out := newOutcome(request.Command)
-	configPath := request.ConfigPath
-	statePath := request.StatePath
-	dryRun := request.DryRun
-	destructiveAcknowledged := request.AcknowledgeDestructive
+	options, ok := runOptionsFrom(request)
+	if !ok {
+		return out.failWith(ConfigurationError, runUsage)
+	}
+	configPath := options.configPath
+	statePath := options.statePath
+	dryRun := options.dryRun
+	destructiveAcknowledged := options.destructiveAcknowledged
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return out.failWith(FileError, "read configuration: "+err.Error())
@@ -736,42 +734,40 @@ func migrationExitCode(err error) int {
 	return TransferError
 }
 
-func runArguments(args []string) (configPath, statePath string, dryRun, destructiveAcknowledged, ok bool) {
+// runArguments reads run's flags. The rules that are not about argv - a config
+// is required, and an unnamed state path is derived from it - belong to
+// validRunOptions, so the API reaches them too.
+func runArguments(args []string) (runOptions, bool) {
+	var options runOptions
 	for index := 0; index < len(args); index++ {
 		switch args[index] {
 		case "--config":
-			if index+1 >= len(args) || configPath != "" {
-				return "", "", false, false, false
+			if index+1 >= len(args) || options.configPath != "" {
+				return runOptions{}, false
 			}
-			configPath = args[index+1]
+			options.configPath = args[index+1]
 			index++
 		case "--state":
-			if index+1 >= len(args) || statePath != "" {
-				return "", "", false, false, false
+			if index+1 >= len(args) || options.statePath != "" {
+				return runOptions{}, false
 			}
-			statePath = args[index+1]
+			options.statePath = args[index+1]
 			index++
 		case "--dry-run":
-			if dryRun {
-				return "", "", false, false, false
+			if options.dryRun {
+				return runOptions{}, false
 			}
-			dryRun = true
+			options.dryRun = true
 		case "--acknowledge-destructive":
-			if destructiveAcknowledged {
-				return "", "", false, false, false
+			if options.destructiveAcknowledged {
+				return runOptions{}, false
 			}
-			destructiveAcknowledged = true
+			options.destructiveAcknowledged = true
 		default:
-			return "", "", false, false, false
+			return runOptions{}, false
 		}
 	}
-	if configPath == "" {
-		return "", "", false, false, false
-	}
-	if statePath == "" {
-		statePath = configPath + ".state.db"
-	}
-	return configPath, statePath, dryRun, destructiveAcknowledged, true
+	return validRunOptions(options)
 }
 
 // executeShowState serves both status and history; Latest distinguishes them.

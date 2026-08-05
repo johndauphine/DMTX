@@ -33,10 +33,7 @@ func executeResume(ctx context.Context, request Request, reporter *progressRepor
 
 	options, ok := resumeOptionsFrom(request)
 	if !ok {
-		return out.failWith(
-			ConfigurationError,
-			"usage: dmtx resume --config migration.yaml [--state migration.state.yaml] [--acknowledge-destructive] [--force-resume] [--abandon --abandon-reason TEXT]",
-		)
+		return out.failWith(ConfigurationError, resumeUsage)
 	}
 	configPath, statePath := options.configPath, options.statePath
 	data, err := os.ReadFile(options.configPath)
