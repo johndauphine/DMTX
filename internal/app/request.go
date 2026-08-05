@@ -25,6 +25,11 @@ type Request struct {
 	// Latest distinguishes status from history, which share an implementation.
 	Latest bool `json:"latest,omitempty"`
 
+	// RunID names a particular run for diagnose. Empty asks for the most
+	// recent run that did not succeed, which is what an operator means when
+	// they type diagnose after something went wrong.
+	RunID string `json:"run_id,omitempty"`
+
 	// Resume-only. Abandon and AbandonReason travel together: abandoning
 	// without a reason, or giving a reason without abandoning, is refused,
 	// because an abandoned run with no recorded why is not a decision anyone
@@ -98,6 +103,7 @@ const (
 	PayloadPreflightReport = "preflight_report"
 	PayloadResumeResponse  = "resume_response"
 	PayloadConfig          = "config"
+	PayloadDiagnosis       = "diagnosis"
 )
 
 // outcomeBuilder accumulates messages while an operation runs.
