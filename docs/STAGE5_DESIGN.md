@@ -248,6 +248,62 @@ has to land with the loader and the wiring into endpoint resolution, so a
 password absent from `migration.yaml` is taken from the store. Otherwise it
 creates a file nothing consumes.
 
+### Profiles
+
+**[decided]** A profile is a whole configuration saved under a name, referenced
+as `--profile NAME` where a config path would go. That is DMT's model and it
+carries over unchanged.
+
+**Storage: SQLite at `~/.secrets/dmtx/profiles.db`.** Matching DMT's shape means
+its behaviour and edge cases carry over rather than being rediscovered.
+Replacing several profiles *can* be made atomic with a transaction. It sits in
+the directory dmtx owns and enforces at `0700`, not in the per-migration state
+database, which is the wrong lifetime — profiles outlive any one migration.
+
+**This is not one file.** In WAL mode SQLite keeps `profiles.db-wal` and
+`profiles.db-shm` beside the database, and §21.2's requirement lands on the
+profile *files*, not on the directory holding them. So `0600` is enforced on the
+database **and its companions**, with the directory mode as defence in depth
+rather than the protection itself. Verify at implementation time what mode
+`modernc.org/sqlite` gives the companions: SQLite normally matches the main
+database, and "normally" is not a guarantee to rest a credential store on.
+
+**Sealing: AES-GCM under a master key**, with a versioned prefix on the
+serialised payload — a *format* version rather than a cipher version, so the
+encoding can change without anything having to guess what an older file
+contains. The key comes from the environment or
+`~/.secrets/dmtx/config.yaml`, which is why that file's `encryption:` section
+exists. An absent key is generated on first seal and written back — and the
+write must preserve the rest of the file, because losing the key makes every
+stored profile unrecoverable. DMT guards this explicitly; carry the guard.
+
+**Export re-encrypts under a passphrase supplied at export time.** The exported
+file is portable to another machine without the master key ever leaving this
+one: the recipient needs only the passphrase. Plaintext export was rejected —
+§21.2 exists to stop credentials being written to an arbitrary path in the
+clear, and "export" is exactly where an operator would expect that to be fine.
+
+**[decided]** The three sub-decisions, settled 2026-08-05:
+
+- **Argon2id** derives the export key from the passphrase. It won the Password
+  Hashing Competition and is what OWASP recommends; being memory-hard, an
+  attacker with GPUs gains far less against it than against an iteration-only
+  function. `golang.org/x/crypto` is **already in the dependency graph
+  indirectly**, pulled in by the database drivers, so promoting it to direct
+  adds no module — which removed the only reason to consider a weaker function.
+  The parameters live in the file header so they can be raised later without
+  breaking exports already written.
+- **`--passphrase-file`**, and not a flag, a prompt, or an environment variable.
+  It matches an idiom dmtx already has, since config passwords support
+  `${file:...}`. The file can be `0600`, never enters shell history, and never
+  appears in a process listing. One path serves a person and automation alike,
+  so there is one thing to test rather than two — and it needs no new module,
+  where a hidden prompt would pull in `golang.org/x/term`.
+- **Import ships with export.** Portability was the whole reason for choosing a
+  passphrase; without import it is theoretical and the file is a backup rather
+  than a transfer. Building both also exercises the format from each end, which
+  is how a format avoids quietly becoming unreadable.
+
 ### Design needed before implementation
 
 Three do not fit the `Request`/`Outcome` seam as it stands:
