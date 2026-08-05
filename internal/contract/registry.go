@@ -62,10 +62,56 @@ var Commands = []Command{
 	},
 }
 
-func Valid() bool {
+// Resolve finds a command by its name or any of its aliases.
+//
+// Aliases are part of the registry, so anything reading the registry to decide
+// what dmtx can do has to read them too. Matching on Name alone made
+// "health-check" - a registered alias of preflight - work on the command line
+// and come back as an unknown command through the seam, which is the surface
+// disagreement the parity criterion forbids.
+func Resolve(name string) (Command, bool) {
 	for _, command := range Commands {
+		if command.Name == name {
+			return command, true
+		}
+		for _, alias := range command.Aliases {
+			if alias == name {
+				return command, true
+			}
+		}
+	}
+	return Command{}, false
+}
+
+// Valid reports whether the shipped registry holds its invariants.
+func Valid() bool { return valid(Commands) }
+
+// valid takes the registry as an argument so the invariants can be tested
+// against deliberately broken ones.
+//
+// Valid() alone could only ever be checked against the registry that ships,
+// which asserts that the data is good and nothing at all about whether the
+// check works - removing a rule from here and the field it guards leaves such
+// a test passing.
+func valid(commands []Command) bool {
+	seen := map[string]bool{}
+	for _, command := range commands {
 		if command.Name == "" || command.TUI == "" || command.WebUI == "" {
 			return false
+		}
+		// A command omitted from both surfaces has to say why, or its refusal
+		// explains nothing to the operator who asked for it.
+		if command.TUI == Omitted && command.WebUI == Omitted && command.Note == "" {
+			return false
+		}
+		// Names and aliases share one space, because that is how they are
+		// looked up. A collision would make which command answers depend on
+		// registry order.
+		for _, spelling := range append([]string{command.Name}, command.Aliases...) {
+			if seen[spelling] {
+				return false
+			}
+			seen[spelling] = true
 		}
 	}
 	return true

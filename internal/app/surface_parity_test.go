@@ -109,6 +109,63 @@ func TestAnUnregisteredCommandIsStillUnknown(t *testing.T) {
 	}
 }
 
+// TestAnAliasAnswersLikeTheCommandItNames pins that a registered alias is not a
+// second-class spelling.
+//
+// "health-check" is an alias of preflight. The command line accepted it and the
+// seam called it unknown, so the two surfaces disagreed about what dmtx can do -
+// the thing the parity criterion forbids, and the thing the parity test above
+// was written to catch. It did not, because it iterates contract.Commands by
+// Name, and aliases are registry entries the name loop never visits.
+//
+// A test that walks a collection by one field cannot hold a property of the
+// other fields, however thorough the walk looks.
+func TestAnAliasAnswersLikeTheCommandItNames(t *testing.T) {
+	aliases := 0
+	for _, registered := range contract.Commands {
+		for _, alias := range registered.Aliases {
+			aliases++
+			t.Run(alias, func(t *testing.T) {
+				byAlias := Execute(context.Background(), Request{Command: alias})
+				byName := Execute(context.Background(), Request{Command: registered.Name})
+
+				if strings.Contains(saidBy(byAlias), "unknown command") {
+					t.Fatalf(
+						"the registered alias %q of %q is refused as unknown: %q",
+						alias, registered.Name, saidBy(byAlias),
+					)
+				}
+				if byAlias.ExitCode != byName.ExitCode {
+					t.Errorf(
+						"%q exits %d but %q exits %d",
+						alias, byAlias.ExitCode, registered.Name, byName.ExitCode,
+					)
+				}
+				// The Outcome names the canonical command, so nothing
+				// downstream has to know the alias exists - which is the rule
+				// parseRequest already follows for argv.
+				if byAlias.Command != registered.Name {
+					t.Errorf(
+						"an outcome for %q names the command %q; it should be canonicalised to %q",
+						alias, byAlias.Command, registered.Name,
+					)
+				}
+			})
+		}
+	}
+	if aliases == 0 {
+		t.Fatal("no command has an alias, so this test proved nothing")
+	}
+}
+
+// TestTheRegistryIsValid pins that the runtime guard actually holds the
+// invariants, rather than leaving them to tests that production never runs.
+func TestTheRegistryIsValid(t *testing.T) {
+	if !contract.Valid() {
+		t.Fatal("the command registry is invalid")
+	}
+}
+
 // TestCacheIsOmittedBecauseThereIsNothingToClear pins the decision itself.
 //
 // The test below iterates the Omitted commands, so it cannot hold membership of
