@@ -48,6 +48,13 @@ func executeAnalyze(ctx context.Context, request Request) Outcome {
 	if err != nil {
 		return out.failWith(ConfigurationError, "configuration: "+err.Error())
 	}
+	// Checked here as run checks it, because a plan for a migration that will
+	// never start is a confident answer to a question the operator did not ask.
+	// It resolves adapter roles from the configured types and opens nothing, so
+	// the report stays offline.
+	if err := migrate.ValidateMigration(cfg); err != nil {
+		return out.failWith(ConfigurationError, "configuration: "+err.Error())
+	}
 
 	tuning, err := migrate.DiscloseTuning(ctx, cfg)
 	if err != nil {

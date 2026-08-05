@@ -12,6 +12,14 @@ import (
 	"github.com/johndauphine/dmtx/internal/migrate"
 )
 
+// analyzableConfig pins the memory ceiling so the plan is deterministic.
+//
+// Without it the budget comes from memory available at the moment it is read,
+// and workers derive from that budget through boundedMemorySlots - so on a
+// machine where memory is the binding constraint rather than the worker cap,
+// two readings seconds apart can resolve to different worker counts. That is a
+// test which passes on a laptop and fails on a small CI runner, occasionally,
+// for reasons unrelated to the code.
 const analyzableConfig = `
 source:
   type: sqlite
@@ -21,6 +29,7 @@ target:
   database: target.db
 migration:
   workers: 3
+  memory_ceiling_bytes: 268435456
 `
 
 func analyzableConfigPath(t *testing.T, contents string) string {
@@ -121,27 +130,19 @@ func TestAnalyzeAgreesWithTheDryRunDisclosure(t *testing.T) {
 		t.Fatalf("disclose: %v", err)
 	}
 
-	// The memory budget is compared by provenance only. It is derived from host
-	// memory available at the moment it is read, so two readings taken seconds
-	// apart differ by whatever the machine did in between - the first version
-	// of this test compared the numbers and failed by 229KB, which is the
-	// machine breathing rather than the two paths disagreeing.
-	if analysis.Tuning.MemoryBudget.Provenance != disclosed.MemoryBudget.Provenance {
-		t.Errorf(
-			"memory budget provenance differs: analyze %q, dry run %q",
-			analysis.Tuning.MemoryBudget.Provenance, disclosed.MemoryBudget.Provenance,
+	// Compared in full, including the memory budget. An earlier version of this
+	// test excused the budget because two readings differed by 229KB - which
+	// was true, and was the wrong fix: the fixture pins memory_ceiling_bytes,
+	// so the budget is clamped rather than measured and every value below it is
+	// deterministic. Excusing the field would also have excused the values
+	// derived from it, which is what made this flaky rather than merely loose.
+	if analysis.Tuning.MemoryBudget.Provenance != "user_memory_ceiling" {
+		t.Fatalf(
+			"the fixture is not pinning memory: budget provenance is %q, so "+
+				"this comparison is against a live reading and will flake",
+			analysis.Tuning.MemoryBudget.Provenance,
 		)
 	}
-	if analysis.Tuning.MemoryBudget.Value <= 0 || disclosed.MemoryBudget.Value <= 0 {
-		t.Errorf(
-			"a memory budget resolved to zero: analyze %d, dry run %d",
-			analysis.Tuning.MemoryBudget.Value, disclosed.MemoryBudget.Value,
-		)
-	}
-
-	// Everything else is derived from the configuration and the machine's
-	// shape rather than its moment, so it must match exactly.
-	analysis.Tuning.MemoryBudget = disclosed.MemoryBudget
 	fromAnalysis, err := json.Marshal(analysis.Tuning)
 	if err != nil {
 		t.Fatal(err)
@@ -237,5 +238,54 @@ func TestAnalysisPayloadWireShape(t *testing.T) {
 		if !present[path] {
 			t.Errorf("the wire shape lost %s", path)
 		}
+	}
+}
+
+// TestAnalyzeRefusesAConfigurationRunWouldReject pins that analyze does not
+// describe a plan for a migration that will never start.
+//
+// run validates the adapter route before doing anything. An analyze that
+// skipped the check would answer "here is your effective plan" for a
+// configuration dmtx cannot execute - a confident answer to a question the
+// operator did not ask.
+//
+// The route matters. An invented engine type is rejected by config.Parse, so a
+// fixture using one never reaches the validation this test exists for: the
+// first version did exactly that, and passed with the check removed.
+// clickhouse-to-sqlite parses cleanly and is an uncertified pair, so it fails
+// where it should.
+func TestAnalyzeRefusesAConfigurationRunWouldReject(t *testing.T) {
+	path := analyzableConfigPath(t, `
+source:
+  type: clickhouse
+  host: source.internal
+  database: source
+  user: reader
+  password: secret
+target:
+  type: sqlite
+  database: target.db
+`)
+	outcome, _ := analysisOf(t, path)
+	if outcome.ExitCode == Success {
+		t.Fatal("analyze reported a plan for a migration dmtx cannot run")
+	}
+	said := saidBy(outcome)
+	if !strings.Contains(said, "not implemented") {
+		t.Errorf("the refusal does not say the route is unsupported: %q", said)
+	}
+
+	// And the same configuration must be refused by run, or analyze is
+	// refusing something that would in fact have worked.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("the fixture no longer parses, so it tests the wrong thing: %v", err)
+	}
+	if err := migrate.ValidateMigration(cfg); err == nil {
+		t.Fatal("the fixture route is valid, so this test proves nothing")
 	}
 }
