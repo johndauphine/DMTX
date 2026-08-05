@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -62,7 +63,7 @@ type job struct {
 
 	mutex    sync.Mutex
 	events   []jobEvent
-	kept     []jobEvent
+	kept     map[string]jobEvent
 	sequence int
 	outcome  *app.Outcome
 	finished time.Time
@@ -74,29 +75,31 @@ type job struct {
 // ID identifies the job in URLs.
 func (running *job) ID() string { return running.id }
 
-// Whether an event survives trimming, named at the call sites so the decision
-// reads there rather than having to be inferred from a bare true.
+// Retention labels: whether an event survives trimming, and if so, as what.
 //
 // An announced-once event is one the engine sends a single time and never
-// restates: which command is running, and which tables are planned. A client
-// that reconnects after it has been trimmed away cannot recover it from any
-// later event, so it is held. Everything else carries enough of its own state
-// to be read on its own.
+// restates - which command is running, and which tables are planned. A client
+// that reconnects after one has been trimmed away cannot recover it from any
+// later event, so it is held back. Everything else carries enough of its own
+// state to be read alone.
+//
+// A label names a slot rather than counting entries: an event stored under a
+// label replaces whatever was there before. That is what bounds the held-back
+// set - by the number of labels spelled in this file, which is a property of
+// the code, rather than by a cap on how many events a job may mark, which would
+// have to silently start dropping retention at some number and so reintroduce
+// exactly the failure this trimming rule exists to prevent.
+//
+// Replacement is also the right answer on its own terms: an engine that sent a
+// second planned set would mean the first is no longer true.
 const (
-	trimmable     = false
-	announcedOnce = true
+	trimmable     = ""
+	retainStarted = "started"
+	retainPlanned = "planned"
 )
 
-// maxAnnouncedOnce bounds how many events a job may hold back from trimming.
-//
-// Two are expected: started, and tables_planned. The bound exists so that a
-// future emitter marking events announcedOnce in a loop cannot grow the buffer
-// past its cap or shorten the trim window to nothing - it would fail loudly at
-// the slice bound instead, which is a worse way to find out.
-const maxAnnouncedOnce = 8
-
 // emit appends an event and wakes every reader waiting on this job.
-func (running *job) emit(kind string, data json.RawMessage, retention bool) {
+func (running *job) emit(kind string, data json.RawMessage, retention string) {
 	running.mutex.Lock()
 	defer running.mutex.Unlock()
 	running.appendLocked(kind, data, retention)
@@ -105,12 +108,15 @@ func (running *job) emit(kind string, data json.RawMessage, retention bool) {
 // appendLocked records an event and wakes every reader. The caller holds the
 // lock, so a caller with more than one thing to change can make all of it
 // visible at once.
-func (running *job) appendLocked(kind string, data json.RawMessage, retention bool) {
+func (running *job) appendLocked(kind string, data json.RawMessage, retention string) {
 	running.sequence++
 	event := jobEvent{Sequence: running.sequence, Kind: kind, Data: data}
 	running.events = append(running.events, event)
-	if retention && len(running.kept) < maxAnnouncedOnce {
-		running.kept = append(running.kept, event)
+	if retention != trimmable {
+		if running.kept == nil {
+			running.kept = map[string]jobEvent{}
+		}
+		running.kept[retention] = event
 	}
 	if len(running.events) > maxRetainedEvents {
 		// The newest events, then whichever announced-once events fell out of
@@ -134,6 +140,13 @@ func (running *job) appendLocked(kind string, data json.RawMessage, retention bo
 				keep = append(keep, kept)
 			}
 		}
+		// Map iteration is unordered, so the held-back events are sorted before
+		// they are put back. Without this a client would see them in a
+		// different order on each reconnect, and sequence numbers going
+		// backwards is the one thing a resuming client cannot survive.
+		sort.Slice(keep, func(first, second int) bool {
+			return keep[first].Sequence < keep[second].Sequence
+		})
 		running.events = append(keep, tail...)
 	}
 	// Closing the current channel and replacing it broadcasts to everyone
@@ -158,7 +171,7 @@ func (running *job) reportProgress(event app.Progress) {
 	// reports which each carry Done and Total.
 	retention := trimmable
 	if event.Kind == app.ProgressTablesPlanned {
-		retention = announcedOnce
+		retention = retainPlanned
 	}
 	running.emit(eventProgress, encoded, retention)
 }
@@ -289,7 +302,7 @@ func (registry *jobs) start(request app.Request) (*job, error) {
 		cancel()
 		return nil, err
 	}
-	running.emit(eventStarted, started, announcedOnce)
+	running.emit(eventStarted, started, retainStarted)
 
 	// Counted as activity for as long as it runs. The idle watchdog's guard was
 	// written when commands ran inside the handler; without this a migration

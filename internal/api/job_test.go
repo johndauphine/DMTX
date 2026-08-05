@@ -494,7 +494,7 @@ func TestAJobNeverReportsEndingBeforeItsFinishedEventExists(t *testing.T) {
 			done:    make(chan struct{}),
 			cancel:  func() {},
 		}
-		running.emit(eventStarted, nil, announcedOnce)
+		running.emit(eventStarted, nil, retainStarted)
 
 		violations := make(chan string, 1)
 		watching := make(chan struct{})
@@ -604,7 +604,7 @@ func TestTheEventBufferIsBounded(t *testing.T) {
 		done:    make(chan struct{}),
 		cancel:  func() {},
 	}
-	running.emit(eventStarted, nil, announcedOnce)
+	running.emit(eventStarted, nil, retainStarted)
 	for index := 0; index < maxRetainedEvents*2; index++ {
 		running.emit(eventProgress, nil, trimmable)
 	}
@@ -712,7 +712,7 @@ func TestTrimmingKeepsThePlannedTableSet(t *testing.T) {
 		done:    make(chan struct{}),
 		cancel:  func() {},
 	}
-	running.emit(eventStarted, nil, announcedOnce)
+	running.emit(eventStarted, nil, retainStarted)
 
 	planned := []string{"alpha", "beta", "gamma"}
 	running.reportProgress(app.Progress{
@@ -769,6 +769,57 @@ func TestTrimmingKeepsThePlannedTableSet(t *testing.T) {
 	// And it still arrives before the reports that depend on it.
 	if events[0].Kind != eventStarted {
 		t.Fatalf("the buffer begins with %s", events[0].Kind)
+	}
+	for index := 1; index < len(events); index++ {
+		if events[index].Sequence <= events[index-1].Sequence {
+			t.Fatalf(
+				"sequence went backwards: %d then %d",
+				events[index-1].Sequence,
+				events[index].Sequence,
+			)
+		}
+	}
+}
+
+// TestRetentionIsBoundedByLabelNotByCount pins what replaced maxAnnouncedOnce.
+//
+// The first version of this held announced-once events in a slice capped at a
+// constant, and silently stopped retaining past it - which would reintroduce
+// the very failure the retention exists to prevent, at whatever number nobody
+// was watching. Labels name slots instead, so an emitter marking the same thing
+// repeatedly replaces rather than accumulates, and the held-back set cannot
+// outgrow the labels this package spells.
+func TestRetentionIsBoundedByLabelNotByCount(t *testing.T) {
+	running := &job{
+		id:      "under-test",
+		changed: make(chan struct{}),
+		done:    make(chan struct{}),
+		cancel:  func() {},
+	}
+	for index := 0; index < maxRetainedEvents; index++ {
+		running.emit(eventProgress, nil, retainPlanned)
+	}
+	if len(running.kept) != 1 {
+		t.Fatalf("held back %d events under one label, want 1", len(running.kept))
+	}
+
+	// The survivor is the newest, not the first. A restated announcement means
+	// the earlier one is no longer true.
+	if running.kept[retainPlanned].Sequence != maxRetainedEvents {
+		t.Fatalf(
+			"held back sequence %d, want the newest (%d)",
+			running.kept[retainPlanned].Sequence,
+			maxRetainedEvents,
+		)
+	}
+
+	// And the trim window never collapses, however much is marked.
+	for index := 0; index < maxRetainedEvents*2; index++ {
+		running.emit(eventProgress, nil, trimmable)
+	}
+	events, _, _ := running.next(0)
+	if len(events) > maxRetainedEvents {
+		t.Fatalf("the buffer holds %d events, over the cap of %d", len(events), maxRetainedEvents)
 	}
 	for index := 1; index < len(events); index++ {
 		if events[index].Sequence <= events[index-1].Sequence {
