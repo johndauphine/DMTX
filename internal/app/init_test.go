@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/johndauphine/dmtx/internal/config"
 )
 
 // TestTheStarterConfigIsValid pins that the file dmtx writes is one dmtx
@@ -116,7 +118,7 @@ func TestTheTemplateShipsNoPlaceholderPassword(t *testing.T) {
 		"password: changeme", "password: secret", "password: password",
 		"password: hunter2", "password: <", "password: your",
 	} {
-		if strings.Contains(strings.ToLower(starterConfig), forbidden) {
+		if strings.Contains(strings.ToLower(starterConfigFor(defaultConfigFilename)), forbidden) {
 			t.Errorf("the template ships %q, which invites being kept", forbidden)
 		}
 	}
@@ -169,4 +171,95 @@ func TestInitRefusesFlagsItDoesNotKnow(t *testing.T) {
 			t.Errorf("init accepted %v", refused)
 		}
 	}
+}
+
+// TestForcingOverAWorldReadableFileTightensIt pins the mode on the path that
+// had none.
+//
+// A mode argument applies only when a file is created, so --force over an
+// existing 0644 file would leave it 0644 - the same defect as the handoff state
+// file in #8, in a second place, because that fix was applied where it was
+// found rather than looked for elsewhere.
+func TestForcingOverAWorldReadableFileTightensIt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not how Windows restricts a file")
+	}
+	path := filepath.Join(t.TempDir(), "migration.yaml")
+	if err := os.WriteFile(path, []byte("# old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if before, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	} else if before.Mode().Perm()&0o077 == 0 {
+		t.Fatal("the fixture file is already restricted, so this proves nothing")
+	}
+
+	outcome := executeInit(Request{Command: "init", ConfigPath: path, Force: true})
+	if outcome.ExitCode != Success {
+		t.Fatalf("init --force failed: %+v", outcome.Messages)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		t.Errorf(
+			"replacing a world-readable config left it %04o; credentials will "+
+				"be added to it",
+			mode,
+		)
+	}
+}
+
+// TestTheTemplateNamesTheFileItIsWrittenTo pins that the instructions inside
+// the file point at the file.
+//
+// A template that says "--config migration.yaml" inside envs/prod.yaml sends
+// the operator to something that does not exist.
+func TestTheTemplateNamesTheFileItIsWrittenTo(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "envs", "prod.yaml")
+	if outcome := executeInit(Request{Command: "init", ConfigPath: path}); outcome.ExitCode != Success {
+		t.Fatalf("init failed: %+v", outcome.Messages)
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(written), "--config "+path) {
+		t.Errorf("the template does not name its own path:\n%s", written)
+	}
+	if strings.Contains(string(written), "--config "+defaultConfigFilename) {
+		t.Errorf(
+			"the template still points at %s, which is not where it was written",
+			defaultConfigFilename,
+		)
+	}
+}
+
+// TestTheTemplateDoesNotClaimToBeAllDefaults pins the comment against the code
+// it describes.
+//
+// The comment once said every value in the template was a default dmtx would
+// apply anyway. It is not: a missing source type defaults to mssql and a
+// missing target type to postgres, so sqlite-to-sqlite is a choice. Saying so
+// matters because the next person to edit the template will trust the comment.
+func TestTheTemplateDoesNotClaimToBeAllDefaults(t *testing.T) {
+	parsed, err := config.Parse([]byte("source:\n  database: a\ntarget:\n  database: b\n"))
+	if err != nil {
+		t.Fatalf("parse a typeless config: %v", err)
+	}
+	if parsed.Source.Type == "sqlite" && parsed.Target.Type == "sqlite" {
+		t.Skip("the defaults are now sqlite-to-sqlite, so the template matches them")
+	}
+	if !strings.Contains(starterConfigFor(defaultConfigFilename), "type: sqlite") {
+		t.Fatal("the template no longer chooses sqlite, so this test is stale")
+	}
+	// The template overrides the defaults deliberately. Nothing to assert
+	// beyond recording that it does, so a future "simplify by removing the
+	// types" reads this first.
+	t.Logf(
+		"dmtx defaults a missing source type to %q and target to %q; the "+
+			"template chooses sqlite for both so it can be tried without a server",
+		parsed.Source.Type, parsed.Target.Type,
+	)
 }

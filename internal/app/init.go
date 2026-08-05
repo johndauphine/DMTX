@@ -12,23 +12,33 @@ import (
 // defaultConfigFilename is what init writes when the operator names nothing.
 const defaultConfigFilename = "migration.yaml"
 
-// starterConfig is the file init writes.
+// starterConfigFor is the file init writes, addressed to where it is written.
+//
+// The path is threaded through rather than hard-coded, because a template that
+// says "dmtx validate --config migration.yaml" inside a file called
+// envs/prod.yaml sends the operator to a file that does not exist.
 //
 // Commented rather than minimal, because the operator reading it is by
-// definition someone who has not written one before. Every value here is a real
-// default dmtx would apply anyway, so the file describes the tool's behaviour
-// rather than overriding it - a starter config full of settings that override
-// defaults teaches the wrong lesson and ages badly.
+// definition someone who has not written one before.
+//
+// Two deliberate choices, neither of them a default. The endpoints are
+// sqlite-to-sqlite because that is the one pair somebody can try without
+// provisioning a server first; dmtx's own defaults for a missing type are
+// mssql and postgres, which are no use to someone finding out what this does.
+// The tuning settings are left commented out because dmtx derives them, and a
+// starter file that pinned them would override the very thing analyze exists
+// to explain.
 //
 // The password is left empty deliberately. Writing a placeholder invites it
 // being kept, and a file created by a tool is a file people trust.
-const starterConfig = `# dmtx migration configuration.
+func starterConfigFor(path string) string {
+	return `# dmtx migration configuration.
 #
 # Fill in the endpoints below, then:
 #
-#   dmtx validate --config ` + defaultConfigFilename + `    check it
-#   dmtx analyze  --config ` + defaultConfigFilename + `    see the plan and why
-#   dmtx run --config ` + defaultConfigFilename + ` --dry-run   rehearse it
+#   dmtx validate --config ` + path + `    check it
+#   dmtx analyze  --config ` + path + `    see the plan and why
+#   dmtx run --config ` + path + ` --dry-run   rehearse it
 
 source:
   type: sqlite            # sqlite, postgres, mysql, sqlserver, clickhouse
@@ -60,6 +70,7 @@ migration:
   # include_tables: [orders, customers]
   # exclude_tables: [audit_log]
 `
+}
 
 // executeInit writes a starter configuration.
 //
@@ -95,7 +106,13 @@ func executeInit(request Request) Outcome {
 	}
 	// 0600 rather than 0644: this file is where credentials will go, and the
 	// operator who adds them should not have to remember to tighten it first.
-	if err := os.WriteFile(path, []byte(starterConfig), 0o600); err != nil {
+	//
+	// Chmod as well as the mode argument, because a mode argument applies only
+	// when a file is created. With --force the file already exists, so it would
+	// otherwise keep whatever mode it had - which is the same defect found in
+	// the handoff state file in #8, in a second place, because I fixed it there
+	// and did not go looking for the pattern.
+	if err := writeRestricted(path, starterConfigFor(path)); err != nil {
 		return out.failWith(FileError, "write configuration: "+err.Error())
 	}
 
@@ -123,9 +140,27 @@ func configPathFor(request Request) string {
 	return defaultConfigFilename
 }
 
+// writeRestricted writes a file and leaves it readable only by its owner,
+// whether or not it already existed.
+func writeRestricted(path, contents string) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if _, err := file.WriteString(contents); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
 // starterConfigIsValid reports whether the template dmtx ships actually parses.
 // Used by a test; kept here so the template and its check stay together.
 func starterConfigIsValid() error {
-	_, err := config.Parse([]byte(starterConfig))
+	_, err := config.Parse([]byte(starterConfigFor(defaultConfigFilename)))
 	return err
 }
