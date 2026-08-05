@@ -25,6 +25,9 @@ type Request struct {
 	// Latest distinguishes status from history, which share an implementation.
 	Latest bool `json:"latest,omitempty"`
 
+	// Force replaces a file init would otherwise refuse to overwrite.
+	Force bool `json:"force,omitempty"`
+
 	// RunID names a particular run for diagnose. Empty asks for the most
 	// recent run that did not succeed, which is what an operator means when
 	// they type diagnose after something went wrong.
