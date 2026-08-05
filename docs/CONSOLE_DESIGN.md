@@ -72,8 +72,8 @@ below, plus: the JSON 401 body (decision 10), `job.started_at` and the
 day the console ships. Decision 1 renders those dispositions, so shipping
 without updating them puts a wrong label on the console's own help.
 
-0. **Something turns a typed line into a `Request`.** This is the change the
-   first three drafts missed entirely, and it is the largest.
+0. **Something turns a typed line into a `Request`.** *Built.* This is the
+   change the first three drafts missed entirely, and it was the largest.
 
    Every decision below assumes flags — decision 7 has `/session config PATH`,
    decision 8 has an operator retyping `run --acknowledge-destructive`. Nothing
@@ -90,17 +90,28 @@ without updating them puts a wrong label on the console's own help.
    single largest piece of correctness in the console, invisible to every Go
    test — precisely what this section exists to prevent.
 
-   **Export the parser**: `app.ParseRequest([]string) (Request, Outcome, bool)`,
-   with `parseRequest` kept as its unexported body, and a route that takes a
-   line and returns the parsed `Request` or the same `Outcome` the CLI would
-   print. The console gets flags for free, the flag rules stay in one place, and
-   the parity criterion gains teeth it does not have today: both surfaces would
-   parse the same bytes with the same function.
+   **Shipped as** `app.ParseRequest([]string) (Request, Outcome, bool)`, with
+   `parseRequest` kept as its unexported body, and `POST /api/v1/parse` taking
+   `{"line": "..."}` and returning either the resolved `Request` or the same
+   `Outcome` the CLI would print. The console gets flags for free, the flag
+   rules stay in one place, and the parity criterion gains teeth it did not
+   have: both surfaces parse the same bytes with the same function.
 
-   This also decides the shape of the input line. Without it the console must
-   offer no flags at all and build `Request` fields from panels only — which is
-   a coherent design, but it is a different one, and decisions 7 and 8 would
-   both need rewriting.
+   Two things settled in the building that the design did not anticipate:
+
+   - **Tokenising lives in `internal/api`, not `internal/app`.** The command
+     line never tokenises — a shell did that before dmtx started — so putting it
+     in `app` would have added a concern the CLI does not have to the package
+     that defines the CLI's contract.
+   - **A line is one line.** An embedded newline is refused rather than treated
+     as whitespace, because `status` and `--state m.db` pasted together
+     tokenise into a perfectly valid `status` the operator never typed. Same
+     reasoning as `decodeRequest` refusing a body with two JSON documents. A
+     *trailing* newline is trimmed, since that is what a paste leaves behind.
+
+   This also decided the shape of the input line: the console offers flags. The
+   alternative — no flags, `Request` fields from panels only — was coherent but
+   would have required rewriting decisions 7 and 8.
 
 1. **`GET /api/v1/commands` returns what the console should show**: filtered to
    non-`Omitted` and alias-expanded.
