@@ -20,13 +20,30 @@ import (
 // errUnterminatedQuote is returned for a line whose quote never closes.
 var errUnterminatedQuote = errors.New("unterminated quote")
 
+// errMultipleLines is returned for input holding more than one line.
+var errMultipleLines = errors.New("input holds more than one line")
+
 // splitLine breaks a typed line into arguments.
 //
-// This is deliberately not a shell. Whitespace separates, single and double
+// This is deliberately not a shell. Spaces and tabs separate, single and double
 // quotes group, and a backslash inside a double-quoted span escapes the next
 // character. There is no variable expansion, no globbing, no command
 // substitution, no operators - a line is a command and its flags, nothing that
 // reaches back out into the machine.
+//
+// Only spaces and tabs, and only ASCII ones. A non-breaking space arrives by
+// pasting from a web page rather than by being typed, and splitting on it would
+// break a path that an operator can see is one path. Quoting protects it either
+// way.
+//
+// Newlines are the other half of that, and they are refused rather than treated
+// as separators. Two pasted lines joined into one would silently produce a
+// different command than either: "status" and "--state m.db" pasted together
+// tokenise into a perfectly valid status the operator never typed. The same
+// reasoning as decodeRequest refusing a body with two JSON documents - a caller
+// must not be able to believe it asked for something that never happened. A
+// trailing newline is trimmed rather than refused, because that is what a paste
+// or a script's ReadString leaves behind and is not part of what was typed.
 //
 // Quoting exists at all because config paths contain spaces. Without it an
 // operator with a config under "My Documents" would find the console unable to
@@ -36,6 +53,10 @@ var errUnterminatedQuote = errors.New("unterminated quote")
 // it would run a command the operator did not finish typing, and the one thing
 // worse than refusing a destructive command is starting a different one.
 func splitLine(line string) ([]string, error) {
+	line = strings.Trim(line, " \t\r\n\v\f")
+	if strings.ContainsAny(line, "\r\n") {
+		return nil, errMultipleLines
+	}
 	var (
 		args    []string
 		current strings.Builder

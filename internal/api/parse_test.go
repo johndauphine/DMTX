@@ -69,6 +69,20 @@ func TestSplitLineHandlesWhatAShellWouldHaveHandled(t *testing.T) {
 			`run --config=a" b".yaml`,
 			[]string{"run", `--config=a b.yaml`},
 		},
+		// A paste leaves one of these behind. It is not part of what was
+		// typed, so it is trimmed rather than becoming part of the last path.
+		{"trailing newline", "status --state m.db\n", []string{"status", "--state", "m.db"}},
+		{"trailing CRLF", "status --state m.db\r\n", []string{"status", "--state", "m.db"}},
+		{"leading newline", "\nstatus --state m.db", []string{"status", "--state", "m.db"}},
+		{"only a newline", "\n", nil},
+		// Not a separator, and not typed either - it arrives by pasting from a
+		// web page. Splitting on it would break a path an operator can see is
+		// one path.
+		{
+			"a non-breaking space is content",
+			"run --config My\u00a0Documents.yaml",
+			[]string{"run", "--config", "My\u00a0Documents.yaml"},
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			got, err := splitLine(testCase.line)
@@ -92,6 +106,25 @@ func TestSplitLineHandlesWhatAShellWouldHaveHandled(t *testing.T) {
 // Closing the quote at end of line would run a command the operator had not
 // finished typing - and the argument list it produced would be a different
 // command from the one they were partway through writing.
+func TestSplitLineRefusesMoreThanOneLine(t *testing.T) {
+	for _, line := range []string{
+		// The dangerous one: these two tokenise into a valid status the
+		// operator never typed, so joining them silently would run a command
+		// nobody asked for.
+		"status\n--state m.db",
+		"run --config a.yaml\nrun --config b.yaml",
+		"run --config a.yaml\r\nstatus",
+		// Inside quotes too. A path with a literal newline in it is not worth
+		// supporting, and allowing it here would reopen the case above for
+		// anyone who pasted between quotes.
+		"run --config \"a\nb.yaml\"",
+	} {
+		if got, err := splitLine(line); err == nil {
+			t.Errorf("splitLine(%q) was accepted as %q", line, got)
+		}
+	}
+}
+
 func TestSplitLineRefusesAnUnfinishedLine(t *testing.T) {
 	for _, line := range []string{
 		`run --config "unfinished`,
