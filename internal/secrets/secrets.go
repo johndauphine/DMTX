@@ -1,11 +1,19 @@
 // Package secrets owns the file dmtx keeps material in that must not sit in a
 // migration configuration.
 //
-// It is at ~/.secrets/dmtx-config.yaml, matching DMT, so an operator moving
-// between the two tools finds it where they expect and their backup exclusions
-// carry over. That does mean dmtx keeps its own files in two places, since the
-// serve state file lives in the platform config directory; the familiarity was
-// judged worth the split.
+// It is at ~/.secrets/dmtx/config.yaml. The ~/.secrets convention comes from
+// DMT, so an operator moving between the tools finds it where they expect and
+// their backup exclusions carry over; the per-tool subdirectory does not,
+// because that convention predates several tools sharing the directory.
+//
+// Partitioning is what makes the protections enforceable. dmtx owns
+// ~/.secrets/dmtx and can tighten it; it cannot tighten ~/.secrets without
+// changing permissions on other tools' files. The rule throughout is: enforce
+// what dmtx owns, report what it does not.
+//
+// It does mean dmtx keeps its own files in two places, since the serve state
+// file lives in the platform config directory; the familiarity was judged worth
+// the split.
 //
 // What this protects, and what it does not: mode 0600 and a refusal to load a
 // looser file keep other accounts on the machine out. They do not protect
@@ -25,12 +33,20 @@ import (
 )
 
 const (
-	// directoryName and fileName are DMT's, deliberately.
-	directoryName = ".secrets"
-	fileName      = "dmtx-config.yaml"
+	// sharedDirectory is where several tools keep their secrets. dmtx creates
+	// it when it is missing but does not otherwise touch it: an operator with
+	// other tools' files in there has made a choice dmtx is not party to.
+	sharedDirectory = ".secrets"
 
-	// fileMode is owner-only. The directory is owner-only too, so a listing
-	// does not disclose that the file exists.
+	// appDirectory is dmtx's own, inside the shared one. Partitioning by tool
+	// is what lets dmtx enforce anything at all here - a directory it owns can
+	// be tightened, where the shared parent cannot be tightened on somebody
+	// else's behalf.
+	appDirectory = "dmtx"
+
+	// fileName needs no prefix now that the directory names the tool.
+	fileName = "config.yaml"
+
 	fileMode      = 0o600
 	directoryMode = 0o700
 )
@@ -67,13 +83,13 @@ type Encryption struct {
 	MasterKey string `yaml:"master_key,omitempty"`
 }
 
-// Path is where the file lives.
+// Path is where the file lives: ~/.secrets/dmtx/config.yaml.
 func Path() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("locate home directory: %w", err)
 	}
-	return filepath.Join(home, directoryName, fileName), nil
+	return filepath.Join(home, sharedDirectory, appDirectory, fileName), nil
 }
 
 // Load reads the file, refusing one that other accounts can read.
@@ -96,30 +112,39 @@ func Load(path string) (Config, error) {
 	return value, nil
 }
 
-// ValidateDirectoryPermissions reports whether the directory holding the file
-// can be listed by other accounts.
+// ValidateDirectoryPermissions reports whether dmtx's own secrets directory can
+// be listed by other accounts.
 //
-// Reported rather than corrected. ~/.secrets is shared with whatever else keeps
-// files there - DMT's own config lives beside this one - so tightening it would
-// change permissions on somebody else's data to fix ours. The operator is told
-// and decides.
-//
-// A listable directory does not disclose the file's contents, but it does
-// disclose that dmtx is configured here and what else is, which is worth
-// knowing about even though it is not worth acting on unasked.
+// This is the directory dmtx owns, so a loose one is a fault rather than a
+// choice - Create tightens it. The check exists for a directory changed
+// afterwards.
 func ValidateDirectoryPermissions(path string) error {
+	return checkDirectory(filepath.Dir(path))
+}
+
+// ValidateSharedDirectoryPermissions reports whether the directory holding
+// every tool's secrets can be listed by other accounts.
+//
+// Reported and never corrected, because dmtx does not own it. A listable
+// ~/.secrets does not disclose any file's contents, but it does disclose which
+// tools an operator has configured - worth telling them once, and not worth
+// changing on their behalf when other tools' files are in there too.
+func ValidateSharedDirectoryPermissions(path string) error {
+	return checkDirectory(filepath.Dir(filepath.Dir(path)))
+}
+
+func checkDirectory(directory string) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
-	info, err := os.Stat(filepath.Dir(path))
+	info, err := os.Stat(directory)
 	if err != nil {
 		return fmt.Errorf("check secrets directory permissions: %w", err)
 	}
 	if mode := info.Mode().Perm(); mode&0o077 != 0 {
 		return fmt.Errorf(
 			"%w: %s is %04o; run: chmod %03o %s",
-			ErrInsecureDirectory, filepath.Dir(path), mode,
-			directoryMode, filepath.Dir(path),
+			ErrInsecureDirectory, directory, mode, directoryMode, directory,
 		)
 	}
 	return nil
@@ -164,13 +189,24 @@ func Create(path string, force bool) error {
 		return fmt.Errorf("check %s: %w", path, err)
 	}
 
-	// Created 0700 when it is missing. An existing directory is left as the
-	// operator has it: this one is shared with whatever else keeps files in
-	// ~/.secrets, and tightening a directory dmtx did not create is not its
-	// decision to make. ValidateDirectoryPermissions reports a loose one so the
-	// operator can decide instead.
-	if err := os.MkdirAll(filepath.Dir(path), directoryMode); err != nil {
+	// Two directories, answered differently, which is the whole reason for
+	// partitioning by tool.
+	//
+	// The shared parent is created when missing and otherwise left exactly as
+	// it is - an operator keeping several tools' secrets there has made a
+	// choice dmtx is not party to, and tightening it would change permissions
+	// on somebody else's data.
+	//
+	// dmtx's own directory inside it is enforced, because it is dmtx's. MkdirAll
+	// applies its mode only when it creates, so an existing one is chmodded:
+	// that is the third place in this codebase where a mode argument alone was
+	// not enough, and here it can simply be fixed rather than reported.
+	own := filepath.Dir(path)
+	if err := os.MkdirAll(own, directoryMode); err != nil {
 		return fmt.Errorf("create secrets directory: %w", err)
+	}
+	if err := os.Chmod(own, directoryMode); err != nil {
+		return fmt.Errorf("restrict secrets directory: %w", err)
 	}
 	// A mode argument applies only when a file is created, so an existing file
 	// replaced with --force would keep whatever mode it had. Chmod covers that;

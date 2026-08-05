@@ -45,13 +45,18 @@ func executeInitSecrets(request Request) Outcome {
 	return out.done(Success)
 }
 
-// reportDirectory mentions a listable secrets directory without changing it.
+// reportDirectory mentions a listable directory above the file.
 //
-// A warning rather than a failure: the file itself is still owner-only, and
-// ~/.secrets is shared with whatever else keeps files there, so this is the
-// operator's call to make on their own directory.
+// Only the shared one can be listable after a successful Create, because dmtx
+// tightens its own. A warning rather than a failure: the file is owner-only
+// regardless, and ~/.secrets holds other tools' files, so what happens to it is
+// the operator's call.
 func reportDirectory(out *outcomeBuilder, path string) {
 	if err := secrets.ValidateDirectoryPermissions(path); err != nil {
 		out.out("warning: " + err.Error())
+	}
+	if err := secrets.ValidateSharedDirectoryPermissions(path); err != nil {
+		out.out("warning: " + err.Error())
+		out.out("  that directory holds other tools' secrets, so dmtx leaves it alone")
 	}
 }

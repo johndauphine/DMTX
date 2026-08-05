@@ -204,8 +204,19 @@ nobody wrote down is rediscovered as a gap.
 
 **[decided]** dmtx has no secrets store today — passwords sit in
 `migration.yaml`, which is the file people share. `init-secrets` creates one at
-**`~/.secrets/dmtx-config.yaml`**, matching DMT so an operator moving between
-the tools finds it where they expect and their backup exclusions carry over.
+**`~/.secrets/dmtx/config.yaml`**.
+
+The `~/.secrets` convention comes from DMT, so an operator moving between the
+tools finds it where they expect and their backup exclusions carry over. The
+per-tool subdirectory does not: that convention predates several tools sharing
+the directory, and on this machine `~/.secrets` already holds DMT's config and
+thirty-five files belonging to a third tool.
+
+**Partitioning is what makes the protections enforceable.** dmtx owns
+`~/.secrets/dmtx` and can tighten it; it cannot tighten `~/.secrets` without
+changing permissions on other tools' files. The rule throughout is: **enforce
+what dmtx owns, report what it does not.**
+
 `os.UserHomeDir` works on Windows, so this is portable even though the
 convention is unix-flavoured. It does mean dmtx keeps its own files in two
 places: `serve.json` stays in `os.UserConfigDir`.

@@ -86,7 +86,7 @@ func TestCreateWritesAnOwnerOnlyFile(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix permission bits are not how Windows restricts a file")
 	}
-	path := filepath.Join(t.TempDir(), ".secrets", fileName)
+	path, _, _ := layout(t, 0o700)
 	if err := Create(path, false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestCreateWritesAnOwnerOnlyFile(t *testing.T) {
 // more here than for a configuration: this file is the only copy of a key, and
 // replacing it makes everything sealed with the old one unreadable.
 func TestCreateRefusesToDiscardKeyMaterial(t *testing.T) {
-	path := filepath.Join(t.TempDir(), ".secrets", fileName)
+	path, _, _ := layout(t, 0o700)
 	if err := Create(path, false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -141,11 +141,10 @@ func TestForceReplacesAndTightens(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix permission bits are not how Windows restricts a file")
 	}
-	directory := filepath.Join(t.TempDir(), ".secrets")
-	if err := os.MkdirAll(directory, 0o700); err != nil {
+	path, _, _ := layout(t, 0o700)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(directory, fileName)
 	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +240,7 @@ func TestPermissionsAreJudgedByTheTargetOfASymlink(t *testing.T) {
 // TestLoadReadsWhatCreateWrote closes the loop: the file dmtx writes is one
 // dmtx can read.
 func TestLoadReadsWhatCreateWrote(t *testing.T) {
-	path := filepath.Join(t.TempDir(), ".secrets", fileName)
+	path, _, _ := layout(t, 0o700)
 	if err := Create(path, false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -262,7 +261,7 @@ func TestLoadReadsWhatCreateWrote(t *testing.T) {
 // The caller answers them quite differently, and reporting an I/O failure as
 // "already exists" sends an operator to look at a file that may not be there.
 func TestCreateDistinguishesAnExistingFileFromAFailure(t *testing.T) {
-	path := filepath.Join(t.TempDir(), ".secrets", fileName)
+	path, _, _ := layout(t, 0o700)
 	if err := Create(path, false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -286,47 +285,99 @@ func TestCreateDistinguishesAnExistingFileFromAFailure(t *testing.T) {
 	}
 }
 
-// TestALooseDirectoryIsReportedNotCorrected pins the decision not to change
-// permissions on a directory dmtx did not create.
+// layout builds ~/.secrets/dmtx/config.yaml under a temporary home, with the
+// shared parent at a chosen mode.
+func layout(t *testing.T, sharedMode os.FileMode) (path, shared, own string) {
+	t.Helper()
+	home := t.TempDir()
+	shared = filepath.Join(home, sharedDirectory)
+	if err := os.MkdirAll(shared, sharedMode); err != nil {
+		t.Fatal(err)
+	}
+	// MkdirAll is subject to umask, so the mode is set explicitly.
+	if err := os.Chmod(shared, sharedMode); err != nil {
+		t.Fatal(err)
+	}
+	own = filepath.Join(shared, appDirectory)
+	return filepath.Join(own, fileName), shared, own
+}
+
+// TestDmtxTightensItsOwnDirectory pins the half of the rule dmtx enforces.
 //
-// ~/.secrets is shared - DMT's own config lives beside this one - so tightening
-// it would change permissions on somebody else's data to fix ours.
-func TestALooseDirectoryIsReportedNotCorrected(t *testing.T) {
+// Partitioning by tool is what makes this possible: ~/.secrets/dmtx belongs to
+// dmtx, so a loose one is a fault to fix rather than somebody else's choice to
+// respect. MkdirAll applies its mode only when it creates, so an existing
+// directory has to be chmodded - the third place in this codebase where a mode
+// argument alone was not enough.
+func TestDmtxTightensItsOwnDirectory(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX mode bits do not represent Windows ACLs")
 	}
-	directory := filepath.Join(t.TempDir(), ".secrets")
-	if err := os.MkdirAll(directory, 0o755); err != nil {
+	path, _, own := layout(t, 0o700)
+	if err := os.MkdirAll(own, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(directory, fileName)
+	if err := os.Chmod(own, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := Create(path, false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-
-	// The file is still owner-only whatever the directory is.
-	info, err := os.Stat(path)
+	info, err := os.Stat(own)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if mode := info.Mode().Perm(); mode&0o077 != 0 {
-		t.Errorf("the file is %04o inside a loose directory", mode)
+		t.Errorf("dmtx left its own secrets directory at %04o", mode)
 	}
-	// The directory is left alone...
-	before, err := os.Stat(directory)
+	if err := ValidateDirectoryPermissions(path); err != nil {
+		t.Errorf("the directory dmtx just tightened is still reported: %v", err)
+	}
+}
+
+// TestTheSharedDirectoryIsReportedNotCorrected pins the other half.
+//
+// ~/.secrets holds other tools' secrets - on the author's machine, DMT's config
+// and thirty-five files belonging to a third tool. Tightening it would change
+// permissions on somebody else's data to fix ours, so it is reported and the
+// operator decides.
+func TestTheSharedDirectoryIsReportedNotCorrected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX mode bits do not represent Windows ACLs")
+	}
+	path, shared, own := layout(t, 0o755)
+
+	if err := Create(path, false); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	after, err := os.Stat(shared)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if before.Mode().Perm() != 0o755 {
+	if after.Mode().Perm() != 0o755 {
 		t.Errorf(
-			"create changed the directory to %04o; it is shared with other "+
-				"tools and is not dmtx's to tighten",
-			before.Mode().Perm(),
+			"create changed the shared directory to %04o; other tools keep "+
+				"files there and it is not dmtx's to tighten",
+			after.Mode().Perm(),
 		)
 	}
-	// ...and reported.
-	if err := ValidateDirectoryPermissions(path); !errors.Is(err, ErrInsecureDirectory) {
-		t.Errorf("a listable secrets directory was not reported: %v", err)
+	if err := ValidateSharedDirectoryPermissions(path); !errors.Is(err, ErrInsecureDirectory) {
+		t.Errorf("a listable shared directory was not reported: %v", err)
+	}
+
+	// dmtx's own directory is still tight, and still not reported, even though
+	// its parent is loose. The two answers are independent.
+	info, err := os.Stat(own)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		t.Errorf("dmtx's own directory is %04o inside a loose parent", mode)
+	}
+	if err := ValidateDirectoryPermissions(path); err != nil {
+		t.Errorf("dmtx's own directory was reported because its parent is loose: %v", err)
 	}
 }
 
@@ -336,11 +387,33 @@ func TestATightDirectoryIsNotReported(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX mode bits do not represent Windows ACLs")
 	}
-	path := filepath.Join(t.TempDir(), ".secrets", fileName)
+	path, _, _ := layout(t, 0o700)
 	if err := Create(path, false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if err := ValidateDirectoryPermissions(path); err != nil {
 		t.Errorf("a directory dmtx created 0700 was reported as loose: %v", err)
+	}
+	if err := ValidateSharedDirectoryPermissions(path); err != nil {
+		t.Errorf("a shared directory at 0700 was reported as loose: %v", err)
+	}
+}
+
+// TestTheFileSitsUnderAToolSpecificDirectory pins the partitioning itself, so
+// dmtx cannot drift back to dropping a file straight into the shared one.
+func TestTheFileSitsUnderAToolSpecificDirectory(t *testing.T) {
+	path, err := Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(filepath.Dir(path)) != appDirectory {
+		t.Errorf(
+			"the secrets file is at %s; it belongs under a %s directory so its "+
+				"permissions are dmtx's to enforce",
+			path, appDirectory,
+		)
+	}
+	if filepath.Base(filepath.Dir(filepath.Dir(path))) != sharedDirectory {
+		t.Errorf("the tool directory is not inside %s: %s", sharedDirectory, path)
 	}
 }
