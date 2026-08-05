@@ -101,11 +101,11 @@ func TestSplitLineHandlesWhatAShellWouldHaveHandled(t *testing.T) {
 	}
 }
 
-// TestSplitLineRefusesAnUnfinishedLine pins the refusal rather than a guess.
+// TestSplitLineRefusesMoreThanOneLine pins that an embedded newline is refused.
 //
-// Closing the quote at end of line would run a command the operator had not
-// finished typing - and the argument list it produced would be a different
-// command from the one they were partway through writing.
+// Joining is worse than refusing here. Two pasted lines can tokenise into a
+// valid command that is neither of them, and the operator would have no way to
+// see that had happened.
 func TestSplitLineRefusesMoreThanOneLine(t *testing.T) {
 	for _, line := range []string{
 		// The dangerous one: these two tokenise into a valid status the
@@ -125,6 +125,11 @@ func TestSplitLineRefusesMoreThanOneLine(t *testing.T) {
 	}
 }
 
+// TestSplitLineRefusesAnUnfinishedLine pins the refusal rather than a guess.
+//
+// Closing the quote at end of line would run a command the operator had not
+// finished typing - and the argument list it produced would be a different
+// command from the one they were partway through writing.
 func TestSplitLineRefusesAnUnfinishedLine(t *testing.T) {
 	for _, line := range []string{
 		`run --config "unfinished`,

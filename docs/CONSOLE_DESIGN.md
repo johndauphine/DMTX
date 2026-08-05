@@ -103,11 +103,13 @@ without updating them puts a wrong label on the console's own help.
      line never tokenises — a shell did that before dmtx started — so putting it
      in `app` would have added a concern the CLI does not have to the package
      that defines the CLI's contract.
-   - **A line is one line.** An embedded newline is refused rather than treated
-     as whitespace, because `status` and `--state m.db` pasted together
+   - **A line is one line.** An *embedded* newline is refused rather than
+     treated as whitespace, because `status` and `--state m.db` pasted together
      tokenise into a perfectly valid `status` the operator never typed. Same
-     reasoning as `decodeRequest` refusing a body with two JSON documents. A
-     *trailing* newline is trimmed, since that is what a paste leaves behind.
+     reasoning as `decodeRequest` refusing a body with two JSON documents.
+     Newlines at either edge are trimmed rather than refused — that is what a
+     paste leaves around what was typed, and there is nothing on the far side
+     of them to join.
 
    This also decided the shape of the input line: the console offers flags. The
    alternative — no flags, `Request` fields from panels only — was coherent but

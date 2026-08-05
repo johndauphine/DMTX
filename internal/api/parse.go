@@ -36,14 +36,19 @@ var errMultipleLines = errors.New("input holds more than one line")
 // break a path that an operator can see is one path. Quoting protects it either
 // way.
 //
-// Newlines are the other half of that, and they are refused rather than treated
-// as separators. Two pasted lines joined into one would silently produce a
-// different command than either: "status" and "--state m.db" pasted together
-// tokenise into a perfectly valid status the operator never typed. The same
-// reasoning as decodeRequest refusing a body with two JSON documents - a caller
-// must not be able to believe it asked for something that never happened. A
-// trailing newline is trimmed rather than refused, because that is what a paste
-// or a script's ReadString leaves behind and is not part of what was typed.
+// Newlines are the other half of that. An *embedded* one is refused rather than
+// treated as a separator: two pasted lines joined into one would silently
+// produce a different command than either, since "status" and "--state m.db"
+// pasted together tokenise into a perfectly valid status the operator never
+// typed. The same reasoning as decodeRequest refusing a body with two JSON
+// documents - a caller must not be able to believe it asked for something that
+// never happened.
+//
+// Leading and trailing whitespace, newlines included, is trimmed rather than
+// refused. That is what a paste or a script's ReadString leaves around what was
+// typed, and it cannot join two commands: there is nothing on the far side of
+// it. So the rule is embedded-only, and the trim happens first so that the
+// check sees a line with its edges already removed.
 //
 // Quoting exists at all because config paths contain spaces. Without it an
 // operator with a config under "My Documents" would find the console unable to
