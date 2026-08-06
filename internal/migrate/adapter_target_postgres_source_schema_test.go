@@ -361,46 +361,48 @@ func TestPostgresTargetPlansMySQLTypesObjectsAndIdentityWithoutMutation(
 	}
 }
 
-func TestPostgresTargetRequiresNoPadMySQLSourceCollation(
+func TestPostgresTargetDropsMySQLTableCollation(
 	t *testing.T,
 ) {
-	base := schema.Table{
-		Schema: "app",
-		Name:   "items",
-		Columns: []schema.Column{mysqlProjectionColumn(
-			"id",
-			"bigint",
-			"bigint",
-		)},
-	}
+	// Replaces a test named for the gate it pinned. That gate accepted
+	// utf8mb4_0900_bin and utf8mb4_nopad_bin and rejected utf8mb4_bin, which
+	// MySQL discovery certifies - so the two copies of one certified set
+	// disagreed, and neither asked about a column anything is ordered by.
+	//
+	// The table's collation is the default its columns inherit. Ordering is
+	// asked of key columns at discovery, once, by
+	// checkMySQLSourceKeyCollations.
 	for _, collation := range []string{
 		"utf8mb4_0900_bin",
 		"utf8mb4_nopad_bin",
-	} {
-		t.Run("accept "+collation, func(t *testing.T) {
-			source := base
-			source.MySQLCollation = collation
-			if _, err := projectMySQLTableForPostgres(
-				source,
-			); err != nil {
-				t.Fatalf("project no-pad collation: %v", err)
-			}
-		})
-	}
-	for _, collation := range []string{
-		"",
 		"utf8mb4_bin",
 		"utf8mb4_0900_ai_ci",
+		"utf8mb4_unicode_ci",
+		"",
 	} {
-		t.Run("reject "+collation, func(t *testing.T) {
-			source := base
-			source.MySQLCollation = collation
-			_, err := projectMySQLTableForPostgres(source)
-			var policy *schema.PolicyError
-			if !errors.As(err, &policy) ||
-				policy.Operation != "map MySQL collation" ||
-				policy.Target != string(schema.Postgres) {
-				t.Fatalf("error = %v", err)
+		t.Run(collation, func(t *testing.T) {
+			source := schema.Table{
+				Schema:         "source_database",
+				Name:           "events",
+				MySQLCollation: collation,
+				Columns: []schema.Column{
+					mysqlProjectionColumn("id", "bigint", "bigint"),
+				},
+			}
+			source.Columns[0].PrimaryKey = true
+			source.Columns[0].PrimaryKeyPosition = 1
+			projected, err := projectMySQLTableForPostgres(source)
+			if err != nil {
+				t.Fatalf("project a table collated %q: %v", collation, err)
+			}
+			// PostgreSQL has no catalog representation for a MySQL collation,
+			// so carrying it would put a fact in the target authority the
+			// target cannot hold.
+			if projected.MySQLCollation != "" {
+				t.Errorf(
+					"projected table kept MySQLCollation %q",
+					projected.MySQLCollation,
+				)
 			}
 		})
 	}

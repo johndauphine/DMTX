@@ -91,17 +91,20 @@ func TestStackOverflowDirectedPairMatrixLive(t *testing.T) {
 		},
 		{source: "postgres", target: "mssql"},
 		{source: "postgres", target: "mysql"},
-		{
-			source: "mysql", target: "postgres",
-			blocked: "MySQL source discovery certifies only utf8mb4_bin and " +
-				"utf8mb4_0900_bin, so an ordinary utf8mb4_unicode_ci table " +
-				"cannot be read at all",
-		},
+		{source: "mysql", target: "postgres"},
 		{
 			source: "mysql", target: "mssql",
-			blocked: "MySQL source discovery certifies only utf8mb4_bin and " +
-				"utf8mb4_0900_bin, so an ordinary utf8mb4_unicode_ci table " +
-				"cannot be read at all",
+			// Not a defect - dmtx is right here. MySQL LONGTEXT holds 4GB and
+			// SQL Server VARCHAR(MAX) holds 2GB, and nothing in the schema says
+			// the data is small, so refusing is what refuse-unless-certified
+			// means.
+			//
+			// It does expose an asymmetry worth naming: mssql->mysql maps
+			// NVARCHAR(MAX) to LONGTEXT, and LONGTEXT cannot come back. The
+			// corpus survives one direction and not the return, which is
+			// exactly what a round-trip idempotence check would be for.
+			blocked: "MySQL LONGTEXT exceeds SQL Server VARCHAR(MAX); a real " +
+				"capacity limit rather than a misplaced rule",
 		},
 	} {
 		t.Run(pair.source+"_to_"+pair.target, func(t *testing.T) {

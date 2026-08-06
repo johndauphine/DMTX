@@ -22,16 +22,17 @@ func projectMySQLTableForSQLServer(
 			source.Name,
 		)
 	}
-	switch strings.ToLower(strings.TrimSpace(source.MySQLCollation)) {
-	case "utf8mb4_0900_bin", "utf8mb4_nopad_bin":
-	default:
-		return schema.Table{}, sqlServerProjectionPolicy(
-			"map MySQL collation",
-			source.MySQLCollation,
-		)
-	}
-
 	projected := cloneSQLServerTargetTable(source)
+	// The table's MySQL collation is dropped rather than gated. It is the
+	// default its columns inherit, not an ordering anything is read by, and the
+	// gate that stood here refused every ordinary MySQL table because
+	// utf8mb4_0900_ai_ci is 8.0's own default.
+	//
+	// Ordering is asked of the columns a paged read is ordered by, in
+	// checkMySQLSourceKeyCollations at discovery, once. The third copy of that
+	// certified set lived here and named a different pair than discovery's -
+	// utf8mb4_bin passed discovery and failed this - so the copies were already
+	// inconsistent before any of them was widened.
 	projected.MySQLCollation = ""
 	for index, column := range source.Columns {
 		target, err := projectMySQLColumnForSQLServer(column)

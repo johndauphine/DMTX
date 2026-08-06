@@ -157,14 +157,6 @@ func TestValidateMySQL80SourceTableCatalogFailsClosed(t *testing.T) {
 		"non-InnoDB": func(value *mysql80SourceTableCatalog) {
 			value.engine.String = "MyISAM"
 		},
-		"nonbinary collation": func(value *mysql80SourceTableCatalog) {
-			value.tableCollation.String = "utf8mb4_0900_ai_ci"
-		},
-		"different binary collation semantics": func(
-			value *mysql80SourceTableCatalog,
-		) {
-			value.tableCollation.String = "utf8mb4_unmodeled_bin"
-		},
 		"table options": func(value *mysql80SourceTableCatalog) {
 			value.createOptions = "stats_persistent=1"
 		},
@@ -744,4 +736,79 @@ func equalMySQLSourceArguments(left, right []int) bool {
 		}
 	}
 	return true
+}
+
+// TestMySQLSourceKeyCollationsMustOrderTheSameOnBothEngines pins the rule that
+// moved rather than the one that went away.
+//
+// A table's collation is the default its columns inherit, so requiring a binary
+// one there refused every ordinary MySQL table - utf8mb4_0900_ai_ci is 8.0's
+// own default - while deciding nothing. Ordering is a property of the columns a
+// paged read is ordered by, so that is where it is asked now.
+//
+// Measured against MySQL 8.0 rather than argued from the names:
+//
+//	utf8mb4_unicode_ci  orders [EUR, y-diaeresis]  and matches 'Ü' to 'ü'
+//	utf8mb4_bin         orders [y-diaeresis, EUR]  and matches neither
+//	PostgreSQL          orders [y-diaeresis, EUR]
+func TestMySQLSourceKeyCollationsMustOrderTheSameOnBothEngines(t *testing.T) {
+	keyed := schema.Table{
+		Schema: "so",
+		Name:   "tags",
+		Columns: []schema.Column{{
+			Name:               "tagname",
+			Type:               "text",
+			PrimaryKeyPosition: 1,
+			DeclaredType:       &schema.DeclaredType{Base: "varchar", Arguments: []int{40}},
+		}},
+	}
+
+	for _, refused := range []struct{ reason, collation string }{
+		{
+			reason:    "case-insensitive: MySQL calls two different strings equal",
+			collation: "utf8mb4_unicode_ci",
+		},
+		{
+			reason:    "8.0's own default, also accent-insensitive",
+			collation: "utf8mb4_0900_ai_ci",
+		},
+		{
+			// Binary by name, and not one dmtx has modelled. Ordering is only
+			// portable when it has been established, not when it looks like it
+			// ought to be - this case moved here from the table-level check.
+			reason:    "an unmodelled binary collation",
+			collation: "utf8mb4_unmodeled_bin",
+		},
+	} {
+		if err := checkMySQLSourceKeyCollations(
+			keyed,
+			map[string]string{"tagname": refused.collation},
+		); err == nil {
+			t.Errorf("accepted a text key with %s (%s)", refused.collation, refused.reason)
+		}
+	}
+
+	for _, accepted := range []string{"utf8mb4_bin", "utf8mb4_0900_bin"} {
+		if err := checkMySQLSourceKeyCollations(
+			keyed,
+			map[string]string{"tagname": accepted},
+		); err != nil {
+			t.Errorf("refused %s, whose ordering matches: %v", accepted, err)
+		}
+	}
+
+	// The same collation on a data column is not asked the question. The value
+	// transfers byte for byte whatever it orders by.
+	data := keyed
+	data.Columns = []schema.Column{{
+		Name:         "tagname",
+		Type:         "text",
+		DeclaredType: &schema.DeclaredType{Base: "varchar", Arguments: []int{40}},
+	}}
+	if err := checkMySQLSourceKeyCollations(
+		data,
+		map[string]string{"tagname": "utf8mb4_unicode_ci"},
+	); err != nil {
+		t.Errorf("refused an ordinary collation on a data column: %v", err)
+	}
 }
