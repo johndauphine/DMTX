@@ -672,38 +672,82 @@ func TestNationalTextLengthIsCharactersNotBytes(t *testing.T) {
 // per-value check it costs nothing at run time, being read once from the
 // catalog at discovery.
 func TestSQLServerSourceKeyCollationsMustOrderTheSameOnBothEngines(t *testing.T) {
-	table := schema.Table{
-		Schema: "dbo",
-		Name:   "Tags",
-		Columns: []schema.Column{{
-			Name:               "TagName",
-			Type:               "text",
-			PrimaryKeyPosition: 1,
-			DeclaredType:       &schema.DeclaredType{Base: "nvarchar", Arguments: []int{40}},
-		}},
+	keyed := func(base string) schema.Table {
+		return schema.Table{
+			Schema: "dbo",
+			Name:   "Tags",
+			Columns: []schema.Column{{
+				Name:               "TagName",
+				Type:               "text",
+				PrimaryKeyPosition: 1,
+				DeclaredType: &schema.DeclaredType{
+					Base:      base,
+					Arguments: []int{40},
+				},
+			}},
+		}
 	}
 
-	if err := checkSQLServerSourceKeyCollations(
-		table,
-		map[string]string{"TagName": "SQL_Latin1_General_CP1_CI_AS"},
-	); err == nil {
-		t.Fatal("a case-insensitive text key was accepted")
+	// Each of these was measured against SQL Server 2022 rather than argued
+	// from the collation's name, and two of the three refusals are near misses
+	// that read as safe.
+	for _, refused := range []struct {
+		reason    string
+		base      string
+		collation string
+	}{
+		{
+			reason:    "case-insensitive: 'a' = 'A' here and not in PostgreSQL",
+			base:      "varchar",
+			collation: "SQL_Latin1_General_CP1_CI_AS",
+		},
+		{
+			// Binary, and still wrong: it orders by CP1252 bytes, so
+			// [EUR, y-diaeresis] where UTF-8 gives the reverse.
+			reason:    "narrow _BIN2 is a codepage ordering",
+			base:      "varchar",
+			collation: "Latin1_General_100_BIN2",
+		},
+		{
+			// UTF-16 code-unit order agrees with PostgreSQL across the BMP and
+			// stops above it, because surrogates sit at D800-DFFF while the
+			// characters they encode live at U+10000 up.
+			reason:    "national types order by UTF-16 code unit",
+			base:      "nvarchar",
+			collation: "Latin1_General_100_BIN2",
+		},
+		{
+			// SQL Server's _UTF8 collations change the encoding of char and
+			// varchar only, so this does not make an nvarchar key portable.
+			reason:    "a _UTF8 collation does not re-encode a national type",
+			base:      "nvarchar",
+			collation: "Latin1_General_100_BIN2_UTF8",
+		},
+	} {
+		if err := checkSQLServerSourceKeyCollations(
+			keyed(refused.base),
+			map[string]string{"TagName": refused.collation},
+		); err == nil {
+			t.Errorf("accepted a text key that %s", refused.reason)
+		}
 	}
-	if err := checkSQLServerSourceKeyCollations(
-		table,
-		map[string]string{"TagName": "Latin1_General_100_BIN2"},
-	); err != nil {
-		t.Fatalf("a binary text key was refused: %v", err)
-	}
-	if err := checkSQLServerSourceKeyCollations(
-		table,
-		map[string]string{"TagName": "Latin1_General_100_BIN2_UTF8"},
-	); err != nil {
-		t.Fatalf("a binary UTF-8 text key was refused: %v", err)
+
+	// The one spelling whose ordering was measured to agree.
+	for _, accepted := range []string{
+		"Latin1_General_100_BIN2_UTF8",
+		// Any locale: BIN2 ignores the prefix and _UTF8 fixes the encoding.
+		"Japanese_XJIS_140_BIN2_UTF8",
+	} {
+		if err := checkSQLServerSourceKeyCollations(
+			keyed("varchar"),
+			map[string]string{"TagName": accepted},
+		); err != nil {
+			t.Errorf("refused %s, whose ordering matches: %v", accepted, err)
+		}
 	}
 
 	// The same column as data rather than key is not asked the question at all.
-	data := table
+	data := keyed("nvarchar")
 	data.Columns = []schema.Column{{
 		Name:         "TagName",
 		Type:         "text",

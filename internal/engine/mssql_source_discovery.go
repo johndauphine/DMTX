@@ -1153,19 +1153,44 @@ func sqlServerPortableTextColumnCollation(
 	collation string,
 ) bool {
 	switch typeName {
-	case "char", "varchar", "nchar", "nvarchar":
-		// BIN2 is the byte-ordered family. Matched by suffix rather than by one
-		// exact name so that the national and non-national spellings, and the
-		// other locales that are equally byte-ordered, are not excluded by an
-		// accident of which one got written down first.
+	case "char", "varchar":
+		// _BIN2_UTF8 and nothing else, because it is the only spelling whose
+		// ordering was measured to agree with PostgreSQL's. Two near misses,
+		// both checked against SQL Server 2022 rather than reasoned about:
+		//
+		//   varchar  COLLATE Latin1_General_100_BIN2       orders [€ ÿ]
+		//   varchar  COLLATE Latin1_General_100_BIN2_UTF8  orders [ÿ €]
+		//   PostgreSQL                                     orders [ÿ €]
+		//
+		// A narrow _BIN2 is a binary *codepage* collation, so it orders by
+		// CP1252 bytes where € is 0x80 and ÿ is 0xFF. Transcoded to UTF-8 the
+		// codepoints are U+20AC and U+00FF, which is the other way round. Byte
+		// ordering is not portable just because it is binary; it is portable
+		// when the bytes are the same bytes.
+		//
+		// Matched by suffix rather than by one full name because BIN2 ignores
+		// the locale that prefixes it - the ordering is binary either way - and
+		// _UTF8 fixes the encoding. So every _BIN2_UTF8 collation is equally
+		// safe, and pinning one name would refuse the others for no reason.
 		return strings.HasSuffix(
-			strings.ToUpper(strings.TrimSpace(collation)),
-			"_BIN2",
-		) || strings.HasSuffix(
 			strings.ToUpper(strings.TrimSpace(collation)),
 			"_BIN2_UTF8",
 		)
 	default:
+		// The national types have no safe spelling, so a text key of one is
+		// refused however it is collated. nchar and nvarchar are UTF-16, and
+		// SQL Server's _UTF8 collations change the encoding of char and varchar
+		// only - so a national key always orders by UTF-16 code unit. That
+		// agrees with PostgreSQL across the BMP and stops agreeing above it,
+		// because surrogates occupy D800-DFFF while the characters they encode
+		// live at U+10000 and beyond. Measured:
+		//
+		//   nvarchar COLLATE Latin1_General_100_BIN2  orders [U+1F389 U+FFFD]
+		//   PostgreSQL                                orders [U+FFFD U+1F389]
+		//
+		// One emoji in a key column is enough to move a chunk boundary. The
+		// data columns are unaffected and stay certified - this is about
+		// ordering, which is asked of keys alone.
 		return false
 	}
 }
