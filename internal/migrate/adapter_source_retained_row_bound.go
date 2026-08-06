@@ -1336,17 +1336,20 @@ func sqlServerRetainedColumnBound(
 	return bound, nil
 }
 
-// sqlServerRetainedTextLengthLimit is the largest declarable length, in
-// characters, that this bound will accept.
+// sqlServerRetainedTextLengthLimit is the largest length this bound accepts.
 //
-// SQL Server caps the national types at 4000 characters and the others at
-// 8000; beyond either, MAX is required and the column arrives as unbounded
-// text down the other branch. Discovery enforces the same limits, so nothing
-// out of range should reach here - which is the reason to check rather than a
-// reason not to. This bound decides how many rows fit in the memory ceiling,
-// and accepting an nvarchar(8000) that cannot exist would under-count it by
-// half. A guard that only matters when something upstream is already wrong is
-// the guard worth having.
+// The unit differs by family and is worth stating, because the arithmetic below
+// multiplies it: char and varchar declare BYTES, nchar and nvarchar declare
+// UTF-16 CODE UNITS. SQL Server caps the first pair at 8000 and the second at
+// 4000, which is the same 8000 bytes of storage. Beyond either, MAX is required
+// and the column arrives as unbounded text down the other branch.
+//
+// Discovery enforces the same limits, so nothing out of range should reach here
+// - which is the reason to check rather than a reason not to. This bound
+// decides how many rows fit in the memory ceiling, and accepting an
+// nvarchar(8000) that cannot exist would under-count it by half. A guard that
+// only matters when something upstream is already wrong is the guard worth
+// having.
 func sqlServerRetainedTextLengthLimit(base string) int64 {
 	switch base {
 	case "nchar", "nvarchar":

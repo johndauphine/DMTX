@@ -1091,9 +1091,10 @@ func applySQLServerSourceTextType(
 		)
 	}
 
-	// max_length is bytes. The national types store two bytes per character, so
-	// the declared length is half of it - and getting this wrong would silently
-	// double every length in the target DDL.
+	// max_length is bytes for every family. The national types store two bytes
+	// per UTF-16 unit, so their declared length is half of it; the others
+	// declare bytes already and pass through. Getting this wrong would silently
+	// double every national length in the target DDL.
 	length := catalog.maxLength
 	if length != -1 && sqlServerNationalText(catalog.typeName) {
 		if length%2 != 0 {
@@ -1141,9 +1142,23 @@ func sqlServerFixedWidthText(typeName string) bool {
 	return typeName == "char" || typeName == "nchar"
 }
 
-// sqlServerTextLengthLimit is the largest declarable length, in characters.
-// Both families cap at 8000 bytes, which is 4000 characters for the national
-// types; beyond that SQL Server requires MAX.
+// sqlServerTextLengthLimit is the largest length each family may declare.
+//
+// The two families do not declare the same unit, and saying so plainly matters
+// more here than brevity - a comment that called both "characters" is what an
+// earlier version of this said, and unit confusion is the defect this file was
+// rewritten to fix.
+//
+//	char/varchar      n is BYTES. Under a _UTF8 collation a multi-byte
+//	                  character spends several of them, so varchar(10) may hold
+//	                  fewer than ten characters. Caps at 8000.
+//	nchar/nvarchar    n is UTF-16 CODE UNITS. A BMP character is one unit and a
+//	                  surrogate pair is two, so nvarchar(10) holds at most ten
+//	                  characters and sometimes five. Caps at 4000, which is the
+//	                  same 8000 bytes of storage.
+//
+// Beyond either cap SQL Server requires MAX, and the column arrives as
+// unbounded text instead.
 func sqlServerTextLengthLimit(typeName string) int {
 	if sqlServerNationalText(typeName) {
 		return 4_000
