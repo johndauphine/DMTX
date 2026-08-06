@@ -268,19 +268,22 @@ func canonicalKindFromPortable(portable string) Kind {
 		return KindReal
 	case "double precision":
 		return KindDouble
-	case "text":
+	case "text", "varchar", "character varying", "char", "bpchar":
+		// PostgreSQL discovery names a bounded string varchar and an unbounded
+		// one text; SQL Server's names both text. Both spellings mean the same
+		// kind, and the bound is carried by Length rather than by the name.
 		return KindText
-	case "blob":
+	case "blob", "bytea":
 		return KindBlob
 	case "date":
 		return KindDate
 	case "time":
 		return KindTime
-	case "datetime":
+	case "datetime", "timestamp":
 		return KindDateTime
 	case "uuid":
 		return KindUUID
-	case "json":
+	case "json", "jsonb":
 		return KindJSON
 	default:
 		return KindUnknown
