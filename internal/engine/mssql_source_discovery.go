@@ -1033,8 +1033,27 @@ func applySQLServerSourceType(
 // with "this column exists".
 //
 // The strict rule is therefore applied where key membership is known, in
-// sqlServerSourceKeyCollationSupported below, rather than here where it is not:
+// checkSQLServerSourceKeyCollations below, rather than here where it is not:
 // columns are read before the primary key is discovered.
+//
+// Where the old rule came from is worth recording, because the asymmetry it
+// left behind looks like an oversight and is not. dmtx's SQL Server *target*
+// emits VARCHAR(n) COLLATE Latin1_General_100_BIN2_UTF8 - see
+// sqlServerPortableTextCollation in internal/schema/mssql_target.go - and that
+// is a good choice: a UTF-8 collation makes varchar hold any Unicode character,
+// including non-BMP, while BIN2 keeps it byte-ordered and therefore safe as a
+// key, and it is more compact than nvarchar for mostly-ASCII data. Source
+// discovery then required the same collation it wrote. So a SQL Server database
+// created by dmtx round-tripped, and one created by anyone else did not: the
+// output contract had leaked backwards into the input contract.
+//
+// This is also why dmtx does not need the national/non-national distinction
+// that a general schema tool carries as a first-class fact. That distinction
+// exists because MSSQL's plain varchar is non-Unicode under an ordinary
+// collation, so a target has to choose nvarchar to avoid losing characters.
+// dmtx's target does not choose between them - it always writes a
+// Unicode-capable varchar - so one text type serves both roles and there is
+// nothing for the flag to decide.
 func applySQLServerSourceTextType(
 	column *schema.Column,
 	catalog sqlServerSourceColumnCatalog,
