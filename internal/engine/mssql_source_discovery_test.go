@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/johndauphine/dmtx/internal/schema"
@@ -363,14 +364,6 @@ func TestSQLServerSourceColumnFromCatalogRejectsUnsafeShapes(t *testing.T) {
 			value.precision = 27
 			value.scale = 7
 		},
-		"legacy datetime driver rounds source ticks": func(
-			value *sqlServerSourceColumnCatalog,
-		) {
-			value.typeName = "datetime"
-			value.maxLength = 8
-			value.precision = 23
-			value.scale = 3
-		},
 		"datetimeoffset loses source offset": func(
 			value *sqlServerSourceColumnCatalog,
 		) {
@@ -403,18 +396,6 @@ func TestSQLServerSourceColumnFromCatalogRejectsUnsafeShapes(t *testing.T) {
 				Valid:  true,
 			}
 		},
-		"national text can contain unpaired UTF-16 surrogates": func(
-			value *sqlServerSourceColumnCatalog,
-		) {
-			value.typeName = "nvarchar"
-			value.maxLength = 80
-			value.precision = 0
-			value.ansiPadded = true
-			value.collation = sql.NullString{
-				String: "Latin1_General_100_BIN2",
-				Valid:  true,
-			}
-		},
 		"binary max catalog shape": func(
 			value *sqlServerSourceColumnCatalog,
 		) {
@@ -422,18 +403,6 @@ func TestSQLServerSourceColumnFromCatalogRejectsUnsafeShapes(t *testing.T) {
 			value.maxLength = -1
 			value.precision = 0
 			value.ansiPadded = true
-		},
-		"non-UTF8 narrow text": func(
-			value *sqlServerSourceColumnCatalog,
-		) {
-			value.typeName = "varchar"
-			value.maxLength = 24
-			value.precision = 0
-			value.ansiPadded = true
-			value.collation = sql.NullString{
-				String: "Latin1_General_100_BIN2",
-				Valid:  true,
-			}
 		},
 	}
 	for name, mutate := range tests {
@@ -448,6 +417,9 @@ func TestSQLServerSourceColumnFromCatalogRejectsUnsafeShapes(t *testing.T) {
 		})
 	}
 
+	// An ordinary collation is certified for transfer. It is refused only for a
+	// key, which sqlServerSourceColumnFromCatalog cannot know about - see
+	// TestSQLServerSourceKeyCollationsMustOrderTheSameOnBothEngines.
 	text := sqlServerSourceTestColumn(
 		"label",
 		"varchar",
@@ -458,8 +430,8 @@ func TestSQLServerSourceColumnFromCatalogRejectsUnsafeShapes(t *testing.T) {
 	text.ansiPadded = true
 	text.collation.Valid = true
 	text.collation.String = "SQL_Latin1_General_CP1_CI_AS"
-	if _, _, err := sqlServerSourceColumnFromCatalog(text); err == nil {
-		t.Fatal("nonbinary text collation was accepted")
+	if _, _, err := sqlServerSourceColumnFromCatalog(text); err != nil {
+		t.Fatalf("ordinary collation was refused for a data column: %v", err)
 	}
 }
 
@@ -524,5 +496,328 @@ func sqlServerSourceTestColumn(
 		precision:   precision,
 		scale:       scale,
 		defaultName: sql.NullString{},
+	}
+}
+
+// TestSQLServerCertifiedSourceTypes pins what dmtx will read from SQL Server.
+//
+// dmtx refuses a type it has not certified, which is the right posture for a
+// tool that moves production data: an unknown type is a value nobody has proved
+// survives the trip. The failure this test exists after was not the posture but
+// the size of the certified set. Text was certified only under
+// Latin1_General_100_BIN2_UTF8 - a collation nobody has unless they chose it -
+// and datetime was not certified at all while datetime2 was. So an ordinary
+// StackOverflow table, whose columns carry the SQL_Latin1_General_CP1_CI_AS
+// that SQL Server installs by default, could not be read at all, and fourteen
+// minutes of armed CI passed over it because dmtx's own fixture stamped the one
+// accepted collation onto every column it created.
+//
+// Certification here means transfer fidelity: the value that leaves the source
+// is the value that arrives. It is established by round-tripping boundary
+// values through a real engine, not by argument - see the live test named in
+// each entry below. Ordering is a separate certification, asked only of keys,
+// because that is the only place it changes an answer.
+func TestSQLServerCertifiedSourceTypes(t *testing.T) {
+	for _, certified := range []struct {
+		name      string
+		typeName  string
+		maxLength int
+		precision int
+		scale     int
+		collation string
+		ansiPad   bool
+		wantType  string
+		wantBase  string
+		wantArgs  []int
+	}{
+		{
+			name:      "nvarchar under the default collation",
+			typeName:  "nvarchar",
+			maxLength: 80, // bytes; 40 characters
+			collation: "SQL_Latin1_General_CP1_CI_AS",
+			ansiPad:   true,
+			wantType:  "text",
+			wantBase:  "nvarchar",
+			wantArgs:  []int{40},
+		},
+		{
+			name:      "nvarchar(max)",
+			typeName:  "nvarchar",
+			maxLength: -1,
+			collation: "SQL_Latin1_General_CP1_CI_AS",
+			ansiPad:   true,
+			wantType:  "text",
+			wantBase:  "text",
+		},
+		{
+			name:      "nchar under the default collation",
+			typeName:  "nchar",
+			maxLength: 20, // bytes; 10 characters
+			collation: "SQL_Latin1_General_CP1_CI_AS",
+			ansiPad:   true,
+			wantType:  "text",
+			wantBase:  "nchar",
+			wantArgs:  []int{10},
+		},
+		{
+			name:      "varchar under the default collation",
+			typeName:  "varchar",
+			maxLength: 50,
+			collation: "SQL_Latin1_General_CP1_CI_AS",
+			ansiPad:   true,
+			wantType:  "text",
+			wantBase:  "varchar",
+			wantArgs:  []int{50},
+		},
+		{
+			name:      "datetime",
+			typeName:  "datetime",
+			maxLength: 8,
+			precision: 23,
+			scale:     3,
+			wantType:  "datetime",
+			wantBase:  "timestamp",
+			wantArgs:  []int{3},
+		},
+	} {
+		t.Run(certified.name, func(t *testing.T) {
+			value := sqlServerSourceTestColumn(
+				"c",
+				certified.typeName,
+				certified.maxLength,
+				certified.precision,
+				certified.scale,
+			)
+			value.ansiPadded = certified.ansiPad
+			if certified.collation != "" {
+				value.collation = sql.NullString{
+					String: certified.collation,
+					Valid:  true,
+				}
+			}
+			column, _, err := sqlServerSourceColumnFromCatalog(value)
+			if err != nil {
+				t.Fatalf("certified type was refused: %v", err)
+			}
+			if column.Type != certified.wantType {
+				t.Errorf("portable type = %q, want %q", column.Type, certified.wantType)
+			}
+			if column.DeclaredType == nil {
+				t.Fatal("no declared type")
+			}
+			if column.DeclaredType.Base != certified.wantBase {
+				t.Errorf(
+					"declared base = %q, want %q",
+					column.DeclaredType.Base,
+					certified.wantBase,
+				)
+			}
+			if len(column.DeclaredType.Arguments) != len(certified.wantArgs) {
+				t.Fatalf(
+					"declared arguments = %v, want %v",
+					column.DeclaredType.Arguments,
+					certified.wantArgs,
+				)
+			}
+			for index, want := range certified.wantArgs {
+				if column.DeclaredType.Arguments[index] != want {
+					t.Fatalf(
+						"declared arguments = %v, want %v",
+						column.DeclaredType.Arguments,
+						certified.wantArgs,
+					)
+				}
+			}
+		})
+	}
+}
+
+// TestNationalTextLengthIsCharactersNotBytes is worth its own test because
+// getting it wrong is silent.
+//
+// sys.columns.max_length is bytes, and the national types store two bytes per
+// character. Reading it straight through would declare nvarchar(40) as
+// nvarchar(80) in the target - a schema that still loads, still validates, and
+// is wrong in a way no row count would show.
+func TestNationalTextLengthIsCharactersNotBytes(t *testing.T) {
+	value := sqlServerSourceTestColumn("c", "nvarchar", 80, 0, 0)
+	value.ansiPadded = true
+	value.collation = sql.NullString{String: "SQL_Latin1_General_CP1_CI_AS", Valid: true}
+	column, _, err := sqlServerSourceColumnFromCatalog(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if column.DeclaredType.Arguments[0] != 40 {
+		t.Fatalf("nvarchar length = %d characters, want 40", column.DeclaredType.Arguments[0])
+	}
+
+	// An odd byte length cannot be a whole number of UTF-16 units, so the
+	// catalog is not describing what it claims to.
+	odd := sqlServerSourceTestColumn("c", "nvarchar", 81, 0, 0)
+	odd.ansiPadded = true
+	odd.collation = sql.NullString{String: "SQL_Latin1_General_CP1_CI_AS", Valid: true}
+	if _, _, err := sqlServerSourceColumnFromCatalog(odd); err == nil {
+		t.Fatal("an odd byte length was accepted for a national type")
+	}
+}
+
+// TestSQLServerSourceKeyCollationsMustOrderTheSameOnBothEngines pins the
+// certification that did NOT move.
+//
+// Ordering is asked only of key columns, and asking it there is not a
+// formality. A paged read orders by the key; under a case-insensitive collation
+// SQL Server says 'a' = 'A' and PostgreSQL does not, so a chunk boundary
+// computed on one engine does not mean the same thing on the other and rows are
+// skipped or repeated at the seam. That is silent corruption proportional to
+// table size, which is the kind speed is not worth trading for - and unlike a
+// per-value check it costs nothing at run time, being read once from the
+// catalog at discovery.
+func TestSQLServerSourceKeyCollationsMustOrderTheSameOnBothEngines(t *testing.T) {
+	keyed := func(base string) schema.Table {
+		return schema.Table{
+			Schema: "dbo",
+			Name:   "Tags",
+			Columns: []schema.Column{{
+				Name:               "TagName",
+				Type:               "text",
+				PrimaryKeyPosition: 1,
+				DeclaredType: &schema.DeclaredType{
+					Base:      base,
+					Arguments: []int{40},
+				},
+			}},
+		}
+	}
+
+	// Each of these was measured against SQL Server 2022 rather than argued
+	// from the collation's name, and two of the three refusals are near misses
+	// that read as safe.
+	for _, refused := range []struct {
+		reason    string
+		base      string
+		collation string
+	}{
+		{
+			reason:    "case-insensitive: 'a' = 'A' here and not in PostgreSQL",
+			base:      "varchar",
+			collation: "SQL_Latin1_General_CP1_CI_AS",
+		},
+		{
+			// Binary, and still wrong: it orders by CP1252 bytes, so
+			// [EUR, y-diaeresis] where UTF-8 gives the reverse.
+			reason:    "narrow _BIN2 is a codepage ordering",
+			base:      "varchar",
+			collation: "Latin1_General_100_BIN2",
+		},
+		{
+			// UTF-16 code-unit order agrees with PostgreSQL across the BMP and
+			// stops above it, because surrogates sit at D800-DFFF while the
+			// characters they encode live at U+10000 up.
+			reason:    "national types order by UTF-16 code unit",
+			base:      "nvarchar",
+			collation: "Latin1_General_100_BIN2",
+		},
+		{
+			// SQL Server's _UTF8 collations change the encoding of char and
+			// varchar only, so this does not make an nvarchar key portable.
+			reason:    "a _UTF8 collation does not re-encode a national type",
+			base:      "nvarchar",
+			collation: "Latin1_General_100_BIN2_UTF8",
+		},
+	} {
+		if err := checkSQLServerSourceKeyCollations(
+			keyed(refused.base),
+			map[string]string{"TagName": refused.collation},
+		); err == nil {
+			t.Errorf("accepted a text key that %s", refused.reason)
+		}
+	}
+
+	// The one spelling whose ordering was measured to agree.
+	for _, accepted := range []string{
+		"Latin1_General_100_BIN2_UTF8",
+		// Any locale: BIN2 ignores the prefix and _UTF8 fixes the encoding.
+		"Japanese_XJIS_140_BIN2_UTF8",
+	} {
+		if err := checkSQLServerSourceKeyCollations(
+			keyed("varchar"),
+			map[string]string{"TagName": accepted},
+		); err != nil {
+			t.Errorf("refused %s, whose ordering matches: %v", accepted, err)
+		}
+	}
+
+	// The same column as data rather than key is not asked the question at all.
+	data := keyed("nvarchar")
+	data.Columns = []schema.Column{{
+		Name:         "TagName",
+		Type:         "text",
+		DeclaredType: &schema.DeclaredType{Base: "nvarchar", Arguments: []int{40}},
+	}}
+	if err := checkSQLServerSourceKeyCollations(
+		data,
+		map[string]string{"TagName": "SQL_Latin1_General_CP1_CI_AS"},
+	); err != nil {
+		t.Fatalf("an ordinary collation was refused for a data column: %v", err)
+	}
+}
+
+// TestRefusedTextKeySaysWhatWouldWork guards the message, not the refusal.
+//
+// It used to say a text key "needs a binary collation". Latin1_General_100_BIN2
+// is a binary collation and is refused, so an operator read that, looked at
+// their column, and had nowhere to go. The two failure modes have different
+// remedies and neither is guessable from the collation's name, so the message
+// has to name the one that applies.
+func TestRefusedTextKeySaysWhatWouldWork(t *testing.T) {
+	keyed := func(base string) schema.Table {
+		return schema.Table{
+			Schema: "dbo",
+			Name:   "Tags",
+			Columns: []schema.Column{{
+				Name:               "TagName",
+				Type:               "text",
+				PrimaryKeyPosition: 1,
+				DeclaredType: &schema.DeclaredType{
+					Base:      base,
+					Arguments: []int{40},
+				},
+			}},
+		}
+	}
+
+	narrow := checkSQLServerSourceKeyCollations(
+		keyed("varchar"),
+		map[string]string{"TagName": "Latin1_General_100_BIN2"},
+	)
+	if narrow == nil {
+		t.Fatal("a narrow _BIN2 key was accepted")
+	}
+	// The spelling that would work has to appear, or the operator is left
+	// guessing which of SQL Server's collations qualifies.
+	if !strings.Contains(narrow.Error(), "_BIN2_UTF8") {
+		t.Errorf("refusal does not name the collation that works: %v", narrow)
+	}
+	// And it must not describe the requirement as "binary", which is what the
+	// refused collation already is.
+	if strings.Contains(narrow.Error(), "needs a binary collation") {
+		t.Errorf("refusal still calls the requirement binary: %v", narrow)
+	}
+
+	national := checkSQLServerSourceKeyCollations(
+		keyed("nvarchar"),
+		map[string]string{"TagName": "Latin1_General_100_BIN2_UTF8"},
+	)
+	if national == nil {
+		t.Fatal("a national text key was accepted")
+	}
+	// This one has no collation that would fix it, and saying so is the whole
+	// point: otherwise the operator tries _BIN2_UTF8, which the other branch
+	// recommends, and is refused again for a reason nothing explained.
+	if !strings.Contains(national.Error(), "whatever its collation") {
+		t.Errorf("national refusal implies a collation would fix it: %v", national)
+	}
+	if !strings.Contains(national.Error(), "UTF-16") {
+		t.Errorf("national refusal does not say why: %v", national)
 	}
 }

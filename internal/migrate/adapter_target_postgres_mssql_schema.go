@@ -96,16 +96,23 @@ func projectSQLServerColumnForPostgres(
 			break
 		}
 		return "double precision", nil, nil
-	case "char", "varchar":
+	case "char", "varchar", "nchar", "nvarchar":
 		// SQL Server's admitted UTF-8 modifier is a byte limit, while
 		// PostgreSQL VARCHAR counts characters. Keeping the numeric modifier
 		// is an explicit safe widening: every source value remains valid, and
 		// CHAR rows/defaults retain their discovered padding without asking
 		// PostgreSQL to add different padding.
+		//
+		// The national spellings arrive already converted to characters by
+		// discovery, which halves sys.columns.max_length for them - so the
+		// bound below is characters for all four, and nvarchar's own 4000
+		// ceiling is enforced where that conversion happens rather than
+		// re-derived here from a number that no longer says which type it came
+		// from.
 		if source.Type != "text" ||
 			len(arguments) != 1 ||
 			arguments[0] < 1 ||
-			arguments[0] > 8_000 {
+			arguments[0] > sqlServerProjectedTextLengthLimit(base) {
 			break
 		}
 		// A PostgreSQL catalog round trip represents VARCHAR as varchar (not
@@ -180,5 +187,29 @@ func postgresSQLServerPolicy(operation, value string) error {
 		Operation: operation,
 		Type:      value,
 		Target:    string(schema.Postgres),
+	}
+}
+
+// sqlServerProjectedTextLengthLimit is the largest length each SQL Server text
+// family can legally declare.
+//
+// char and varchar declare bytes and cap at 8000; nchar and nvarchar declare
+// UTF-16 code units and cap at 4000, which is the same 8000 bytes of storage.
+// Beyond either, SQL Server requires MAX and the column arrives as unbounded
+// text instead.
+//
+// This is the third place the same two numbers appear - discovery refuses an
+// over-long declaration in sqlServerTextLengthLimit, and the retained row bound
+// refuses one again in sqlServerRetainedTextLengthLimit. Three copies of one
+// fact is not a design; it is what a pairwise projection costs, and it is why
+// an nvarchar(8000) that cannot exist was refused in two of the three and
+// accepted here. Until the canonical type work removes the duplication, the
+// copies are at least spelled the same way so a search finds all of them.
+func sqlServerProjectedTextLengthLimit(base string) int {
+	switch base {
+	case "nchar", "nvarchar":
+		return 4_000
+	default:
+		return 8_000
 	}
 }

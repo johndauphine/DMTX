@@ -170,14 +170,6 @@ func TestProjectSQLServerTableForPostgresFailsClosed(t *testing.T) {
 			},
 		},
 		{
-			Name: "national_text",
-			Type: "text",
-			DeclaredType: &schema.DeclaredType{
-				Base:      "nvarchar",
-				Arguments: []int{80},
-			},
-		},
-		{
 			Name: "legacy_datetime",
 			Type: "datetime",
 			DeclaredType: &schema.DeclaredType{
@@ -197,6 +189,128 @@ func TestProjectSQLServerTableForPostgresFailsClosed(t *testing.T) {
 			var policy *schema.PolicyError
 			if !errors.As(err, &policy) {
 				t.Fatalf("error = %v, want PolicyError", err)
+			}
+		})
+	}
+}
+
+// TestProjectSQLServerNationalTextForPostgres pins the certification that
+// national text carries.
+//
+// nvarchar and nchar used to be refused here and in discovery. Both are now
+// certified for transfer - the evidence is a live round trip of emoji, CJK and
+// accented text through a real pair of engines - so the projection has to
+// produce a target column that holds them.
+//
+// The length matters as much as the type. Discovery converts
+// sys.columns.max_length from bytes to characters for the national spellings,
+// so an nvarchar(40) arrives here as 40 and must leave as varchar(40). Passing
+// the byte count through would declare varchar(80): a target that still loads,
+// still validates, and is silently wrong.
+func TestProjectSQLServerNationalTextForPostgres(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		declared *schema.DeclaredType
+		wantType string
+		wantBase string
+		wantArgs []int
+	}{
+		{
+			name:     "nvarchar keeps its character length",
+			declared: &schema.DeclaredType{Base: "nvarchar", Arguments: []int{40}},
+			wantType: "varchar",
+			wantBase: "varchar",
+			wantArgs: []int{40},
+		},
+		{
+			name:     "nchar keeps its character length",
+			declared: &schema.DeclaredType{Base: "nchar", Arguments: []int{10}},
+			wantType: "varchar",
+			wantBase: "varchar",
+			wantArgs: []int{10},
+		},
+		{
+			name:     "nvarchar(max) becomes text",
+			declared: &schema.DeclaredType{Base: "text"},
+			wantType: "text",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			projected, err := projectSQLServerTableForPostgres(schema.Table{
+				Name: "items",
+				Columns: []schema.Column{{
+					Name:         "c",
+					Type:         "text",
+					DeclaredType: testCase.declared,
+				}},
+			})
+			if err != nil {
+				t.Fatalf("certified national text was refused: %v", err)
+			}
+			column := projected.Columns[0]
+			if column.Type != testCase.wantType {
+				t.Errorf("type = %q, want %q", column.Type, testCase.wantType)
+			}
+			if testCase.wantBase == "" {
+				return
+			}
+			if column.DeclaredType == nil ||
+				column.DeclaredType.Base != testCase.wantBase {
+				t.Fatalf("declared = %+v, want base %q", column.DeclaredType, testCase.wantBase)
+			}
+			if len(column.DeclaredType.Arguments) != len(testCase.wantArgs) {
+				t.Fatalf("arguments = %v, want %v", column.DeclaredType.Arguments, testCase.wantArgs)
+			}
+			for index, want := range testCase.wantArgs {
+				if column.DeclaredType.Arguments[index] != want {
+					t.Fatalf("arguments = %v, want %v", column.DeclaredType.Arguments, testCase.wantArgs)
+				}
+			}
+		})
+	}
+}
+
+// TestProjectedNationalTextRefusesAnImpossibleLength keeps this projection
+// fail-closed on a declaration SQL Server cannot produce.
+//
+// nvarchar caps at 4000 UTF-16 code units. The projection accepted up to 8000
+// for every family, so an nvarchar(8000) - which cannot exist - was refused by
+// discovery and by the retained row bound and accepted here. Three encodings of
+// one limit, and the odd one out was the one nothing tested.
+func TestProjectedNationalTextRefusesAnImpossibleLength(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		base     string
+		length   int
+		accepted bool
+	}{
+		{name: "nvarchar at its limit", base: "nvarchar", length: 4_000, accepted: true},
+		{name: "nvarchar past its limit", base: "nvarchar", length: 4_001},
+		{name: "nchar past its limit", base: "nchar", length: 4_001},
+		{name: "varchar at its limit", base: "varchar", length: 8_000, accepted: true},
+		{name: "varchar past its limit", base: "varchar", length: 8_001},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := projectSQLServerTableForPostgres(schema.Table{
+				Name: "items",
+				Columns: []schema.Column{{
+					Name: "c",
+					Type: "text",
+					DeclaredType: &schema.DeclaredType{
+						Base:      testCase.base,
+						Arguments: []int{testCase.length},
+					},
+				}},
+			})
+			if testCase.accepted && err != nil {
+				t.Fatalf("%s(%d) was refused: %v", testCase.base, testCase.length, err)
+			}
+			if !testCase.accepted && err == nil {
+				t.Fatalf(
+					"%s(%d) was accepted; SQL Server cannot declare it",
+					testCase.base,
+					testCase.length,
+				)
 			}
 		})
 	}

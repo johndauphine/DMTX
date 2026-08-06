@@ -1226,3 +1226,61 @@ func (rows *adapterRetainedBoundTestRows) Next(
 	copy(destinations, values)
 	return nil
 }
+
+// TestSQLServerRetainedTextLimitsMatchTheEngine keeps this bound's idea of a
+// legal declaration from drifting from discovery's.
+//
+// Both places encode SQL Server's limits - 4000 characters for the national
+// types, 8000 for the others - and they are in different packages, so nothing
+// but a test stops one from being widened alone. The consequence of drift is
+// quiet: an nvarchar declared past 4000 cannot exist, but if one reached here
+// the bound would accept it and under-count the column by half, and this bound
+// is what decides how many rows fit inside the memory ceiling.
+func TestSQLServerRetainedTextLimitsMatchTheEngine(t *testing.T) {
+	t.Parallel()
+	for _, expected := range []struct {
+		base  string
+		limit int64
+	}{
+		{base: "nvarchar", limit: 4_000},
+		{base: "nchar", limit: 4_000},
+		{base: "varchar", limit: 8_000},
+		{base: "char", limit: 8_000},
+	} {
+		if got := sqlServerRetainedTextLengthLimit(expected.base); got != expected.limit {
+			t.Errorf(
+				"%s limit = %d characters, want %d",
+				expected.base,
+				got,
+				expected.limit,
+			)
+		}
+	}
+}
+
+// TestSQLServerRetainedNationalTextCountsUTF8Bytes pins the expansion factor.
+//
+// The declared length is characters by the time it reaches here - discovery
+// converts nchar/nvarchar from sys.columns.max_length, which is bytes - and the
+// driver returns Go strings, which are UTF-8. A BMP character costs up to three
+// bytes there. A surrogate pair costs four across two units, which is less per
+// unit, so three is the worst case and four would be a looser bound than the
+// engine can produce.
+func TestSQLServerRetainedNationalTextCountsUTF8Bytes(t *testing.T) {
+	t.Parallel()
+	if got := sqlServerRetainedUTF8Expansion("nvarchar"); got != 3 {
+		t.Errorf("nvarchar expansion = %d, want 3", got)
+	}
+	if got := sqlServerRetainedUTF8Expansion("nchar"); got != 3 {
+		t.Errorf("nchar expansion = %d, want 3", got)
+	}
+	// char and varchar are deliberately 1 and that is a tracked gap, not a
+	// correct answer - see the comment on sqlServerRetainedUTF8Expansion. This
+	// asserts the current state so the gap is visible rather than assumed.
+	if got := sqlServerRetainedUTF8Expansion("varchar"); got != 1 {
+		t.Errorf("varchar expansion = %d, want 1 (the tracked gap)", got)
+	}
+	if got := sqlServerRetainedUTF8Expansion("bigint"); got != 1 {
+		t.Errorf("non-text expansion = %d, want 1", got)
+	}
+}

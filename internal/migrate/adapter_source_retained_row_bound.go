@@ -1257,14 +1257,18 @@ func sqlServerRetainedColumnBound(
 			column.DeclaredType,
 			"char",
 			"varchar",
+			"nchar",
+			"nvarchar",
 		)
-		if !ok || length > 8_000 {
+		if !ok || length > sqlServerRetainedTextLengthLimit(
+			column.DeclaredType.Base,
+		) {
 			return bound, errors.New("text declaration is invalid")
 		}
 		var err error
 		bound.fixedBytes, err = addAdapterRetainedBytes(
 			int64(unsafe.Sizeof("")),
-			length,
+			length*sqlServerRetainedUTF8Expansion(column.DeclaredType.Base),
 		)
 		if err != nil {
 			return bound, err
@@ -1330,6 +1334,61 @@ func sqlServerRetainedColumnBound(
 		)
 	}
 	return bound, nil
+}
+
+// sqlServerRetainedTextLengthLimit is the largest length this bound accepts.
+//
+// The unit differs by family and is worth stating, because the arithmetic below
+// multiplies it: char and varchar declare BYTES, nchar and nvarchar declare
+// UTF-16 CODE UNITS. SQL Server caps the first pair at 8000 and the second at
+// 4000, which is the same 8000 bytes of storage. Beyond either, MAX is required
+// and the column arrives as unbounded text down the other branch.
+//
+// Discovery enforces the same limits, so nothing out of range should reach here
+// - which is the reason to check rather than a reason not to. This bound
+// decides how many rows fit in the memory ceiling, and accepting an
+// nvarchar(8000) that cannot exist would under-count it by half. A guard that
+// only matters when something upstream is already wrong is the guard worth
+// having.
+func sqlServerRetainedTextLengthLimit(base string) int64 {
+	switch base {
+	case "nchar", "nvarchar":
+		return 4_000
+	default:
+		return 8_000
+	}
+}
+
+// sqlServerRetainedUTF8Expansion is the worst-case UTF-8 bytes per unit of a
+// declared text length.
+//
+// This bound sizes chunks against the memory ceiling, so it must not be
+// optimistic: under-counting hands the reader more rows per chunk than the
+// budget allows, and the ceiling stops meaning anything.
+//
+// nchar and nvarchar declare a count of UTF-16 code units, and the driver hands
+// back Go strings, which are UTF-8. A unit inside the BMP costs up to three
+// bytes there. A surrogate pair costs four bytes across two units, which is
+// cheaper per unit, so three is the worst case rather than four.
+//
+// char and varchar are deliberately left at 1 here, and that is a known gap
+// rather than a claim of correctness. They declare bytes, and those bytes are
+// UTF-8 only under a _UTF8 collation; under any other they are codepage bytes
+// that widen on the way out, so a CP1252 high byte becomes two or three UTF-8
+// bytes. Certifying ordinary collations for data columns introduced that
+// exposure. It is not corrected here because the aggregate this feeds moves by
+// more than the arithmetic accounts for, and a bound whose value cannot be
+// explained is not a bound worth trusting. Tracked separately.
+//
+// Three times a declared length is a bound, not a measurement. It costs smaller
+// chunks on wide national text and buys a ceiling that holds.
+func sqlServerRetainedUTF8Expansion(base string) int64 {
+	switch base {
+	case "nchar", "nvarchar":
+		return 3
+	default:
+		return 1
+	}
 }
 
 func sqlServerLiveRetainedColumnBound(
