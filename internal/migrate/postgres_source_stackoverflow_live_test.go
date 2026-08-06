@@ -269,21 +269,3 @@ func stripPostgresClientDirectives(script string) string {
 	}
 	return strings.Join(kept, "\n")
 }
-
-// mySQLTLSConfigName reads the tls= name out of a MySQL DSN.
-//
-// Taken from the DSN rather than hard-coded so the fixtures stay the single
-// place that decides what it is called; env.sh sets both, and a constant here
-// would be a second copy free to drift from them.
-func mySQLTLSConfigName(dsn string) string {
-	const marker = "tls="
-	start := strings.Index(dsn, marker)
-	if start < 0 {
-		return ""
-	}
-	name := dsn[start+len(marker):]
-	if end := strings.IndexAny(name, "&"); end >= 0 {
-		name = name[:end]
-	}
-	return name
-}
