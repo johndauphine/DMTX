@@ -22,18 +22,21 @@
 
 name: Verify
 
+# Triggers, and why each is filtered.
+#
+# This workflow used to run on bare `push` and bare `pull_request`. Both fire
+# for a branch with an open PR, on the same SHA, producing identical results -
+# and the armed gate takes about fifteen minutes, so that was thirty minutes of
+# runner time for fifteen minutes of information.
+#
+# The schedule carries the checks that are too expensive to gate a PR on but
+# must not go unrun; workflow_dispatch so they can be demanded rather than
+# waited for.
 on:
-  # pull_request only, plus pushes to main. This used to be `push` and
-  # `pull_request` with no filter, which ran the whole workflow TWICE for every
-  # commit on a branch with an open PR - once for each event, on the same SHA,
-  # producing identical results. The armed gate takes about fifteen minutes, so
-  # that was thirty minutes of runner time per push for fifteen minutes of
-  # information.
   pull_request:
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
-  # Nightly, for the checks that are too expensive to gate a PR on but must not
-  # go unrun. workflow_dispatch so they can be demanded on request.
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
@@ -44,8 +47,14 @@ permissions:
 # Supersede a run when its branch moves. Without this, pushing three times in
 # five minutes leaves three full gates running against commits nobody is waiting
 # on any more, and the newest one queues behind them.
+#
+# event_name is in the key, and that is not decoration. Keyed on the ref alone,
+# a nightly run and a push to main share refs/heads/main, so any push during the
+# nightly cancels it - and the expensive race coverage this schedule exists to
+# carry would be skipped silently on exactly the days the repository is busy.
+# A saving that deletes the thing it was meant to preserve is not a saving.
 concurrency:
-  group: verify-${{ github.workflow }}-${{ github.ref }}
+  group: verify-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
