@@ -200,6 +200,18 @@ func assertStackOverflowTargetShape(
 //
 // Split on GO because GO is a batch separator understood by sqlcmd and not by
 // the server, so a driver handed the whole file gets a syntax error.
+//
+// Every batch runs on one pinned connection, and that is not a detail.
+// database/sql hands out a pooled connection per call, while the script's
+// USE StackOverflow2010Minimal changes the database of the connection it runs
+// on and no other. Spread across the pool, the CREATE TABLE batches land in
+// master, the migration finds nothing, and the failure - "no source tables
+// match migration filters" - says nothing about why.
+//
+// The tables are dropped first rather than after. A fixture left behind by an
+// earlier run would otherwise let this test pass while its own loading was
+// broken, which is how the pooled-connection bug above survived a local run:
+// the tables were already there from a manual load.
 func loadStackOverflowFixture(t *testing.T, ctx context.Context, dsn string) {
 	t.Helper()
 	path := filepath.Join(
@@ -215,10 +227,45 @@ func loadStackOverflowFixture(t *testing.T, ctx context.Context, dsn string) {
 	}
 	t.Cleanup(func() { _ = database.Close() })
 
+	pinned, err := database.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin a SQL Server connection: %v", err)
+	}
+	defer func() { _ = pinned.Close() }()
+
+	if _, err := pinned.ExecContext(
+		ctx,
+		"IF DB_ID('"+stackOverflowFixtureDatabase+"') IS NOT NULL "+
+			"ALTER DATABASE ["+stackOverflowFixtureDatabase+"] "+
+			"SET SINGLE_USER WITH ROLLBACK IMMEDIATE",
+	); err != nil {
+		t.Fatalf("quiesce any earlier fixture database: %v", err)
+	}
+	if _, err := pinned.ExecContext(
+		ctx,
+		"IF DB_ID('"+stackOverflowFixtureDatabase+"') IS NOT NULL "+
+			"DROP DATABASE ["+stackOverflowFixtureDatabase+"]",
+	); err != nil {
+		t.Fatalf("drop any earlier fixture database: %v", err)
+	}
+
 	for index, batch := range splitSQLServerBatches(string(script)) {
-		if _, err := database.ExecContext(ctx, batch); err != nil {
+		if _, err := pinned.ExecContext(ctx, batch); err != nil {
 			t.Fatalf("load fixture batch %d: %v", index+1, err)
 		}
+	}
+
+	// The loader proved it loaded. Without this the test can only report that
+	// the migration found nothing, which is a symptom several steps downstream.
+	var tables int
+	if err := pinned.QueryRowContext(
+		ctx,
+		"SELECT COUNT(*) FROM ["+stackOverflowFixtureDatabase+"].sys.tables",
+	).Scan(&tables); err != nil {
+		t.Fatalf("count fixture tables: %v", err)
+	}
+	if tables != 9 {
+		t.Fatalf("fixture loaded %d tables, want 9", tables)
 	}
 }
 
