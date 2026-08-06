@@ -449,8 +449,11 @@ func validateMySQL80SourceTableCatalog(
 			"row format",
 			identity+" row format "+quotedNullString(value.rowFormat),
 		)
-	case !value.tableCollation.Valid ||
-		!mySQLBinaryUTF8Collation(value.tableCollation.String):
+	// A table's collation is the default its columns inherit, not an ordering
+	// anything is read by. Requiring a binary one here refused every ordinary
+	// MySQL table - utf8mb4_0900_ai_ci is 8.0's own default - while protecting
+	// nothing that the per-key rule below does not protect properly.
+	case !value.tableCollation.Valid:
 		return mysqlSourcePolicy(
 			"table collation",
 			identity+" collation "+quotedNullString(value.tableCollation),
@@ -547,7 +550,11 @@ func readMySQL80SourceColumns(
 	table mysql80SourceTableCatalog,
 	namespace string,
 	name string,
-) ([]schema.Column, []string, error) {
+) ([]schema.Column, []string, map[string]string, error) {
+	// Text collations by column name, for the key rule applied once the primary
+	// key is known. Absent for every non-text column, which is what a key of
+	// those types should be checked against: nothing.
+	collations := map[string]string{}
 	rows, err := database.QueryContext(
 		ctx,
 		mysql80SourceColumnsQuery,
@@ -555,7 +562,7 @@ func readMySQL80SourceColumns(
 		name,
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf(
+		return nil, nil, nil, fmt.Errorf(
 			"list MySQL columns for %s.%s: %w",
 			namespace,
 			name,
@@ -588,7 +595,7 @@ func readMySQL80SourceColumns(
 			&catalog.comment,
 			&catalog.srid,
 		); err != nil {
-			return nil, nil, fmt.Errorf(
+			return nil, nil, nil, fmt.Errorf(
 				"read MySQL column for %s.%s: %w",
 				namespace,
 				name,
@@ -596,7 +603,7 @@ func readMySQL80SourceColumns(
 			)
 		}
 		if catalog.position != len(columns)+1 {
-			return nil, nil, mysqlSourcePolicy(
+			return nil, nil, nil, mysqlSourcePolicy(
 				"column order",
 				fmt.Sprintf(
 					"%s.%s position=%d expected=%d",
@@ -609,7 +616,7 @@ func readMySQL80SourceColumns(
 		}
 		column, metadata, err := mySQL80SourceColumnFromCatalog(catalog)
 		if err != nil {
-			return nil, nil, fmt.Errorf(
+			return nil, nil, nil, fmt.Errorf(
 				"discover MySQL column %s.%s.%s: %w",
 				namespace,
 				name,
@@ -617,17 +624,23 @@ func readMySQL80SourceColumns(
 				err,
 			)
 		}
-		if catalog.characterSet.Valid &&
-			(!catalog.collation.Valid ||
-				!strings.EqualFold(
-					catalog.collation.String,
-					table.tableCollation.String,
-				)) {
-			return nil, nil, mysqlSourcePolicy(
-				"column collation override",
-				namespace+"."+name+"."+catalog.name,
-			)
-		}
+		// A column may carry its own collation. The rule that stood here
+		// required every text column to match the table's, which made the
+		// table collation a reliable summary and cost the one remedy an
+		// operator actually has.
+		//
+		// Once ordering is asked of key columns, the fix for a non-portable key
+		// is to give that column a binary collation and leave the rest alone -
+		// table DEFAULT utf8mb4_unicode_ci, key column COLLATE utf8mb4_bin.
+		// That is a per-column override, so it was refused here before the key
+		// check could approve it, and the operator was told "column collation
+		// override" about the thing they had just done to fix the previous
+		// error.
+		//
+		// Nothing is lost. The character set is still required to be utf8mb4 per
+		// column where each column type is read, and the collation each column
+		// reports is the one the key rule reads - so a per-column collation is
+		// exactly the fact those checks want, not an obstacle to them.
 		if catalog.defaultValue.Valid || metadata.defaultGenerated {
 			var catalogDefault *string
 			if catalog.defaultValue.Valid {
@@ -640,7 +653,7 @@ func readMySQL80SourceColumns(
 				metadata.defaultGenerated,
 			)
 			if err != nil {
-				return nil, nil, fmt.Errorf(
+				return nil, nil, nil, fmt.Errorf(
 					"discover MySQL default for %s.%s.%s: %w",
 					namespace,
 					name,
@@ -655,10 +668,13 @@ func readMySQL80SourceColumns(
 				catalog.name,
 			)
 		}
+		if catalog.collation.Valid {
+			collations[catalog.name] = catalog.collation.String
+		}
 		columns = append(columns, column)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf(
+		return nil, nil, nil, fmt.Errorf(
 			"iterate MySQL columns for %s.%s: %w",
 			namespace,
 			name,
@@ -666,7 +682,7 @@ func readMySQL80SourceColumns(
 		)
 	}
 	if len(columns) != table.columnCount {
-		return nil, nil, mysqlSourcePolicy(
+		return nil, nil, nil, mysqlSourcePolicy(
 			"column catalog shape",
 			fmt.Sprintf(
 				"%s.%s table columns=%d discovered=%d",
@@ -678,7 +694,7 @@ func readMySQL80SourceColumns(
 		)
 	}
 	if len(autoIncrementColumns) > 1 {
-		return nil, nil, mysqlSourcePolicy(
+		return nil, nil, nil, mysqlSourcePolicy(
 			"auto-increment",
 			fmt.Sprintf(
 				"%s.%s columns=%d",
@@ -688,7 +704,7 @@ func readMySQL80SourceColumns(
 			),
 		)
 	}
-	return columns, autoIncrementColumns, nil
+	return columns, autoIncrementColumns, collations, nil
 }
 
 func mySQL80SourceColumnFromCatalog(
@@ -860,7 +876,6 @@ func mySQL80SourceColumnFromCatalog(
 			!catalog.characterSet.Valid ||
 			catalog.characterSet.String != "utf8mb4" ||
 			!catalog.collation.Valid ||
-			!mySQLBinaryUTF8Collation(catalog.collation.String) ||
 			catalog.numericPrecision.Valid ||
 			catalog.numericScale.Valid ||
 			catalog.datetimePrecision.Valid ||
@@ -885,7 +900,6 @@ func mySQL80SourceColumnFromCatalog(
 			!catalog.characterSet.Valid ||
 			catalog.characterSet.String != "utf8mb4" ||
 			!catalog.collation.Valid ||
-			!mySQLBinaryUTF8Collation(catalog.collation.String) ||
 			catalog.numericPrecision.Valid ||
 			catalog.numericScale.Valid ||
 			catalog.datetimePrecision.Valid {
@@ -1125,7 +1139,7 @@ func inspectMySQL80Table(
 	if err != nil {
 		return schema.Table{}, err
 	}
-	columns, autoIncrementColumns, err := readMySQL80SourceColumns(
+	columns, autoIncrementColumns, columnCollations, err := readMySQL80SourceColumns(
 		ctx,
 		database,
 		tableCatalog,
@@ -1146,6 +1160,12 @@ func inspectMySQL80Table(
 		database,
 		&table,
 	); err != nil {
+		return schema.Table{}, err
+	}
+	// Only now is key membership known, which is why the ordering rule lives
+	// here rather than beside the column read that used to enforce it on every
+	// text column.
+	if err := checkMySQLSourceKeyCollations(table, columnCollations); err != nil {
 		return schema.Table{}, err
 	}
 	if len(autoIncrementColumns) == 1 {
@@ -1262,4 +1282,48 @@ func quotedNullString(value sql.NullString) string {
 		return "NULL"
 	}
 	return quotedCatalogValue(value.String)
+}
+
+// checkMySQLSourceKeyCollations refuses a text primary key whose collation does
+// not order the same way on both sides of a migration.
+//
+// Measured against MySQL 8.0 rather than argued from the collation's name:
+//
+//	utf8mb4_unicode_ci  orders [EUR, y-diaeresis]   and matches 'Ü' to 'ü'
+//	utf8mb4_bin         orders [y-diaeresis, EUR]   and matches neither
+//	PostgreSQL          orders [y-diaeresis, EUR]
+//
+// A paged read orders by the key. Under a case- or accent-insensitive collation
+// MySQL calls two different strings equal where the target does not, so a chunk
+// boundary computed on one engine does not mean the same thing on the other and
+// rows are skipped or repeated at the seam. That is silent corruption
+// proportional to table size.
+//
+// Asked of keys alone. The same collation on a data column changes nothing: the
+// value transfers byte for byte, which is what the round trip above shows.
+func checkMySQLSourceKeyCollations(
+	table schema.Table,
+	collations map[string]string,
+) error {
+	for _, column := range table.Columns {
+		if column.PrimaryKeyPosition == 0 {
+			continue
+		}
+		collation, isText := collations[column.Name]
+		if !isText {
+			continue
+		}
+		if !mySQLBinaryUTF8Collation(collation) {
+			return mysqlSourcePolicy(
+				"primary-key collation",
+				table.Schema+"."+table.Name+"."+column.Name+
+					" is "+collation+
+					"; a text key must carry a binary collation"+
+					" (utf8mb4_bin or utf8mb4_0900_bin), because a"+
+					" case- or accent-insensitive one calls two different"+
+					" strings equal where the target does not",
+			)
+		}
+	}
+	return nil
 }

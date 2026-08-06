@@ -39,20 +39,24 @@ func projectMySQLTableForPostgres(
 			sourceTable.Name,
 		)
 	}
-	if !postgresCompatibleMySQLSourceCollation(
-		sourceTable.MySQLCollation,
-	) {
-		return schema.Table{}, postgresMySQLPolicy(
-			"map MySQL collation",
-			sourceTable.MySQLCollation,
-		)
-	}
-
 	projected := sourceTable
 	// MySQL collation is source-only admission evidence. PostgreSQL has no
 	// catalog representation for it, so it must not become part of the
-	// projected target authority after the certified binary-collation check
-	// above succeeds.
+	// projected target authority.
+	//
+	// The binary-collation gate that stood here has been removed rather than
+	// widened. It read the TABLE's collation, which is only the default its
+	// columns inherit, and refused every ordinary MySQL table -
+	// utf8mb4_0900_ai_ci is 8.0's own default. It also disagreed with the set
+	// discovery certified: this accepted utf8mb4_0900_bin and
+	// utf8mb4_nopad_bin, discovery accepted utf8mb4_bin and utf8mb4_0900_bin,
+	// so utf8mb4_bin passed one and failed the other. Two copies of one fact,
+	// already inconsistent, neither of them checking the thing that matters.
+	//
+	// What matters is ordering, and ordering is a property of the columns a
+	// paged read is ordered by. checkMySQLSourceKeyCollations asks it of those
+	// columns, once, where key membership is known. A data column's collation
+	// changes nothing here: the value transfers byte for byte.
 	projected.MySQLCollation = ""
 	projected.Columns = append([]schema.Column(nil), sourceTable.Columns...)
 	projected.Indexes = clonePostgresProjectionIndexes(sourceTable.Indexes)
@@ -91,15 +95,6 @@ func projectMySQLTableForPostgres(
 		)
 	}
 	return projected, nil
-}
-
-func postgresCompatibleMySQLSourceCollation(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "utf8mb4_0900_bin", "utf8mb4_nopad_bin":
-		return true
-	default:
-		return false
-	}
 }
 
 // projectMySQLColumnForPostgres accepts only the structured output of MySQL

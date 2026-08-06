@@ -247,34 +247,46 @@ func TestProjectMySQLTableForSQLServerPreservesAdmittedShape(
 	}
 }
 
-func TestProjectMySQLTableForSQLServerPinsSourceCollation(
+func TestProjectMySQLTableForSQLServerDropsTableCollation(
 	t *testing.T,
 ) {
+	// This replaces a test that pinned a gate on the table's collation, and the
+	// set it pinned is the evidence for removing it. That gate accepted
+	// utf8mb4_0900_bin and utf8mb4_nopad_bin and rejected utf8mb4_bin - while
+	// MySQL discovery certified utf8mb4_bin and utf8mb4_0900_bin. So
+	// utf8mb4_bin passed one and failed the other, and utf8mb4_nopad_bin the
+	// reverse. Two copies of one certified set, already disagreeing, and
+	// neither asking about a column anything is ordered by.
+	//
+	// A table's collation is the default its columns inherit. Ordering belongs
+	// to the columns a paged read is ordered by, and is asked there once, in
+	// checkMySQLSourceKeyCollations at discovery.
 	for _, collation := range []string{
 		"utf8mb4_0900_bin",
 		"utf8mb4_nopad_bin",
+		"utf8mb4_bin",
+		// MySQL 8.0's own default, which the old gate refused - so no ordinary
+		// MySQL table could reach a SQL Server target at all.
+		"utf8mb4_0900_ai_ci",
+		"utf8mb4_unicode_ci",
+		"",
 	} {
 		t.Run(collation, func(t *testing.T) {
 			source := mySQLSQLServerProjectionFixture(t)
 			source.MySQLCollation = collation
-			if _, err := projectMySQLTableForSQLServer(source); err != nil {
-				t.Fatalf("project %s source: %v", collation, err)
+			projected, err := projectMySQLTableForSQLServer(source)
+			if err != nil {
+				t.Fatalf("project a table collated %q: %v", collation, err)
 			}
-		})
-	}
-	for _, collation := range []string{
-		"",
-		"utf8mb4_bin",
-		"utf8mb4_0900_ai_ci",
-	} {
-		t.Run("reject_"+collation, func(t *testing.T) {
-			source := mySQLSQLServerProjectionFixture(t)
-			source.MySQLCollation = collation
-			assertMySQLSQLServerPolicy(
-				t,
-				projectMySQLTableForSQLServerError(source),
-				"map MySQL collation",
-			)
+			// Dropped rather than carried: SQL Server has no catalog
+			// representation for a MySQL collation, so letting it through would
+			// put a fact in the target authority that the target cannot hold.
+			if projected.MySQLCollation != "" {
+				t.Errorf(
+					"projected table kept MySQLCollation %q",
+					projected.MySQLCollation,
+				)
+			}
 		})
 	}
 }

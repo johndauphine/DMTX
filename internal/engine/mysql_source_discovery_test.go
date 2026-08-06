@@ -157,14 +157,6 @@ func TestValidateMySQL80SourceTableCatalogFailsClosed(t *testing.T) {
 		"non-InnoDB": func(value *mysql80SourceTableCatalog) {
 			value.engine.String = "MyISAM"
 		},
-		"nonbinary collation": func(value *mysql80SourceTableCatalog) {
-			value.tableCollation.String = "utf8mb4_0900_ai_ci"
-		},
-		"different binary collation semantics": func(
-			value *mysql80SourceTableCatalog,
-		) {
-			value.tableCollation.String = "utf8mb4_unmodeled_bin"
-		},
 		"table options": func(value *mysql80SourceTableCatalog) {
 			value.createOptions = "stats_persistent=1"
 		},
@@ -744,4 +736,132 @@ func equalMySQLSourceArguments(left, right []int) bool {
 		}
 	}
 	return true
+}
+
+// TestMySQLSourceKeyCollationsMustOrderTheSameOnBothEngines pins the rule that
+// moved rather than the one that went away.
+//
+// A table's collation is the default its columns inherit, so requiring a binary
+// one there refused every ordinary MySQL table - utf8mb4_0900_ai_ci is 8.0's
+// own default - while deciding nothing. Ordering is a property of the columns a
+// paged read is ordered by, so that is where it is asked now.
+//
+// Measured against MySQL 8.0 rather than argued from the names:
+//
+//	utf8mb4_unicode_ci  orders [EUR, y-diaeresis]  and matches 'Ü' to 'ü'
+//	utf8mb4_bin         orders [y-diaeresis, EUR]  and matches neither
+//	PostgreSQL          orders [y-diaeresis, EUR]
+func TestMySQLSourceKeyCollationsMustOrderTheSameOnBothEngines(t *testing.T) {
+	keyed := schema.Table{
+		Schema: "so",
+		Name:   "tags",
+		Columns: []schema.Column{{
+			Name:               "tagname",
+			Type:               "text",
+			PrimaryKeyPosition: 1,
+			DeclaredType:       &schema.DeclaredType{Base: "varchar", Arguments: []int{40}},
+		}},
+	}
+
+	for _, refused := range []struct{ reason, collation string }{
+		{
+			reason:    "case-insensitive: MySQL calls two different strings equal",
+			collation: "utf8mb4_unicode_ci",
+		},
+		{
+			reason:    "8.0's own default, also accent-insensitive",
+			collation: "utf8mb4_0900_ai_ci",
+		},
+		{
+			// Binary by name, and not one dmtx has modelled. Ordering is only
+			// portable when it has been established, not when it looks like it
+			// ought to be - this case moved here from the table-level check.
+			reason:    "an unmodelled binary collation",
+			collation: "utf8mb4_unmodeled_bin",
+		},
+	} {
+		if err := checkMySQLSourceKeyCollations(
+			keyed,
+			map[string]string{"tagname": refused.collation},
+		); err == nil {
+			t.Errorf("accepted a text key with %s (%s)", refused.collation, refused.reason)
+		}
+	}
+
+	for _, accepted := range []string{"utf8mb4_bin", "utf8mb4_0900_bin"} {
+		if err := checkMySQLSourceKeyCollations(
+			keyed,
+			map[string]string{"tagname": accepted},
+		); err != nil {
+			t.Errorf("refused %s, whose ordering matches: %v", accepted, err)
+		}
+	}
+
+	// The same collation on a data column is not asked the question. The value
+	// transfers byte for byte whatever it orders by.
+	data := keyed
+	data.Columns = []schema.Column{{
+		Name:         "tagname",
+		Type:         "text",
+		DeclaredType: &schema.DeclaredType{Base: "varchar", Arguments: []int{40}},
+	}}
+	if err := checkMySQLSourceKeyCollations(
+		data,
+		map[string]string{"tagname": "utf8mb4_unicode_ci"},
+	); err != nil {
+		t.Errorf("refused an ordinary collation on a data column: %v", err)
+	}
+}
+
+// TestMySQLKeyMayOverrideTheTableCollation pins the remedy for a non-portable
+// text key.
+//
+// The key rule refuses a case-insensitive key, and the fix an operator reaches
+// for is to give that one column a binary collation while the table keeps its
+// default: DEFAULT COLLATE utf8mb4_unicode_ci with the key column COLLATE
+// utf8mb4_bin. Verified against MySQL 8.0 - the catalog reports the column as
+// utf8mb4_bin and the table as utf8mb4_unicode_ci.
+//
+// A rule requiring every column to match the table's collation refused exactly
+// that shape, so the operator was told "column collation override" about the
+// change they had just made to satisfy the previous error. Both rules were
+// individually defensible and together they left no way through.
+func TestMySQLKeyMayOverrideTheTableCollation(t *testing.T) {
+	table := schema.Table{
+		Schema: "so",
+		Name:   "tags",
+		Columns: []schema.Column{
+			{
+				Name:               "tagname",
+				Type:               "text",
+				PrimaryKeyPosition: 1,
+				DeclaredType: &schema.DeclaredType{
+					Base:      "varchar",
+					Arguments: []int{40},
+				},
+			},
+			{
+				Name: "note",
+				Type: "text",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "varchar",
+					Arguments: []int{100},
+				},
+			},
+		},
+	}
+	// The key binary, the data column on the table's ordinary default.
+	if err := checkMySQLSourceKeyCollations(table, map[string]string{
+		"tagname": "utf8mb4_bin",
+		"note":    "utf8mb4_unicode_ci",
+	}); err != nil {
+		t.Fatalf("refused a binary key beside an ordinary data column: %v", err)
+	}
+	// And the reverse is still refused: an ordinary key is what the rule is for.
+	if err := checkMySQLSourceKeyCollations(table, map[string]string{
+		"tagname": "utf8mb4_unicode_ci",
+		"note":    "utf8mb4_bin",
+	}); err == nil {
+		t.Fatal("accepted a case-insensitive key")
+	}
 }

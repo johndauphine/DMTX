@@ -26,6 +26,18 @@ docker exec -e MYSQL_PWD=dmtx_root_test_only "$mysql_container" mysql -uroot -e 
   GRANT ALL ON dmtx_target.* TO 'dmtx'@'%';
   FLUSH PRIVILEGES;"
 
+# The StackOverflow corpus creates its own source database rather than living
+# in dmtx's, because it is dmt's fixture kept byte-identical and that is what it
+# does there. So the grant has to exist before the fixture runs: the corpus can
+# create the database as root and still be unreadable by the test user, which
+# surfaces as "Access denied for user 'dmtx'@'%'" from the loader rather than
+# anything about permissions being missing.
+echo "provisioning MySQL StackOverflow corpus grants"
+docker exec -e MYSQL_PWD=dmtx_root_test_only "$mysql_container" mysql -uroot -e "
+  CREATE DATABASE IF NOT EXISTS so2010_minimal_src;
+  GRANT ALL ON so2010_minimal_src.* TO 'dmtx'@'%';
+  FLUSH PRIVILEGES;"
+
 echo "provisioning MariaDB target database"
 docker exec -e MYSQL_PWD=dmtx_root_test_only "$mariadb_container" mariadb -uroot -e "
   CREATE DATABASE IF NOT EXISTS dmtx_target;
