@@ -552,14 +552,25 @@ func projectSQLServerColumnForMySQL(
 		}
 		target.Type = "double precision"
 		declaration("double")
-	case "char", "varchar":
-		// SQL Server's modifier is a UTF-8 byte limit while MySQL's is a
+	case "char", "varchar", "nchar", "nvarchar":
+		// SQL Server's narrow modifier is a UTF-8 byte limit while MySQL's is a
 		// character limit. VARCHAR is a safe widening that also retains the
 		// padding already present in admitted SQL Server CHAR rows/defaults.
+		//
+		// The national spellings need no widening and get none: nchar and
+		// nvarchar declare UTF-16 code units, which discovery has already
+		// converted to characters, and MySQL's modifier is characters. The
+		// numbers mean the same thing, so the length passes straight through.
+		// Multiplying here - as the SQL Server *target* must, going the other
+		// way - would declare four times the length the source could hold.
+		//
+		// The ceiling is the source family's own, because nvarchar stops at
+		// 4000 where varchar stops at 8000. One constant would accept an
+		// nvarchar(8000) that SQL Server cannot declare.
 		if sourceType != "text" ||
 			len(arguments) != 1 ||
 			arguments[0] < 1 ||
-			arguments[0] > 8_000 {
+			arguments[0] > sqlServerProjectedTextLengthLimit(base) {
 			break
 		}
 		target.Type = "varchar"
@@ -658,9 +669,13 @@ func sqlServerMySQLNonportableComparison(
 		))
 	}
 	switch base {
-	case "char", "varchar", "text",
+	case "char", "varchar", "nchar", "nvarchar", "text",
 		"binary", "varbinary", "blob",
 		"uuid", "uniqueidentifier":
+		// The national spellings belong here for the same reason as the narrow
+		// ones: an nvarchar column's comparison is no more portable than a
+		// varchar's, and leaving them out would have exempted them from a
+		// check that exists because comparison semantics differ across engines.
 		return true
 	default:
 		return false

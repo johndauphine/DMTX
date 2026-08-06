@@ -84,11 +84,7 @@ func TestStackOverflowDirectedPairMatrixLive(t *testing.T) {
 	// each should be unskipped by the change that closes it.
 	for _, pair := range []struct{ source, target, blocked string }{
 		{source: "mssql", target: "postgres"},
-		{
-			source: "mssql", target: "mysql",
-			blocked: "the MySQL target refuses nvarchar; PR #27 fixed this in " +
-				"the PostgreSQL projection only",
-		},
+		{source: "mssql", target: "mysql"},
 		{source: "postgres", target: "mssql"},
 		{source: "postgres", target: "mysql"},
 		{source: "mysql", target: "postgres"},
