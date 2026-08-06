@@ -787,13 +787,20 @@ func mysqlDeleteBinaryCollation(
 	flavor engine.MySQLServerFlavor,
 	collation string,
 ) bool {
-	collation = strings.ToLower(strings.TrimSpace(collation))
+	// This function knew flavour mattered before anything else did; the fact
+	// is now shared rather than restated, and the flavour distinction travels
+	// with it.
 	switch flavor {
 	case engine.MySQLServerFlavorOracle80:
-		return collation == "utf8mb4_bin" ||
-			collation == "utf8mb4_0900_bin"
+		return schema.MySQLTextKeyCollationCertified(
+			schema.MySQLFlavorOracle,
+			collation,
+		)
 	case engine.MySQLServerFlavorMariaDB1011:
-		return collation == "utf8mb4_nopad_bin"
+		return schema.MySQLTextKeyCollationCertified(
+			schema.MySQLFlavorMariaDB,
+			collation,
+		)
 	default:
 		return false
 	}
