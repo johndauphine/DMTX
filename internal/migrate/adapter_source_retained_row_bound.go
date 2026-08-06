@@ -1260,7 +1260,9 @@ func sqlServerRetainedColumnBound(
 			"nchar",
 			"nvarchar",
 		)
-		if !ok || length > 8_000 {
+		if !ok || length > sqlServerRetainedTextLengthLimit(
+			column.DeclaredType.Base,
+		) {
 			return bound, errors.New("text declaration is invalid")
 		}
 		var err error
@@ -1332,6 +1334,26 @@ func sqlServerRetainedColumnBound(
 		)
 	}
 	return bound, nil
+}
+
+// sqlServerRetainedTextLengthLimit is the largest declarable length, in
+// characters, that this bound will accept.
+//
+// SQL Server caps the national types at 4000 characters and the others at
+// 8000; beyond either, MAX is required and the column arrives as unbounded
+// text down the other branch. Discovery enforces the same limits, so nothing
+// out of range should reach here - which is the reason to check rather than a
+// reason not to. This bound decides how many rows fit in the memory ceiling,
+// and accepting an nvarchar(8000) that cannot exist would under-count it by
+// half. A guard that only matters when something upstream is already wrong is
+// the guard worth having.
+func sqlServerRetainedTextLengthLimit(base string) int64 {
+	switch base {
+	case "nchar", "nvarchar":
+		return 4_000
+	default:
+		return 8_000
+	}
 }
 
 // sqlServerRetainedUTF8Expansion is the worst-case UTF-8 bytes per unit of a
