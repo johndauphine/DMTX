@@ -269,3 +269,49 @@ func TestProjectSQLServerNationalTextForPostgres(t *testing.T) {
 		})
 	}
 }
+
+// TestProjectedNationalTextRefusesAnImpossibleLength keeps this projection
+// fail-closed on a declaration SQL Server cannot produce.
+//
+// nvarchar caps at 4000 UTF-16 code units. The projection accepted up to 8000
+// for every family, so an nvarchar(8000) - which cannot exist - was refused by
+// discovery and by the retained row bound and accepted here. Three encodings of
+// one limit, and the odd one out was the one nothing tested.
+func TestProjectedNationalTextRefusesAnImpossibleLength(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		base     string
+		length   int
+		accepted bool
+	}{
+		{name: "nvarchar at its limit", base: "nvarchar", length: 4_000, accepted: true},
+		{name: "nvarchar past its limit", base: "nvarchar", length: 4_001},
+		{name: "nchar past its limit", base: "nchar", length: 4_001},
+		{name: "varchar at its limit", base: "varchar", length: 8_000, accepted: true},
+		{name: "varchar past its limit", base: "varchar", length: 8_001},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := projectSQLServerTableForPostgres(schema.Table{
+				Name: "items",
+				Columns: []schema.Column{{
+					Name: "c",
+					Type: "text",
+					DeclaredType: &schema.DeclaredType{
+						Base:      testCase.base,
+						Arguments: []int{testCase.length},
+					},
+				}},
+			})
+			if testCase.accepted && err != nil {
+				t.Fatalf("%s(%d) was refused: %v", testCase.base, testCase.length, err)
+			}
+			if !testCase.accepted && err == nil {
+				t.Fatalf(
+					"%s(%d) was accepted; SQL Server cannot declare it",
+					testCase.base,
+					testCase.length,
+				)
+			}
+		})
+	}
+}
