@@ -1,9 +1,6 @@
 package migrate
 
 import (
-	"fmt"
-	"strings"
-
 	"github.com/johndauphine/dmtx/internal/schema"
 )
 
@@ -45,141 +42,36 @@ func projectSQLServerTableForPostgres(
 	return projected, nil
 }
 
+// projectSQLServerColumnForPostgres routes through the canonical type.
+//
+// This is the first route to leave the pairwise projection behind. What was a
+// switch over SQL Server's spellings deciding PostgreSQL's is now two steps
+// that each have one job: the source's declaration becomes a canonical type,
+// and the canonical type becomes the target's.
+//
+// Proved equivalent before it was switched, not after.
+// TestCanonicalMatchesPairwiseForSQLServerToPostgres runs both paths over the
+// SO2010 corpus's shapes and the boundaries that have gone wrong on this branch
+// - a bounded national string, an unbounded one, a datetime carrying fractional
+// seconds - and requires identical portable types and identical declarations.
+// The pairwise code is what has been writing production schemas, so a canonical
+// path that differed from it would be a behaviour change wearing a refactor's
+// clothes.
+//
+// Collation is not consulted here and the isKey argument is false, because this
+// function projects a column's shape rather than deciding whether it may order
+// a paged read. That question is asked at discovery, where key membership is
+// known - checkSQLServerSourceKeyCollations - and asking it again here with
+// neither the collation nor the key set to hand is how the old rule came to be
+// applied to every text column in the table.
 func projectSQLServerColumnForPostgres(
 	source schema.Column,
 ) (string, *schema.DeclaredType, error) {
-	if source.DeclaredType == nil {
-		return "", nil, fmt.Errorf("missing declared type")
+	canonical, err := schema.CanonicalFromSQLServer(source, "", false)
+	if err != nil {
+		return "", nil, err
 	}
-	base := strings.ToLower(strings.TrimSpace(source.DeclaredType.Base))
-	arguments := source.DeclaredType.Arguments
-	noArguments := func() bool { return len(arguments) == 0 }
-	copyDeclaration := func(base string) *schema.DeclaredType {
-		return &schema.DeclaredType{
-			Base:      base,
-			Arguments: append([]int(nil), arguments...),
-		}
-	}
-	switch base {
-	case "tinyint", "smallint", "int", "integer":
-		if !noArguments() || source.Type != "integer" {
-			break
-		}
-		return "integer", nil, nil
-	case "bigint":
-		if !noArguments() || source.Type != "bigint" {
-			break
-		}
-		return "bigint", nil, nil
-	case "bool", "boolean":
-		if !noArguments() || source.Type != "boolean" {
-			break
-		}
-		return "boolean", nil, nil
-	case "decimal", "numeric":
-		if source.Type != "numeric" ||
-			len(arguments) != 2 ||
-			arguments[0] < 1 ||
-			arguments[0] > 38 ||
-			arguments[1] < 0 ||
-			arguments[1] > arguments[0] {
-			break
-		}
-		return "numeric", copyDeclaration("numeric"), nil
-	case "real":
-		if !noArguments() || source.Type != "real" {
-			break
-		}
-		return "real", &schema.DeclaredType{Base: "real"}, nil
-	case "double precision":
-		if !noArguments() || source.Type != "double precision" {
-			break
-		}
-		return "double precision", nil, nil
-	case "char", "varchar", "nchar", "nvarchar":
-		// SQL Server's admitted UTF-8 modifier is a byte limit, while
-		// PostgreSQL VARCHAR counts characters. Keeping the numeric modifier
-		// is an explicit safe widening: every source value remains valid, and
-		// CHAR rows/defaults retain their discovered padding without asking
-		// PostgreSQL to add different padding.
-		//
-		// The national spellings arrive already converted to characters by
-		// discovery, which halves sys.columns.max_length for them - so the
-		// bound below is characters for all four, and nvarchar's own 4000
-		// ceiling is enforced where that conversion happens rather than
-		// re-derived here from a number that no longer says which type it came
-		// from.
-		if source.Type != "text" ||
-			len(arguments) != 1 ||
-			arguments[0] < 1 ||
-			arguments[0] > sqlServerProjectedTextLengthLimit(base) {
-			break
-		}
-		// A PostgreSQL catalog round trip represents VARCHAR as varchar (not
-		// source-neutral text). Keep the projection canonical so retained
-		// target authority can be authenticated on later incremental runs.
-		return "varchar", copyDeclaration("varchar"), nil
-	case "text":
-		if !noArguments() || source.Type != "text" {
-			break
-		}
-		return "text", nil, nil
-	case "binary", "varbinary":
-		// BYTEA has no length modifier. This is likewise a safe widening for
-		// copied values; binary columns are excluded from comparator-bearing
-		// objects because SQL Server's zero-padding equality is not portable.
-		if source.Type != "blob" ||
-			len(arguments) != 1 ||
-			arguments[0] < 1 ||
-			arguments[0] > 8_000 {
-			break
-		}
-		return "bytea", nil, nil
-	case "blob":
-		if !noArguments() || source.Type != "blob" {
-			break
-		}
-		return "bytea", nil, nil
-	case "date":
-		if !noArguments() || source.Type != "date" {
-			break
-		}
-		return "date", nil, nil
-	case "time":
-		if source.Type != "time" ||
-			len(arguments) != 1 ||
-			arguments[0] < 0 ||
-			arguments[0] > 6 {
-			break
-		}
-		return "time", copyDeclaration("time"), nil
-	case "timestamp":
-		if source.Type != "datetime" ||
-			len(arguments) != 1 ||
-			arguments[0] < 0 ||
-			arguments[0] > 6 {
-			break
-		}
-		// PostgreSQL catalog discovery represents TIMESTAMP as timestamp, not
-		// the source-neutral datetime alias.  Keep the projected generic type
-		// canonical so a later prior-authority proof can authenticate the exact
-		// table that this projection created.
-		return "timestamp", copyDeclaration("timestamp"), nil
-	case "smalldatetime":
-		if !noArguments() || source.Type != "datetime" {
-			break
-		}
-		return "timestamp", &schema.DeclaredType{
-			Base:      "timestamp",
-			Arguments: []int{0},
-		}, nil
-	case "uuid":
-		if !noArguments() || source.Type != "uuid" {
-			break
-		}
-		return "uuid", nil, nil
-	}
-	return "", nil, fmt.Errorf("unsupported SQL Server declared type")
+	return schema.CanonicalToDeclared(canonical, schema.Postgres)
 }
 
 func postgresSQLServerPolicy(operation, value string) error {

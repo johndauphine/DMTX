@@ -159,25 +159,78 @@ func CanonicalFromSQLServer(
 			column.Type,
 		)
 	}
-
-	if length, ok := declaredLength(column.DeclaredType); ok {
-		if canonical.Kind == KindText && length > SQLServerTextLengthLimit(base) {
-			return CanonicalType{}, fmt.Errorf(
-				"SQL Server column %s declares %s(%d), beyond the %d this"+
-					" family can declare",
-				column.Name,
-				base,
-				length,
-				SQLServerTextLengthLimit(base),
-			)
-		}
-		bounded := length
-		canonical.Length = &bounded
+	// The declared base has to be one this converter recognises for that kind,
+	// not merely present. Classifying from column.Type alone would accept a
+	// blob declared as SQL Server's deprecated image, or a datetime declared as
+	// datetime rather than the timestamp discovery emits - spellings that reach
+	// here only when something upstream is already wrong, and that a permissive
+	// converter would pass through into a target.
+	if !sqlServerBaseKnown(base, canonical.Kind) {
+		return CanonicalType{}, fmt.Errorf(
+			"SQL Server column %s declares %q, which is not a base dmtx"+
+				" certifies for %s",
+			column.Name,
+			base,
+			canonical.Kind,
+		)
 	}
+
+	// The single positional argument means different things by kind - a length
+	// for text, a fractional-second precision for a temporal - so it is read
+	// into the field that matches rather than into Length for everything. An
+	// earlier draft did the latter, which quietly gave every timestamp a
+	// character length of three.
 	canonical.Precision = column.DeclaredType.Precision
 	canonical.Scale = column.DeclaredType.Scale
 	canonical.FractionalSecondPrecision =
 		column.DeclaredType.FractionalSecondPrecision
+
+	switch canonical.Kind {
+	case KindNumeric:
+		// decimal declares two positional arguments, and discovery writes them
+		// there rather than into the structured Precision and Scale. Reading
+		// only the structured pair left a numeric with no modifiers at all,
+		// which the PostgreSQL renderer refuses - found by the armed live gate
+		// rather than by a unit test, because the unit fixtures had been
+		// written with the structured spelling.
+		if canonical.Precision == nil && len(column.DeclaredType.Arguments) == 2 {
+			precision := int64(column.DeclaredType.Arguments[0])
+			scale := int64(column.DeclaredType.Arguments[1])
+			canonical.Precision = &precision
+			canonical.Scale = &scale
+		}
+	case KindText, KindBlob:
+		if length, ok := declaredModifier(column.DeclaredType); ok {
+			if canonical.Kind == KindText &&
+				length > SQLServerTextLengthLimit(base) {
+				return CanonicalType{}, fmt.Errorf(
+					"SQL Server column %s declares %s(%d), beyond the %d this"+
+						" family can declare",
+					column.Name,
+					base,
+					length,
+					SQLServerTextLengthLimit(base),
+				)
+			}
+			bounded := length
+			canonical.Length = &bounded
+		}
+	case KindTime, KindDateTime:
+		if canonical.FractionalSecondPrecision == nil {
+			if digits, ok := declaredModifier(column.DeclaredType); ok {
+				precision := digits
+				canonical.FractionalSecondPrecision = &precision
+			}
+		}
+		// smalldatetime resolves to the minute, so it has no sub-second
+		// component at all - and that is an explicit zero rather than an
+		// absence. Absent would let a target choose its own default precision,
+		// which for PostgreSQL is six digits the source can never fill.
+		if base == "smalldatetime" && canonical.FractionalSecondPrecision == nil {
+			zero := int64(0)
+			canonical.FractionalSecondPrecision = &zero
+		}
+	}
 
 	// Ordering is asked only where it changes an answer.
 	if !isKey {
@@ -234,12 +287,14 @@ func canonicalKindFromPortable(portable string) Kind {
 	}
 }
 
-// declaredLength reads a length from either spelling a DeclaredType uses.
+// declaredModifier reads the single positional modifier a declaration carries.
 //
-// The structured Length field is the newer one; Arguments carries the same
-// number for the types declared positionally. Reading both here means the
-// converter does not care which spelling a discoverer chose.
-func declaredLength(declared *DeclaredType) (int64, bool) {
+// The structured fields are the newer spelling; Arguments carries the same
+// number for types declared positionally, which is what SQL Server discovery
+// populates. Reading both means the converter does not care which a discoverer
+// chose - but the CALLER must decide what the number means, because Arguments
+// says nothing about whether it is a length or a precision.
+func declaredModifier(declared *DeclaredType) (int64, bool) {
 	if declared.Length != nil {
 		return *declared.Length, true
 	}
@@ -247,4 +302,52 @@ func declaredLength(declared *DeclaredType) (int64, bool) {
 		return int64(declared.Arguments[0]), true
 	}
 	return 0, false
+}
+
+// sqlServerBaseKnown reports whether a declared base is one discovery emits for
+// this kind.
+//
+// Fail-closed by enumeration rather than by trusting the portable type. The
+// bases here are exactly the ones internal/engine assigns; anything else is a
+// declaration dmtx did not produce and has not certified.
+func sqlServerBaseKnown(base string, kind Kind) bool {
+	switch kind {
+	case KindBoolean:
+		return base == "bool"
+	case KindInteger:
+		return base == "tinyint" || base == "smallint" || base == "int" ||
+			base == "integer"
+	case KindBigInt:
+		return base == "bigint"
+	case KindNumeric:
+		return base == "decimal" || base == "numeric"
+	case KindReal:
+		return base == "real"
+	case KindDouble:
+		return base == "double precision" || base == "float"
+	case KindText:
+		return base == "char" || base == "varchar" || base == "nchar" ||
+			base == "nvarchar" || base == "text"
+	case KindBlob:
+		return base == "binary" || base == "varbinary" || base == "blob"
+	case KindDate:
+		return base == "date"
+	case KindTime:
+		return base == "time"
+	case KindDateTime:
+		// timestamp is what discovery emits for datetime and datetime2, and
+		// smalldatetime keeps its own name because its resolution is a minute -
+		// a fact the target authority needs and "timestamp" would lose.
+		//
+		// Enumerated rather than assumed. An earlier draft claimed all three
+		// arrived as timestamp, which was a guess, and it refused every
+		// smalldatetime column until a test said so.
+		return base == "timestamp" || base == "smalldatetime"
+	case KindUUID:
+		return base == "uuid"
+	case KindJSON:
+		return base == "json"
+	default:
+		return false
+	}
 }

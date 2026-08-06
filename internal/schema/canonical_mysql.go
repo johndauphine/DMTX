@@ -123,14 +123,41 @@ func CanonicalFromMySQL(
 		)
 	}
 
-	if length, ok := declaredLength(column.DeclaredType); ok {
-		bounded := length
-		canonical.Length = &bounded
-	}
 	canonical.Precision = column.DeclaredType.Precision
 	canonical.Scale = column.DeclaredType.Scale
 	canonical.FractionalSecondPrecision =
 		column.DeclaredType.FractionalSecondPrecision
+
+	// The positional modifier means a length for text and a fractional-second
+	// precision for a temporal, so it is read into the field that matches its
+	// kind rather than into Length for everything.
+	switch canonical.Kind {
+	case KindNumeric:
+		// decimal declares two positional arguments, and discovery writes them
+		// there rather than into the structured Precision and Scale. Reading
+		// only the structured pair left a numeric with no modifiers at all,
+		// which the PostgreSQL renderer refuses - found by the armed live gate
+		// rather than by a unit test, because the unit fixtures had been
+		// written with the structured spelling.
+		if canonical.Precision == nil && len(column.DeclaredType.Arguments) == 2 {
+			precision := int64(column.DeclaredType.Arguments[0])
+			scale := int64(column.DeclaredType.Arguments[1])
+			canonical.Precision = &precision
+			canonical.Scale = &scale
+		}
+	case KindText, KindBlob:
+		if length, ok := declaredModifier(column.DeclaredType); ok {
+			bounded := length
+			canonical.Length = &bounded
+		}
+	case KindTime, KindDateTime:
+		if canonical.FractionalSecondPrecision == nil {
+			if digits, ok := declaredModifier(column.DeclaredType); ok {
+				precision := digits
+				canonical.FractionalSecondPrecision = &precision
+			}
+		}
+	}
 
 	if !isKey {
 		return canonical, nil
