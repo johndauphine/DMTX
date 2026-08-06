@@ -225,6 +225,9 @@ func (server *Server) routes() http.Handler {
 	// process becomes authenticated. It proves itself with the handoff secret
 	// instead of a session; see Server.handoff.
 	mux.HandleFunc("POST /api/v1/handoff", server.handoff)
+	mux.Handle("POST /api/v1/parse", server.auth.require(
+		http.HandlerFunc(server.parse),
+	))
 	mux.Handle("POST /api/v1/execute", server.auth.require(
 		http.HandlerFunc(server.execute),
 	))
