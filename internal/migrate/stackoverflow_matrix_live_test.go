@@ -234,7 +234,7 @@ func stackOverflowPostgresTarget(
 		Password:  parsed.Password,
 		Schema:    namespace,
 		SSLMode:   "verify-full",
-		TLSCAFile: os.Getenv("DMTX_TEST_MSSQL_CA"),
+		TLSCAFile: postgresFixtureCAFile(dsn),
 	}
 }
 

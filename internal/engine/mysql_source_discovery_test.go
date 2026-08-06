@@ -812,3 +812,56 @@ func TestMySQLSourceKeyCollationsMustOrderTheSameOnBothEngines(t *testing.T) {
 		t.Errorf("refused an ordinary collation on a data column: %v", err)
 	}
 }
+
+// TestMySQLKeyMayOverrideTheTableCollation pins the remedy for a non-portable
+// text key.
+//
+// The key rule refuses a case-insensitive key, and the fix an operator reaches
+// for is to give that one column a binary collation while the table keeps its
+// default: DEFAULT COLLATE utf8mb4_unicode_ci with the key column COLLATE
+// utf8mb4_bin. Verified against MySQL 8.0 - the catalog reports the column as
+// utf8mb4_bin and the table as utf8mb4_unicode_ci.
+//
+// A rule requiring every column to match the table's collation refused exactly
+// that shape, so the operator was told "column collation override" about the
+// change they had just made to satisfy the previous error. Both rules were
+// individually defensible and together they left no way through.
+func TestMySQLKeyMayOverrideTheTableCollation(t *testing.T) {
+	table := schema.Table{
+		Schema: "so",
+		Name:   "tags",
+		Columns: []schema.Column{
+			{
+				Name:               "tagname",
+				Type:               "text",
+				PrimaryKeyPosition: 1,
+				DeclaredType: &schema.DeclaredType{
+					Base:      "varchar",
+					Arguments: []int{40},
+				},
+			},
+			{
+				Name: "note",
+				Type: "text",
+				DeclaredType: &schema.DeclaredType{
+					Base:      "varchar",
+					Arguments: []int{100},
+				},
+			},
+		},
+	}
+	// The key binary, the data column on the table's ordinary default.
+	if err := checkMySQLSourceKeyCollations(table, map[string]string{
+		"tagname": "utf8mb4_bin",
+		"note":    "utf8mb4_unicode_ci",
+	}); err != nil {
+		t.Fatalf("refused a binary key beside an ordinary data column: %v", err)
+	}
+	// And the reverse is still refused: an ordinary key is what the rule is for.
+	if err := checkMySQLSourceKeyCollations(table, map[string]string{
+		"tagname": "utf8mb4_unicode_ci",
+		"note":    "utf8mb4_bin",
+	}); err == nil {
+		t.Fatal("accepted a case-insensitive key")
+	}
+}

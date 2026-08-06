@@ -624,17 +624,23 @@ func readMySQL80SourceColumns(
 				err,
 			)
 		}
-		if catalog.characterSet.Valid &&
-			(!catalog.collation.Valid ||
-				!strings.EqualFold(
-					catalog.collation.String,
-					table.tableCollation.String,
-				)) {
-			return nil, nil, nil, mysqlSourcePolicy(
-				"column collation override",
-				namespace+"."+name+"."+catalog.name,
-			)
-		}
+		// A column may carry its own collation. The rule that stood here
+		// required every text column to match the table's, which made the
+		// table collation a reliable summary and cost the one remedy an
+		// operator actually has.
+		//
+		// Once ordering is asked of key columns, the fix for a non-portable key
+		// is to give that column a binary collation and leave the rest alone -
+		// table DEFAULT utf8mb4_unicode_ci, key column COLLATE utf8mb4_bin.
+		// That is a per-column override, so it was refused here before the key
+		// check could approve it, and the operator was told "column collation
+		// override" about the thing they had just done to fix the previous
+		// error.
+		//
+		// Nothing is lost. The character set is still required to be utf8mb4 per
+		// column where each column type is read, and the collation each column
+		// reports is the one the key rule reads - so a per-column collation is
+		// exactly the fact those checks want, not an obstacle to them.
 		if catalog.defaultValue.Valid || metadata.defaultGenerated {
 			var catalogDefault *string
 			if catalog.defaultValue.Valid {

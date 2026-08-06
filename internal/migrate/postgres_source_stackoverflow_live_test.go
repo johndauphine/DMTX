@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"database/sql"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -182,8 +183,27 @@ func loadPostgresStackOverflowFixture(
 		Password:  parsed.Password,
 		Schema:    namespace,
 		SSLMode:   "verify-full",
-		TLSCAFile: os.Getenv("DMTX_TEST_MSSQL_CA"),
+		TLSCAFile: postgresFixtureCAFile(dsn),
 	}
+}
+
+// postgresFixtureCAFile reads the CA out of the PostgreSQL DSN.
+//
+// There is no DMTX_TEST_POSTGRES_CA - env.sh puts PostgreSQL's CA in the DSN's
+// sslrootcert parameter, where libpq expects it, and exports a separate
+// variable only for the engines whose drivers take one argument-side.
+//
+// This used to read DMTX_TEST_MSSQL_CA, which worked and was wrong. Every
+// fixture in test/fixtures shares one generated CA, so pointing a PostgreSQL
+// endpoint at SQL Server's copy verified against the right certificate by
+// accident. It would have kept working until someone gave one engine its own
+// CA, and then failed as a TLS error naming neither this line nor that change.
+func postgresFixtureCAFile(dsn string) string {
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		return ""
+	}
+	return parsed.Query().Get("sslrootcert")
 }
 
 // stackOverflowSQLServerTarget makes an empty database for one route to fill.
