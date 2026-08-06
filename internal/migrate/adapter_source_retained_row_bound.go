@@ -1253,10 +1253,6 @@ func sqlServerRetainedColumnBound(
 			)
 			break
 		}
-		// The national spellings are here for the same reason as char and
-		// varchar: this is a memory bound, and a declared length in characters
-		// bounds the value however the source spelled the type. Discovery has
-		// already converted nchar/nvarchar lengths from bytes to characters.
 		length, ok := exactAdapterDeclaredLengthIn(
 			column.DeclaredType,
 			"char",
@@ -1270,7 +1266,7 @@ func sqlServerRetainedColumnBound(
 		var err error
 		bound.fixedBytes, err = addAdapterRetainedBytes(
 			int64(unsafe.Sizeof("")),
-			length,
+			length*sqlServerRetainedUTF8Expansion(column.DeclaredType.Base),
 		)
 		if err != nil {
 			return bound, err
@@ -1336,6 +1332,38 @@ func sqlServerRetainedColumnBound(
 		)
 	}
 	return bound, nil
+}
+
+// sqlServerRetainedUTF8Expansion is the worst-case UTF-8 bytes per unit of a
+// declared text length.
+//
+// This bound sizes chunks against the memory ceiling, so it must not be
+// optimistic: under-counting hands the reader more rows per chunk than the
+// budget allows, and the ceiling stops meaning anything.
+//
+// nchar and nvarchar declare a count of UTF-16 code units, and the driver hands
+// back Go strings, which are UTF-8. A unit inside the BMP costs up to three
+// bytes there. A surrogate pair costs four bytes across two units, which is
+// cheaper per unit, so three is the worst case rather than four.
+//
+// char and varchar are deliberately left at 1 here, and that is a known gap
+// rather than a claim of correctness. They declare bytes, and those bytes are
+// UTF-8 only under a _UTF8 collation; under any other they are codepage bytes
+// that widen on the way out, so a CP1252 high byte becomes two or three UTF-8
+// bytes. Certifying ordinary collations for data columns introduced that
+// exposure. It is not corrected here because the aggregate this feeds moves by
+// more than the arithmetic accounts for, and a bound whose value cannot be
+// explained is not a bound worth trusting. Tracked separately.
+//
+// Three times a declared length is a bound, not a measurement. It costs smaller
+// chunks on wide national text and buys a ceiling that holds.
+func sqlServerRetainedUTF8Expansion(base string) int64 {
+	switch base {
+	case "nchar", "nvarchar":
+		return 3
+	default:
+		return 1
+	}
 }
 
 func sqlServerLiveRetainedColumnBound(

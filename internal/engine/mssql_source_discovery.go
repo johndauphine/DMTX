@@ -1066,9 +1066,24 @@ func applySQLServerSourceTextType(
 			catalog.name+" "+catalog.typeName,
 		)
 	}
-	// ansi_padded is false for varchar/nvarchar under some session settings and
-	// is meaningless for the fixed-width forms, which are always padded. It said
-	// nothing about portability, and requiring it excluded ordinary tables.
+	// ansi_padded is still required of the fixed-width forms, and dropped for
+	// the varying ones.
+	//
+	// An earlier version of this comment said the flag was meaningless for
+	// char and nchar because they are always padded. That is wrong, and the
+	// catalog says so: a column created under SET ANSI_PADDING OFF reports
+	// is_ansi_padded = 0, for char as readily as for varchar. Measured on SQL
+	// Server 2022, both spellings, both settings.
+	//
+	// It matters for the fixed-width forms because under ANSI_PADDING OFF a
+	// nullable char trims its trailing spaces instead of padding them, so the
+	// stored value is not the padded value a target would write back. That is
+	// a fidelity difference, which is the thing certification is about, so it
+	// stays refused.
+	//
+	// For varchar and nvarchar the flag records a session setting that does not
+	// change what the column holds, and requiring it excluded ordinary tables
+	// for no gain.
 	if sqlServerFixedWidthText(catalog.typeName) && !catalog.ansiPadded {
 		return sqlServerSourcePolicy(
 			"column type",
