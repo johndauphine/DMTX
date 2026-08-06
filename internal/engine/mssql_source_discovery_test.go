@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/johndauphine/dmtx/internal/schema"
@@ -758,5 +759,65 @@ func TestSQLServerSourceKeyCollationsMustOrderTheSameOnBothEngines(t *testing.T)
 		map[string]string{"TagName": "SQL_Latin1_General_CP1_CI_AS"},
 	); err != nil {
 		t.Fatalf("an ordinary collation was refused for a data column: %v", err)
+	}
+}
+
+// TestRefusedTextKeySaysWhatWouldWork guards the message, not the refusal.
+//
+// It used to say a text key "needs a binary collation". Latin1_General_100_BIN2
+// is a binary collation and is refused, so an operator read that, looked at
+// their column, and had nowhere to go. The two failure modes have different
+// remedies and neither is guessable from the collation's name, so the message
+// has to name the one that applies.
+func TestRefusedTextKeySaysWhatWouldWork(t *testing.T) {
+	keyed := func(base string) schema.Table {
+		return schema.Table{
+			Schema: "dbo",
+			Name:   "Tags",
+			Columns: []schema.Column{{
+				Name:               "TagName",
+				Type:               "text",
+				PrimaryKeyPosition: 1,
+				DeclaredType: &schema.DeclaredType{
+					Base:      base,
+					Arguments: []int{40},
+				},
+			}},
+		}
+	}
+
+	narrow := checkSQLServerSourceKeyCollations(
+		keyed("varchar"),
+		map[string]string{"TagName": "Latin1_General_100_BIN2"},
+	)
+	if narrow == nil {
+		t.Fatal("a narrow _BIN2 key was accepted")
+	}
+	// The spelling that would work has to appear, or the operator is left
+	// guessing which of SQL Server's collations qualifies.
+	if !strings.Contains(narrow.Error(), "_BIN2_UTF8") {
+		t.Errorf("refusal does not name the collation that works: %v", narrow)
+	}
+	// And it must not describe the requirement as "binary", which is what the
+	// refused collation already is.
+	if strings.Contains(narrow.Error(), "needs a binary collation") {
+		t.Errorf("refusal still calls the requirement binary: %v", narrow)
+	}
+
+	national := checkSQLServerSourceKeyCollations(
+		keyed("nvarchar"),
+		map[string]string{"TagName": "Latin1_General_100_BIN2_UTF8"},
+	)
+	if national == nil {
+		t.Fatal("a national text key was accepted")
+	}
+	// This one has no collation that would fix it, and saying so is the whole
+	// point: otherwise the operator tries _BIN2_UTF8, which the other branch
+	// recommends, and is refused again for a reason nothing explained.
+	if !strings.Contains(national.Error(), "whatever its collation") {
+		t.Errorf("national refusal implies a collation would fix it: %v", national)
+	}
+	if !strings.Contains(national.Error(), "UTF-16") {
+		t.Errorf("national refusal does not say why: %v", national)
 	}
 }

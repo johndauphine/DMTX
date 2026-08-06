@@ -1487,11 +1487,34 @@ func checkSQLServerSourceKeyCollations(
 			return sqlServerSourcePolicy(
 				"primary-key collation",
 				table.Schema+"."+table.Name+"."+column.Name+
-					" is "+collation+
-					"; a text key needs a binary collation to order the"+
-					" same way on both engines",
+					" is "+column.DeclaredType.Base+" "+collation+"; "+
+					sqlServerKeyCollationRemedy(column.DeclaredType.Base),
 			)
 		}
 	}
 	return nil
+}
+
+// sqlServerKeyCollationRemedy says what a refused text key would need.
+//
+// "A binary collation" was the old wording and it was actively misleading:
+// Latin1_General_100_BIN2 is a binary collation and is refused, so an operator
+// read the message, looked at their column, and had nowhere to go. The two ways
+// a text key fails have different remedies, and neither is guessable, so the
+// message names the one that applies.
+func sqlServerKeyCollationRemedy(base string) string {
+	if sqlServerNationalText(base) {
+		// No collation fixes this one. SQL Server's _UTF8 collations re-encode
+		// char and varchar only, so a national key always orders by UTF-16 code
+		// unit - which agrees with PostgreSQL across the BMP and stops agreeing
+		// above it, where surrogates sort before the characters they encode.
+		return "a national text key cannot order the same way on both engines" +
+			" whatever its collation, because nchar and nvarchar are UTF-16;" +
+			" declare the key as varchar with a _BIN2_UTF8 collation, or key" +
+			" the table on a non-text column"
+	}
+	return "a text key must carry a _BIN2_UTF8 collation, which is the only" +
+		" kind whose byte ordering matches the target's; a plain _BIN2 orders" +
+		" by code page, so it sorts the same bytes differently once they are" +
+		" UTF-8"
 }
