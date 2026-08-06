@@ -22,40 +22,12 @@
 
 name: Verify
 
-# Triggers, and why each is filtered.
-#
-# This workflow used to run on bare `push` and bare `pull_request`. Both fire
-# for a branch with an open PR, on the same SHA, producing identical results -
-# and the armed gate takes about fifteen minutes, so that was thirty minutes of
-# runner time for fifteen minutes of information.
-#
-# The schedule carries the checks that are too expensive to gate a PR on but
-# must not go unrun; workflow_dispatch so they can be demanded rather than
-# waited for.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
   push:
-    branches: [main]
-  schedule:
-    - cron: "0 7 * * *"
-  workflow_dispatch:
+  pull_request:
 
 permissions:
   contents: read
-
-# Supersede a run when its branch moves. Without this, pushing three times in
-# five minutes leaves three full gates running against commits nobody is waiting
-# on any more, and the newest one queues behind them.
-#
-# event_name is in the key, and that is not decoration. Keyed on the ref alone,
-# a nightly run and a push to main share refs/heads/main, so any push during the
-# nightly cancels it - and the expensive race coverage this schedule exists to
-# carry would be skipped silently on exactly the days the repository is busy.
-# A saving that deletes the thing it was meant to preserve is not a saving.
-concurrency:
-  group: verify-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   test:
@@ -159,17 +131,7 @@ jobs:
           source test/fixtures/env.sh
           DMTX_STAGE4_LIVE_REQUIRED=1 go test ./... -count=1 -timeout 30m
 
-      # The armed race run moved to the nightly schedule. It is the expensive
-      # half of this job - the same live suite a second time, with the race
-      # detector's slowdown on top - and it re-runs everything the pass above
-      # just ran. The offline race run in the `test` job still gates every PR,
-      # so a data race in ordinary code is still caught here; what waits until
-      # tonight is a race that only appears against a live endpoint.
-      #
-      # This is the trade the budget forced and the one worth making anyway: a
-      # gate nobody can afford to run is not a gate.
       - name: Run armed live tests with the race detector
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
           source test/fixtures/env.sh
           # 30m, not Go's 10m default. The race run of internal/migrate takes
@@ -177,27 +139,6 @@ jobs:
           # four-core runner, so the default sat close enough to the limit that
           # the job passed or timed out depending on runner load.
           DMTX_STAGE4_LIVE_REQUIRED=1 go test -race ./... -count=1 -timeout 30m
-
-      - name: Record what this run did not cover
-        if: always()
-        run: |
-          {
-            if [ "${{ github.event_name }}" = "schedule" ] || \
-               [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-              echo "### Armed live gate, full"
-              echo
-              echo "Live tests ran with and without the race detector."
-            else
-              echo "### Armed live gate, pull-request scope"
-              echo
-              echo "Live tests ran once. The **armed race run did not**, and is"
-              echo "on the nightly schedule instead."
-              echo
-              echo "So a data race that only appears against a live endpoint is"
-              echo "not caught by this run. The offline race run in the \`test\`"
-              echo "job did run, and covers a race in ordinary code."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Collect fixture logs on failure
         if: failure()
