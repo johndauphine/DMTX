@@ -96,12 +96,19 @@ func projectSQLServerColumnForPostgres(
 			break
 		}
 		return "double precision", nil, nil
-	case "char", "varchar":
+	case "char", "varchar", "nchar", "nvarchar":
 		// SQL Server's admitted UTF-8 modifier is a byte limit, while
 		// PostgreSQL VARCHAR counts characters. Keeping the numeric modifier
 		// is an explicit safe widening: every source value remains valid, and
 		// CHAR rows/defaults retain their discovered padding without asking
 		// PostgreSQL to add different padding.
+		//
+		// The national spellings arrive already converted to characters by
+		// discovery, which halves sys.columns.max_length for them - so the
+		// bound below is characters for all four, and nvarchar's own 4000
+		// ceiling is enforced where that conversion happens rather than
+		// re-derived here from a number that no longer says which type it came
+		// from.
 		if source.Type != "text" ||
 			len(arguments) != 1 ||
 			arguments[0] < 1 ||

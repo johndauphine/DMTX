@@ -1253,10 +1253,16 @@ func sqlServerRetainedColumnBound(
 			)
 			break
 		}
+		// The national spellings are here for the same reason as char and
+		// varchar: this is a memory bound, and a declared length in characters
+		// bounds the value however the source spelled the type. Discovery has
+		// already converted nchar/nvarchar lengths from bytes to characters.
 		length, ok := exactAdapterDeclaredLengthIn(
 			column.DeclaredType,
 			"char",
 			"varchar",
+			"nchar",
+			"nvarchar",
 		)
 		if !ok || length > 8_000 {
 			return bound, errors.New("text declaration is invalid")

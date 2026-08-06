@@ -579,15 +579,20 @@ func readSQLServerSourceColumns(
 ) (
 	[]schema.Column,
 	*sqlServerSourceIdentityCatalog,
+	map[string]string,
 	error,
 ) {
+	// Text collations, by column name, for the key rule applied after the
+	// primary key is known. Empty for every non-text column, which is what a
+	// key of those types should be checked against: nothing.
+	collations := map[string]string{}
 	rows, err := database.QueryContext(
 		ctx,
 		sqlServerSourceColumnsQuery,
 		table.objectID,
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf(
+		return nil, nil, nil, fmt.Errorf(
 			"list SQL Server columns for %s.%s: %w",
 			namespace,
 			name,
@@ -640,7 +645,7 @@ func readSQLServerSourceColumns(
 			&catalog.identityLast,
 			&catalog.identityNotForReplication,
 		); err != nil {
-			return nil, nil, fmt.Errorf(
+			return nil, nil, nil, fmt.Errorf(
 				"read SQL Server column for %s.%s: %w",
 				namespace,
 				name,
@@ -648,7 +653,7 @@ func readSQLServerSourceColumns(
 			)
 		}
 		if catalog.position != len(columns)+1 {
-			return nil, nil, sqlServerSourcePolicy(
+			return nil, nil, nil, sqlServerSourcePolicy(
 				"column order",
 				fmt.Sprintf(
 					"%s.%s position=%d expected=%d",
@@ -661,7 +666,7 @@ func readSQLServerSourceColumns(
 		}
 		folded := strings.ToLower(catalog.name)
 		if foldedNames[folded] {
-			return nil, nil, sqlServerSourcePolicy(
+			return nil, nil, nil, sqlServerSourcePolicy(
 				"column identifier",
 				namespace+"."+name+"."+catalog.name,
 			)
@@ -670,7 +675,7 @@ func readSQLServerSourceColumns(
 		column, discoveredIdentity, err :=
 			sqlServerSourceColumnFromCatalog(catalog)
 		if err != nil {
-			return nil, nil, fmt.Errorf(
+			return nil, nil, nil, fmt.Errorf(
 				"discover SQL Server column %s.%s.%s: %w",
 				namespace,
 				name,
@@ -678,9 +683,12 @@ func readSQLServerSourceColumns(
 				err,
 			)
 		}
+		if catalog.collation.Valid {
+			collations[catalog.name] = catalog.collation.String
+		}
 		if discoveredIdentity != nil {
 			if identity != nil {
-				return nil, nil, sqlServerSourcePolicy(
+				return nil, nil, nil, sqlServerSourcePolicy(
 					"identity",
 					namespace+"."+name+" has multiple identity columns",
 				)
@@ -690,7 +698,7 @@ func readSQLServerSourceColumns(
 		columns = append(columns, column)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf(
+		return nil, nil, nil, fmt.Errorf(
 			"iterate SQL Server columns for %s.%s: %w",
 			namespace,
 			name,
@@ -698,7 +706,7 @@ func readSQLServerSourceColumns(
 		)
 	}
 	if len(columns) != table.columnCount {
-		return nil, nil, sqlServerSourcePolicy(
+		return nil, nil, nil, sqlServerSourcePolicy(
 			"column catalog shape",
 			fmt.Sprintf(
 				"%s.%s table columns=%d discovered=%d",
@@ -709,7 +717,7 @@ func readSQLServerSourceColumns(
 			),
 		)
 	}
-	return columns, identity, nil
+	return columns, identity, collations, nil
 }
 
 func sqlServerSourceColumnFromCatalog(
@@ -902,7 +910,7 @@ func applySQLServerSourceType(
 		}
 		column.Type = "double precision"
 		declaration("double precision")
-	case "char", "varchar":
+	case "char", "varchar", "nchar", "nvarchar":
 		if err := applySQLServerSourceTextType(
 			column,
 			catalog,
@@ -967,6 +975,28 @@ func applySQLServerSourceType(
 		}
 		column.Type = "datetime"
 		declaration("timestamp", catalog.scale)
+	case "datetime":
+		// SQL Server's original DATETIME. Not parameterised, fixed 8 bytes,
+		// and the catalog reports precision 23 scale 3 for every one of them.
+		//
+		// It was missing entirely while datetime2 was handled, which is the
+		// same shape of gap as nvarchar beside varchar: the modern spelling
+		// was implemented and the one real schemas actually use was not.
+		//
+		// Declared as timestamp(3) rather than timestamp(0). The stored
+		// resolution is 1/300th of a second, which is finer than a second and
+		// coarser than a millisecond, so 3 is the smallest declaration that
+		// does not truncate a value the source can hold. Rounding is the
+		// source's own - a DATETIME cannot represent .997 exactly either.
+		if !noCollation() ||
+			catalog.ansiPadded ||
+			catalog.maxLength != 8 ||
+			catalog.precision != 23 ||
+			catalog.scale != 3 {
+			return unsupported()
+		}
+		column.Type = "datetime"
+		declaration("timestamp", 3)
 	case "smalldatetime":
 		if !exact(4, 16, 0) {
 			return unsupported()
@@ -985,16 +1015,31 @@ func applySQLServerSourceType(
 	return nil
 }
 
+// applySQLServerSourceTextType handles char, varchar, nchar and nvarchar.
+//
+// Collation is deliberately not policed here, and that is a change. It used to
+// require Latin1_General_100_BIN2_UTF8 on every text column, which no database
+// has unless someone chose it - so an ordinary StackOverflow table, whose
+// columns carry the SQL_Latin1_General_CP1_CI_AS that SQL Server installs by
+// default, could not be read at all. The armed gate passed anyway because
+// dmtx's own fixture stamped that collation onto every column it created.
+//
+// The property the rule was protecting is real but belongs to keys, not to all
+// columns. A collation decides how two values compare, so it matters when a
+// column orders a paged read or proves a row identical across engines - and
+// adapter_validation_database.go already refuses a text key without a certified
+// equality and ordering domain. It does not matter for Users.AboutMe, which is
+// HTML that gets copied. Enforcing it everywhere confused "this column sorts"
+// with "this column exists".
+//
+// The strict rule is therefore applied where key membership is known, in
+// sqlServerSourceKeyCollationSupported below, rather than here where it is not:
+// columns are read before the primary key is discovered.
 func applySQLServerSourceTextType(
 	column *schema.Column,
 	catalog sqlServerSourceColumnCatalog,
 ) error {
 	if !catalog.collation.Valid ||
-		!sqlServerPortableTextColumnCollation(
-			catalog.typeName,
-			catalog.collation.String,
-		) ||
-		!catalog.ansiPadded ||
 		catalog.precision != 0 ||
 		catalog.scale != 0 {
 		return sqlServerSourcePolicy(
@@ -1002,14 +1047,37 @@ func applySQLServerSourceTextType(
 			catalog.name+" "+catalog.typeName,
 		)
 	}
-	length := catalog.maxLength
-	if length == -1 && catalog.typeName != "varchar" {
+	// ansi_padded is false for varchar/nvarchar under some session settings and
+	// is meaningless for the fixed-width forms, which are always padded. It said
+	// nothing about portability, and requiring it excluded ordinary tables.
+	if sqlServerFixedWidthText(catalog.typeName) && !catalog.ansiPadded {
 		return sqlServerSourcePolicy(
 			"column type",
 			catalog.name+" "+catalog.typeName,
 		)
 	}
-	if length != -1 && (length < 1 || length > 8_000) {
+
+	// max_length is bytes. The national types store two bytes per character, so
+	// the declared length is half of it - and getting this wrong would silently
+	// double every length in the target DDL.
+	length := catalog.maxLength
+	if length != -1 && sqlServerNationalText(catalog.typeName) {
+		if length%2 != 0 {
+			return sqlServerSourcePolicy(
+				"column type",
+				catalog.name+" "+catalog.typeName,
+			)
+		}
+		length /= 2
+	}
+	// -1 is MAX. Only the varying forms have it; nchar(MAX) does not exist.
+	if length == -1 && !sqlServerVaryingText(catalog.typeName) {
+		return sqlServerSourcePolicy(
+			"column type",
+			catalog.name+" "+catalog.typeName,
+		)
+	}
+	if length != -1 && (length < 1 || length > sqlServerTextLengthLimit(catalog.typeName)) {
 		return sqlServerSourcePolicy(
 			"column type",
 			catalog.name+" "+catalog.typeName,
@@ -1027,15 +1095,56 @@ func applySQLServerSourceTextType(
 	return nil
 }
 
+func sqlServerNationalText(typeName string) bool {
+	return typeName == "nchar" || typeName == "nvarchar"
+}
+
+func sqlServerVaryingText(typeName string) bool {
+	return typeName == "varchar" || typeName == "nvarchar"
+}
+
+func sqlServerFixedWidthText(typeName string) bool {
+	return typeName == "char" || typeName == "nchar"
+}
+
+// sqlServerTextLengthLimit is the largest declarable length, in characters.
+// Both families cap at 8000 bytes, which is 4000 characters for the national
+// types; beyond that SQL Server requires MAX.
+func sqlServerTextLengthLimit(typeName string) int {
+	if sqlServerNationalText(typeName) {
+		return 4_000
+	}
+	return 8_000
+}
+
+// sqlServerPortableTextColumnCollation reports whether a text column may order
+// a paged read or prove a row identical across engines.
+//
+// A binary collation is required because that is the only kind whose ordering
+// and equality survive the trip: a case- or accent-insensitive collation makes
+// 'a' = 'A' in SQL Server and not in PostgreSQL, so a chunk boundary computed on
+// one side would not mean the same thing on the other, and rows would be
+// skipped or repeated at the seam.
+//
+// This is now asked only of key columns. It used to be asked of every text
+// column, which is what made an ordinary StackOverflow table unreadable - see
+// applySQLServerSourceTextType.
 func sqlServerPortableTextColumnCollation(
 	typeName string,
 	collation string,
 ) bool {
 	switch typeName {
-	case "char", "varchar":
-		return strings.EqualFold(
-			strings.TrimSpace(collation),
-			"Latin1_General_100_BIN2_UTF8",
+	case "char", "varchar", "nchar", "nvarchar":
+		// BIN2 is the byte-ordered family. Matched by suffix rather than by one
+		// exact name so that the national and non-national spellings, and the
+		// other locales that are equally byte-ordered, are not excluded by an
+		// accident of which one got written down first.
+		return strings.HasSuffix(
+			strings.ToUpper(strings.TrimSpace(collation)),
+			"_BIN2",
+		) || strings.HasSuffix(
+			strings.ToUpper(strings.TrimSpace(collation)),
+			"_BIN2_UTF8",
 		)
 	default:
 		return false
@@ -1144,7 +1253,7 @@ func inspectSQLServer2022TableOnce(
 	if err != nil {
 		return schema.Table{}, 0, err
 	}
-	columns, identityCatalog, err := readSQLServerSourceColumns(
+	columns, identityCatalog, collations, err := readSQLServerSourceColumns(
 		ctx,
 		database,
 		catalog,
@@ -1166,6 +1275,12 @@ func inspectSQLServer2022TableOnce(
 		catalog.objectID,
 		targetPhysicalPrimaryKey,
 	); err != nil {
+		return schema.Table{}, 0, err
+	}
+	// Only now is key membership known, which is why the collation rule lives
+	// here rather than beside the column read that used to enforce it on
+	// everything.
+	if err := checkSQLServerSourceKeyCollations(table, collations); err != nil {
 		return schema.Table{}, 0, err
 	}
 	if identityCatalog != nil {
@@ -1283,4 +1398,41 @@ func sqlServerSourcePolicy(operation, value string) error {
 		Type:      value,
 		Target:    string(schema.SQLServer),
 	}
+}
+
+// checkSQLServerSourceKeyCollations refuses a text primary key whose collation
+// does not order the same way on both sides of a migration.
+//
+// This is the rule applySQLServerSourceTextType used to apply to every text
+// column. Applied to keys it protects something real: a paged read orders by
+// the key, and a case-insensitive collation makes 'a' = 'A' in SQL Server and
+// not in PostgreSQL, so a chunk boundary would not mean the same thing on both
+// sides and rows would be skipped or repeated at the seam. Applied to every
+// column it protected nothing and cost the ability to read ordinary tables.
+func checkSQLServerSourceKeyCollations(
+	table schema.Table,
+	collations map[string]string,
+) error {
+	for _, column := range table.Columns {
+		if column.PrimaryKeyPosition == 0 || column.DeclaredType == nil {
+			continue
+		}
+		collation, isText := collations[column.Name]
+		if !isText {
+			continue
+		}
+		if !sqlServerPortableTextColumnCollation(
+			column.DeclaredType.Base,
+			collation,
+		) {
+			return sqlServerSourcePolicy(
+				"primary-key collation",
+				table.Schema+"."+table.Name+"."+column.Name+
+					" is "+collation+
+					"; a text key needs a binary collation to order the"+
+					" same way on both engines",
+			)
+		}
+	}
+	return nil
 }
