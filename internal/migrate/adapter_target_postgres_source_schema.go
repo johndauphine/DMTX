@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -86,7 +87,15 @@ func projectMySQLTableForPostgres(
 				sourceColumn.DeclaredType != nil {
 				value = strings.TrimSpace(sourceColumn.DeclaredType.Base)
 			}
-			return schema.Table{}, postgresMySQLPolicy(operation, value)
+			// The converter's message says WHICH rule was broken - "declares
+			// longtext[100], and this family carries no length" - and this used
+			// to discard it, leaving an operator with a category and a column
+			// name. The category is still the Operation; the reason is now here
+			// too.
+			return schema.Table{}, postgresMySQLPolicy(
+				operation,
+				value+": "+err.Error(),
+			)
 		}
 		projected.Columns[index].Type = targetType
 		projected.Columns[index].DeclaredType = declaration
@@ -102,6 +111,22 @@ func projectMySQLTableForPostgres(
 // expose are widened to INTEGER. MySQL CHAR uses VARCHAR so COPY does not add
 // padding, and bounded binary values use BYTEA because PostgreSQL has no
 // length-modified binary scalar; both conversions preserve every source value.
+// projectMySQLColumnForPostgres routes through the canonical type.
+//
+// The fourth route to leave the pairwise projection behind, and the one that
+// showed the two engines disagreeing about a word.
+//
+// MySQL's CHAR is carried here as a varchar, and PostgreSQL's is refused
+// everywhere. Both spell it "char" and only one of them can be moved: MySQL
+// strips trailing spaces when a CHAR value is RETRIEVED, so a reader gets back
+// what a varchar would have held, while PostgreSQL's bpchar pads on storage and
+// compares padded. The mysql -> mssql route refuses MySQL's char for a
+// different reason again - SQL Server's own char pads - so all three answers
+// are correct and none of them is a property of the word.
+//
+// That is what a canonical layer is for. The converter says what MySQL means,
+// CanonicalFromPostgres says what PostgreSQL means, and each target says what
+// it can hold. Nobody has to know all three at once.
 func projectMySQLColumnForPostgres(
 	source schema.Column,
 ) (string, *schema.DeclaredType, string, error) {
@@ -109,221 +134,36 @@ func projectMySQLColumnForPostgres(
 		return "", nil, "map MySQL declared type",
 			fmt.Errorf("missing declared type")
 	}
-	base := strings.ToLower(strings.TrimSpace(source.DeclaredType.Base))
-	sourceType := strings.ToLower(strings.TrimSpace(source.Type))
-	arguments := source.DeclaredType.Arguments
-	typeMatches := func(candidates ...string) bool {
-		for _, candidate := range candidates {
-			if sourceType == candidate {
-				return true
-			}
-		}
-		return false
-	}
-	noArguments := func() error {
-		if len(arguments) != 0 {
-			return fmt.Errorf("unexpected type modifiers")
-		}
-		return nil
-	}
-	modifierError := func() (string, *schema.DeclaredType, string, error) {
-		return "", nil, "map MySQL type modifier",
-			fmt.Errorf("invalid type modifiers")
-	}
-	canonicalError := func() (string, *schema.DeclaredType, string, error) {
-		return "", nil, "map MySQL declared type",
-			fmt.Errorf("declared type does not match canonical type")
+	// MySQL's TIME is a signed duration running from -838:59:59 to 838:59:59.
+	// PostgreSQL's time is a time of day, so the out-of-range values have
+	// nowhere to arrive - a refusal about VALUES rather than about types, which
+	// is why it stays with the route rather than moving into the canonical
+	// layer.
+	if strings.EqualFold(strings.TrimSpace(source.DeclaredType.Base), "time") {
+		return "", nil, "map MySQL type",
+			fmt.Errorf("TIME includes signed durations outside PostgreSQL time")
 	}
 
-	switch base {
-	case "tinyint":
-		if len(arguments) > 1 ||
-			len(arguments) == 1 && arguments[0] != 1 {
-			return modifierError()
-		}
-		if len(arguments) == 1 &&
-			typeMatches("bool", "boolean") {
-			return "boolean", nil, "", nil
-		}
-		if len(arguments) == 0 &&
-			typeMatches("bool", "boolean") {
-			return canonicalError()
-		}
-		if !typeMatches("tinyint", "smallint", "integer", "int") {
-			return canonicalError()
-		}
-		return "integer", nil, "", nil
-	case "bool", "boolean":
-		if err := noArguments(); err != nil {
-			return modifierError()
-		}
-		if !typeMatches("bool", "boolean") {
-			return canonicalError()
-		}
-		return "boolean", nil, "", nil
-	case "smallint":
-		if err := noArguments(); err != nil {
-			return modifierError()
-		}
-		if !typeMatches("smallint", "integer", "int") {
-			return canonicalError()
-		}
-		return "integer", nil, "", nil
-	case "mediumint", "int", "integer":
-		if err := noArguments(); err != nil {
-			return modifierError()
-		}
-		if !typeMatches("mediumint", "int", "integer") {
-			return canonicalError()
-		}
-		return "integer", nil, "", nil
-	case "bigint":
-		if err := noArguments(); err != nil {
-			return modifierError()
-		}
-		if !typeMatches("bigint", "int8") {
-			return canonicalError()
-		}
-		return "bigint", nil, "", nil
-	case "double", "double precision":
-		if err := noArguments(); err != nil {
-			return modifierError()
-		}
-		if !typeMatches("double", "double precision", "float8") {
-			return canonicalError()
-		}
-		return "double precision", nil, "", nil
-	case "decimal", "numeric":
-		if !typeMatches("decimal", "numeric") {
-			return canonicalError()
-		}
-		if len(arguments) != 2 ||
-			arguments[0] < 1 ||
-			arguments[0] > 65 ||
-			arguments[1] < 0 ||
-			arguments[1] > arguments[0] {
-			return modifierError()
-		}
-		return "numeric", &schema.DeclaredType{
-			Base:      "numeric",
-			Arguments: append([]int(nil), arguments...),
-		}, "", nil
-	case "char", "character":
-		if !typeMatches("char", "character", "text") {
-			return canonicalError()
-		}
-		if len(arguments) != 1 ||
-			arguments[0] < 1 ||
-			arguments[0] > 255 {
-			return modifierError()
-		}
-		return "varchar", &schema.DeclaredType{
-			Base:      "varchar",
-			Arguments: append([]int(nil), arguments...),
-		}, "", nil
-	case "varchar", "character varying":
-		if !typeMatches(
-			"varchar",
-			"character varying",
-			"text",
-		) {
-			return canonicalError()
-		}
-		if len(arguments) != 1 ||
-			arguments[0] < 1 ||
-			arguments[0] > 65_535 {
-			return modifierError()
-		}
-		return "varchar", &schema.DeclaredType{
-			Base:      "varchar",
-			Arguments: append([]int(nil), arguments...),
-		}, "", nil
-	case "tinytext", "text", "mediumtext", "longtext":
-		if err := noArguments(); err != nil {
-			return modifierError()
-		}
-		if !typeMatches(
-			"tinytext",
-			"text",
-			"mediumtext",
-			"longtext",
-		) {
-			return canonicalError()
-		}
-		return "text", nil, "", nil
-	case "binary":
-		if !typeMatches("binary", "bytea") {
-			return canonicalError()
-		}
-		if len(arguments) != 1 ||
-			arguments[0] < 1 ||
-			arguments[0] > 255 {
-			return modifierError()
-		}
-		return "bytea", nil, "", nil
-	case "varbinary":
-		if !typeMatches("varbinary", "bytea") {
-			return canonicalError()
-		}
-		if len(arguments) != 1 ||
-			arguments[0] < 1 ||
-			arguments[0] > 65_535 {
-			return modifierError()
-		}
-		return "bytea", nil, "", nil
-	case "tinyblob", "blob", "mediumblob", "longblob":
-		if err := noArguments(); err != nil {
-			return modifierError()
-		}
-		if !typeMatches(
-			"tinyblob",
-			"blob",
-			"mediumblob",
-			"longblob",
-			"bytea",
-		) {
-			return canonicalError()
-		}
-		return "bytea", nil, "", nil
-	case "date":
-		if err := noArguments(); err != nil {
-			return modifierError()
-		}
-		if !typeMatches("date") {
-			return canonicalError()
-		}
-		return "date", nil, "", nil
-	case "datetime", "timestamp":
-		if !typeMatches("datetime", "timestamp") {
-			return canonicalError()
-		}
-		precision := 0
-		switch len(arguments) {
-		case 0:
-		case 1:
-			precision = arguments[0]
-		default:
-			return modifierError()
-		}
-		if precision < 0 || precision > 6 {
-			return modifierError()
-		}
-		return "timestamp", &schema.DeclaredType{
-			Base:      "timestamp",
-			Arguments: []int{precision},
-		}, "", nil
-	case "json":
-		if err := noArguments(); err != nil {
-			return modifierError()
-		}
-		if !typeMatches("json") {
-			return canonicalError()
-		}
-		return "json", nil, "", nil
-	default:
-		return "", nil, "map MySQL type",
-			fmt.Errorf("unsupported MySQL type")
+	// Flavour and collation are not consulted and isKey is false: this projects
+	// a column's shape, and whether a column may order a paged read is asked at
+	// discovery where the key set is known.
+	canonical, err := schema.CanonicalFromMySQL(
+		source,
+		schema.MySQLFlavorUnknown,
+		"",
+		false,
+	)
+	if err != nil {
+		return "", nil, mySQLRefusalOperation(err), err
 	}
+	targetType, declared, err := schema.CanonicalToDeclared(
+		canonical,
+		schema.Postgres,
+	)
+	if err != nil {
+		return "", nil, "map MySQL type", err
+	}
+	return targetType, declared, "", nil
 }
 
 func cloneSchemaExpression(
@@ -538,5 +378,23 @@ func postgresSQLitePolicy(operation, value string) error {
 		Operation: operation,
 		Type:      value,
 		Target:    string(schema.Postgres),
+	}
+}
+
+// mySQLRefusalOperation names the category a converter refusal belongs to.
+//
+// The pairwise projection reported three, and they are worth keeping: an
+// operator reading "map MySQL type" knows the type is not certified at all,
+// where "map MySQL type modifier" means the type is fine and the declaration
+// around it is not. The converter tags its errors so this can be asked rather
+// than matched on message text, which would break the first rewording.
+func mySQLRefusalOperation(err error) string {
+	switch {
+	case errors.Is(err, schema.ErrMySQLUnsupportedType):
+		return "map MySQL type"
+	case errors.Is(err, schema.ErrMySQLBadModifier):
+		return "map MySQL type modifier"
+	default:
+		return "map MySQL declared type"
 	}
 }

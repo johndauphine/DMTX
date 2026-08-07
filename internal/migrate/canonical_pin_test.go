@@ -141,10 +141,14 @@ func TestSQLServerToPostgresDeclarations(t *testing.T) {
 					Precision: &precision, Scale: &scale,
 				},
 			},
+			// Arguments only. The source declaration carries the structured
+			// Precision and Scale as well, and the projection deliberately does
+			// not copy them: PostgreSQL's own discovery records a numeric as
+			// Arguments and nothing else, so carrying them would record a shape
+			// the target's catalog will never report.
 			wantType: "numeric",
 			wantDeclared: &schema.DeclaredType{
 				Base: "numeric", Arguments: []int{12, 2},
-				Precision: &precision, Scale: &scale,
 			},
 		},
 		{
@@ -639,5 +643,181 @@ func assertRefusalNames(t *testing.T, err error, columnName string) {
 	if policy.Operation != "project canonical numeric precision" {
 		t.Errorf("operation = %q, want the rule that was violated",
 			policy.Operation)
+	}
+}
+
+// TestMySQLToPostgresDeclarations pins the fourth swapped route.
+//
+// The interesting cases are the two where MySQL and PostgreSQL mean different
+// things by the same word, and the family bounds that a first draft of this swap
+// silently dropped.
+func TestMySQLToPostgresDeclarations(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		column       schema.Column
+		wantType     string
+		wantDeclared *schema.DeclaredType
+		wantRefused  string
+	}{
+		{
+			// MySQL strips trailing spaces from a CHAR when the value is
+			// RETRIEVED, so a reader gets back what a varchar would have held.
+			// PostgreSQL's bpchar pads on storage and compares padded, and is
+			// refused by CanonicalFromPostgres for exactly that reason - one
+			// spelling, two engines, opposite answers.
+			name:         "char, which MySQL returns unpadded",
+			column:       mySQLColumn("char", "char", 10),
+			wantType:     "varchar",
+			wantDeclared: &schema.DeclaredType{Base: "varchar", Arguments: []int{10}},
+		},
+		{
+			name:         "varchar(40)",
+			column:       mySQLColumn("varchar", "varchar", 40),
+			wantType:     "varchar",
+			wantDeclared: &schema.DeclaredType{Base: "varchar", Arguments: []int{40}},
+		},
+		{
+			name:         "text stays unbounded",
+			column:       mySQLColumn("text", "text"),
+			wantType:     "text",
+			wantDeclared: nil,
+		},
+		{
+			// LONGTEXT is carried here, unlike on the SQL Server target where
+			// its capacity exceeds VARCHAR(MAX). PostgreSQL's text has no bound
+			// to exceed.
+			name:         "longtext, which this target can hold",
+			column:       mySQLColumn("text", "longtext"),
+			wantType:     "text",
+			wantDeclared: nil,
+		},
+		{
+			name:         "tinyint",
+			column:       mySQLColumn("integer", "tinyint"),
+			wantType:     "integer",
+			wantDeclared: nil,
+		},
+		{
+			name:         "bigint",
+			column:       mySQLColumn("bigint", "bigint"),
+			wantType:     "bigint",
+			wantDeclared: nil,
+		},
+		{
+			// Arguments only. PostgreSQL's own discovery records a numeric that
+			// way and nothing else, so populating the structured pair would
+			// record a shape the target's catalog never reports.
+			name:     "decimal",
+			column:   mySQLColumn("numeric", "decimal", 12, 2),
+			wantType: "numeric",
+			wantDeclared: &schema.DeclaredType{
+				Base: "numeric", Arguments: []int{12, 2},
+			},
+		},
+		{
+			name:         "binary(16), which bytea holds without a width",
+			column:       mySQLColumn("binary", "binary", 16),
+			wantType:     "bytea",
+			wantDeclared: nil,
+		},
+		{
+			name:         "blob",
+			column:       mySQLColumn("blob", "blob"),
+			wantType:     "bytea",
+			wantDeclared: nil,
+		},
+		{
+			name:     "datetime(6)",
+			column:   mySQLColumn("datetime", "datetime", 6),
+			wantType: "timestamp",
+			wantDeclared: &schema.DeclaredType{
+				Base: "timestamp", Arguments: []int{6},
+			},
+		},
+		{
+			// A bare MySQL DATETIME means ZERO fractional digits, where a bare
+			// PostgreSQL timestamp means six. Recording an absence would let the
+			// target apply its own six, which this source can never fill.
+			name:     "bare datetime means zero digits",
+			column:   mySQLColumn("datetime", "datetime"),
+			wantType: "timestamp",
+			wantDeclared: &schema.DeclaredType{
+				Base: "timestamp", Arguments: []int{0},
+			},
+		},
+		{
+			// Carried here, refused on the SQL Server target, which has no JSON
+			// type at all.
+			name:         "json",
+			column:       mySQLColumn("json", "json"),
+			wantType:     "json",
+			wantDeclared: nil,
+		},
+
+		// The bounds a first draft of this swap dropped. Each produced a schema
+		// that loads and is not the source's.
+		{
+			name:        "longtext with a length bounds an unbounded column",
+			column:      mySQLColumn("text", "longtext", 100),
+			wantRefused: "carries no length",
+		},
+		{
+			name:        "char without a length unbounds a bounded one",
+			column:      mySQLColumn("text", "char"),
+			wantRefused: "carries a length",
+		},
+		{
+			// One argument where MySQL always reports two. The branch that reads
+			// a precision only fires on a pair, so this came out as an unbounded
+			// NUMERIC.
+			name:        "decimal with no scale",
+			column:      mySQLColumn("numeric", "decimal", 12),
+			wantRefused: "a precision and a scale",
+		},
+		{
+			name:        "decimal whose scale exceeds its precision",
+			column:      mySQLColumn("numeric", "decimal", 4, 5),
+			wantRefused: "outside what MySQL can declare",
+		},
+		{
+			// MySQL's TIME runs from -838:59:59 to 838:59:59, and PostgreSQL's
+			// is a time of day.
+			name:        "time, which is a signed duration",
+			column:      mySQLColumn("time", "time", 0),
+			wantRefused: "signed durations",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			gotType, gotDeclared, _, err :=
+				projectMySQLColumnForPostgres(testCase.column)
+			if testCase.wantRefused != "" {
+				if err == nil {
+					t.Fatalf("accepted as %s/%+v, want a refusal naming %q",
+						gotType, gotDeclared, testCase.wantRefused)
+				}
+				if !strings.Contains(err.Error(), testCase.wantRefused) {
+					t.Errorf("refusal does not name %q: %v",
+						testCase.wantRefused, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("projection refused the column: %v", err)
+			}
+			assertProjected(
+				t, gotType, gotDeclared,
+				testCase.wantType, testCase.wantDeclared,
+			)
+			if _, err := schema.CreateTable(schema.Postgres, schema.Table{
+				Schema: "public", Name: "t",
+				Columns: []schema.Column{{
+					Name: "c", Type: gotType,
+					DeclaredType: gotDeclared, Nullable: true,
+				}},
+			}); err != nil {
+				t.Fatalf("the target cannot create %s/%+v: %v",
+					gotType, gotDeclared, err)
+			}
+		})
 	}
 }

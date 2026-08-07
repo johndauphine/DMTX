@@ -65,14 +65,22 @@ func CanonicalToDeclared(
 	case KindNumeric:
 		declared := &DeclaredType{Base: "numeric"}
 		if value.Precision != nil {
-			precision := *value.Precision
-			declared.Precision = &precision
 			scale := int64(0)
 			if value.Scale != nil {
 				scale = *value.Scale
 			}
-			declared.Scale = &scale
-			declared.Arguments = []int{int(precision), int(scale)}
+			// Arguments only, with Precision and Scale left nil - the same
+			// shape canonicalTextDeclared and canonicalTemporalDeclared keep,
+			// and for a reason that can be checked rather than argued.
+			// postgres_source_discovery.go records a numeric as
+			// Arguments{precision, scale} and nothing else, so populating the
+			// structured pair records a shape the target's OWN catalog will
+			// never report back.
+			//
+			// The DDL is identical either way - NUMERIC(12,2) - so this was
+			// invisible until a MySQL source, whose discovery also writes
+			// Arguments only, was run through both paths side by side.
+			declared.Arguments = []int{int(*value.Precision), int(scale)}
 		}
 		return "numeric", declared, nil
 	case KindText:
