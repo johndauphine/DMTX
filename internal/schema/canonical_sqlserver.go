@@ -221,6 +221,29 @@ func CanonicalFromSQLServer(
 			canonical.Precision = &precision
 			canonical.Scale = &scale
 		}
+		// SQL Server cannot declare past 38 digits, so a source presenting more
+		// is a declaration dmtx never read from a catalog. The SOURCE bound is
+		// here; the TARGET bound is in each vocabulary, and they are different
+		// numbers - MySQL declares 65 - which is why a target check alone let
+		// decimal(39,2) through on the route to MySQL.
+		if canonical.Precision != nil {
+			scale := int64(0)
+			if canonical.Scale != nil {
+				scale = *canonical.Scale
+			}
+			if *canonical.Precision < 1 ||
+				*canonical.Precision > SQLServerNumericPrecisionLimit ||
+				scale < 0 || scale > *canonical.Precision {
+				return CanonicalType{}, fmt.Errorf(
+					"SQL Server column %s declares %s(%d,%d), which SQL Server"+
+						" cannot declare",
+					column.Name,
+					base,
+					*canonical.Precision,
+					scale,
+				)
+			}
+		}
 	case KindText, KindBinary, KindBlob:
 		if length, ok := declaredModifier(column.DeclaredType); ok {
 			if canonical.Kind == KindText &&
