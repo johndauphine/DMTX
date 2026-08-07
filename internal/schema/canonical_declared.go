@@ -184,9 +184,19 @@ func canonicalToSQLServerDeclared(
 	case KindReal:
 		return "real", declared("real"), nil
 	case KindDouble:
-		// No declaration: SQL Server's float is the portable name's own shape,
-		// and inventing one would record a fact the catalog does not report.
-		return "double precision", nil, nil
+		// A declaration, and the comment that used to sit here was wrong on the
+		// fact it rested on. It claimed SQL Server's catalog does not report one;
+		// mssql_source_discovery.go writes declaration("double precision") for
+		// float, and renderSQLServerDeclaredColumn refuses a column that has
+		// none - so a PostgreSQL double reaching a SQL Server target could not be
+		// created at all. The old pairwise projection wrote this declaration and
+		// the swap dropped it.
+		//
+		// Neither the differential test nor the armed live gate caught it. The
+		// test had no double-precision case, and the SO2010 corpus has no
+		// floating-point column at all: a corpus proves what it contains, and
+		// nothing about what it does not.
+		return "double precision", declared("double precision"), nil
 	case KindNumeric:
 		if value.Precision == nil {
 			return "", nil, &PolicyError{
