@@ -73,13 +73,11 @@ func RenderCanonical(value CanonicalType, target Dialect) (string, error) {
 // renderSmallInt has to agree with CanonicalToDeclared, or the DDL a target is
 // created with says one thing and the authority recorded for it says another.
 //
-// Only SQL Server keeps the narrow width. Every other target widens to an
-// integer, which is compatibility rather than indifference - those targets have
-// been recorded as integer since before the canonical type existed, and a later
-// incremental run authenticates its recorded authority against the catalog.
-//
-// smallIntKeepsItsWidth is the one place that rule is written, so the renderer
-// and the projection cannot drift apart the way they did here once already.
+// Which targets keep the narrow width is smallIntKeepsItsWidth's answer and not
+// repeated here - the list gained MySQL one commit after this comment named SQL
+// Server alone, which is exactly how a duplicated fact goes stale. The rule
+// lives in one place so the renderer and the projection cannot drift apart the
+// way they did here once already.
 func renderSmallInt(target Dialect) string {
 	if smallIntKeepsItsWidth(target) {
 		return renderNamed(target, "SMALLINT", "Int16")
