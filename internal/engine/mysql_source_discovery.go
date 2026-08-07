@@ -1269,12 +1269,7 @@ func validMySQLSourceIdentifier(value string) bool {
 }
 
 func mySQLBinaryUTF8Collation(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "utf8mb4_bin", "utf8mb4_0900_bin":
-		return true
-	default:
-		return false
-	}
+	return schema.MySQLTextKeyCollationCertified(schema.MySQLFlavorOracle, value)
 }
 
 func quotedNullString(value sql.NullString) string {

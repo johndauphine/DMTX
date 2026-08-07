@@ -1131,7 +1131,7 @@ func applySQLServerSourceTextType(
 }
 
 func sqlServerNationalText(typeName string) bool {
-	return typeName == "nchar" || typeName == "nvarchar"
+	return schema.SQLServerNationalText(typeName)
 }
 
 func sqlServerVaryingText(typeName string) bool {
@@ -1160,10 +1160,7 @@ func sqlServerFixedWidthText(typeName string) bool {
 // Beyond either cap SQL Server requires MAX, and the column arrives as
 // unbounded text instead.
 func sqlServerTextLengthLimit(typeName string) int {
-	if sqlServerNationalText(typeName) {
-		return 4_000
-	}
-	return 8_000
+	return int(schema.SQLServerTextLengthLimit(typeName))
 }
 
 // sqlServerPortableTextColumnCollation reports whether a text column may order

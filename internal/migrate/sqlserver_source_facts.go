@@ -1,5 +1,7 @@
 package migrate
 
+import "github.com/johndauphine/dmtx/internal/schema"
+
 // Facts about SQL Server sources that more than one target projection needs.
 //
 // This limit lived in the PostgreSQL adapter and was then used by the MySQL one
@@ -20,18 +22,15 @@ package migrate
 // Beyond either, SQL Server requires MAX and the column arrives as unbounded
 // text instead.
 //
-// This is the third place the same two numbers appear - discovery refuses an
-// over-long declaration in sqlServerTextLengthLimit, and the retained row bound
-// refuses one again in sqlServerRetainedTextLengthLimit. Three copies of one
-// fact is not a design; it is what a pairwise projection costs, and it is why
-// an nvarchar(8000) that cannot exist was refused in two of the three and
-// accepted here. Until the canonical type work removes the duplication, the
-// copies are at least spelled the same way so a search finds all of them.
+// The numbers are no longer written here. They are schema.SQLServerTextLengthLimit,
+// which is the one home this fact has - the same constants discovery reads and
+// the same ones the target vocabulary multiplies by four going the other way.
+// Three copies of one fact was what let an nvarchar(8000) that cannot exist be
+// refused in two of them and accepted in the third.
+//
+// The wrapper survives the move because callers in this package pass a base
+// string and want an int, and converting at each of them would spread the
+// conversion instead of the constant.
 func sqlServerProjectedTextLengthLimit(base string) int {
-	switch base {
-	case "nchar", "nvarchar":
-		return 4_000
-	default:
-		return 8_000
-	}
+	return int(schema.SQLServerTextLengthLimit(base))
 }

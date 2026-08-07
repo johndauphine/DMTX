@@ -1351,12 +1351,7 @@ func sqlServerRetainedColumnBound(
 // only matters when something upstream is already wrong is the guard worth
 // having.
 func sqlServerRetainedTextLengthLimit(base string) int64 {
-	switch base {
-	case "nchar", "nvarchar":
-		return 4_000
-	default:
-		return 8_000
-	}
+	return schema.SQLServerTextLengthLimit(base)
 }
 
 // sqlServerRetainedUTF8Expansion is the worst-case UTF-8 bytes per unit of a
@@ -1383,12 +1378,7 @@ func sqlServerRetainedTextLengthLimit(base string) int64 {
 // Three times a declared length is a bound, not a measurement. It costs smaller
 // chunks on wide national text and buys a ceiling that holds.
 func sqlServerRetainedUTF8Expansion(base string) int64 {
-	switch base {
-	case "nchar", "nvarchar":
-		return 3
-	default:
-		return 1
-	}
+	return schema.SQLServerTextTransferBytes(base)
 }
 
 func sqlServerLiveRetainedColumnBound(

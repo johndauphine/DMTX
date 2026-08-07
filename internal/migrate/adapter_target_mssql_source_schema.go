@@ -254,162 +254,63 @@ func projectPostgresTableForSQLServer(
 	return projected, nil
 }
 
+// projectPostgresColumnForSQLServer routes through the canonical type.
+//
+// The second route to leave the pairwise projection, and the first with a
+// target other than PostgreSQL - which is what made it worth doing next, since
+// it exercises the SQL Server side of the renderer rather than a second variant
+// of the same one.
+//
+// Proved equivalent before the switch by
+// TestCanonicalMatchesPairwiseForPostgresToSQLServer, and then failed the armed
+// live gate anyway, on a bare timestamp the converter was recording without a
+// precision. Both facts are worth keeping: the differential test is necessary
+// and it is not sufficient, because its fixtures are still fixtures.
+//
+// The fact this route contributes to the canonical layer is the character-to-
+// byte widening. PostgreSQL's varchar(n) is n characters; SQL Server's
+// varchar(n) under the UTF-8 collation dmtx writes is n bytes, and a character
+// can spend four. That multiplication lived here; it lives in
+// canonicalToSQLServerText now, next to the halving that applies going the
+// other way. One fact, two directions, and only the direction says which
+// arithmetic is right.
 func projectPostgresColumnForSQLServer(
 	source schema.Column,
 ) (schema.Column, error) {
-	target := source
-	target.Default = cloneSchemaExpression(source.Default)
-	base := strings.ToLower(strings.TrimSpace(source.Type))
-	declaredBase := base
-	var arguments []int
-	if source.DeclaredType != nil {
-		declaredBase = strings.ToLower(strings.TrimSpace(
-			source.DeclaredType.Base,
-		))
-		arguments = append(
-			[]int(nil),
-			source.DeclaredType.Arguments...,
-		)
-	}
-	if declaredBase != base {
-		return schema.Column{}, sqlServerProjectionPolicy(
-			"map PostgreSQL declared type",
-			source.Name,
-		)
-	}
-	declaration := func(name string, values ...int) {
-		target.DeclaredType = &schema.DeclaredType{
-			Base:      name,
-			Arguments: append([]int(nil), values...),
-		}
-	}
-	requireNoArguments := func() error {
-		if len(arguments) != 0 {
-			return sqlServerProjectionPolicy(
-				"map PostgreSQL type modifier",
-				source.Name,
-			)
-		}
-		return nil
-	}
-
-	switch base {
-	case "integer":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "integer"
-		declaration("int")
-	case "bigint":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "bigint"
-		declaration("bigint")
-	case "real":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "real"
-		declaration("real")
-	case "double precision":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "double precision"
-		declaration("double precision")
-	case "numeric":
-		if len(arguments) != 2 ||
-			arguments[0] < 1 || arguments[0] > 38 ||
-			arguments[1] < 0 || arguments[1] > arguments[0] {
-			return schema.Column{}, sqlServerProjectionPolicy(
-				"map PostgreSQL numeric modifier",
-				source.Name,
-			)
-		}
-		target.Type = "numeric"
-		declaration("decimal", arguments...)
-	case "char":
+	// A refusal names its reason, not just the column. Flattening every
+	// converter error into one message told an operator with a fixed-width char
+	// column that something about its declaration was wrong and nothing about
+	// what - and blank-padding is not a thing anyone guesses.
+	if base := postgresSourceBase(source); base == "char" || base == "bpchar" {
 		return schema.Column{}, sqlServerProjectionPolicy(
 			"map PostgreSQL character type",
 			"fixed-width blank-padding semantics cannot be preserved",
 		)
-	case "varchar":
-		if len(arguments) != 1 ||
-			arguments[0] < 1 || arguments[0] > 2_000 {
-			return schema.Column{}, sqlServerProjectionPolicy(
-				"map PostgreSQL character modifier",
-				source.Name,
-			)
-		}
-		target.Type = "text"
-		declaration("varchar", arguments[0]*4)
-	case "text", "jsonb":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "text"
-		declaration("text")
-	case "json":
+	}
+	canonical, err := schema.CanonicalFromPostgres(source, false)
+	if err != nil {
 		return schema.Column{}, sqlServerProjectionPolicy(
-			"map PostgreSQL type",
-			"json source text is normalized differently by drivers",
-		)
-	case "bytea":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "blob"
-		declaration("blob")
-	case "boolean":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "boolean"
-		declaration("bool")
-	case "date":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "date"
-		declaration("date")
-	case "time":
-		precision, err := postgresTemporalPrecisionForSQLServer(
-			source.Name,
-			arguments,
-		)
-		if err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "time"
-		declaration("time", precision)
-	case "timestamp":
-		precision, err := postgresTemporalPrecisionForSQLServer(
-			source.Name,
-			arguments,
-		)
-		if err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "datetime"
-		declaration("timestamp", precision)
-	case "uuid":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "uuid"
-		declaration("uuid")
-	case "timestamptz":
-		return schema.Column{}, sqlServerProjectionPolicy(
-			"map PostgreSQL type",
-			base,
-		)
-	default:
-		return schema.Column{}, sqlServerProjectionPolicy(
-			"map PostgreSQL type",
-			base,
+			"map PostgreSQL declared type",
+			source.Name+": "+err.Error(),
 		)
 	}
+	targetType, declared, err := schema.CanonicalToDeclared(
+		canonical,
+		schema.SQLServer,
+	)
+	if err != nil {
+		return schema.Column{}, err
+	}
+	target := source
+	target.Default = cloneSchemaExpression(source.Default)
+	target.Type = targetType
+	target.DeclaredType = declared
+
+	// A clock default stays a projection concern rather than moving into the
+	// canonical type, because it is a property of the DEFAULT and not of the
+	// type. CURRENT_TIMESTAMP means "when the row was written", and a row
+	// written by a migration was written now rather than when the source wrote
+	// it - so carrying the expression across would silently restamp history.
 	if target.Default != nil {
 		switch strings.ToUpper(strings.TrimSpace(
 			target.Default.CanonicalSQL(),
@@ -424,26 +325,14 @@ func projectPostgresColumnForSQLServer(
 	return target, nil
 }
 
-func postgresTemporalPrecisionForSQLServer(
-	column string,
-	arguments []int,
-) (int, error) {
-	precision := 6
-	if len(arguments) == 1 {
-		precision = arguments[0]
-	} else if len(arguments) != 0 {
-		return 0, sqlServerProjectionPolicy(
-			"map PostgreSQL temporal modifier",
-			column,
-		)
+// postgresSourceBase is the declared base a PostgreSQL column carries, or its
+// portable type when the catalog recorded no declaration - which is the
+// ordinary case for text, uuid, bytea, json, bool and date.
+func postgresSourceBase(column schema.Column) string {
+	if column.DeclaredType != nil {
+		return strings.ToLower(strings.TrimSpace(column.DeclaredType.Base))
 	}
-	if precision < 0 || precision > 6 {
-		return 0, sqlServerProjectionPolicy(
-			"map PostgreSQL temporal modifier",
-			column,
-		)
-	}
-	return precision, nil
+	return strings.ToLower(strings.TrimSpace(column.Type))
 }
 
 func postgresTextColumnForSQLServer(column schema.Column) bool {
