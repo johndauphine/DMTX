@@ -189,27 +189,3 @@ func postgresSQLServerPolicy(operation, value string) error {
 		Target:    string(schema.Postgres),
 	}
 }
-
-// sqlServerProjectedTextLengthLimit is the largest length each SQL Server text
-// family can legally declare.
-//
-// char and varchar declare bytes and cap at 8000; nchar and nvarchar declare
-// UTF-16 code units and cap at 4000, which is the same 8000 bytes of storage.
-// Beyond either, SQL Server requires MAX and the column arrives as unbounded
-// text instead.
-//
-// This is the third place the same two numbers appear - discovery refuses an
-// over-long declaration in sqlServerTextLengthLimit, and the retained row bound
-// refuses one again in sqlServerRetainedTextLengthLimit. Three copies of one
-// fact is not a design; it is what a pairwise projection costs, and it is why
-// an nvarchar(8000) that cannot exist was refused in two of the three and
-// accepted here. Until the canonical type work removes the duplication, the
-// copies are at least spelled the same way so a search finds all of them.
-func sqlServerProjectedTextLengthLimit(base string) int {
-	switch base {
-	case "nchar", "nvarchar":
-		return 4_000
-	default:
-		return 8_000
-	}
-}

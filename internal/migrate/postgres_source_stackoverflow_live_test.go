@@ -246,10 +246,14 @@ func stackOverflowSQLServerTarget(t *testing.T, ctx context.Context) config.Endp
 	return endpoint
 }
 
-// stackOverflowMySQLTarget points at the target database provision.sh makes.
+// stackOverflowMySQLTarget points at a database this matrix owns alone.
 //
-// That database is shared with other live tests, and this route recreates the
-// tables it owns rather than the schema, so it does not disturb them.
+// It used to point at the shared dmtx_target, on the reasoning that recreating
+// its own tables would not disturb anything. That was wrong, and enabling
+// mssql->mysql proved it: the corpus writes Badges and Users, MySQL lower-cases
+// them, and every other test that validates dmtx_target then fails on a
+// case-aliased table. A test that breaks its neighbours is worse than one that
+// skips, so it has its own database, which provision.sh creates.
 func stackOverflowMySQLTarget(t *testing.T) config.Endpoint {
 	t.Helper()
 	dsn := os.Getenv("DMTX_TEST_MYSQL_TARGET_DSN")
@@ -264,7 +268,11 @@ func stackOverflowMySQLTarget(t *testing.T) config.Endpoint {
 	if err != nil {
 		t.Fatalf("parse MySQL target DSN: %v", err)
 	}
-	return mysqlNativeTargetEndpoint(t, parsed, caFile)
+	endpoint := mysqlNativeTargetEndpoint(t, parsed, caFile)
+	const corpusTarget = "so2010_minimal_tgt"
+	endpoint.Database = corpusTarget
+	endpoint.Schema = corpusTarget
+	return endpoint
 }
 
 // stripPostgresClientDirectives removes psql's backslash commands.

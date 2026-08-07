@@ -38,6 +38,17 @@ docker exec -e MYSQL_PWD=dmtx_root_test_only "$mysql_container" mysql -uroot -e 
   GRANT ALL ON so2010_minimal_src.* TO 'dmtx'@'%';
   FLUSH PRIVILEGES;"
 
+# The corpus matrix needs a target of its own, not the shared dmtx_target.
+# It writes the StackOverflow tables, MySQL lower-cases them, and every other
+# test that validates dmtx_target then refuses on a case-aliased table - which
+# is a test polluting its neighbours rather than a product defect, and the
+# cheapest fix is a database nobody else reads.
+echo "provisioning MySQL StackOverflow corpus target"
+docker exec -e MYSQL_PWD=dmtx_root_test_only "$mysql_container" mysql -uroot -e "
+  CREATE DATABASE IF NOT EXISTS so2010_minimal_tgt;
+  GRANT ALL ON so2010_minimal_tgt.* TO 'dmtx'@'%';
+  FLUSH PRIVILEGES;"
+
 echo "provisioning MariaDB target database"
 docker exec -e MYSQL_PWD=dmtx_root_test_only "$mariadb_container" mariadb -uroot -e "
   CREATE DATABASE IF NOT EXISTS dmtx_target;
