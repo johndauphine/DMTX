@@ -1006,3 +1006,155 @@ func TestSQLServerToMySQLDeclarations(t *testing.T) {
 		})
 	}
 }
+
+// TestPostgresToMySQLDeclarations pins the sixth swapped route.
+//
+// It added no target code: the MySQL vocabulary written for mssql -> mysql
+// serves this one unchanged, which is the first time a route has cost nothing
+// on the target side. That is what N converters and N vocabularies buys.
+func TestPostgresToMySQLDeclarations(t *testing.T) {
+	bare := func(portable string) schema.Column {
+		return schema.Column{Name: "c", Type: portable}
+	}
+	for _, testCase := range []struct {
+		name         string
+		column       schema.Column
+		wantType     string
+		wantDeclared *schema.DeclaredType
+		wantRefused  string
+	}{
+		{
+			name:         "integer",
+			column:       mySQLColumn("integer", "integer"),
+			wantType:     "integer",
+			wantDeclared: &schema.DeclaredType{Base: "int"},
+		},
+		{
+			name:     "numeric",
+			column:   mySQLColumn("numeric", "numeric", 12, 2),
+			wantType: "numeric",
+			wantDeclared: &schema.DeclaredType{
+				Base: "decimal", Arguments: []int{12, 2},
+			},
+		},
+		{
+			name:     "varchar(40)",
+			column:   mySQLColumn("varchar", "varchar", 40),
+			wantType: "varchar",
+			wantDeclared: &schema.DeclaredType{
+				Base: "varchar", Arguments: []int{40},
+			},
+		},
+		{
+			// Past what a MySQL row can declare inline, so it widens to LONGTEXT
+			// rather than being refused - the same trade postgres -> mssql makes
+			// at 4000 and mysql -> mssql at 2001. Refusing an ordinary column
+			// because the target cannot bound it is the behaviour the lattice
+			// has been converging away from on every route.
+			name:         "varchar past MySQL's inline bound widens",
+			column:       mySQLColumn("varchar", "varchar", 16_384),
+			wantType:     "text",
+			wantDeclared: &schema.DeclaredType{Base: "longtext"},
+		},
+		{
+			name:         "text",
+			column:       bare("text"),
+			wantType:     "text",
+			wantDeclared: &schema.DeclaredType{Base: "longtext"},
+		},
+		{
+			name:         "bytea",
+			column:       bare("bytea"),
+			wantType:     "blob",
+			wantDeclared: &schema.DeclaredType{Base: "longblob"},
+		},
+		{
+			name:         "boolean becomes MySQL's tinyint(1)",
+			column:       bare("boolean"),
+			wantType:     "integer",
+			wantDeclared: &schema.DeclaredType{Base: "tinyint", Arguments: []int{1}},
+		},
+		{
+			// jsonb is carried as text rather than MySQL's JSON, which would
+			// reorder keys and rewrite whitespace - the bytes that arrive would
+			// not be the bytes that left.
+			name:         "jsonb",
+			column:       bare("jsonb"),
+			wantType:     "text",
+			wantDeclared: &schema.DeclaredType{Base: "longtext"},
+		},
+		{
+			// A bare PostgreSQL timestamp MEANS timestamp(6).
+			name:     "bare timestamp",
+			column:   bare("timestamp"),
+			wantType: "datetime",
+			wantDeclared: &schema.DeclaredType{
+				Base: "datetime", Arguments: []int{6},
+			},
+		},
+		{
+			name:     "timestamp(0)",
+			column:   mySQLColumn("timestamp", "timestamp", 0),
+			wantType: "datetime",
+			wantDeclared: &schema.DeclaredType{
+				Base: "datetime", Arguments: []int{0},
+			},
+		},
+
+		// Three the MySQL vocabulary can express and this route still refuses,
+		// because the question is the DATA path rather than the schema. See
+		// refusePostgresTypeThisRouteHasNotProved and task #45.
+		{
+			name:        "uuid, which the SQL Server route carries as char(36)",
+			column:      bare("uuid"),
+			wantRefused: "value path for it has not been measured",
+		},
+		{
+			name:        "json, where jsonb is carried",
+			column:      bare("json"),
+			wantRefused: "value path for it has not been measured",
+		},
+		{
+			name:        "real, which the SQL Server route carries as double",
+			column:      bare("real"),
+			wantRefused: "value path for it has not been measured",
+		},
+		{
+			// PostgreSQL's fixed-width character type, refused by the converter
+			// rather than by this route - it pads on storage and compares
+			// padded, and no target can undo that.
+			name:        "bpchar",
+			column:      mySQLColumn("char", "bpchar", 10),
+			wantRefused: "blank-padding",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, err := projectPostgresColumnForMySQL(testCase.column)
+			if testCase.wantRefused != "" {
+				if err == nil {
+					t.Fatalf("accepted as %s/%+v, want a refusal naming %q",
+						got.Type, got.DeclaredType, testCase.wantRefused)
+				}
+				if !strings.Contains(err.Error(), testCase.wantRefused) {
+					t.Errorf("refusal does not name %q: %v",
+						testCase.wantRefused, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("projection refused the column: %v", err)
+			}
+			assertProjected(
+				t, got.Type, got.DeclaredType,
+				testCase.wantType, testCase.wantDeclared,
+			)
+			got.Nullable = true
+			if _, err := schema.CreateTable(schema.MySQL, schema.Table{
+				Schema: "dmtx", Name: "t", Columns: []schema.Column{got},
+			}); err != nil {
+				t.Fatalf("the target cannot create %s/%+v: %v",
+					got.Type, got.DeclaredType, err)
+			}
+		})
+	}
+}
