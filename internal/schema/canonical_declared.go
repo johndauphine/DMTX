@@ -42,15 +42,16 @@ func CanonicalToDeclared(
 	case KindBoolean:
 		return "boolean", nil, nil
 	case KindSmallInt, KindInteger:
-		// The PostgreSQL target widens a small integer to integer, and that is
-		// compatibility rather than indifference. It has been writing integer
-		// for SQL Server's tinyint and smallint since before this package
-		// existed, and target authority is authenticated against the target's
-		// catalog on later incremental runs - so a dmtx that started declaring
-		// smallint would disagree with every target an older dmtx created.
+		// Widening a small integer to integer here is compatibility rather than
+		// indifference. These targets have been recorded as integer since before
+		// this package existed, and target authority is authenticated against
+		// the target's catalog on later incremental runs - so a dmtx that
+		// started declaring smallint would disagree with every target an older
+		// dmtx created.
 		//
-		// The SQL Server target does honour the width, because nothing has been
-		// written there yet that says otherwise.
+		// smallIntKeepsItsWidth says which targets do keep it, and the DDL
+		// renderer asks the same question. The two must agree: the DDL creates
+		// the catalog that this declaration is later authenticated against.
 		return "integer", nil, nil
 	case KindBigInt:
 		return "bigint", nil, nil

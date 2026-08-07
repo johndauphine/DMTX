@@ -71,7 +71,14 @@ func projectSQLServerColumnForPostgres(
 	if err != nil {
 		return "", nil, err
 	}
-	return schema.CanonicalToDeclared(canonical, schema.Postgres)
+	targetType, declared, err := schema.CanonicalToDeclared(
+		canonical,
+		schema.Postgres,
+	)
+	if err != nil {
+		return "", nil, nameTheColumn(err, source.Name)
+	}
+	return targetType, declared, nil
 }
 
 func postgresSQLServerPolicy(operation, value string) error {

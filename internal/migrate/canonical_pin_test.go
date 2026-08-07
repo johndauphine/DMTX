@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -592,4 +593,51 @@ func mySQLColumn(portable, base string, arguments ...int) schema.Column {
 		declared.Arguments = arguments
 	}
 	return schema.Column{Name: "c", Type: portable, DeclaredType: declared}
+}
+
+// TestCanonicalRefusalNamesTheColumn checks the thing an operator needs.
+//
+// The canonical layer knows the type it could not project and not the column it
+// came from, so its refusals read "decimal(39,2) exceeds what SQL Server can
+// declare" - true, and no help at all finding which of four hundred columns it
+// was. The Operation is left alone: it says which rule was violated, and the
+// fail-closed tests assert on it.
+func TestCanonicalRefusalNamesTheColumn(t *testing.T) {
+	wide := &schema.DeclaredType{Base: "numeric", Arguments: []int{39, 2}}
+
+	t.Run("postgres source", func(t *testing.T) {
+		_, err := projectPostgresColumnForSQLServer(schema.Column{
+			Name: "Reputation", Type: "numeric", DeclaredType: wide,
+		})
+		assertRefusalNames(t, err, "Reputation")
+	})
+	t.Run("mysql source", func(t *testing.T) {
+		_, err := projectMySQLColumnForSQLServer(schema.Column{
+			Name: "Reputation", Type: "numeric",
+			DeclaredType: &schema.DeclaredType{
+				Base: "decimal", Arguments: []int{39, 2},
+			},
+		})
+		assertRefusalNames(t, err, "Reputation")
+	})
+}
+
+func assertRefusalNames(t *testing.T, err error, columnName string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("the column was accepted")
+	}
+	if !strings.Contains(err.Error(), columnName) {
+		t.Errorf("refusal does not name %q: %v", columnName, err)
+	}
+	var policy *schema.PolicyError
+	if !errors.As(err, &policy) {
+		t.Fatalf("refusal is not a PolicyError: %v", err)
+	}
+	// The Operation still says which rule was violated, rather than being
+	// flattened into a generic wrapper by the renaming.
+	if policy.Operation != "project canonical numeric precision" {
+		t.Errorf("operation = %q, want the rule that was violated",
+			policy.Operation)
+	}
 }

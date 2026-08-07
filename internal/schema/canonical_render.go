@@ -36,7 +36,7 @@ func RenderCanonical(value CanonicalType, target Dialect) (string, error) {
 	case KindBoolean:
 		return renderBoolean(target), nil
 	case KindSmallInt:
-		return renderNamed(target, "SMALLINT", "Int16"), nil
+		return renderSmallInt(target), nil
 	case KindInteger:
 		return renderNamed(target, "INTEGER", "Int32"), nil
 	case KindBigInt:
@@ -68,6 +68,28 @@ func RenderCanonical(value CanonicalType, target Dialect) (string, error) {
 			Target:    string(target),
 		}
 	}
+}
+
+// renderSmallInt has to agree with CanonicalToDeclared, or the DDL a target is
+// created with says one thing and the authority recorded for it says another.
+//
+// Only SQL Server keeps the narrow width. Every other target widens to an
+// integer, which is compatibility rather than indifference - those targets have
+// been recorded as integer since before the canonical type existed, and a later
+// incremental run authenticates its recorded authority against the catalog.
+//
+// smallIntKeepsItsWidth is the one place that rule is written, so the renderer
+// and the projection cannot drift apart the way they did here once already.
+func renderSmallInt(target Dialect) string {
+	if smallIntKeepsItsWidth(target) {
+		return renderNamed(target, "SMALLINT", "Int16")
+	}
+	return renderNamed(target, "INTEGER", "Int32")
+}
+
+// smallIntKeepsItsWidth reports whether a target declares the narrow integer.
+func smallIntKeepsItsWidth(target Dialect) bool {
+	return target == SQLServer
 }
 
 func renderNamed(target Dialect, standard, clickhouse string) string {
@@ -195,10 +217,20 @@ func renderBinary(value CanonicalType, target Dialect) string {
 		}
 		return "VARBINARY(" + length + ")"
 	case MySQL:
-		if *value.Length > mySQLBinaryLengthLimit {
+		if *value.Length > MySQLVarBinaryLengthLimit {
 			return renderBlob(target)
 		}
-		if value.Kind == KindBinary {
+		// MySQL's two binary families have DIFFERENT caps, unlike SQL Server's:
+		// BINARY stops at 255 and VARBINARY runs to 65535. A SQL Server source
+		// can declare BINARY(8000), so rendering the fixed spelling at the
+		// varying family's limit would emit DDL MySQL rejects.
+		//
+		// Past 255 the column widens to VARBINARY at the same width. The padding
+		// bytes are part of the stored value and travel either way; what is lost
+		// is the target re-applying the padding itself, which is a schema fact
+		// rather than a data one - the same trade the PostgreSQL target makes by
+		// having no fixed binary type at all.
+		if value.Kind == KindBinary && *value.Length <= MySQLBinaryLengthLimit {
 			return "BINARY(" + length + ")"
 		}
 		return "VARBINARY(" + length + ")"
@@ -209,12 +241,16 @@ func renderBinary(value CanonicalType, target Dialect) string {
 	}
 }
 
-// mySQLBinaryLengthLimit is what a MySQL row can declare inline.
+// MySQL's binary widths, which are not one number.
 //
-// VARBINARY shares the 65535-byte row limit rather than having a cap of its
-// own, so this is the ceiling past which the column has to become a BLOB
-// family type. It is the same number MySQL discovery already refuses beyond.
-const mySQLBinaryLengthLimit = 65_535
+// The two families differ, and the difference is why a shared limit produced
+// BINARY(8000) - valid on SQL Server, rejected by MySQL. These are the same
+// bounds mysqlDeclaredTypeSQL already enforces when it renders a declared type;
+// stating them once here means the canonical renderer cannot drift from it.
+const (
+	MySQLBinaryLengthLimit    = 255
+	MySQLVarBinaryLengthLimit = 65_535
+)
 
 func renderBlob(target Dialect) string {
 	switch target {

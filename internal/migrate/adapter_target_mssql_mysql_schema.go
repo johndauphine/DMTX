@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"errors"
 	"strings"
 
 	"github.com/johndauphine/dmtx/internal/schema"
@@ -214,7 +215,7 @@ func projectMySQLColumnForSQLServer(
 		schema.SQLServer,
 	)
 	if err != nil {
-		return schema.Column{}, err
+		return schema.Column{}, nameTheColumn(err, source.Name)
 	}
 
 	target := source
@@ -310,4 +311,22 @@ func mySQLTextColumnForSQLServer(column schema.Column) bool {
 	default:
 		return false
 	}
+}
+
+// nameTheColumn puts the source column's name into a refusal from the canonical
+// layer.
+//
+// The canonical layer knows the type it could not project and not the column it
+// came from, so its refusals read "decimal(39,2) exceeds what SQL Server can
+// declare" - true, and no help finding which of four hundred columns it was.
+// The Operation is left alone, because it says which rule was violated and
+// tests assert on it.
+func nameTheColumn(err error, columnName string) error {
+	var policy *schema.PolicyError
+	if !errors.As(err, &policy) {
+		return err
+	}
+	named := *policy
+	named.Type = columnName + ": " + policy.Type
+	return &named
 }

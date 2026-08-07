@@ -299,7 +299,7 @@ func projectPostgresColumnForSQLServer(
 		schema.SQLServer,
 	)
 	if err != nil {
-		return schema.Column{}, err
+		return schema.Column{}, nameTheColumn(err, source.Name)
 	}
 	target := source
 	target.Default = cloneSchemaExpression(source.Default)
