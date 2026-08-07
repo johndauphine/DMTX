@@ -222,3 +222,51 @@ func TestCanonicalFromSQLiteCertifiesOrderingForEveryKey(t *testing.T) {
 		t.Error("ordering was granted to a column that was not asked about")
 	}
 }
+
+// sqliteSpellingsDeliberatelyRefused is the other half of
+// canonicalKindFromSQLite: what ParseSQLiteDeclaredType admits and the
+// converter will not classify.
+//
+// Written out here rather than inferred, so that adding a spelling to this set
+// is a deliberate act with a reason attached rather than a test going quiet.
+var sqliteSpellingsDeliberatelyRefused = map[string]string{
+	"any": "declares no affinity, so dmtx cannot say what the column holds",
+	"unsigned big int": "names a range SQLite does not have - it stores a" +
+		" signed eight-byte integer",
+}
+
+// TestEverySQLiteSpellingIsClassifiedOrDeliberatelyRefused holds the converter
+// to the parser.
+//
+// The two lists are maintained by hand in different files, and a spelling added
+// to sqliteTypeRules without a kind here would not fail anything - it would
+// simply be refused at runtime as "not certified", which reads like a policy
+// decision rather than the omission it is. This makes the omission fail here,
+// with the spelling named.
+func TestEverySQLiteSpellingIsClassifiedOrDeliberatelyRefused(t *testing.T) {
+	for base := range sqliteTypeRules {
+		kind, classified := canonicalKindFromSQLite(base)
+		why, refused := sqliteSpellingsDeliberatelyRefused[base]
+
+		switch {
+		case classified && refused:
+			t.Errorf("%q is both classified as %s and listed as refused (%s)",
+				base, kind, why)
+		case !classified && !refused:
+			t.Errorf("%q is admitted by ParseSQLiteDeclaredType and has no"+
+				" kind - give it one, or add it to"+
+				" sqliteSpellingsDeliberatelyRefused with the reason",
+				base)
+		}
+	}
+
+	// And the reverse: a refusal for a spelling the parser does not admit is
+	// dead weight that will outlive whatever it was guarding.
+	for base, why := range sqliteSpellingsDeliberatelyRefused {
+		if _, admitted := sqliteTypeRules[base]; !admitted {
+			t.Errorf("%q is listed as deliberately refused (%s) but"+
+				" ParseSQLiteDeclaredType does not admit it, so nothing"+
+				" reaches the refusal", base, why)
+		}
+	}
+}

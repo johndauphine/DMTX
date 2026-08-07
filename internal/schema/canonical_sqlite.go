@@ -107,9 +107,14 @@ func CanonicalFromSQLite(column Column, isKey bool) (CanonicalType, error) {
 
 // canonicalKindFromSQLite maps SQLite's declared spellings onto kinds.
 //
-// The list is exactly sqliteTypeRules, which is what ParseSQLiteDeclaredType
-// admits, so a spelling that reaches here has already been through that gate.
-// Anything this does not name is refused rather than guessed.
+// The spellings come from sqliteTypeRules, which is what
+// ParseSQLiteDeclaredType admits, MINUS two it deliberately will not classify -
+// see the default case for which and why. So this is not a list to "fix" into
+// agreement with the parser: doing that would re-admit them.
+//
+// TestEverySQLiteSpellingIsClassifiedOrDeliberatelyRefused holds both halves to
+// the parser, so a spelling added there fails here rather than falling through
+// as an unclassified type nobody notices.
 func canonicalKindFromSQLite(base string) (Kind, bool) {
 	switch base {
 	case "int", "integer", "tinyint", "smallint", "mediumint",
