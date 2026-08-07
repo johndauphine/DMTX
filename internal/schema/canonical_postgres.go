@@ -31,6 +31,28 @@ import (
 // has already been established to order by bytes. There is no per-column
 // collation left to interrogate.
 func CanonicalFromPostgres(column Column, isKey bool) (CanonicalType, error) {
+	// The fixed-width character type is refused here rather than by each target.
+	//
+	// PostgreSQL's char - reported as bpchar - is blank-padded on storage and
+	// compared padded, so the value that comes back is not the value a varchar
+	// would have returned. That is a property of the SOURCE type and no target
+	// can undo it, so the refusal belongs in the converter.
+	//
+	// It used to live in projectPostgresColumnForSQLServer, where it protected
+	// exactly one route. That was safe only while the kind mapper refused
+	// "char" outright - and the mapper now accepts it, because MySQL's CHAR
+	// strips trailing spaces on retrieval and IS carryable. Two engines, one
+	// spelling, opposite answers; the converter that knows which engine is the
+	// place to say so.
+	if base := postgresDeclaredBase(column); base == "char" || base == "bpchar" {
+		return CanonicalType{}, fmt.Errorf(
+			"PostgreSQL column %s is %s, whose fixed-width blank-padding"+
+				" semantics cannot be preserved",
+			column.Name,
+			base,
+		)
+	}
+
 	canonical := CanonicalType{
 		Kind:          canonicalKindFromPortable(column.Type),
 		Certification: Certification{Transfer: true},
@@ -128,4 +150,14 @@ func applyPostgresTemporalDefault(canonical *CanonicalType) {
 			canonical.FractionalSecondPrecision = &microseconds
 		}
 	}
+}
+
+// postgresDeclaredBase is the base a column declares, or its portable type when
+// the catalog recorded no declaration - which is the ordinary case for text,
+// uuid, bytea, json, bool and date.
+func postgresDeclaredBase(column Column) string {
+	if column.DeclaredType != nil {
+		return strings.ToLower(strings.TrimSpace(column.DeclaredType.Base))
+	}
+	return strings.ToLower(strings.TrimSpace(column.Type))
 }

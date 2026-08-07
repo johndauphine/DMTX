@@ -311,18 +311,25 @@ func canonicalKindFromPortable(portable string) Kind {
 		return KindReal
 	case "double precision":
 		return KindDouble
-	case "text", "varchar", "character varying":
+	case "text", "varchar", "character varying", "char", "character":
+		// "char" is here for MySQL, and the two engines do not mean the same
+		// thing by it. MySQL strips trailing spaces from a CHAR when the value
+		// is RETRIEVED, so what a reader gets back is what a varchar would have
+		// held, and the mysql -> postgres projection has been mapping it to
+		// varchar since before this package existed. PostgreSQL's pads on
+		// storage and compares padded, so it cannot be.
+		//
+		// One spelling, two answers, which is why the mapper is not where the
+		// question is settled. CanonicalFromPostgres refuses char and bpchar
+		// before reaching here; the SQL Server target refuses MySQL's char for
+		// a reason of its own.
 		// PostgreSQL discovery names a bounded string varchar and an unbounded
 		// one text; SQL Server's names both text. Both spellings mean the same
 		// kind, and the bound is carried by Length rather than by the name.
 		//
-		// char and bpchar are deliberately absent. PostgreSQL's fixed-width
-		// character type is blank-padded, which is a different comparison and a
-		// different stored value from varchar, and the projections refuse it.
-		// An earlier draft listed them here on the assumption that a character
-		// type is a character type - the same shape of guess that refused every
-		// smalldatetime column - and it silently accepted a type no target
-		// certifies.
+		// bpchar is absent and always will be. It is PostgreSQL's fixed-width
+		// spelling, blank-padded and compared padded, and no target can undo
+		// that - CanonicalFromPostgres refuses it, and its plain "char" with it.
 		return KindText
 	case "blob", "bytea", "varbinary":
 		// SQL Server discovery spells binary, varbinary and varbinary(max) all
