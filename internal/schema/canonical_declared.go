@@ -34,8 +34,11 @@ func CanonicalToDeclared(
 		}
 	}
 
-	if target == SQLServer {
+	switch target {
+	case SQLServer:
 		return canonicalToSQLServerDeclared(value)
+	case MySQL:
+		return canonicalToMySQLDeclared(value)
 	}
 
 	switch value.Kind {

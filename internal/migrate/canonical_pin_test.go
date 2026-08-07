@@ -838,3 +838,171 @@ func TestMySQLToPostgresDeclarations(t *testing.T) {
 		})
 	}
 }
+
+// TestSQLServerToMySQLDeclarations pins the fifth swapped route, and the first
+// onto a MySQL target.
+//
+// Every case here matched the pairwise projection before the swap except the
+// one marked, which was a defect: SQL Server's BINARY runs to 8000 and MySQL's
+// stops at 255, and the projection carried the width under the same keyword.
+func TestSQLServerToMySQLDeclarations(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		column       schema.Column
+		wantType     string
+		wantDeclared *schema.DeclaredType
+		wantRefused  string
+	}{
+		{
+			name:         "tinyint keeps a narrow width here",
+			column:       mySQLColumn("integer", "tinyint"),
+			wantType:     "integer",
+			wantDeclared: &schema.DeclaredType{Base: "smallint"},
+		},
+		{
+			name:         "int",
+			column:       mySQLColumn("integer", "int"),
+			wantType:     "integer",
+			wantDeclared: &schema.DeclaredType{Base: "int"},
+		},
+		{
+			// MySQL has no boolean; BOOLEAN is a synonym for tinyint(1).
+			name:         "bool",
+			column:       mySQLColumn("boolean", "bool"),
+			wantType:     "integer",
+			wantDeclared: &schema.DeclaredType{Base: "tinyint", Arguments: []int{1}},
+		},
+		{
+			// Every binary32 value is exactly representable in binary64, so the
+			// collapse is lossless for the column. The DEFAULT is what the
+			// projection refuses.
+			name:         "real collapses into double",
+			column:       mySQLColumn("real", "real"),
+			wantType:     "double precision",
+			wantDeclared: &schema.DeclaredType{Base: "double"},
+		},
+		{
+			// Forty CHARACTERS. nvarchar declares UTF-16 code units, which
+			// discovery has already converted to characters, and MySQL's
+			// modifier is characters - so the number passes through. The SQL
+			// Server TARGET multiplies by four going the other way; doing it
+			// here would declare four times what the source can hold.
+			name:         "nvarchar(40) passes its length through",
+			column:       mySQLColumn("text", "nvarchar", 40),
+			wantType:     "varchar",
+			wantDeclared: &schema.DeclaredType{Base: "varchar", Arguments: []int{40}},
+		},
+		{
+			name:         "varchar at SQL Server's own ceiling",
+			column:       mySQLColumn("text", "varchar", 8_000),
+			wantType:     "varchar",
+			wantDeclared: &schema.DeclaredType{Base: "varchar", Arguments: []int{8_000}},
+		},
+		{
+			name:         "varchar(max), which arrives as unbounded text",
+			column:       mySQLColumn("text", "text"),
+			wantType:     "text",
+			wantDeclared: &schema.DeclaredType{Base: "longtext"},
+		},
+		{
+			name:         "binary(16) stays fixed",
+			column:       mySQLColumn("blob", "binary", 16),
+			wantType:     "binary",
+			wantDeclared: &schema.DeclaredType{Base: "binary", Arguments: []int{16}},
+		},
+		{
+			// The defect. SQL Server can declare BINARY(300); MySQL's BINARY
+			// stops at 255, and the pairwise projection wrote BINARY(300) - DDL
+			// MySQL refuses, so the route produced a table nobody could create.
+			name:         "binary(300) widens rather than failing at CREATE TABLE",
+			column:       mySQLColumn("blob", "binary", 300),
+			wantType:     "varbinary",
+			wantDeclared: &schema.DeclaredType{Base: "varbinary", Arguments: []int{300}},
+		},
+		{
+			name:         "varbinary(8000), which MySQL can declare",
+			column:       mySQLColumn("blob", "varbinary", 8_000),
+			wantType:     "varbinary",
+			wantDeclared: &schema.DeclaredType{Base: "varbinary", Arguments: []int{8_000}},
+		},
+		{
+			name:         "varbinary(max)",
+			column:       mySQLColumn("blob", "blob"),
+			wantType:     "blob",
+			wantDeclared: &schema.DeclaredType{Base: "longblob"},
+		},
+		{
+			name:     "datetime(3), the CreationDate shape",
+			column:   mySQLColumn("datetime", "timestamp", 3),
+			wantType: "datetime",
+			wantDeclared: &schema.DeclaredType{
+				Base: "datetime", Arguments: []int{3},
+			},
+		},
+		{
+			// smalldatetime resolves to the minute, and that zero is a
+			// precision rather than an absence.
+			name:     "smalldatetime",
+			column:   mySQLColumn("datetime", "smalldatetime"),
+			wantType: "datetime",
+			wantDeclared: &schema.DeclaredType{
+				Base: "datetime", Arguments: []int{0},
+			},
+		},
+		{
+			// MySQL stops at six fractional digits where datetime2 carries
+			// seven, so this is not something to render smaller - rendering it
+			// as six would truncate every value while producing a schema that
+			// loads.
+			name:        "datetime2(7), which MySQL cannot hold",
+			column:      mySQLColumn("datetime", "timestamp", 7),
+			wantRefused: "temporal precision",
+		},
+		{
+			name:         "uniqueidentifier as the canonical text form",
+			column:       mySQLColumn("uuid", "uuid"),
+			wantType:     "char",
+			wantDeclared: &schema.DeclaredType{Base: "char", Arguments: []int{36}},
+		},
+		{
+			// SQL Server cannot declare it, so a source presenting one is a
+			// declaration dmtx never read from a catalog. Refused by the
+			// CONVERTER, because MySQL's own limit is 65 and a target check
+			// alone let this through.
+			name:        "decimal(39,2), which SQL Server cannot declare",
+			column:      mySQLColumn("numeric", "decimal", 39, 2),
+			wantRefused: "which SQL Server cannot declare",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, err := projectSQLServerColumnForMySQL(testCase.column)
+			if testCase.wantRefused != "" {
+				if err == nil {
+					t.Fatalf("accepted as %s/%+v, want a refusal naming %q",
+						got.Type, got.DeclaredType, testCase.wantRefused)
+				}
+				if !strings.Contains(err.Error(), testCase.wantRefused) {
+					t.Errorf("refusal does not name %q: %v",
+						testCase.wantRefused, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("projection refused the column: %v", err)
+			}
+			assertProjected(
+				t, got.Type, got.DeclaredType,
+				testCase.wantType, testCase.wantDeclared,
+			)
+			// And MySQL must be able to create it. This is what the pairwise
+			// BINARY(300) failed, and no differential test would have asked.
+			got.Nullable = true
+			if _, err := schema.CreateTable(schema.MySQL, schema.Table{
+				Schema: "dmtx", Name: "t", Columns: []schema.Column{got},
+			}); err != nil {
+				t.Fatalf("the target cannot create %s/%+v: %v",
+					got.Type, got.DeclaredType, err)
+			}
+		})
+	}
+}

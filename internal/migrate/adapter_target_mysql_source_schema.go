@@ -456,6 +456,27 @@ func projectSQLServerTableForMySQL(
 	return projected, nil
 }
 
+// projectSQLServerColumnForMySQL routes through the canonical type.
+//
+// The fifth route, and the first onto a MySQL target - so the vocabulary it
+// projects into is new: canonicalToMySQLDeclared, in internal/schema.
+//
+// Every shape was compared against the pairwise projection before the swap and
+// they agree on all but one, including the cases that have gone wrong before:
+// an nvarchar's length passing through unmultiplied, a smalldatetime arriving as
+// datetime(0), a REAL collapsing into DOUBLE, a uniqueidentifier as char(36).
+//
+// The one disagreement is a defect in the pairwise code. SQL Server's BINARY
+// runs to 8000 and MySQL's stops at 255, and the projection carried the width
+// under the same keyword, so a BINARY(300) was declared as MySQL BINARY(300) -
+// which MySQL's own renderer refuses:
+//
+//	render MySQL declared type type "binary(300)" is unsupported for mysql
+//
+// The canonical target widens it to VARBINARY(300). The padding bytes are part
+// of the stored value and travel either way; what is lost is the target
+// re-applying the padding, which is a schema fact rather than a data one. The
+// alternative was a table that could not be created.
 func projectSQLServerColumnForMySQL(
 	source schema.Column,
 ) (schema.Column, error) {
@@ -465,193 +486,38 @@ func projectSQLServerColumnForMySQL(
 			source.Name,
 		)
 	}
-	target := source
-	target.Default = cloneSchemaExpression(source.Default)
-	base := strings.ToLower(strings.Join(
-		strings.Fields(source.DeclaredType.Base),
-		" ",
-	))
-	arguments := append(
-		[]int(nil),
-		source.DeclaredType.Arguments...,
-	)
-	sourceType := strings.ToLower(strings.Join(
-		strings.Fields(source.Type),
-		" ",
-	))
-	mapped := false
-	declaration := func(name string, values ...int) {
-		target.DeclaredType = &schema.DeclaredType{
-			Base:      name,
-			Arguments: append([]int(nil), values...),
-		}
-		mapped = true
-	}
-	noArguments := func() bool {
-		return len(arguments) == 0
+	// A REAL default is refused while REAL itself is carried, because the
+	// refusal is about the DEFAULT rather than the type. Every binary32 value
+	// is exactly representable in binary64, so the column is safe; but the
+	// default travels as a decimal token, and re-evaluating that token as a
+	// double would not reproduce SQL Server's binary32 rounding.
+	if sqlServerMySQLRealColumn(source) && source.Default != nil {
+		return schema.Column{}, mysqlProjectionPolicy(
+			"map SQL Server default",
+			source.Name+": a REAL default re-evaluated as DOUBLE would not"+
+				" reproduce the source's binary32 rounding",
+		)
 	}
 
-	switch base {
-	case "tinyint":
-		// SQL Server TINYINT is unsigned (0..255); MySQL TINYINT is signed.
-		if sourceType != "integer" || !noArguments() {
-			break
-		}
-		target.Type = "integer"
-		declaration("smallint")
-	case "smallint":
-		if sourceType != "integer" || !noArguments() {
-			break
-		}
-		target.Type = "integer"
-		declaration("smallint")
-	case "int", "integer":
-		if sourceType != "integer" || !noArguments() {
-			break
-		}
-		target.Type = "integer"
-		declaration("int")
-	case "bigint":
-		if sourceType != "bigint" || !noArguments() {
-			break
-		}
-		target.Type = "bigint"
-		declaration("bigint")
-	case "bool", "boolean":
-		if sourceType != "boolean" || !noArguments() {
-			break
-		}
-		target.Type = "integer"
-		declaration("tinyint", 1)
-	case "decimal", "numeric":
-		if sourceType != "numeric" ||
-			len(arguments) != 2 ||
-			arguments[0] < 1 ||
-			arguments[0] > 38 ||
-			arguments[1] < 0 ||
-			arguments[1] > 30 ||
-			arguments[1] > arguments[0] {
-			break
-		}
-		target.Type = "numeric"
-		declaration("decimal", arguments...)
-	case "real":
-		// Every IEEE-754 binary32 value is represented exactly by DOUBLE.
-		// A source REAL default is rejected because re-evaluating its decimal
-		// token as DOUBLE would not reproduce SQL Server's binary32 rounding.
-		if sourceType != "real" ||
-			!noArguments() ||
-			source.Default != nil {
-			break
-		}
-		target.Type = "double precision"
-		declaration("double")
-	case "double precision":
-		if sourceType != "double precision" || !noArguments() {
-			break
-		}
-		target.Type = "double precision"
-		declaration("double")
-	case "char", "varchar", "nchar", "nvarchar":
-		// The two families declare different units, and this case handles both,
-		// so both are stated before either is acted on:
-		//
-		//	char, varchar      BYTES
-		//	nchar, nvarchar    UTF-16 code units, which discovery has already
-		//	                   converted to characters
-		//
-		// MySQL's modifier is characters. So the narrow families are widened -
-		// n bytes hold at most n characters, and VARCHAR(n) characters holds
-		// them all, which also retains the padding present in admitted SQL
-		// Server CHAR rows and defaults.
-		//
-		// The national spellings need no widening and get none: nchar and
-		// nvarchar declare UTF-16 code units, which discovery has already
-		// converted to characters, and MySQL's modifier is characters. The
-		// numbers mean the same thing, so the length passes straight through.
-		// Multiplying here - as the SQL Server *target* must, going the other
-		// way - would declare four times the length the source could hold.
-		//
-		// The ceiling is the source family's own, because nvarchar stops at
-		// 4000 where varchar stops at 8000. One constant would accept an
-		// nvarchar(8000) that SQL Server cannot declare.
-		if sourceType != "text" ||
-			len(arguments) != 1 ||
-			arguments[0] < 1 ||
-			arguments[0] > sqlServerProjectedTextLengthLimit(base) {
-			break
-		}
-		target.Type = "varchar"
-		declaration("varchar", arguments[0])
-	case "text":
-		if sourceType != "text" || !noArguments() {
-			break
-		}
-		target.Type = "text"
-		declaration("longtext")
-	case "binary", "varbinary":
-		if sourceType != "blob" ||
-			len(arguments) != 1 ||
-			arguments[0] < 1 ||
-			arguments[0] > 8_000 {
-			break
-		}
-		target.Type = base
-		declaration(base, arguments[0])
-	case "blob":
-		if sourceType != "blob" || !noArguments() {
-			break
-		}
-		target.Type = "blob"
-		declaration("longblob")
-	case "date":
-		if sourceType != "date" || !noArguments() {
-			break
-		}
-		target.Type = "date"
-		declaration("date")
-	case "time":
-		if sourceType != "time" ||
-			len(arguments) != 1 ||
-			arguments[0] < 0 ||
-			arguments[0] > 6 {
-			break
-		}
-		target.Type = "time"
-		declaration("time", arguments[0])
-	case "timestamp":
-		if sourceType != "datetime" ||
-			len(arguments) != 1 ||
-			arguments[0] < 0 ||
-			arguments[0] > 6 {
-			break
-		}
-		target.Type = "datetime"
-		declaration("datetime", arguments[0])
-	case "smalldatetime":
-		if sourceType != "datetime" || !noArguments() {
-			break
-		}
-		target.Type = "datetime"
-		declaration("datetime", 0)
-	case "uuid":
-		if sourceType != "uuid" || !noArguments() {
-			break
-		}
-		target.Type = "char"
-		declaration("char", 36)
-	default:
+	canonical, err := schema.CanonicalFromSQLServer(source, "", false)
+	if err != nil {
 		return schema.Column{}, mysqlProjectionPolicy(
-			"map SQL Server type",
-			base,
+			"map SQL Server declared type",
+			source.Name+": "+err.Error(),
 		)
 	}
-	if !mapped {
-		return schema.Column{}, mysqlProjectionPolicy(
-			"map SQL Server type",
-			source.Name+"."+base,
-		)
+	targetType, declared, err := schema.CanonicalToDeclared(
+		canonical,
+		schema.MySQL,
+	)
+	if err != nil {
+		return schema.Column{}, nameTheColumn(err, source.Name)
 	}
+
+	target := source
+	target.Type = targetType
+	target.DeclaredType = declared
+	target.Default = cloneSchemaExpression(source.Default)
 	if target.Default != nil {
 		normalized, err := schema.NormalizeMySQLDefault(target)
 		if err != nil {

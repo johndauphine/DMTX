@@ -88,8 +88,13 @@ func renderSmallInt(target Dialect) string {
 }
 
 // smallIntKeepsItsWidth reports whether a target declares the narrow integer.
+//
+// SQL Server and MySQL do; PostgreSQL and SQLite widen to an integer. That is
+// not a judgement about the engines - all four have a smallint - it is what
+// each target has been RECORDED as since before the canonical type existed, and
+// target authority is authenticated against the catalogs those runs created.
 func smallIntKeepsItsWidth(target Dialect) bool {
-	return target == SQLServer
+	return target == SQLServer || target == MySQL
 }
 
 func renderNamed(target Dialect, standard, clickhouse string) string {
