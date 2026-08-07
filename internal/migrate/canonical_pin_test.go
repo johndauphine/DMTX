@@ -1139,6 +1139,12 @@ func TestPostgresToMySQLDeclarations(t *testing.T) {
 					t.Errorf("refusal does not name %q: %v",
 						testCase.wantRefused, err)
 				}
+				// And the column, always. A refusal naming only the type
+				// leaves an operator grepping a schema for it.
+				if !strings.Contains(err.Error(), testCase.column.Name) {
+					t.Errorf("refusal does not name the column %q: %v",
+						testCase.column.Name, err)
+				}
 				return
 			}
 			if err != nil {

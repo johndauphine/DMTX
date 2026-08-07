@@ -799,24 +799,28 @@ func refusePostgresTypeThisRouteHasNotProved(source schema.Column) error {
 	if source.DeclaredType != nil {
 		base = strings.ToLower(strings.TrimSpace(source.DeclaredType.Base))
 	}
+	// The column's name leads every one of these. A refusal that says only
+	// which TYPE was refused leaves an operator grepping a schema for it, and
+	// the rest of this file has named the column since before the swap.
 	switch base {
 	case "uuid":
 		return mysqlProjectionPolicy(
 			"map PostgreSQL type",
-			"uuid: the SQL Server route carries this as char(36), and the"+
-				" PostgreSQL value path for it has not been measured",
+			source.Name+" (uuid): the SQL Server route carries this as"+
+				" char(36), and the PostgreSQL value path for it has not been"+
+				" measured",
 		)
 	case "json":
 		return mysqlProjectionPolicy(
 			"map PostgreSQL type",
-			"json: jsonb is carried as longtext and this would be too, but the"+
-				" value path for it has not been measured",
+			source.Name+" (json): jsonb is carried as longtext and this would"+
+				" be too, but the value path for it has not been measured",
 		)
 	case "real", "float4":
 		return mysqlProjectionPolicy(
 			"map PostgreSQL type",
-			"real: the SQL Server route carries this as double, and the"+
-				" PostgreSQL value path for it has not been measured",
+			source.Name+" (real): the SQL Server route carries this as double,"+
+				" and the PostgreSQL value path for it has not been measured",
 		)
 	}
 	return nil
