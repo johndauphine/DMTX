@@ -268,10 +268,18 @@ func canonicalKindFromPortable(portable string) Kind {
 		return KindReal
 	case "double precision":
 		return KindDouble
-	case "text", "varchar", "character varying", "char", "bpchar":
+	case "text", "varchar", "character varying":
 		// PostgreSQL discovery names a bounded string varchar and an unbounded
 		// one text; SQL Server's names both text. Both spellings mean the same
 		// kind, and the bound is carried by Length rather than by the name.
+		//
+		// char and bpchar are deliberately absent. PostgreSQL's fixed-width
+		// character type is blank-padded, which is a different comparison and a
+		// different stored value from varchar, and the projections refuse it.
+		// An earlier draft listed them here on the assumption that a character
+		// type is a character type - the same shape of guess that refused every
+		// smalldatetime column - and it silently accepted a type no target
+		// certifies.
 		return KindText
 	case "blob", "bytea":
 		return KindBlob

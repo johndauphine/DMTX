@@ -92,6 +92,18 @@ func CanonicalFromPostgres(column Column, isKey bool) (CanonicalType, error) {
 				canonical.FractionalSecondPrecision = &precision
 			}
 		}
+		// A bare PostgreSQL timestamp MEANS timestamp(6). Microseconds are the
+		// type's definition rather than a default a target may reinterpret, so
+		// the canonical type records six rather than an absence.
+		//
+		// Leaving it absent let a bare timestamp reach the SQL Server renderer
+		// with no precision at all, which it refuses - found by the armed live
+		// gate on a corpus column named date that is a TIMESTAMP, which is also
+		// why the error read "date timestamp".
+		if canonical.FractionalSecondPrecision == nil {
+			microseconds := int64(6)
+			canonical.FractionalSecondPrecision = &microseconds
+		}
 	}
 
 	if isKey {

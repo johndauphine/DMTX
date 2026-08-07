@@ -175,3 +175,100 @@ func assertSameDeclaration(t *testing.T, canonical, pairwise *schema.DeclaredTyp
 			canonical, pairwise)
 	}
 }
+
+// The postgres -> mssql route, both ways, over the same columns.
+//
+// Written before that swap, and shaped by what the first one taught: it
+// compares the whole projected column, because a subset comparison proves a
+// subset of the equivalence.
+//
+// The fixtures include the case that has no analogue on the SQL Server side -
+// a column recorded with NO DeclaredType at all, which is how PostgreSQL
+// discovery records text, uuid, bytea, json, bool and date.
+func TestCanonicalMatchesPairwiseForPostgresToSQLServer(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		column schema.Column
+	}{
+		{name: "text, recorded with no declaration",
+			column: schema.Column{Name: "aboutme", Type: "text"}},
+		{name: "uuid, likewise",
+			column: schema.Column{Name: "external_id", Type: "uuid"}},
+		{name: "bytea, likewise",
+			column: schema.Column{Name: "payload", Type: "bytea"}},
+		{name: "boolean, likewise",
+			column: schema.Column{Name: "enabled", Type: "boolean"}},
+		{name: "date, likewise",
+			column: schema.Column{Name: "born", Type: "date"}},
+		{
+			name: "integer",
+			column: schema.Column{
+				Name: "id", Type: "integer",
+				DeclaredType: &schema.DeclaredType{Base: "integer"},
+			},
+		},
+		{
+			name: "bigint",
+			column: schema.Column{
+				Name: "big", Type: "bigint",
+				DeclaredType: &schema.DeclaredType{Base: "bigint"},
+			},
+		},
+		{
+			// The character-to-byte widening: 40 characters becomes 160 bytes.
+			name: "bounded varchar",
+			column: schema.Column{
+				Name: "displayname", Type: "varchar",
+				DeclaredType: &schema.DeclaredType{
+					Base: "varchar", Arguments: []int{40},
+				},
+			},
+		},
+		{
+			name: "numeric with precision and scale",
+			column: schema.Column{
+				Name: "amount", Type: "numeric",
+				DeclaredType: &schema.DeclaredType{
+					Base: "numeric", Arguments: []int{12, 2},
+				},
+			},
+		},
+		{
+			name: "timestamp with fractional seconds",
+			column: schema.Column{
+				Name: "creationdate", Type: "timestamp",
+				DeclaredType: &schema.DeclaredType{
+					Base: "timestamp", Arguments: []int{6},
+				},
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			pairwise, pairwiseErr := projectPostgresColumnForSQLServer(testCase.column)
+
+			canonical, err := schema.CanonicalFromPostgres(testCase.column, false)
+			if err != nil {
+				if pairwiseErr == nil {
+					t.Fatalf("canonical refused what the projection accepted: %v", err)
+				}
+				return
+			}
+			canonicalType, canonicalDeclared, err :=
+				schema.CanonicalToDeclared(canonical, schema.SQLServer)
+			if err != nil {
+				if pairwiseErr == nil {
+					t.Fatalf("canonical refused what the projection accepted: %v", err)
+				}
+				return
+			}
+			if pairwiseErr != nil {
+				t.Fatalf("the projection refused this but canonical produced %s", canonicalType)
+			}
+			if canonicalType != pairwise.Type {
+				t.Errorf("portable type: canonical %q, pairwise %q",
+					canonicalType, pairwise.Type)
+			}
+			assertSameDeclaration(t, canonicalDeclared, pairwise.DeclaredType)
+		})
+	}
+}

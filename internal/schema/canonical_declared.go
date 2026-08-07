@@ -32,6 +32,10 @@ func CanonicalToDeclared(
 		}
 	}
 
+	if target == SQLServer {
+		return canonicalToSQLServerDeclared(value)
+	}
+
 	switch value.Kind {
 	case KindBoolean:
 		return "boolean", nil, nil
@@ -152,4 +156,115 @@ func temporalDigitCeiling(target Dialect) int64 {
 		// PostgreSQL, MySQL and SQLite all stop at six.
 		return 6
 	}
+}
+
+// canonicalToSQLServerDeclared is the SQL Server target's own vocabulary.
+//
+// A target records the names its catalog reports, and SQL Server's differ from
+// PostgreSQL's in both directions: it declares int where PostgreSQL declares
+// nothing at all, and decimal where PostgreSQL says numeric. Target authority
+// is authenticated against that catalog on later incremental runs, so the
+// declaration has to be what SQL Server will say, not a neutral spelling.
+func canonicalToSQLServerDeclared(
+	value CanonicalType,
+) (string, *DeclaredType, error) {
+	declared := func(base string, arguments ...int) *DeclaredType {
+		return &DeclaredType{
+			Base:      base,
+			Arguments: append([]int(nil), arguments...),
+		}
+	}
+	switch value.Kind {
+	case KindBoolean:
+		return "boolean", declared("bool"), nil
+	case KindInteger:
+		return "integer", declared("int"), nil
+	case KindBigInt:
+		return "bigint", declared("bigint"), nil
+	case KindReal:
+		return "real", declared("real"), nil
+	case KindDouble:
+		// No declaration: SQL Server's float is the portable name's own shape,
+		// and inventing one would record a fact the catalog does not report.
+		return "double precision", nil, nil
+	case KindNumeric:
+		if value.Precision == nil {
+			return "", nil, &PolicyError{
+				Operation: "project canonical type",
+				Type:      "numeric without precision",
+				Target:    string(SQLServer),
+			}
+		}
+		scale := int64(0)
+		if value.Scale != nil {
+			scale = *value.Scale
+		}
+		return "numeric", declared("decimal", int(*value.Precision), int(scale)), nil
+	case KindText:
+		return canonicalToSQLServerText(value, declared)
+	case KindBlob:
+		return "blob", declared("blob"), nil
+	case KindDate:
+		return "date", declared("date"), nil
+	case KindTime:
+		if value.FractionalSecondPrecision == nil {
+			return "time", declared("time"), nil
+		}
+		return "time", declared("time", int(*value.FractionalSecondPrecision)), nil
+	case KindDateTime:
+		if value.FractionalSecondPrecision == nil {
+			return "datetime", declared("timestamp"), nil
+		}
+		return "datetime",
+			declared("timestamp", int(*value.FractionalSecondPrecision)), nil
+	case KindUUID:
+		// Declared, unlike on the PostgreSQL target. SQL Server's catalog
+		// reports uniqueidentifier as its own type, so the target authority
+		// records it rather than reconstructing it from the portable name.
+		return "uuid", declared("uuid"), nil
+	case KindJSON:
+		// SQL Server has no JSON type; it holds the document as text, which is
+		// what the pairwise projection did and is why json and bytea share a
+		// target shape here.
+		return "blob", declared("blob"), nil
+	default:
+		return "", nil, &PolicyError{
+			Operation: "project canonical type",
+			Type:      string(value.Kind),
+			Target:    string(SQLServer),
+		}
+	}
+}
+
+// canonicalToSQLServerText multiplies a character length into bytes.
+//
+// This is the mirror of the halving on the SQL Server SOURCE side, and getting
+// the direction wrong is the defect this whole lattice was written after.
+//
+// A canonical Length is CHARACTERS. SQL Server's varchar(n) under the UTF-8
+// collation dmtx writes counts BYTES, and one character can spend four of them,
+// so the declared length is multiplied by four. That is a widening: every value
+// the source could hold still fits, and no value the source could not hold
+// becomes representable, because the source's own bound still governs what
+// arrives.
+//
+// Going the other way the same fact halves - sys.columns.max_length is bytes
+// and the national types store two per unit. One fact, two directions, and only
+// the direction says which arithmetic applies. That is precisely why it belongs
+// here rather than in each projection that happens to need it.
+func canonicalToSQLServerText(
+	value CanonicalType,
+	declared func(string, ...int) *DeclaredType,
+) (string, *DeclaredType, error) {
+	if value.Length == nil {
+		return "text", declared("text"), nil
+	}
+	bytes := *value.Length * 4
+	if bytes > SQLServerNarrowTextLimit {
+		// Beyond what varchar can declare, so it becomes unbounded rather than
+		// being truncated to the limit - which would refuse values the source
+		// holds.
+		return "text", declared("text"), nil
+	}
+	return "text", declared("varchar", int(bytes)), nil
 }
