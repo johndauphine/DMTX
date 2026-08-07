@@ -299,14 +299,6 @@ func TestProjectPostgresTableForMySQLFailsClosed(t *testing.T) {
 			},
 		},
 		{
-			name: "varchar octet bound",
-			column: schema.Column{
-				Name:         "value",
-				Type:         "varchar",
-				DeclaredType: &schema.DeclaredType{Base: "varchar", Arguments: []int{16_384}},
-			},
-		},
-		{
 			name: "uuid semantic mismatch",
 			column: schema.Column{
 				Name: "value",

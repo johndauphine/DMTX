@@ -701,184 +701,67 @@ func mySQLBooleanCheckName(table schema.Table, column string) string {
 	return "dmtx_bool_" + hex.EncodeToString(digest[:8])
 }
 
+// projectPostgresColumnForMySQL routes through the canonical type.
+//
+// The sixth route, and the second onto the MySQL vocabulary written for the
+// fifth - so this one adds no target code at all, which is the first time that
+// has been true. That is the lattice paying for itself: N converters and N
+// vocabularies, and a new pair costs neither.
+//
+// Every accepted shape matched the pairwise projection before the swap.
 func projectPostgresColumnForMySQL(
 	source schema.Column,
 ) (schema.Column, error) {
-	target := source
-	target.Default = cloneSchemaExpression(source.Default)
-	base := strings.ToLower(strings.TrimSpace(source.Type))
-	arguments := []int(nil)
-	declaredBase := base
-	if source.DeclaredType != nil {
-		declaredBase = strings.ToLower(strings.TrimSpace(
-			source.DeclaredType.Base,
-		))
-		arguments = append(
-			[]int(nil),
-			source.DeclaredType.Arguments...,
-		)
-	}
-	if declaredBase != base {
-		return schema.Column{}, mysqlProjectionPolicy(
-			"map PostgreSQL declared type",
-			source.Name,
-		)
-	}
-	declaration := func(name string, values ...int) {
-		target.DeclaredType = &schema.DeclaredType{
-			Base:      name,
-			Arguments: append([]int(nil), values...),
-		}
-	}
-	requireNoArguments := func() error {
-		if len(arguments) != 0 {
-			return mysqlProjectionPolicy(
-				"map PostgreSQL type modifier",
-				source.Name,
-			)
-		}
-		return nil
+	if err := refusePostgresTypeThisRouteHasNotProved(source); err != nil {
+		return schema.Column{}, err
 	}
 
-	switch base {
-	case "integer":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "integer"
-		declaration("int")
-	case "bigint":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "bigint"
-		declaration("bigint")
-	case "double precision":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "double precision"
-		declaration("double")
-	case "numeric":
-		if len(arguments) != 2 ||
-			arguments[0] < 1 || arguments[0] > 65 ||
-			arguments[1] < 0 || arguments[1] > 30 ||
-			arguments[1] > arguments[0] {
-			return schema.Column{}, mysqlProjectionPolicy(
-				"map PostgreSQL numeric modifier",
-				source.Name,
-			)
-		}
-		target.Type = "numeric"
-		declaration("decimal", arguments...)
-	case "char":
+	canonical, err := schema.CanonicalFromPostgres(source, false)
+	if err != nil {
 		return schema.Column{}, mysqlProjectionPolicy(
-			"map PostgreSQL character type",
-			"fixed-width blank-padding semantics cannot be preserved",
-		)
-	case "varchar":
-		if len(arguments) != 1 ||
-			arguments[0] < 1 || arguments[0] > 16_383 {
-			return schema.Column{}, mysqlProjectionPolicy(
-				"map PostgreSQL character modifier",
-				source.Name,
-			)
-		}
-		target.Type = "varchar"
-		declaration("varchar", arguments...)
-	case "text":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "text"
-		declaration("longtext")
-	case "bytea":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "blob"
-		declaration("longblob")
-	case "jsonb":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		// PostgreSQL jsonb has a deterministic textual form with numeric
-		// precision beyond MySQL's binary JSON number domain. Preserve that
-		// canonical source representation as LONGTEXT instead of allowing a
-		// warning-free numeric rewrite inside MySQL JSON.
-		target.Type = "text"
-		declaration("longtext")
-	case "json":
-		return schema.Column{}, mysqlProjectionPolicy(
-			"map PostgreSQL type",
-			"json preserves source text that MySQL JSON normalizes",
-		)
-	case "boolean":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "integer"
-		declaration("tinyint", 1)
-		if source.Default != nil {
-			value := strings.ToUpper(strings.TrimSpace(
-				source.Default.CanonicalSQL(),
-			))
-			switch value {
-			case "TRUE":
-				value = "1"
-			case "FALSE":
-				value = "0"
-			default:
-				return schema.Column{}, mysqlProjectionPolicy(
-					"map PostgreSQL boolean default",
-					source.Name,
-				)
-			}
-			expression, err := schema.ParseMySQLCatalogDefault(
-				target,
-				&value,
-				false,
-			)
-			if err != nil {
-				return schema.Column{}, err
-			}
-			target.Default = expression
-		}
-	case "date":
-		if err := requireNoArguments(); err != nil {
-			return schema.Column{}, err
-		}
-		target.Type = "date"
-		declaration("date")
-	case "timestamp":
-		precision := 6
-		if len(arguments) == 1 {
-			precision = arguments[0]
-		} else if len(arguments) != 0 {
-			return schema.Column{}, mysqlProjectionPolicy(
-				"map PostgreSQL temporal modifier",
-				source.Name,
-			)
-		}
-		if precision < 0 || precision > 6 {
-			return schema.Column{}, mysqlProjectionPolicy(
-				"map PostgreSQL temporal modifier",
-				source.Name,
-			)
-		}
-		target.Type = "datetime"
-		declaration("datetime", precision)
-	case "uuid", "timestamptz":
-		return schema.Column{}, mysqlProjectionPolicy(
-			"map PostgreSQL type",
-			base,
-		)
-	default:
-		return schema.Column{}, mysqlProjectionPolicy(
-			"map PostgreSQL type",
-			base,
+			"map PostgreSQL declared type",
+			source.Name+": "+err.Error(),
 		)
 	}
+	targetType, declared, err := schema.CanonicalToDeclared(
+		canonical,
+		schema.MySQL,
+	)
+	if err != nil {
+		return schema.Column{}, nameTheColumn(err, source.Name)
+	}
+
+	target := source
+	target.Type = targetType
+	target.DeclaredType = declared
+	target.Default = cloneSchemaExpression(source.Default)
+
+	// A boolean's DEFAULT has to be rewritten, not just its type. PostgreSQL
+	// writes TRUE and FALSE where MySQL's tinyint(1) wants 1 and 0, and this is
+	// a property of the default rather than of the type - so it stays with the
+	// route.
+	if canonical.Kind == schema.KindBoolean && target.Default != nil {
+		value := strings.ToUpper(strings.TrimSpace(
+			target.Default.CanonicalSQL(),
+		))
+		switch value {
+		case "TRUE":
+			value = "1"
+		case "FALSE":
+			value = "0"
+		default:
+			return schema.Column{}, mysqlProjectionPolicy(
+				"map PostgreSQL boolean default",
+				source.Name,
+			)
+		}
+		expression, err := schema.ParseMySQLCatalogDefault(target, &value, false)
+		if err != nil {
+			return schema.Column{}, err
+		}
+		target.Default = expression
+	}
+
 	if target.Default != nil {
 		normalized, err := schema.NormalizeMySQLDefault(target)
 		if err != nil {
@@ -891,6 +774,56 @@ func projectPostgresColumnForMySQL(
 		target.Default = normalized
 	}
 	return target, nil
+}
+
+// refusePostgresTypeThisRouteHasNotProved keeps three refusals the canonical
+// layer would not make.
+//
+// All three are types the MySQL vocabulary CAN express and the mssql -> mysql
+// route already carries - uuid as char(36), json as longtext, real as double.
+// Accepting them here would make the two routes agree, which is the point of
+// the lattice, and it is not what this change is for.
+//
+// The reason is the DATA path rather than the schema. SQL Server's source
+// adapter converts a uniqueidentifier to its text form explicitly, in
+// adapter_source_mssql_values.go; PostgreSQL's has no such layer, so what a
+// uuid or a json document becomes on the way to MySQL is whatever the driver
+// hands over, and nothing has measured it. The SO2010 corpus has no column of
+// any of these three types, so the armed gate cannot answer it either.
+//
+// A schema that accepts what the data path cannot carry is worse than a
+// refusal: it produces a target that loads and is wrong. So these stay refused
+// until there is a live test, which is task #45.
+func refusePostgresTypeThisRouteHasNotProved(source schema.Column) error {
+	base := strings.ToLower(strings.TrimSpace(source.Type))
+	if source.DeclaredType != nil {
+		base = strings.ToLower(strings.TrimSpace(source.DeclaredType.Base))
+	}
+	// The column's name leads every one of these. A refusal that says only
+	// which TYPE was refused leaves an operator grepping a schema for it, and
+	// the rest of this file has named the column since before the swap.
+	switch base {
+	case "uuid":
+		return mysqlProjectionPolicy(
+			"map PostgreSQL type",
+			source.Name+" (uuid): the SQL Server route carries this as"+
+				" char(36), and the PostgreSQL value path for it has not been"+
+				" measured",
+		)
+	case "json":
+		return mysqlProjectionPolicy(
+			"map PostgreSQL type",
+			source.Name+" (json): jsonb is carried as longtext and this would"+
+				" be too, but the value path for it has not been measured",
+		)
+	case "real", "float4":
+		return mysqlProjectionPolicy(
+			"map PostgreSQL type",
+			source.Name+" (real): the SQL Server route carries this as double,"+
+				" and the PostgreSQL value path for it has not been measured",
+		)
+	}
+	return nil
 }
 
 func mySQLProjectedBoolean(column schema.Column) bool {
