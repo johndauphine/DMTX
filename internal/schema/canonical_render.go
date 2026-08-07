@@ -35,6 +35,8 @@ func RenderCanonical(value CanonicalType, target Dialect) (string, error) {
 	switch value.Kind {
 	case KindBoolean:
 		return renderBoolean(target), nil
+	case KindSmallInt:
+		return renderNamed(target, "SMALLINT", "Int16"), nil
 	case KindInteger:
 		return renderNamed(target, "INTEGER", "Int32"), nil
 	case KindBigInt:
@@ -47,8 +49,8 @@ func RenderCanonical(value CanonicalType, target Dialect) (string, error) {
 		return renderNumeric(value, target)
 	case KindText:
 		return renderText(value, target), nil
-	case KindBlob:
-		return renderBlob(target), nil
+	case KindBinary, KindBlob:
+		return renderBinary(value, target), nil
 	case KindDate:
 		return renderNamed(target, "DATE", "Date"), nil
 	case KindTime:
@@ -170,6 +172,49 @@ func renderText(value CanonicalType, target Dialect) string {
 		return "VARCHAR(" + length + ")"
 	}
 }
+
+// renderBinary keeps a declared width where the target has one.
+//
+// The unbounded spelling differs enough per engine that the bounded one cannot
+// be derived from it - PostgreSQL has no width at all, ClickHouse has no binary
+// type distinct from String, and SQL Server and MySQL disagree on which keyword
+// is fixed. So the bound is applied only where it means something, and every
+// other target falls through to the unbounded form it already had.
+func renderBinary(value CanonicalType, target Dialect) string {
+	if value.Length == nil {
+		return renderBlob(target)
+	}
+	length := strconv.FormatInt(*value.Length, 10)
+	switch target {
+	case SQLServer:
+		if *value.Length > SQLServerBinaryLengthLimit {
+			return renderBlob(target)
+		}
+		if value.Kind == KindBinary {
+			return "BINARY(" + length + ")"
+		}
+		return "VARBINARY(" + length + ")"
+	case MySQL:
+		if *value.Length > mySQLBinaryLengthLimit {
+			return renderBlob(target)
+		}
+		if value.Kind == KindBinary {
+			return "BINARY(" + length + ")"
+		}
+		return "VARBINARY(" + length + ")"
+	default:
+		// PostgreSQL's bytea and SQLite's blob take no width, and ClickHouse's
+		// String takes none either. Declaring one would be inventing syntax.
+		return renderBlob(target)
+	}
+}
+
+// mySQLBinaryLengthLimit is what a MySQL row can declare inline.
+//
+// VARBINARY shares the 65535-byte row limit rather than having a cap of its
+// own, so this is the ceiling past which the column has to become a BLOB
+// family type. It is the same number MySQL discovery already refuses beyond.
+const mySQLBinaryLengthLimit = 65_535
 
 func renderBlob(target Dialect) string {
 	switch target {

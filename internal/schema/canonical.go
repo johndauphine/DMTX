@@ -40,13 +40,45 @@ const (
 	// which is a bug rather than a shape to handle.
 	KindUnknown Kind = ""
 
-	KindBoolean  Kind = "boolean"
-	KindInteger  Kind = "integer"
-	KindBigInt   Kind = "bigint"
-	KindNumeric  Kind = "numeric"
-	KindReal     Kind = "real"
-	KindDouble   Kind = "double precision"
-	KindText     Kind = "text"
+	KindBoolean Kind = "boolean"
+
+	// KindSmallInt is an integer of sixteen bits or fewer.
+	//
+	// Separate from KindInteger because the information exists at the source and
+	// throwing it away costs storage on every row of every table. MySQL's
+	// TINYINT and SMALLINT and SQL Server's both land here; MySQL's MEDIUMINT
+	// does not, because it is 24 bits and no other engine has it, so INTEGER is
+	// the narrowest honest home for it.
+	//
+	// It does NOT mean "the target should declare TINYINT". SQL Server's TINYINT
+	// is unsigned 0-255 and MySQL's is signed -128..127, so the two spellings
+	// are not the same type and mapping one to the other would refuse half its
+	// range. SMALLINT holds both, which is what the pairwise projection worked
+	// out and what this kind preserves.
+	KindSmallInt Kind = "smallint"
+
+	KindInteger Kind = "integer"
+	KindBigInt  Kind = "bigint"
+	KindNumeric Kind = "numeric"
+	KindReal    Kind = "real"
+	KindDouble  Kind = "double precision"
+	KindText    Kind = "text"
+
+	// KindBinary is a FIXED-width byte string, padded to its declared length.
+	//
+	// Unlike fixed-width text, which every route refuses, this one is carryable:
+	// the padding byte is zero on both SQL Server and MySQL, comparison is
+	// bytewise on both, and no collation is involved. Fixed-width TEXT is
+	// refused because it is blank-padded and compared under a collation, which
+	// is a different stored value and a different answer - two facts that do not
+	// apply here.
+	//
+	// A target without a fixed-width binary type widens it to the varying one.
+	// That is safe in the direction that matters: the padding is part of the
+	// stored value, so it travels.
+	KindBinary Kind = "binary"
+
+	// KindBlob is a VARYING byte string, bounded by Length or unbounded.
 	KindBlob     Kind = "blob"
 	KindDate     Kind = "date"
 	KindTime     Kind = "time"
@@ -100,7 +132,8 @@ type Certification struct {
 type CanonicalType struct {
 	Kind Kind
 
-	// Length is in CHARACTERS for text and BYTES for blob, and the distinction
+	// Length is in CHARACTERS for text and BYTES for binary and blob, and the
+	// distinction
 	// is not pedantry. SQL Server's nchar/nvarchar declare UTF-16 code units
 	// while char/varchar declare bytes; MySQL's sys catalog reports bytes for
 	// both. Carrying the wrong unit here declared an nvarchar(40) as
