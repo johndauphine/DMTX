@@ -1,7 +1,9 @@
 package migrate
 
 import (
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/johndauphine/dmtx/internal/schema"
@@ -176,6 +178,7 @@ func TestPostgresToSQLServerDeclarations(t *testing.T) {
 		column       schema.Column
 		wantType     string
 		wantDeclared *schema.DeclaredType
+		wantRefused  string
 	}{
 		{
 			name:         "text, recorded with no declaration",
@@ -261,6 +264,20 @@ func TestPostgresToSQLServerDeclarations(t *testing.T) {
 			wantDeclared: &schema.DeclaredType{Base: "text"},
 		},
 		{
+			// SQL Server's decimal stops at 38 digits. Both swaps dropped that
+			// bound and it now lives in the target vocabulary, so the refusal
+			// arrives at projection time naming the source column rather than at
+			// CREATE TABLE time naming a declaration nobody asked for.
+			name: "numeric past 38 digits",
+			column: schema.Column{
+				Name: "amount", Type: "numeric",
+				DeclaredType: &schema.DeclaredType{
+					Base: "numeric", Arguments: []int{39, 2},
+				},
+			},
+			wantRefused: "exceeds what SQL Server can declare",
+		},
+		{
 			name: "numeric with precision and scale",
 			column: schema.Column{
 				Name: "amount", Type: "numeric",
@@ -300,6 +317,17 @@ func TestPostgresToSQLServerDeclarations(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			got, err := projectPostgresColumnForSQLServer(testCase.column)
+			if testCase.wantRefused != "" {
+				if err == nil {
+					t.Fatalf("accepted as %s/%+v, want a refusal naming %q",
+						got.Type, got.DeclaredType, testCase.wantRefused)
+				}
+				if !strings.Contains(err.Error(), testCase.wantRefused) {
+					t.Errorf("refusal does not name %q: %v",
+						testCase.wantRefused, err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("projection refused the column: %v", err)
 			}
@@ -335,5 +363,281 @@ func assertProjected(
 		// reflect.DeepEqual - which is a failure message that says the two
 		// sides are equal while the test says they are not.
 		t.Errorf("declaration:\n  got  %#v\n  want %#v", gotDeclared, wantDeclared)
+	}
+}
+
+// TestMySQLToSQLServerDeclarations pins the third swapped route.
+//
+// Every accepted shape here was compared against the pairwise projection before
+// the swap and agreed with it, whole declaration at a time. The numbers are the
+// interesting part: a MySQL modifier is characters for text and bytes for
+// binary, and SQL Server's varchar under the UTF-8 collation dmtx writes counts
+// bytes while its varbinary already does - so one family multiplies by four and
+// the other must not.
+func TestMySQLToSQLServerDeclarations(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		column       schema.Column
+		wantType     string
+		wantDeclared *schema.DeclaredType
+		wantRefused  string
+	}{
+		{
+			// Not TINYINT. SQL Server's is unsigned 0-255 and MySQL's is signed,
+			// so the narrowest type that holds the source's whole range is
+			// SMALLINT.
+			name:         "tinyint",
+			column:       mySQLColumn("integer", "tinyint"),
+			wantType:     "integer",
+			wantDeclared: &schema.DeclaredType{Base: "smallint"},
+		},
+		{
+			name:         "tinyint(1), which is MySQL's conventional boolean",
+			column:       mySQLColumn("integer", "tinyint", 1),
+			wantType:     "integer",
+			wantDeclared: &schema.DeclaredType{Base: "smallint"},
+		},
+		{
+			name:         "smallint",
+			column:       mySQLColumn("integer", "smallint"),
+			wantType:     "integer",
+			wantDeclared: &schema.DeclaredType{Base: "smallint"},
+		},
+		{
+			// MEDIUMINT is 24 bits and nothing else has it, so INTEGER is the
+			// narrowest honest home rather than SMALLINT.
+			name:         "mediumint",
+			column:       mySQLColumn("integer", "mediumint"),
+			wantType:     "integer",
+			wantDeclared: &schema.DeclaredType{Base: "int"},
+		},
+		{
+			name:         "int",
+			column:       mySQLColumn("integer", "int"),
+			wantType:     "integer",
+			wantDeclared: &schema.DeclaredType{Base: "int"},
+		},
+		{
+			name:         "bigint",
+			column:       mySQLColumn("bigint", "bigint"),
+			wantType:     "bigint",
+			wantDeclared: &schema.DeclaredType{Base: "bigint"},
+		},
+		{
+			name:         "double",
+			column:       mySQLColumn("double precision", "double"),
+			wantType:     "double precision",
+			wantDeclared: &schema.DeclaredType{Base: "double precision"},
+		},
+		{
+			name:     "decimal, whose two arguments are positional",
+			column:   mySQLColumn("numeric", "decimal", 12, 2),
+			wantType: "numeric",
+			wantDeclared: &schema.DeclaredType{
+				Base: "decimal", Arguments: []int{12, 2},
+			},
+		},
+		{
+			// Forty characters becomes 160 bytes.
+			name:     "varchar(40)",
+			column:   mySQLColumn("varchar", "varchar", 40),
+			wantType: "text",
+			wantDeclared: &schema.DeclaredType{
+				Base: "varchar", Arguments: []int{160},
+			},
+		},
+		{
+			name:     "varchar(2000), the widest that still fits multiplied",
+			column:   mySQLColumn("varchar", "varchar", 2_000),
+			wantType: "text",
+			wantDeclared: &schema.DeclaredType{
+				Base: "varchar", Arguments: []int{8_000},
+			},
+		},
+		{
+			// One character wider, and 8004 bytes is past what varchar can
+			// declare - so it widens to the MAX form rather than being refused,
+			// which is what the pairwise projection did and what made an
+			// ordinary MySQL column unmovable.
+			name:         "varchar(2001), one past that",
+			column:       mySQLColumn("varchar", "varchar", 2_001),
+			wantType:     "text",
+			wantDeclared: &schema.DeclaredType{Base: "text"},
+		},
+		{
+			name:         "text",
+			column:       mySQLColumn("text", "text"),
+			wantType:     "text",
+			wantDeclared: &schema.DeclaredType{Base: "text"},
+		},
+		{
+			// Bytes, so no multiplication. Multiplying here would declare four
+			// times the width for no reason - the mirror of the mistake that
+			// halving would be on the text path.
+			name:     "binary(16), which stays fixed and stays sixteen",
+			column:   mySQLColumn("binary", "binary", 16),
+			wantType: "blob",
+			wantDeclared: &schema.DeclaredType{
+				Base: "binary", Arguments: []int{16},
+			},
+		},
+		{
+			name:     "varbinary(16), which stays varying",
+			column:   mySQLColumn("varbinary", "varbinary", 16),
+			wantType: "blob",
+			wantDeclared: &schema.DeclaredType{
+				Base: "varbinary", Arguments: []int{16},
+			},
+		},
+		{
+			name:         "varbinary(9000), past what SQL Server can declare",
+			column:       mySQLColumn("varbinary", "varbinary", 9_000),
+			wantType:     "blob",
+			wantDeclared: &schema.DeclaredType{Base: "blob"},
+		},
+		{
+			name:         "blob",
+			column:       mySQLColumn("blob", "blob"),
+			wantType:     "blob",
+			wantDeclared: &schema.DeclaredType{Base: "blob"},
+		},
+		{
+			name:         "date",
+			column:       mySQLColumn("date", "date"),
+			wantType:     "date",
+			wantDeclared: &schema.DeclaredType{Base: "date"},
+		},
+		{
+			name:     "datetime(6)",
+			column:   mySQLColumn("datetime", "datetime", 6),
+			wantType: "datetime",
+			wantDeclared: &schema.DeclaredType{
+				Base: "timestamp", Arguments: []int{6},
+			},
+		},
+		{
+			// Zero digits is a precision, not an absence.
+			name:     "datetime(0)",
+			column:   mySQLColumn("datetime", "datetime", 0),
+			wantType: "datetime",
+			wantDeclared: &schema.DeclaredType{
+				Base: "timestamp", Arguments: []int{0},
+			},
+		},
+
+		// The refusals, each for a reason about VALUES rather than about types.
+		{
+			name:        "char, which is blank-padded",
+			column:      mySQLColumn("char", "char", 10),
+			wantRefused: "blank-padding",
+		},
+		{
+			name:        "longtext, which can hold more than VARCHAR(MAX)",
+			column:      mySQLColumn("text", "longtext"),
+			wantRefused: "LONGTEXT",
+		},
+		{
+			name:        "longblob, likewise",
+			column:      mySQLColumn("blob", "longblob"),
+			wantRefused: "LONGBLOB",
+		},
+		{
+			// MySQL's TIME runs from -838:59:59 to 838:59:59. SQL Server's is a
+			// time of day, so the out-of-range values have nowhere to arrive.
+			name:        "time, which is a signed duration",
+			column:      mySQLColumn("time", "time", 0),
+			wantRefused: "signed durations",
+		},
+		{
+			name:        "json",
+			column:      mySQLColumn("json", "json"),
+			wantRefused: "JSON storage",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, err := projectMySQLColumnForSQLServer(testCase.column)
+			if testCase.wantRefused != "" {
+				if err == nil {
+					t.Fatalf("accepted as %s/%+v, want a refusal naming %q",
+						got.Type, got.DeclaredType, testCase.wantRefused)
+				}
+				if !strings.Contains(err.Error(), testCase.wantRefused) {
+					t.Errorf("refusal does not name %q: %v",
+						testCase.wantRefused, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("projection refused the column: %v", err)
+			}
+			assertProjected(
+				t, got.Type, got.DeclaredType,
+				testCase.wantType, testCase.wantDeclared,
+			)
+			// And the target must be able to create it, which is the check the
+			// differential tests never made.
+			got.Nullable = true
+			if _, err := schema.CreateSQLServerTable(schema.Table{
+				Schema: "dbo", Name: "t", Columns: []schema.Column{got},
+			}); err != nil {
+				t.Fatalf("the target cannot create %s/%+v: %v",
+					got.Type, got.DeclaredType, err)
+			}
+		})
+	}
+}
+
+func mySQLColumn(portable, base string, arguments ...int) schema.Column {
+	declared := &schema.DeclaredType{Base: base}
+	if len(arguments) > 0 {
+		declared.Arguments = arguments
+	}
+	return schema.Column{Name: "c", Type: portable, DeclaredType: declared}
+}
+
+// TestCanonicalRefusalNamesTheColumn checks the thing an operator needs.
+//
+// The canonical layer knows the type it could not project and not the column it
+// came from, so its refusals read "decimal(39,2) exceeds what SQL Server can
+// declare" - true, and no help at all finding which of four hundred columns it
+// was. The Operation is left alone: it says which rule was violated, and the
+// fail-closed tests assert on it.
+func TestCanonicalRefusalNamesTheColumn(t *testing.T) {
+	wide := &schema.DeclaredType{Base: "numeric", Arguments: []int{39, 2}}
+
+	t.Run("postgres source", func(t *testing.T) {
+		_, err := projectPostgresColumnForSQLServer(schema.Column{
+			Name: "Reputation", Type: "numeric", DeclaredType: wide,
+		})
+		assertRefusalNames(t, err, "Reputation")
+	})
+	t.Run("mysql source", func(t *testing.T) {
+		_, err := projectMySQLColumnForSQLServer(schema.Column{
+			Name: "Reputation", Type: "numeric",
+			DeclaredType: &schema.DeclaredType{
+				Base: "decimal", Arguments: []int{39, 2},
+			},
+		})
+		assertRefusalNames(t, err, "Reputation")
+	})
+}
+
+func assertRefusalNames(t *testing.T, err error, columnName string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("the column was accepted")
+	}
+	if !strings.Contains(err.Error(), columnName) {
+		t.Errorf("refusal does not name %q: %v", columnName, err)
+	}
+	var policy *schema.PolicyError
+	if !errors.As(err, &policy) {
+		t.Fatalf("refusal is not a PolicyError: %v", err)
+	}
+	// The Operation still says which rule was violated, rather than being
+	// flattened into a generic wrapper by the renaming.
+	if policy.Operation != "project canonical numeric precision" {
+		t.Errorf("operation = %q, want the rule that was violated",
+			policy.Operation)
 	}
 }

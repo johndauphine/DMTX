@@ -35,6 +35,8 @@ func RenderCanonical(value CanonicalType, target Dialect) (string, error) {
 	switch value.Kind {
 	case KindBoolean:
 		return renderBoolean(target), nil
+	case KindSmallInt:
+		return renderSmallInt(target), nil
 	case KindInteger:
 		return renderNamed(target, "INTEGER", "Int32"), nil
 	case KindBigInt:
@@ -47,8 +49,8 @@ func RenderCanonical(value CanonicalType, target Dialect) (string, error) {
 		return renderNumeric(value, target)
 	case KindText:
 		return renderText(value, target), nil
-	case KindBlob:
-		return renderBlob(target), nil
+	case KindBinary, KindBlob:
+		return renderBinary(value, target), nil
 	case KindDate:
 		return renderNamed(target, "DATE", "Date"), nil
 	case KindTime:
@@ -66,6 +68,28 @@ func RenderCanonical(value CanonicalType, target Dialect) (string, error) {
 			Target:    string(target),
 		}
 	}
+}
+
+// renderSmallInt has to agree with CanonicalToDeclared, or the DDL a target is
+// created with says one thing and the authority recorded for it says another.
+//
+// Only SQL Server keeps the narrow width. Every other target widens to an
+// integer, which is compatibility rather than indifference - those targets have
+// been recorded as integer since before the canonical type existed, and a later
+// incremental run authenticates its recorded authority against the catalog.
+//
+// smallIntKeepsItsWidth is the one place that rule is written, so the renderer
+// and the projection cannot drift apart the way they did here once already.
+func renderSmallInt(target Dialect) string {
+	if smallIntKeepsItsWidth(target) {
+		return renderNamed(target, "SMALLINT", "Int16")
+	}
+	return renderNamed(target, "INTEGER", "Int32")
+}
+
+// smallIntKeepsItsWidth reports whether a target declares the narrow integer.
+func smallIntKeepsItsWidth(target Dialect) bool {
+	return target == SQLServer
 }
 
 func renderNamed(target Dialect, standard, clickhouse string) string {
@@ -170,6 +194,63 @@ func renderText(value CanonicalType, target Dialect) string {
 		return "VARCHAR(" + length + ")"
 	}
 }
+
+// renderBinary keeps a declared width where the target has one.
+//
+// The unbounded spelling differs enough per engine that the bounded one cannot
+// be derived from it - PostgreSQL has no width at all, ClickHouse has no binary
+// type distinct from String, and SQL Server and MySQL disagree on which keyword
+// is fixed. So the bound is applied only where it means something, and every
+// other target falls through to the unbounded form it already had.
+func renderBinary(value CanonicalType, target Dialect) string {
+	if value.Length == nil {
+		return renderBlob(target)
+	}
+	length := strconv.FormatInt(*value.Length, 10)
+	switch target {
+	case SQLServer:
+		if *value.Length > SQLServerBinaryLengthLimit {
+			return renderBlob(target)
+		}
+		if value.Kind == KindBinary {
+			return "BINARY(" + length + ")"
+		}
+		return "VARBINARY(" + length + ")"
+	case MySQL:
+		if *value.Length > MySQLVarBinaryLengthLimit {
+			return renderBlob(target)
+		}
+		// MySQL's two binary families have DIFFERENT caps, unlike SQL Server's:
+		// BINARY stops at 255 and VARBINARY runs to 65535. A SQL Server source
+		// can declare BINARY(8000), so rendering the fixed spelling at the
+		// varying family's limit would emit DDL MySQL rejects.
+		//
+		// Past 255 the column widens to VARBINARY at the same width. The padding
+		// bytes are part of the stored value and travel either way; what is lost
+		// is the target re-applying the padding itself, which is a schema fact
+		// rather than a data one - the same trade the PostgreSQL target makes by
+		// having no fixed binary type at all.
+		if value.Kind == KindBinary && *value.Length <= MySQLBinaryLengthLimit {
+			return "BINARY(" + length + ")"
+		}
+		return "VARBINARY(" + length + ")"
+	default:
+		// PostgreSQL's bytea and SQLite's blob take no width, and ClickHouse's
+		// String takes none either. Declaring one would be inventing syntax.
+		return renderBlob(target)
+	}
+}
+
+// MySQL's binary widths, which are not one number.
+//
+// The two families differ, and the difference is why a shared limit produced
+// BINARY(8000) - valid on SQL Server, rejected by MySQL. These are the same
+// bounds mysqlDeclaredTypeSQL already enforces when it renders a declared type;
+// stating them once here means the canonical renderer cannot drift from it.
+const (
+	MySQLBinaryLengthLimit    = 255
+	MySQLVarBinaryLengthLimit = 65_535
+)
 
 func renderBlob(target Dialect) string {
 	switch target {

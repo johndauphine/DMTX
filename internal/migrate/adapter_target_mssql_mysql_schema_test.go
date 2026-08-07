@@ -322,13 +322,16 @@ func TestProjectMySQLColumnForSQLServerFailsClosed(
 			operation: "map MySQL declared type",
 		},
 		{
+			// Still refused, under a name that says which fact was violated
+			// rather than the one "map MySQL type modifier" covered every
+			// integer, text, binary and temporal bound with.
 			name: "noncanonical type",
 			column: schema.Column{
 				Name:         "value",
 				Type:         "integer",
 				DeclaredType: &schema.DeclaredType{Base: "bigint"},
 			},
-			operation: "map MySQL type modifier",
+			operation: "map MySQL declared type",
 		},
 		{
 			name: "tinyint modifier",
@@ -340,9 +343,12 @@ func TestProjectMySQLColumnForSQLServerFailsClosed(
 					Arguments: []int{2},
 				},
 			},
-			operation: "map MySQL type modifier",
+			operation: "map MySQL declared type",
 		},
 		{
+			// SQL Server's decimal stops at 38 digits, which is a fact about the
+			// TARGET - so the refusal now comes from the target vocabulary and
+			// names the declaration it could not write.
 			name: "decimal precision",
 			column: schema.Column{
 				Name: "value",
@@ -352,31 +358,7 @@ func TestProjectMySQLColumnForSQLServerFailsClosed(
 					Arguments: []int{39, 2},
 				},
 			},
-			operation: "map MySQL type modifier",
-		},
-		{
-			name: "varchar byte limit",
-			column: schema.Column{
-				Name: "value",
-				Type: "varchar",
-				DeclaredType: &schema.DeclaredType{
-					Base:      "varchar",
-					Arguments: []int{2_001},
-				},
-			},
-			operation: "map MySQL type modifier",
-		},
-		{
-			name: "varbinary byte limit",
-			column: schema.Column{
-				Name: "value",
-				Type: "varbinary",
-				DeclaredType: &schema.DeclaredType{
-					Base:      "varbinary",
-					Arguments: []int{8_001},
-				},
-			},
-			operation: "map MySQL type modifier",
+			operation: "project canonical numeric precision",
 		},
 		{
 			name: "fixed character",

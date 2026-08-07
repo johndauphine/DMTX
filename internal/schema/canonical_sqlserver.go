@@ -29,6 +29,16 @@ import (
 const (
 	SQLServerNarrowTextLimit   = 8_000
 	SQLServerNationalTextLimit = 4_000
+
+	// SQLServerBinaryLengthLimit is the same 8000, and it is a separate constant
+	// on purpose. A byte string's n is bytes because bytes are what it stores,
+	// not because a UTF-8 collation makes it so - the two limits agree today by
+	// coincidence of SQL Server's page layout, and sharing one name would invite
+	// a future edit to move both.
+	SQLServerBinaryLengthLimit = 8_000
+
+	// SQLServerNumericPrecisionLimit is the most digits decimal can declare.
+	SQLServerNumericPrecisionLimit = 38
 )
 
 // SQLServerTextLengthLimit is the largest length the named family may declare.
@@ -174,6 +184,18 @@ func CanonicalFromSQLServer(
 			canonical.Kind,
 		)
 	}
+	// Two kinds the portable name cannot tell apart, refined from the base.
+	//
+	// Discovery sets column.Type to "integer" for tinyint, smallint and int
+	// alike, and to "blob" for binary, varbinary and varbinary(max) alike, so
+	// the portable name is where the width and the fixed/varying distinction go
+	// to die. Both facts are in the base, and both are worth keeping - one saves
+	// bytes on every row, the other is the difference between a padded value and
+	// an unpadded one.
+	//
+	// Refined after the base check rather than inside canonicalKindFromPortable,
+	// because that function sees only the portable name and would have to guess.
+	canonical.Kind = refineSQLServerKind(canonical.Kind, base)
 
 	// The single positional argument means different things by kind - a length
 	// for text, a fractional-second precision for a temporal - so it is read
@@ -199,7 +221,7 @@ func CanonicalFromSQLServer(
 			canonical.Precision = &precision
 			canonical.Scale = &scale
 		}
-	case KindText, KindBlob:
+	case KindText, KindBinary, KindBlob:
 		if length, ok := declaredModifier(column.DeclaredType); ok {
 			if canonical.Kind == KindText &&
 				length > SQLServerTextLengthLimit(base) {
@@ -248,6 +270,27 @@ func CanonicalFromSQLServer(
 	return canonical, nil
 }
 
+// refineSQLServerKind narrows a kind using the declared base.
+//
+// Only two kinds need it, and both are cases where discovery deliberately
+// assigned a broad portable name. Everything else passes through unchanged, so
+// a base this does not mention cannot silently become something else.
+func refineSQLServerKind(kind Kind, base string) Kind {
+	switch kind {
+	case KindInteger:
+		if base == "tinyint" || base == "smallint" {
+			return KindSmallInt
+		}
+	case KindBlob:
+		// varbinary and varbinary(max), which discovery spells "blob", stay
+		// varying. Only the fixed spelling moves.
+		if base == "binary" {
+			return KindBinary
+		}
+	}
+	return kind
+}
+
 // canonicalKindFromPortable maps the portable type a source already assigns.
 //
 // dmtx's engines have set column.Type to a small vocabulary since before this
@@ -281,8 +324,14 @@ func canonicalKindFromPortable(portable string) Kind {
 		// smalldatetime column - and it silently accepted a type no target
 		// certifies.
 		return KindText
-	case "blob", "bytea":
+	case "blob", "bytea", "varbinary":
+		// SQL Server discovery spells binary, varbinary and varbinary(max) all
+		// as "blob" and keeps the distinction in the declared base, which
+		// refineSQLServerKind reads. MySQL discovery spells them out here
+		// instead, so "varbinary" is listed and "binary" has its own case.
 		return KindBlob
+	case "binary":
+		return KindBinary
 	case "date":
 		return KindDate
 	case "time":
@@ -325,7 +374,11 @@ func sqlServerBaseKnown(base string, kind Kind) bool {
 	switch kind {
 	case KindBoolean:
 		return base == "bool"
-	case KindInteger:
+	case KindInteger, KindSmallInt:
+		// One case for both, because this runs BEFORE refineSQLServerKind and
+		// therefore always sees KindInteger from a SQL Server source. It also
+		// sees KindSmallInt when a caller validates an already-refined type, and
+		// the same four bases are legal either way.
 		return base == "tinyint" || base == "smallint" || base == "int" ||
 			base == "integer"
 	case KindBigInt:
@@ -339,7 +392,7 @@ func sqlServerBaseKnown(base string, kind Kind) bool {
 	case KindText:
 		return base == "char" || base == "varchar" || base == "nchar" ||
 			base == "nvarchar" || base == "text"
-	case KindBlob:
+	case KindBinary, KindBlob:
 		return base == "binary" || base == "varbinary" || base == "blob"
 	case KindDate:
 		return base == "date"

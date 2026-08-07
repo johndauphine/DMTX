@@ -123,6 +123,63 @@ func CanonicalFromMySQL(
 		)
 	}
 
+	// The declared base has to be one MySQL discovery emits for this kind.
+	//
+	// Fail closed by enumeration, the same posture the SQL Server converter
+	// takes. Classifying from column.Type alone would let a column whose
+	// declaration says something dmtx never wrote pass straight through into a
+	// target - and the pairwise projection this replaces checked the pair on
+	// every branch, so leaving the check out would be a loss of strictness
+	// wearing a refactor's clothes.
+	base := strings.ToLower(strings.TrimSpace(column.DeclaredType.Base))
+	if !mySQLBaseKnown(base, canonical.Kind) {
+		return CanonicalType{}, fmt.Errorf(
+			"MySQL column %s declares %q, which is not a base dmtx certifies"+
+				" for %s",
+			column.Name,
+			column.DeclaredType.Base,
+			canonical.Kind,
+		)
+	}
+
+	// An integer carries no modifier, with one exception discovery emits.
+	//
+	// MySQL 8.0 deprecated display widths and mysql_source_discovery.go admits
+	// only a bare integer or tinyint(1) - the conventional boolean. Anything
+	// else is a declaration dmtx did not produce. The pairwise projection
+	// checked this on every integer branch; the check is here now rather than
+	// nowhere.
+	switch canonical.Kind {
+	case KindInteger, KindBigInt:
+		arguments := column.DeclaredType.Arguments
+		legal := len(arguments) == 0 ||
+			base == "tinyint" && len(arguments) == 1 && arguments[0] == 1
+		if !legal {
+			return CanonicalType{}, fmt.Errorf(
+				"MySQL column %s declares %s%v, and discovery emits only a bare"+
+					" integer or tinyint(1)",
+				column.Name,
+				base,
+				arguments,
+			)
+		}
+	}
+
+	// The width MySQL declared, which the portable name lost.
+	//
+	// Discovery names tinyint, smallint, mediumint and int alike "integer", so
+	// carrying an ordinary MySQL TINYINT to a target as INT would spend four
+	// bytes a row where one was declared. MEDIUMINT is deliberately not
+	// narrowed: it is 24 bits, no other engine has it, and INTEGER is the
+	// narrowest home that holds all of it.
+	//
+	// SMALLINT rather than TINYINT on the far side is not an accident of this
+	// mapping - see KindSmallInt. MySQL's TINYINT is signed and SQL Server's is
+	// not, so they are different types wearing one name.
+	if canonical.Kind == KindInteger && (base == "tinyint" || base == "smallint") {
+		canonical.Kind = KindSmallInt
+	}
+
 	canonical.Precision = column.DeclaredType.Precision
 	canonical.Scale = column.DeclaredType.Scale
 	canonical.FractionalSecondPrecision =
@@ -145,7 +202,7 @@ func CanonicalFromMySQL(
 			canonical.Precision = &precision
 			canonical.Scale = &scale
 		}
-	case KindText, KindBlob:
+	case KindText, KindBinary, KindBlob:
 		if length, ok := declaredModifier(column.DeclaredType); ok {
 			bounded := length
 			canonical.Length = &bounded
@@ -172,4 +229,55 @@ func CanonicalFromMySQL(
 	}
 	canonical.Certification.Reason = MySQLKeyCollationRemedy(flavor)
 	return canonical, nil
+}
+
+// mySQLBaseKnown reports whether a declared base is one MySQL discovery emits
+// for this kind.
+//
+// Taken from the type switch in mysql_source_discovery.go rather than from
+// MySQL's manual: the point is not what MySQL can declare, it is what dmtx has
+// admitted. Anything else reaching here is a declaration dmtx did not produce.
+//
+// The spelling pairs - character for char, character varying for varchar,
+// double precision for double, numeric for decimal - are what a catalog can
+// report for the same type, and the pairwise projection accepted both. They are
+// kept so that a source describing itself in the standard's words is not
+// refused for it.
+func mySQLBaseKnown(base string, kind Kind) bool {
+	switch kind {
+	case KindSmallInt, KindInteger:
+		// One case for both. This runs before the width refinement below, so a
+		// MySQL source always arrives as KindInteger; KindSmallInt appears only
+		// when a caller validates an already-refined type.
+		return base == "tinyint" || base == "smallint" ||
+			base == "mediumint" || base == "int" || base == "integer"
+	case KindBigInt:
+		return base == "bigint"
+	case KindNumeric:
+		return base == "decimal" || base == "numeric"
+	case KindDouble:
+		return base == "double" || base == "double precision"
+	case KindText:
+		return base == "char" || base == "character" ||
+			base == "varchar" || base == "character varying" ||
+			base == "tinytext" || base == "text" ||
+			base == "mediumtext" || base == "longtext"
+	case KindBinary:
+		return base == "binary"
+	case KindBlob:
+		return base == "varbinary" || base == "tinyblob" ||
+			base == "blob" || base == "mediumblob" || base == "longblob"
+	case KindDate:
+		return base == "date"
+	case KindTime:
+		return base == "time"
+	case KindDateTime:
+		return base == "datetime" || base == "timestamp"
+	case KindJSON:
+		return base == "json"
+	default:
+		// MySQL discovery emits no boolean, no real and no uuid, so a column
+		// claiming one of those kinds did not come from it.
+		return false
+	}
 }

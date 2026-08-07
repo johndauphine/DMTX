@@ -1,5 +1,7 @@
 package schema
 
+import "fmt"
+
 // Canonical types, projected into a target's catalog shape.
 //
 // RenderCanonical writes DDL. This writes what dmtx carries between the
@@ -39,7 +41,17 @@ func CanonicalToDeclared(
 	switch value.Kind {
 	case KindBoolean:
 		return "boolean", nil, nil
-	case KindInteger:
+	case KindSmallInt, KindInteger:
+		// Widening a small integer to integer here is compatibility rather than
+		// indifference. These targets have been recorded as integer since before
+		// this package existed, and target authority is authenticated against
+		// the target's catalog on later incremental runs - so a dmtx that
+		// started declaring smallint would disagree with every target an older
+		// dmtx created.
+		//
+		// smallIntKeepsItsWidth says which targets do keep it, and the DDL
+		// renderer asks the same question. The two must agree: the DDL creates
+		// the catalog that this declaration is later authenticated against.
 		return "integer", nil, nil
 	case KindBigInt:
 		return "bigint", nil, nil
@@ -65,10 +77,15 @@ func CanonicalToDeclared(
 		return "numeric", declared, nil
 	case KindText:
 		return canonicalTextDeclared(value)
-	case KindBlob:
+	case KindBinary, KindBlob:
 		// The portable name a target assigns is the target's own, not a
 		// neutral one: PostgreSQL's catalog says bytea where SQLite says blob,
 		// and target authority is authenticated against that catalog.
+		//
+		// Fixed and varying collapse here because PostgreSQL has no fixed-width
+		// binary type. The padding bytes are part of the stored value, so they
+		// arrive; what is lost is the target's ability to re-declare the width,
+		// which is a schema fact rather than a data one.
 		if target == Postgres {
 			return "bytea", nil, nil
 		}
@@ -177,6 +194,13 @@ func canonicalToSQLServerDeclared(
 	switch value.Kind {
 	case KindBoolean:
 		return "boolean", declared("bool"), nil
+	case KindSmallInt:
+		// SMALLINT, never TINYINT. SQL Server's TINYINT is unsigned 0-255 and
+		// every other engine's is signed, so declaring TINYINT here would refuse
+		// half the range the source can hold. The portable name stays "integer"
+		// because that is what SQL Server discovery assigns to smallint, and the
+		// target authority is compared against what discovery will say.
+		return "integer", declared("smallint"), nil
 	case KindInteger:
 		return "integer", declared("int"), nil
 	case KindBigInt:
@@ -209,11 +233,33 @@ func canonicalToSQLServerDeclared(
 		if value.Scale != nil {
 			scale = *value.Scale
 		}
+		// SQL Server's decimal carries at most 38 digits, and the scale cannot
+		// exceed them. Both bounds were in the pairwise projections and both
+		// swaps dropped them, so numeric(39,2) was projected happily and then
+		// refused by the renderer at CREATE TABLE time - a failure at the last
+		// possible moment, naming the declaration rather than the source column
+		// it came from.
+		//
+		// It belongs here rather than in each converter for the same reason the
+		// temporal ceiling does: it is a fact about what this TARGET can
+		// declare, and a source has no way to know it.
+		if *value.Precision < 1 ||
+			*value.Precision > SQLServerNumericPrecisionLimit ||
+			scale < 0 || scale > *value.Precision {
+			return "", nil, &PolicyError{
+				Operation: "project canonical numeric precision",
+				Type: fmt.Sprintf(
+					"decimal(%d,%d) exceeds what SQL Server can declare",
+					*value.Precision, scale,
+				),
+				Target: string(SQLServer),
+			}
+		}
 		return "numeric", declared("decimal", int(*value.Precision), int(scale)), nil
 	case KindText:
 		return canonicalToSQLServerText(value, declared)
-	case KindBlob:
-		return "blob", declared("blob"), nil
+	case KindBinary, KindBlob:
+		return canonicalToSQLServerBinary(value, declared)
 	case KindDate:
 		return "date", declared("date"), nil
 	case KindTime:
@@ -244,6 +290,39 @@ func canonicalToSQLServerDeclared(
 			Target:    string(SQLServer),
 		}
 	}
+}
+
+// canonicalToSQLServerBinary keeps the width and the padding.
+//
+// SQL Server's limit is the same 8000 bytes its narrow text families have, and
+// past it a byte string has to be VARBINARY(MAX) - which discovery spells
+// "blob" with no argument. Both facts are the same shape as the text case above
+// and neither is the same NUMBER as it, so they are written out rather than
+// shared: the text limit is about a UTF-8 collation and this one is not.
+//
+// No multiplication happens here. Length is already bytes for a byte string,
+// which is the whole reason CanonicalType documents its unit per kind - the
+// text path multiplies by four and this one must not, and a single shared
+// helper would have had to be told which.
+func canonicalToSQLServerBinary(
+	value CanonicalType,
+	declared func(string, ...int) *DeclaredType,
+) (string, *DeclaredType, error) {
+	if value.Length == nil {
+		return "blob", declared("blob"), nil
+	}
+	if *value.Length > SQLServerBinaryLengthLimit {
+		// Wider than SQL Server can declare, so it becomes VARBINARY(MAX)
+		// rather than being truncated - which would refuse values the source
+		// holds. Fixed width is lost along with the bound, and it has to be:
+		// there is no MAX form of BINARY.
+		return "blob", declared("blob"), nil
+	}
+	base := "varbinary"
+	if value.Kind == KindBinary {
+		base = "binary"
+	}
+	return "blob", declared(base, int(*value.Length)), nil
 }
 
 // canonicalToSQLServerText multiplies a character length into bytes.
