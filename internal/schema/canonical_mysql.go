@@ -497,13 +497,20 @@ func mySQLModifiersValid(base string, kind Kind, declared *DeclaredType) error {
 
 // mySQLNumericModifiers reads a decimal's precision and scale from whichever
 // pair of fields the caller populated.
+//
+// A PAIR, in both spellings. A first draft defaulted a missing structured Scale
+// to zero, which reopened through Precision/Scale the exact gap it had just
+// closed through Arguments: MySQL reports both for every decimal, so one of them
+// is not "the other was omitted" - it is a declaration dmtx did not read from a
+// catalog, and decimal(12) silently became an unbounded NUMERIC once already.
 func mySQLNumericModifiers(declared *DeclaredType) (int, int, bool) {
-	if declared.Precision != nil {
-		scale := 0
-		if declared.Scale != nil {
-			scale = int(*declared.Scale)
-		}
-		return int(*declared.Precision), scale, true
+	if declared.Precision != nil && declared.Scale != nil {
+		return int(*declared.Precision), int(*declared.Scale), true
+	}
+	if declared.Precision != nil || declared.Scale != nil {
+		// One of the pair, which is the case worth refusing loudly rather than
+		// completing.
+		return 0, 0, false
 	}
 	if len(declared.Arguments) == 2 {
 		return declared.Arguments[0], declared.Arguments[1], true

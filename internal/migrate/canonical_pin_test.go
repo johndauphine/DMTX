@@ -780,6 +780,23 @@ func TestMySQLToPostgresDeclarations(t *testing.T) {
 			wantRefused: "outside what MySQL can declare",
 		},
 		{
+			// The same gap through the other spelling. A structured Precision
+			// with no Scale used to default the scale to zero, which completed
+			// a declaration rather than refusing it - the Arguments path had
+			// just been fixed for exactly this.
+			name: "decimal with a structured precision and no scale",
+			column: func() schema.Column {
+				precision := int64(12)
+				return schema.Column{
+					Name: "c", Type: "numeric",
+					DeclaredType: &schema.DeclaredType{
+						Base: "decimal", Precision: &precision,
+					},
+				}
+			}(),
+			wantRefused: "a precision and a scale",
+		},
+		{
 			// MySQL's TIME runs from -838:59:59 to 838:59:59, and PostgreSQL's
 			// is a time of day.
 			name:        "time, which is a signed duration",
