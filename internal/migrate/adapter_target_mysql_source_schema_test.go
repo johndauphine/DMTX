@@ -1070,3 +1070,120 @@ func TestProjectMySQLTargetTableRejectsCrossFlavorCollation(t *testing.T) {
 		})
 	}
 }
+
+// TestProjectSQLServerNationalTextForMySQL covers the projection this branch
+// added, which the live corpus proved and no unit test pinned.
+//
+// The lengths are the point. nchar and nvarchar declare UTF-16 code units,
+// which discovery has already converted to characters, and MySQL's modifier is
+// characters - so the number passes straight through. Multiplying it, as the
+// SQL Server target correctly must going the other way, would declare four
+// times what the source can hold. That is the defect this whole area was
+// rewritten after, pointing in the opposite direction.
+func TestProjectSQLServerNationalTextForMySQL(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		base     string
+		argument []int
+		wantType string
+		wantBase string
+		wantArgs []int
+		refused  bool
+	}{
+		{
+			name: "nvarchar keeps its character length",
+			base: "nvarchar", argument: []int{40},
+			wantType: "varchar", wantBase: "varchar", wantArgs: []int{40},
+		},
+		{
+			name: "nchar likewise",
+			base: "nchar", argument: []int{10},
+			wantType: "varchar", wantBase: "varchar", wantArgs: []int{10},
+		},
+		{
+			name: "nvarchar at its ceiling",
+			base: "nvarchar", argument: []int{4_000},
+			wantType: "varchar", wantBase: "varchar", wantArgs: []int{4_000},
+		},
+		{
+			// The ceiling is the SOURCE family's, not one constant: SQL Server
+			// cannot declare an nvarchar past 4000, so accepting one would be
+			// accepting a column that cannot exist.
+			name: "nvarchar past its ceiling is refused",
+			base: "nvarchar", argument: []int{4_001},
+			refused: true,
+		},
+		{
+			// And the same number is legal for the narrow family, which is why
+			// the ceiling cannot be one constant.
+			name: "varchar at the same length is fine",
+			base: "varchar", argument: []int{4_001},
+			wantType: "varchar", wantBase: "varchar", wantArgs: []int{4_001},
+		},
+		{
+			name: "varchar past its own ceiling is refused",
+			base: "varchar", argument: []int{8_001},
+			refused: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			column := schema.Column{
+				Name: "c",
+				Type: "text",
+				DeclaredType: &schema.DeclaredType{
+					Base:      testCase.base,
+					Arguments: testCase.argument,
+				},
+			}
+			projected, err := projectSQLServerColumnForMySQL(column)
+			if testCase.refused {
+				if err == nil {
+					t.Fatalf("%s(%v) was accepted as %+v",
+						testCase.base, testCase.argument, projected.DeclaredType)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%s(%v) was refused: %v", testCase.base, testCase.argument, err)
+			}
+			if projected.Type != testCase.wantType {
+				t.Errorf("type = %q, want %q", projected.Type, testCase.wantType)
+			}
+			if projected.DeclaredType == nil ||
+				projected.DeclaredType.Base != testCase.wantBase {
+				t.Fatalf("declared = %+v, want base %q",
+					projected.DeclaredType, testCase.wantBase)
+			}
+			if len(projected.DeclaredType.Arguments) != len(testCase.wantArgs) {
+				t.Fatalf("arguments = %v, want %v",
+					projected.DeclaredType.Arguments, testCase.wantArgs)
+			}
+			for index, want := range testCase.wantArgs {
+				if projected.DeclaredType.Arguments[index] != want {
+					t.Errorf("arguments = %v, want %v - a byte count would give %d",
+						projected.DeclaredType.Arguments, testCase.wantArgs, want*4)
+				}
+			}
+		})
+	}
+}
+
+// TestProjectSQLServerUnboundedNationalTextForMySQL pins nvarchar(max).
+//
+// Discovery records it as an unbounded text rather than a national one, so the
+// projection never sees the national spelling - and the target is LONGTEXT,
+// which is what let the corpus's AboutMe column arrive intact.
+func TestProjectSQLServerUnboundedNationalTextForMySQL(t *testing.T) {
+	column := schema.Column{
+		Name:         "AboutMe",
+		Type:         "text",
+		DeclaredType: &schema.DeclaredType{Base: "text"},
+	}
+	projected, err := projectSQLServerColumnForMySQL(column)
+	if err != nil {
+		t.Fatalf("unbounded text was refused: %v", err)
+	}
+	if projected.DeclaredType == nil || projected.DeclaredType.Base != "longtext" {
+		t.Fatalf("declared = %+v, want longtext", projected.DeclaredType)
+	}
+}

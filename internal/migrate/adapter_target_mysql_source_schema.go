@@ -553,9 +553,17 @@ func projectSQLServerColumnForMySQL(
 		target.Type = "double precision"
 		declaration("double")
 	case "char", "varchar", "nchar", "nvarchar":
-		// SQL Server's narrow modifier is a UTF-8 byte limit while MySQL's is a
-		// character limit. VARCHAR is a safe widening that also retains the
-		// padding already present in admitted SQL Server CHAR rows/defaults.
+		// The two families declare different units, and this case handles both,
+		// so both are stated before either is acted on:
+		//
+		//	char, varchar      BYTES
+		//	nchar, nvarchar    UTF-16 code units, which discovery has already
+		//	                   converted to characters
+		//
+		// MySQL's modifier is characters. So the narrow families are widened -
+		// n bytes hold at most n characters, and VARCHAR(n) characters holds
+		// them all, which also retains the padding present in admitted SQL
+		// Server CHAR rows and defaults.
 		//
 		// The national spellings need no widening and get none: nchar and
 		// nvarchar declare UTF-16 code units, which discovery has already
