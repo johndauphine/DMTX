@@ -43,9 +43,17 @@ func CanonicalFromPostgres(column Column, isKey bool) (CanonicalType, error) {
 		)
 	}
 
-	// A nil declaration is ordinary. The portable name is the whole fact for
-	// the types PostgreSQL records without a modifier.
+	// A nil declaration is ordinary - the portable name is the whole fact for
+	// the types PostgreSQL records without a modifier - but it is not the whole
+	// fact for a temporal one, so the defaults below are applied either way.
+	//
+	// Returning early here was a real defect and only the armed live gate found
+	// it: a bare timestamp reached the SQL Server target with no precision, and
+	// its renderer refuses that. The corpus column is badges.date, which is a
+	// TIMESTAMP, so the refusal read "date timestamp" and looked like a type
+	// confusion rather than a missing modifier.
 	if column.DeclaredType == nil {
+		applyPostgresTemporalDefault(&canonical)
 		if isKey {
 			canonical.Certification.Ordering = true
 		}
@@ -92,22 +100,32 @@ func CanonicalFromPostgres(column Column, isKey bool) (CanonicalType, error) {
 				canonical.FractionalSecondPrecision = &precision
 			}
 		}
-		// A bare PostgreSQL timestamp MEANS timestamp(6). Microseconds are the
-		// type's definition rather than a default a target may reinterpret, so
-		// the canonical type records six rather than an absence.
-		//
-		// Leaving it absent let a bare timestamp reach the SQL Server renderer
-		// with no precision at all, which it refuses - found by the armed live
-		// gate on a corpus column named date that is a TIMESTAMP, which is also
-		// why the error read "date timestamp".
-		if canonical.FractionalSecondPrecision == nil {
-			microseconds := int64(6)
-			canonical.FractionalSecondPrecision = &microseconds
-		}
+		applyPostgresTemporalDefault(&canonical)
 	}
 
 	if isKey {
 		canonical.Certification.Ordering = true
 	}
 	return canonical, nil
+}
+
+// applyPostgresTemporalDefault records the precision a bare temporal means.
+//
+// A PostgreSQL timestamp with no modifier IS timestamp(6). Microseconds are the
+// type's definition rather than a default a target may reinterpret, so the
+// canonical type carries six rather than an absence - and a target that would
+// have chosen differently, or refused, never gets the chance to.
+//
+// Applied on both paths through the converter, because PostgreSQL records some
+// temporals with a declaration and some without, and the meaning is the same
+// either way. Applying it on one path only is what let a bare timestamp reach
+// the SQL Server renderer unmodified.
+func applyPostgresTemporalDefault(canonical *CanonicalType) {
+	switch canonical.Kind {
+	case KindTime, KindDateTime:
+		if canonical.FractionalSecondPrecision == nil {
+			microseconds := int64(6)
+			canonical.FractionalSecondPrecision = &microseconds
+		}
+	}
 }
